@@ -1,0 +1,35 @@
+{
+  "paths": {
+    "data_root": "C:/Users/gianl/Desktop/Thesis/Sensor-Fusion_Final_Model_Repo/data/HerculesFiles/Data",
+    "output_root": "C:/Users/gianl/Desktop/Thesis/Sensor-Fusion_Final_Model_Repo/Fault_Localization_Model/mixed_target_v2_1000_dataset_x64_y32"
+  },
+  "hercules": {
+    "day": "Day_1_Parking",
+    "session": "01_Day"
+  },
+  "generation": {
+    "num_samples": 1000,
+    "seed": 42,
+    "shuffle": true
+  },
+  "bev": {
+    "x_min": 0.0,
+    "x_max": 64.0,
+    "y_min": -32.0,
+    "y_max": 32.0,
+    "resolution": 0.20,
+    "grid_size": 100,
+    "min_range": 1.0,
+    "max_range": 120.0
+  },
+  "faults": {
+    "plan": [
+      "fog_sim:4",
+      "rain_sim:5",
+      "snow_sim:5",
+      "old_laser_degradation:0",
+      "fov_filter:1"
+    ],
+    "fog_noise": 10
+  }
+}

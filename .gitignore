@@ -1,0 +1,54 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.matplotlib/
+
+# Local raw datasets. Keep only placeholders.
+data/**
+!data/
+/HerculesFiles/
+/K-Radar-main/
+!data/.gitkeep
+
+# Generated reliability datasets and previews
+Fault_Localization_Model/grid_reliability*/
+Fault_Localization_Model/*dataset*/
+Fault_Localization_Model/*smoke*/
+Fault_Localization_Model/test_*heatmaps*/
+Fault_Localization_Model/**/*.npz
+Fault_Localization_Model/**/*.png
+Fault_Localization_Model/**/*.csv
+
+# Training outputs and checkpoints
+Fault_Localization_Model/runs/
+PFS/runs/
+**/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.log
+
+# Local outputs
+outputs/
+results*/
+
+# Archives/editor/system files
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+Thumbs.db
+.DS_Store
