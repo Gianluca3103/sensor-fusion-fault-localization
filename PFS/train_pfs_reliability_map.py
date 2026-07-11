@@ -360,6 +360,16 @@ def build_warmup_cosine_scheduler(optimizer, epochs, warmup_epochs, min_lr, base
 def main():
     parser = argparse.ArgumentParser(description="Train a PFS-style model for Hercules BEV fault reliability maps.")
     parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
+    parser.add_argument(
+        "--train-root",
+        default=None,
+        help="Optional training dataset folder. If set with --val-root, disables random splitting of --dataset-root.",
+    )
+    parser.add_argument(
+        "--val-root",
+        default=None,
+        help="Optional validation dataset folder generated from held-out scenes.",
+    )
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -414,13 +424,24 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    dataset_root = Path(args.dataset_root)
     output_root = Path(args.output_root)
-    paths = sorted(dataset_root.glob("*.npz"))
-    if not paths:
-        raise FileNotFoundError(f"No .npz files found in {dataset_root}")
-
-    train_paths, val_paths = split_paths(paths, args.val_ratio, args.seed)
+    if args.train_root or args.val_root:
+        if not args.train_root or not args.val_root:
+            raise ValueError("--train-root and --val-root must be provided together.")
+        train_root = Path(args.train_root)
+        val_root = Path(args.val_root)
+        train_paths = sorted(train_root.glob("*.npz"))
+        val_paths = sorted(val_root.glob("*.npz"))
+        if not train_paths:
+            raise FileNotFoundError(f"No .npz files found in train root {train_root}")
+        if not val_paths:
+            raise FileNotFoundError(f"No .npz files found in validation root {val_root}")
+    else:
+        dataset_root = Path(args.dataset_root)
+        paths = sorted(dataset_root.glob("*.npz"))
+        if not paths:
+            raise FileNotFoundError(f"No .npz files found in {dataset_root}")
+        train_paths, val_paths = split_paths(paths, args.val_ratio, args.seed)
     resize_hw = (args.resize_height, args.resize_width)
     device = torch.device(args.device)
 

@@ -61,6 +61,8 @@ def config_defaults(config):
         "day": config_get(config, "hercules.day", "Day_1_Parking"),
         "session": config_get(config, "hercules.session", "01_Day"),
         "all_scenes": config_get(config, "hercules.all_scenes", False),
+        "include_scenes": config_get(config, "hercules.include_scenes", None),
+        "exclude_scenes": config_get(config, "hercules.exclude_scenes", None),
         "keep_duplicate_frames": config_get(config, "hercules.keep_duplicate_frames", False),
         "num_samples": config_get(config, "generation.num_samples", 24),
         "seed": config_get(config, "generation.seed", 42),
@@ -102,6 +104,18 @@ def parse_args():
         action="store_true",
         default=defaults["all_scenes"],
         help="Use every Hercules LiDAR/Aeva folder found under --data-root instead of one --day/--session.",
+    )
+    parser.add_argument(
+        "--include-scenes",
+        nargs="*",
+        default=defaults["include_scenes"],
+        help="Only use these top-level Hercules scene folders, e.g. Bridge01_Day Mountain01_Day.",
+    )
+    parser.add_argument(
+        "--exclude-scenes",
+        nargs="*",
+        default=defaults["exclude_scenes"],
+        help="Exclude these top-level Hercules scene folders.",
     )
     parser.add_argument(
         "--keep-duplicate-frames",
@@ -359,10 +373,24 @@ def clean_bev_rgb(points, x_range, y_range, resolution):
     return make_rgb_preview(layers), layers
 
 
-def list_all_aeva_bins(data_root, dedupe=True):
+def normalize_scene_filter(scene_names):
+    if not scene_names:
+        return None
+    return {str(scene).strip().lower() for scene in scene_names if str(scene).strip()}
+
+
+def list_all_aeva_bins(data_root, dedupe=True, include_scenes=None, exclude_scenes=None):
+    include_scenes = normalize_scene_filter(include_scenes)
+    exclude_scenes = normalize_scene_filter(exclude_scenes)
     aeva_dirs = []
     for candidate in sorted(data_root.rglob("Aeva")):
         if candidate.is_dir() and list(candidate.glob("*.bin")):
+            relative = candidate.relative_to(data_root)
+            scene = relative.parts[0].lower() if relative.parts else ""
+            if include_scenes is not None and scene not in include_scenes:
+                continue
+            if exclude_scenes is not None and scene in exclude_scenes:
+                continue
             aeva_dirs.append(candidate)
     if not aeva_dirs:
         raise FileNotFoundError(f"No Hercules Aeva folders with .bin files found under {data_root}")
@@ -668,7 +696,12 @@ def main():
     fog_root = Path(args.fog_root)
 
     if args.all_scenes:
-        bins, aeva_dirs = list_all_aeva_bins(data_root, dedupe=not args.keep_duplicate_frames)
+        bins, aeva_dirs = list_all_aeva_bins(
+            data_root,
+            dedupe=not args.keep_duplicate_frames,
+            include_scenes=args.include_scenes,
+            exclude_scenes=args.exclude_scenes,
+        )
         source_description = f"{len(aeva_dirs)} Aeva folders under {data_root}"
     else:
         aeva_dir = find_aeva_dir(data_root, args.day, args.session)

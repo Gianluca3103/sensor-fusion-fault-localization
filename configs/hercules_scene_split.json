@@ -1,0 +1,28 @@
+{
+  "description": "Scene-level split for Hercules reliability-map experiments. Fault injection should be generated separately for each split to avoid frame/scene leakage.",
+  "train": [
+    "Bridge01_Day",
+    "Library01_Day",
+    "Library02_Night",
+    "Library03_Day",
+    "Mountain01_Day",
+    "Mountain02_Night",
+    "Mountain03_Day",
+    "ParkingLot01_Day",
+    "ParkingLot02_Day",
+    "ParkingLot03_Night",
+    "ParkingLot04_Day",
+    "RiversIsland01_Day",
+    "SportsComplex01_Day",
+    "SportsComplex02_Night",
+    "Stream01_Day"
+  ],
+  "validation": [
+    "RiversIsland03_Day",
+    "SportsComplex03_Day"
+  ],
+  "test": [
+    "Stream02_Night",
+    "Street01_Day"
+  ]
+}
