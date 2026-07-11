@@ -422,6 +422,42 @@ def worker_init(context):
     WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(injector_root)
 
 
+def existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severity):
+    try:
+        with np.load(npz_path, allow_pickle=False) as data:
+            metadata = json.loads(str(data["metadata_json"]))
+            _ = data["fault_heatmap"].shape
+    except Exception as exc:
+        LOGGER.warning("Regenerating unreadable existing sample %s: %s", npz_path.name, exc)
+        return False
+
+    expected = {
+        "dataset": "Hercules",
+        "scene": source_meta["scene"],
+        "session": source_meta["session"],
+        "timestamp": timestamp,
+        "fault": fault,
+        "severity": severity,
+        "grid_size": cfg["grid_size"],
+        "image_height": cfg["image_height"],
+        "image_width": cfg["image_width"],
+        "x_range": [cfg["x_min"], cfg["x_max"]],
+        "y_range": [cfg["y_min"], cfg["y_max"]],
+        "resolution": cfg["resolution"],
+    }
+    for key, expected_value in expected.items():
+        if metadata.get(key) != expected_value:
+            LOGGER.warning(
+                "Regenerating %s because metadata %s is %r, expected %r",
+                npz_path.name,
+                key,
+                metadata.get(key),
+                expected_value,
+            )
+            return False
+    return True
+
+
 def create_one_sample(task):
     if WORKER_CONTEXT is None:
         raise RuntimeError("Worker context was not initialized.")
@@ -448,7 +484,7 @@ def create_one_sample(task):
     comparison_png = output_root / f"{stem}_comparison.png"
     npz_path = output_root / f"{stem}.npz"
 
-    if npz_path.exists():
+    if npz_path.exists() and existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severity):
         return {"index": index, "skipped": True, "npz": str(npz_path)}
 
     clean_raw = read_hercules_aeva_bin(bin_path)
