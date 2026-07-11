@@ -27,6 +27,13 @@ class FaultInjectorTests(unittest.TestCase):
         second = choose_samples(bins, 6, seed=7, plan=plan, shuffle=True)
         self.assertEqual(first, second)
 
+    def test_choose_samples_draws_from_shuffled_candidate_pool(self):
+        bins = [Path(f"{index}.bin") for index in range(20)]
+        plan = [("fog_sim", 4)]
+        samples = choose_samples(bins, 5, seed=7, plan=plan, shuffle=True)
+        selected_bins = [sample[0] for sample in samples]
+        self.assertNotEqual(selected_bins, bins[:5])
+
 
 if __name__ == "__main__":
     unittest.main()
