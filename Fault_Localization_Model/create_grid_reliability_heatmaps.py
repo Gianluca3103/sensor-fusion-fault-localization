@@ -676,45 +676,33 @@ def main():
     rows = []
     skipped = 0
 
-    if args.num_workers == 1:
-        worker_init(worker_context)
-        for task in tasks:
-            result = create_one_sample(task)
+    LOGGER.info("Creating samples with %d worker processes", args.num_workers)
+    with ProcessPoolExecutor(
+        max_workers=args.num_workers,
+        initializer=worker_init,
+        initargs=(worker_context,),
+    ) as executor:
+        future_to_task = {executor.submit(create_one_sample, task): task for task in tasks}
+        completed = 0
+        for future in as_completed(future_to_task):
+            completed += 1
+            result = future.result()
             if result.get("skipped"):
                 skipped += 1
-                LOGGER.info("Skipping existing %s", Path(result["npz"]).name)
+                LOGGER.info(
+                    "Skipping existing %04d/%04d: %s",
+                    completed,
+                    len(tasks),
+                    Path(result["npz"]).name,
+                )
             else:
                 rows.append(result)
-                LOGGER.info("Created %04d/%04d: %s", result["index"] + 1, len(tasks), Path(result["npz"]).name)
-    else:
-        LOGGER.info("Creating samples with %d worker processes", args.num_workers)
-        with ProcessPoolExecutor(
-            max_workers=args.num_workers,
-            initializer=worker_init,
-            initargs=(worker_context,),
-        ) as executor:
-            future_to_task = {executor.submit(create_one_sample, task): task for task in tasks}
-            completed = 0
-            for future in as_completed(future_to_task):
-                completed += 1
-                task = future_to_task[future]
-                result = future.result()
-                if result.get("skipped"):
-                    skipped += 1
-                    LOGGER.info(
-                        "Skipping existing %04d/%04d: %s",
-                        completed,
-                        len(tasks),
-                        Path(result["npz"]).name,
-                    )
-                else:
-                    rows.append(result)
-                    LOGGER.info(
-                        "Created %04d/%04d: %s",
-                        completed,
-                        len(tasks),
-                        Path(result["npz"]).name,
-                    )
+                LOGGER.info(
+                    "Created %04d/%04d: %s",
+                    completed,
+                    len(tasks),
+                    Path(result["npz"]).name,
+                )
 
     rows = sorted(rows, key=lambda row: row["index"])
     if skipped:
