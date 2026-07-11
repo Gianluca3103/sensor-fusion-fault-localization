@@ -208,15 +208,16 @@ def save_validation_artifacts(accumulator, sweep_rows, examples, output_dir, arg
 
 
 def checkpoint_score(stats, metric_name):
+    if metric_name not in {"val_loss", "val_f1", "val_iou", "val_brier_score"}:
+        raise ValueError(f"Unknown checkpoint metric: {metric_name}")
     if metric_name == "val_loss":
         return stats["loss"]
     if metric_name == "val_f1":
-        return stats["f1"]
+        return stats.get("f1")
     if metric_name == "val_iou":
-        return stats["iou"]
+        return stats.get("iou")
     if metric_name == "val_brier_score":
-        return stats["brier_score"]
-    raise ValueError(f"Unknown checkpoint metric: {metric_name}")
+        return stats.get("brier_score")
 
 
 def checkpoint_improved(score, best_score, metric_name, min_delta):
@@ -225,7 +226,7 @@ def checkpoint_improved(score, best_score, metric_name, min_delta):
     return score < best_score - min_delta
 
 
-def run_epoch(model, loader, optimizer, device, train, args):
+def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=True):
     model.train(train)
     totals = {"loss": 0.0, "heatmap_loss": 0.0, "stability_loss": 0.0, "pfs_reliability_loss": 0.0}
     count = 0
@@ -255,7 +256,7 @@ def run_epoch(model, loader, optimizer, device, train, args):
                 if args.grad_clip > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
-        if not train and not args.disable_metrics:
+        if not train and compute_metrics and not args.disable_metrics:
             logits = outputs["logits"]
             x_cell, y_cell = metric_cell_sizes_from_batch(batch, args)
             if metric_accumulator is None:
@@ -392,10 +393,19 @@ def main():
     parser.add_argument("--metric-x-cell-size", type=float, default=0.64)
     parser.add_argument("--metric-y-cell-size", type=float, default=0.64)
     parser.add_argument("--metric-example-count", type=int, default=5)
+    parser.add_argument(
+        "--metrics-every",
+        type=int,
+        default=1,
+        help="Compute expensive validation metrics every N epochs. Validation loss still runs every epoch.",
+    )
     parser.add_argument("--threshold-sweep", action="store_true", default=True)
     parser.add_argument("--disable-threshold-sweep", action="store_false", dest="threshold_sweep")
     parser.add_argument("--boundary-chamfer", action="store_true")
     parser.add_argument("--disable-metrics", action="store_true")
+    parser.add_argument("--disable-validation-artifacts", action="store_true")
+    parser.add_argument("--disable-plots", action="store_true")
+    parser.add_argument("--disable-final-predictions", action="store_true")
     parser.add_argument(
         "--resume",
         default=None,
@@ -465,8 +475,22 @@ def main():
     latest_val_artifacts = None
     for epoch in range(start_epoch, args.epochs + 1):
         train_stats, _ = run_epoch(model, train_loader, optimizer, device, train=True, args=args)
-        val_stats, val_artifacts = run_epoch(model, val_loader, optimizer, device, train=False, args=args)
-        latest_val_artifacts = val_artifacts
+        compute_val_metrics = (
+            not args.disable_metrics
+            and args.metrics_every > 0
+            and (epoch % args.metrics_every == 0 or epoch == args.epochs)
+        )
+        val_stats, val_artifacts = run_epoch(
+            model,
+            val_loader,
+            optimizer,
+            device,
+            train=False,
+            args=args,
+            compute_metrics=compute_val_metrics,
+        )
+        if compute_val_metrics:
+            latest_val_artifacts = val_artifacts
         scheduler.step()
 
         row = {
@@ -500,7 +524,7 @@ def main():
             flush=True,
         )
         score = checkpoint_score(val_stats, args.best_checkpoint_metric)
-        if checkpoint_improved(score, best_score, args.best_checkpoint_metric, args.min_delta):
+        if score is not None and checkpoint_improved(score, best_score, args.best_checkpoint_metric, args.min_delta):
             best_score = score
             epochs_without_improvement = 0
             torch.save(
@@ -517,7 +541,7 @@ def main():
                 },
                 checkpoint_dir / "best_model.pt",
             )
-            if val_artifacts["accumulator"] is not None:
+            if not args.disable_validation_artifacts and val_artifacts["accumulator"] is not None:
                 save_validation_artifacts(
                     val_artifacts["accumulator"],
                     val_artifacts["threshold_sweep"],
@@ -527,7 +551,7 @@ def main():
                     x_range=val_artifacts["x_range"],
                     y_range=val_artifacts["y_range"],
                 )
-        else:
+        elif score is not None:
             epochs_without_improvement += 1
         torch.save(
             {
@@ -555,10 +579,11 @@ def main():
             )
             break
 
-    save_curve(curve_history, output_root / "plots" / "training_curve.png")
+    if not args.disable_plots:
+        save_curve(curve_history, output_root / "plots" / "training_curve.png")
     write_history(history, output_root / "training_history.csv")
     write_metrics_csv(history, output_root / "validation_metrics" / "epoch_metrics.csv")
-    if latest_val_artifacts and latest_val_artifacts["accumulator"] is not None:
+    if not args.disable_validation_artifacts and latest_val_artifacts and latest_val_artifacts["accumulator"] is not None:
         save_validation_artifacts(
             latest_val_artifacts["accumulator"],
             latest_val_artifacts["threshold_sweep"],
@@ -569,14 +594,15 @@ def main():
             y_range=latest_val_artifacts["y_range"],
         )
 
-    checkpoint = torch.load(checkpoint_dir / "best_model.pt", map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    rows = save_predictions(model, val_loader, output_root, device, args.max_val_images)
-    if rows:
-        with (output_root / "val_predictions" / "prediction_metrics.csv").open("w", encoding="utf-8", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
+    if not args.disable_final_predictions and args.max_val_images > 0:
+        checkpoint = torch.load(checkpoint_dir / "best_model.pt", map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        rows = save_predictions(model, val_loader, output_root, device, args.max_val_images)
+        if rows:
+            with (output_root / "val_predictions" / "prediction_metrics.csv").open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
     print(f"Saved PFS run: {output_root}", flush=True)
 
 
