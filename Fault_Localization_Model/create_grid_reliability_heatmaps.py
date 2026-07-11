@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import json
 import logging
@@ -48,6 +49,7 @@ FAULT_PLAN = [
     ("impulse_noise", 1),
 ]
 FINE_MATCH_FACTOR = 4
+WORKER_CONTEXT = None
 
 
 def config_defaults(config):
@@ -67,6 +69,7 @@ def config_defaults(config):
         "faults": config_get(config, "faults.names", None),
         "severities": config_get(config, "faults.severities", None),
         "fog_noise": config_get(config, "faults.fog_noise", 10),
+        "num_workers": config_get(config, "generation.num_workers", 1),
         "grid_size": config_get(config, "bev.grid_size", 100),
         "x_min": config_get(config, "bev.x_min", 0.0),
         "x_max": config_get(config, "bev.x_max", 64.0),
@@ -131,6 +134,12 @@ def parse_args():
     parser.add_argument("--min-range", type=float, default=defaults["min_range"])
     parser.add_argument("--max-range", type=float, default=defaults["max_range"])
     parser.add_argument("--fog-noise", type=int, default=defaults["fog_noise"])
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=defaults["num_workers"],
+        help="Number of parallel sample-generation worker processes. Use 1 for the original sequential behavior.",
+    )
     parser.add_argument("--seed", type=int, default=defaults["seed"])
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -143,6 +152,7 @@ def validate_generation_args(args):
     require_positive(args.num_samples, "num_samples")
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
+    require_positive(args.num_workers, "num_workers")
     require_range(args.x_min, args.x_max, "x range")
     require_range(args.y_min, args.y_max, "y range")
     require_range(args.min_range, args.max_range, "point range")
@@ -405,6 +415,209 @@ def side_by_side(images):
     return np.concatenate(padded, axis=1)
 
 
+def worker_init(context):
+    global WORKER_CONTEXT
+    WORKER_CONTEXT = dict(context)
+    injector_root = Path(WORKER_CONTEXT["injector_root"])
+    WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(injector_root)
+
+
+def create_one_sample(task):
+    if WORKER_CONTEXT is None:
+        raise RuntimeError("Worker context was not initialized.")
+
+    cfg = WORKER_CONTEXT
+    index = task["index"]
+    bin_path = Path(task["bin_path"])
+    data_root = Path(cfg["data_root"])
+    output_root = Path(cfg["output_root"])
+    injector_root = Path(cfg["injector_root"])
+    fog_root = Path(cfg["fog_root"])
+    fault = task["fault"]
+    severity = task["severity"]
+
+    timestamp = bin_path.stem
+    source_meta = hercules_source_metadata(bin_path, data_root)
+    stem = f"{index:04d}_{timestamp}_{fault}_s{severity}"
+
+    fault_png = output_root / f"{stem}_fault_heatmap.png"
+    reliability_png = output_root / f"{stem}_reliability_map.png"
+    overlay_png = output_root / f"{stem}_fault_overlay.png"
+    clean_png = output_root / f"{stem}_clean_bev.png"
+    marked_png = output_root / f"{stem}_ideal_bev_changes_marked.png"
+    comparison_png = output_root / f"{stem}_comparison.png"
+    npz_path = output_root / f"{stem}.npz"
+
+    if npz_path.exists():
+        return {"index": index, "skipped": True, "npz": str(npz_path)}
+
+    clean_raw = read_hercules_aeva_bin(bin_path)
+    clean_points = filter_pointcloud(clean_raw, cfg["min_range"], cfg["max_range"])[:, :4]
+    clean_rgb, clean_layers = clean_bev_rgb(
+        clean_points,
+        x_range=(cfg["x_min"], cfg["x_max"]),
+        y_range=(cfg["y_min"], cfg["y_max"]),
+        resolution=cfg["resolution"],
+    )
+    faulty_raw, fog_counts = inject_fault(
+        fault,
+        clean_points,
+        severity,
+        injector_root,
+        fog_root,
+        cfg["fog_noise"],
+        cfg["lidar_corruptions"],
+    )
+    label_counts = lisa_label_counts(faulty_raw)
+    faulty_points = filter_pointcloud(faulty_raw, cfg["min_range"], cfg["max_range"])
+    faulty_rgb, faulty_layers = clean_bev_rgb(
+        faulty_points[:, :4],
+        x_range=(cfg["x_min"], cfg["x_max"]),
+        y_range=(cfg["y_min"], cfg["y_max"]),
+        resolution=cfg["resolution"],
+    )
+
+    maps = make_reliability_maps(
+        clean_points,
+        faulty_points,
+        x_min=cfg["x_min"],
+        x_max=cfg["x_max"],
+        y_min=cfg["y_min"],
+        y_max=cfg["y_max"],
+        grid_rows=cfg["grid_size"],
+        grid_cols=cfg["grid_size"],
+    )
+
+    fault_rgb = resize_nearest(colorize_fault_heatmap(maps["fault_heatmap"]), cfg["image_height"], cfg["image_width"])
+    reliability_rgb = resize_nearest(
+        colorize_reliability(maps["reliability_map"]),
+        cfg["image_height"],
+        cfg["image_width"],
+    )
+    overlay_rgb = resize_nearest(
+        overlay_heatmap_on_counts(maps["clean_counts"], maps["fault_heatmap"]),
+        cfg["image_height"],
+        cfg["image_width"],
+    )
+    marked_rgb, change_counts = mark_bev_changes(
+        {"rgb": clean_rgb, **clean_layers},
+        {"rgb": faulty_rgb, **faulty_layers},
+        clean_point_count=len(clean_points),
+        corrupted_point_count=len(faulty_points),
+    )
+
+    clean_labeled = add_legend_above(
+        clean_rgb,
+        "ORIGINAL CLEAN BEV",
+        [f"x={cfg['x_min']:g}..{cfg['x_max']:g}m, y={cfg['y_min']:g}..{cfg['y_max']:g}m"],
+    )
+    fault_rgb = add_legend_above(
+        fault_rgb,
+        "FAULT HEATMAP: 0=ok, 1=max fault",
+        [
+            f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
+            "reliability=clean/(clean+faulty), fault=1-reliability",
+        ],
+    )
+    reliability_rgb = add_legend_above(
+        reliability_rgb,
+        "IDEAL RELIABILITY MAP",
+        [
+            "blue=reliable, red=unreliable",
+            f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
+        ],
+    )
+    reliability_rgb = add_reliability_colorbar(reliability_rgb)
+    overlay_rgb = add_legend_above(
+        overlay_rgb,
+        "FAULT HEATMAP OVER CLEAN DENSITY",
+        [f"{fault} severity {severity}"],
+    )
+    marked_rgb = add_legend_above(
+        marked_rgb,
+        "IDEAL BEV CHANGES",
+        [
+            f"YELLOW=gained {change_counts['gained_density_cells']} cells, ORANGE=lost {change_counts['lost_density_cells']}",
+            f"CYAN=changed {change_counts['intensity_changed_cells'] + change_counts['height_changed_cells']} cells, POINT LOSS={change_counts['point_loss']} ({change_counts['point_loss_percent']:.2f}%)",
+        ],
+    )
+    comparison_rgb = side_by_side([clean_labeled, marked_rgb, reliability_rgb])
+
+    write_image(clean_png, clean_labeled)
+    write_image(fault_png, fault_rgb)
+    write_image(reliability_png, reliability_rgb)
+    write_image(overlay_png, overlay_rgb)
+    write_image(marked_png, marked_rgb)
+    write_image(comparison_png, comparison_rgb)
+    np.savez_compressed(
+        npz_path,
+        **maps,
+        clean_rgb=clean_rgb,
+        clean_density=clean_layers["raw_density"],
+        faulty_rgb=faulty_rgb,
+        faulty_density=faulty_layers["raw_density"],
+        metadata_json=json.dumps(
+            {
+                "dataset": "Hercules",
+                "day": source_meta["day"],
+                "scene": source_meta["scene"],
+                "session": source_meta["session"],
+                "source_relative_path": source_meta["source_relative_path"],
+                "source_aeva_dir": source_meta["source_aeva_dir"],
+                "timestamp": timestamp,
+                "fault": fault,
+                "severity": severity,
+                "grid_size": cfg["grid_size"],
+                "image_height": cfg["image_height"],
+                "image_width": cfg["image_width"],
+                "x_cell_size_m": (cfg["x_max"] - cfg["x_min"]) / cfg["grid_size"],
+                "y_cell_size_m": (cfg["y_max"] - cfg["y_min"]) / cfg["grid_size"],
+                "x_range": [cfg["x_min"], cfg["x_max"]],
+                "y_range": [cfg["y_min"], cfg["y_max"]],
+                "resolution": cfg["resolution"],
+                "definition": "reliability=clean_point_counts/(clean_point_counts+faulty_point_counts), where faulty points are missing, moved/added, or synthetic/labeled faulty evidence",
+            },
+            indent=2,
+        ),
+    )
+
+    total_clean = float(np.sum(maps["clean_point_counts"]))
+    total_faulty = float(np.sum(maps["faulty_point_counts"]))
+    total_missing = float(np.sum(maps["missing_faulty_counts"]))
+    total_added = float(np.sum(maps["added_faulty_counts"]))
+    return {
+        "index": index,
+        "scene": source_meta["scene"],
+        "day": source_meta["day"],
+        "session": source_meta["session"],
+        "source_relative_path": source_meta["source_relative_path"],
+        "source_aeva_dir": source_meta["source_aeva_dir"],
+        "timestamp": timestamp,
+        "fault": fault,
+        "severity": severity,
+        "clean_points": len(clean_points),
+        "faulty_points": len(faulty_points),
+        "total_clean_reliable_points": total_clean,
+        "total_faulty_unreliable_points": total_faulty,
+        "total_missing_faulty_points": total_missing,
+        "total_added_faulty_points": total_added,
+        "global_reliability": total_clean / max(total_clean + total_faulty, 1.0),
+        "global_error_ratio": total_faulty / max(total_clean + total_faulty, 1.0),
+        "mean_fault_heatmap": float(np.mean(maps["fault_heatmap"])),
+        "max_fault_heatmap": float(np.max(maps["fault_heatmap"])),
+        "fault_heatmap_png": str(fault_png),
+        "reliability_png": str(reliability_png),
+        "overlay_png": str(overlay_png),
+        "clean_png": str(clean_png),
+        "marked_png": str(marked_png),
+        "comparison_png": str(comparison_png),
+        "npz": str(npz_path),
+        **change_counts,
+        **label_counts,
+        **fog_counts,
+    }
+
+
 def main():
     args = parse_args()
     setup_logging(args.log_level)
@@ -417,8 +630,6 @@ def main():
     output_root = Path(args.output_root)
     injector_root = Path(args.injector_root)
     fog_root = Path(args.fog_root)
-    LOGGER.info("Loading fault injector from %s", injector_root)
-    lidar_corruptions = load_fault_injector(injector_root)
 
     if args.all_scenes:
         bins, aeva_dirs = list_all_aeva_bins(data_root, dedupe=not args.keep_duplicate_frames)
@@ -439,191 +650,75 @@ def main():
     LOGGER.info("Selected %d frame candidates from %s", len(bins), source_description)
     LOGGER.info("Fault plan: %s", ", ".join(f"{fault}:S{severity}" for fault, severity in plan))
     samples = choose_samples(bins, args.num_samples, args.seed, plan, shuffle=not args.no_shuffle)
-    rows = []
     output_root.mkdir(parents=True, exist_ok=True)
 
-    for index, (bin_path, fault, severity) in enumerate(samples):
-        timestamp = bin_path.stem
-        source_meta = hercules_source_metadata(bin_path, data_root)
-        stem = f"{index:04d}_{timestamp}_{fault}_s{severity}"
+    worker_context = {
+        "data_root": str(data_root),
+        "output_root": str(output_root),
+        "injector_root": str(injector_root),
+        "fog_root": str(fog_root),
+        "fog_noise": args.fog_noise,
+        "grid_size": args.grid_size,
+        "x_min": args.x_min,
+        "x_max": args.x_max,
+        "y_min": args.y_min,
+        "y_max": args.y_max,
+        "resolution": args.resolution,
+        "min_range": args.min_range,
+        "max_range": args.max_range,
+        "image_height": image_height,
+        "image_width": image_width,
+    }
+    tasks = [
+        {"index": index, "bin_path": str(bin_path), "fault": fault, "severity": severity}
+        for index, (bin_path, fault, severity) in enumerate(samples)
+    ]
+    rows = []
+    skipped = 0
 
-        fault_png = output_root / f"{stem}_fault_heatmap.png"
-        reliability_png = output_root / f"{stem}_reliability_map.png"
-        overlay_png = output_root / f"{stem}_fault_overlay.png"
-        clean_png = output_root / f"{stem}_clean_bev.png"
-        marked_png = output_root / f"{stem}_ideal_bev_changes_marked.png"
-        comparison_png = output_root / f"{stem}_comparison.png"
-        npz_path = output_root / f"{stem}.npz"
+    if args.num_workers == 1:
+        worker_init(worker_context)
+        for task in tasks:
+            result = create_one_sample(task)
+            if result.get("skipped"):
+                skipped += 1
+                LOGGER.info("Skipping existing %s", Path(result["npz"]).name)
+            else:
+                rows.append(result)
+                LOGGER.info("Created %04d/%04d: %s", result["index"] + 1, len(tasks), Path(result["npz"]).name)
+    else:
+        LOGGER.info("Creating samples with %d worker processes", args.num_workers)
+        with ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=worker_init,
+            initargs=(worker_context,),
+        ) as executor:
+            future_to_task = {executor.submit(create_one_sample, task): task for task in tasks}
+            completed = 0
+            for future in as_completed(future_to_task):
+                completed += 1
+                task = future_to_task[future]
+                result = future.result()
+                if result.get("skipped"):
+                    skipped += 1
+                    LOGGER.info(
+                        "Skipping existing %04d/%04d: %s",
+                        completed,
+                        len(tasks),
+                        Path(result["npz"]).name,
+                    )
+                else:
+                    rows.append(result)
+                    LOGGER.info(
+                        "Created %04d/%04d: %s",
+                        completed,
+                        len(tasks),
+                        Path(result["npz"]).name,
+                    )
 
-        if npz_path.exists():
-            LOGGER.info("Skipping existing %s", npz_path.name)
-            continue
-
-        LOGGER.info("Creating %s from %s", stem, source_meta["source_relative_path"])
-
-        clean_raw = read_hercules_aeva_bin(bin_path)
-        clean_points = filter_pointcloud(clean_raw, args.min_range, args.max_range)[:, :4]
-        clean_rgb, clean_layers = clean_bev_rgb(
-            clean_points,
-            x_range=(args.x_min, args.x_max),
-            y_range=(args.y_min, args.y_max),
-            resolution=args.resolution,
-        )
-        faulty_raw, fog_counts = inject_fault(
-            fault,
-            clean_points,
-            severity,
-            injector_root,
-            fog_root,
-            args.fog_noise,
-            lidar_corruptions,
-        )
-        label_counts = lisa_label_counts(faulty_raw)
-        faulty_points = filter_pointcloud(faulty_raw, args.min_range, args.max_range)
-        faulty_rgb, faulty_layers = clean_bev_rgb(
-            faulty_points[:, :4],
-            x_range=(args.x_min, args.x_max),
-            y_range=(args.y_min, args.y_max),
-            resolution=args.resolution,
-        )
-
-        maps = make_reliability_maps(
-            clean_points,
-            faulty_points,
-            x_min=args.x_min,
-            x_max=args.x_max,
-            y_min=args.y_min,
-            y_max=args.y_max,
-            grid_rows=args.grid_size,
-            grid_cols=args.grid_size,
-        )
-
-        fault_rgb = resize_nearest(colorize_fault_heatmap(maps["fault_heatmap"]), image_height, image_width)
-        reliability_rgb = resize_nearest(colorize_reliability(maps["reliability_map"]), image_height, image_width)
-        overlay_rgb = resize_nearest(
-            overlay_heatmap_on_counts(maps["clean_counts"], maps["fault_heatmap"]),
-            image_height,
-            image_width,
-        )
-        marked_rgb, change_counts = mark_bev_changes(
-            {"rgb": clean_rgb, **clean_layers},
-            {"rgb": faulty_rgb, **faulty_layers},
-            clean_point_count=len(clean_points),
-            corrupted_point_count=len(faulty_points),
-        )
-
-        clean_labeled = add_legend_above(
-            clean_rgb,
-            "ORIGINAL CLEAN BEV",
-            [f"x={args.x_min:g}..{args.x_max:g}m, y={args.y_min:g}..{args.y_max:g}m"],
-        )
-        fault_rgb = add_legend_above(
-            fault_rgb,
-            "FAULT HEATMAP: 0=ok, 1=max fault",
-            [
-                f"{image_width}x{image_height} BEV split into {args.grid_size}x{args.grid_size} squares",
-                "reliability=clean/(clean+faulty), fault=1-reliability",
-            ],
-        )
-        reliability_rgb = add_legend_above(
-            reliability_rgb,
-            "IDEAL RELIABILITY MAP",
-            [
-                "blue=reliable, red=unreliable",
-                f"{image_width}x{image_height} BEV split into {args.grid_size}x{args.grid_size} squares",
-            ],
-        )
-        reliability_rgb = add_reliability_colorbar(reliability_rgb)
-        overlay_rgb = add_legend_above(
-            overlay_rgb,
-            "FAULT HEATMAP OVER CLEAN DENSITY",
-            [f"{fault} severity {severity}"],
-        )
-        marked_rgb = add_legend_above(
-            marked_rgb,
-            "IDEAL BEV CHANGES",
-            [
-                f"YELLOW=gained {change_counts['gained_density_cells']} cells, ORANGE=lost {change_counts['lost_density_cells']}",
-                f"CYAN=changed {change_counts['intensity_changed_cells'] + change_counts['height_changed_cells']} cells, POINT LOSS={change_counts['point_loss']} ({change_counts['point_loss_percent']:.2f}%)",
-            ],
-        )
-        comparison_rgb = side_by_side([clean_labeled, marked_rgb, reliability_rgb])
-
-        write_image(clean_png, clean_labeled)
-        write_image(fault_png, fault_rgb)
-        write_image(reliability_png, reliability_rgb)
-        write_image(overlay_png, overlay_rgb)
-        write_image(marked_png, marked_rgb)
-        write_image(comparison_png, comparison_rgb)
-        np.savez_compressed(
-            npz_path,
-            **maps,
-            clean_rgb=clean_rgb,
-            clean_density=clean_layers["raw_density"],
-            faulty_rgb=faulty_rgb,
-            faulty_density=faulty_layers["raw_density"],
-            metadata_json=json.dumps(
-                {
-                    "dataset": "Hercules",
-                    "day": source_meta["day"],
-                    "scene": source_meta["scene"],
-                    "session": source_meta["session"],
-                    "source_relative_path": source_meta["source_relative_path"],
-                    "source_aeva_dir": source_meta["source_aeva_dir"],
-                    "timestamp": timestamp,
-                    "fault": fault,
-                    "severity": severity,
-                    "grid_size": args.grid_size,
-                    "image_height": image_height,
-                    "image_width": image_width,
-                    "x_cell_size_m": (args.x_max - args.x_min) / args.grid_size,
-                    "y_cell_size_m": (args.y_max - args.y_min) / args.grid_size,
-                    "x_range": [args.x_min, args.x_max],
-                    "y_range": [args.y_min, args.y_max],
-                    "resolution": args.resolution,
-                    "definition": "reliability=clean_point_counts/(clean_point_counts+faulty_point_counts), where faulty points are missing, moved/added, or synthetic/labeled faulty evidence",
-                },
-                indent=2,
-            ),
-        )
-
-        total_clean = float(np.sum(maps["clean_point_counts"]))
-        total_faulty = float(np.sum(maps["faulty_point_counts"]))
-        total_missing = float(np.sum(maps["missing_faulty_counts"]))
-        total_added = float(np.sum(maps["added_faulty_counts"]))
-        rows.append(
-            {
-                "index": index,
-                "scene": source_meta["scene"],
-                "day": source_meta["day"],
-                "session": source_meta["session"],
-                "source_relative_path": source_meta["source_relative_path"],
-                "source_aeva_dir": source_meta["source_aeva_dir"],
-                "timestamp": timestamp,
-                "fault": fault,
-                "severity": severity,
-                "clean_points": len(clean_points),
-                "faulty_points": len(faulty_points),
-                "total_clean_reliable_points": total_clean,
-                "total_faulty_unreliable_points": total_faulty,
-                "total_missing_faulty_points": total_missing,
-                "total_added_faulty_points": total_added,
-                "global_reliability": total_clean / max(total_clean + total_faulty, 1.0),
-                "global_error_ratio": total_faulty / max(total_clean + total_faulty, 1.0),
-                "mean_fault_heatmap": float(np.mean(maps["fault_heatmap"])),
-                "max_fault_heatmap": float(np.max(maps["fault_heatmap"])),
-                "fault_heatmap_png": str(fault_png),
-                "reliability_png": str(reliability_png),
-                "overlay_png": str(overlay_png),
-                "clean_png": str(clean_png),
-                "marked_png": str(marked_png),
-                "comparison_png": str(comparison_png),
-                "npz": str(npz_path),
-                **change_counts,
-                **label_counts,
-                **fog_counts,
-            }
-        )
+    rows = sorted(rows, key=lambda row: row["index"])
+    if skipped:
+        LOGGER.info("Skipped %d existing samples", skipped)
 
     if rows:
         manifest_path = output_root / "manifest.csv"
