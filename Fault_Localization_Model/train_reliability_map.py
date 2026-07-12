@@ -235,7 +235,16 @@ def save_predictions(model, loader, output_root, device, max_images):
                         add_reliability_colorbar(add_label_above(pred_rgb, f"learned reliability: {meta['fault']} S{meta['severity']}")),
                     ]
                 )
+                heatmap_panel = add_reliability_colorbar(
+                    side_by_side(
+                        [
+                            add_label_above(target_rgb, f"ideal heatmap: {meta['fault']} S{meta['severity']}"),
+                            add_label_above(pred_rgb, f"learned heatmap: {meta['fault']} S{meta['severity']}"),
+                        ]
+                    )
+                )
                 save_image(pred_dir / f"{stem}_comparison.png", panel)
+                save_image(pred_dir / f"{stem}_ideal_vs_learned_heatmaps.png", heatmap_panel)
                 save_image(pred_dir / f"{stem}_target_reliability.png", target_rgb)
                 save_image(pred_dir / f"{stem}_pred_reliability.png", pred_rgb)
                 rows.append(
