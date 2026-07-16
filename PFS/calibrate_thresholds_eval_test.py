@@ -24,7 +24,6 @@ from heatmap_metrics import (  # noqa: E402
     HeatmapMetricAccumulator,
     prepare_probability_target,
     save_group_metrics,
-    threshold_sweep,
 )
 from pfs_model import PFSReliabilityModel  # noqa: E402
 from train_pfs_reliability_map import PFSReliabilityDataset, collate  # noqa: E402
@@ -105,9 +104,24 @@ def build_loader(paths, resize_hw, batch_size, num_workers):
     )
 
 
+def metric_cell_metadata(metadata, metric_shape):
+    rows, cols = metric_shape
+    adjusted = []
+    for item in metadata:
+        meta = dict(item)
+        x_range = meta.get("x_range")
+        y_range = meta.get("y_range")
+        if x_range is not None and y_range is not None:
+            meta["x_cell_size_m"] = (float(x_range[1]) - float(x_range[0])) / float(rows)
+            meta["y_cell_size_m"] = (float(y_range[1]) - float(y_range[0])) / float(cols)
+        adjusted.append(meta)
+    return adjusted
+
+
 def collect_probabilities(model, loader, device, metric_grid_size, label, progress_every):
     outputs = []
     targets = []
+    metadata_rows = []
     model.eval()
     total_batches = len(loader)
     with torch.no_grad():
@@ -123,9 +137,10 @@ def collect_probabilities(model, loader, device, metric_grid_size, label, progre
             )
             outputs.append(prob.cpu())
             targets.append(target.cpu())
+            metadata_rows.extend(metric_cell_metadata(batch["metadata"], prob.shape[-2:]))
             if batch_index == 1 or batch_index == total_batches or batch_index % progress_every == 0:
                 print(f"[{label}] collected batch {batch_index}/{total_batches}", flush=True)
-    return outputs, targets
+    return outputs, targets, metadata_rows
 
 
 def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundary_chamfer, label, progress_every):
@@ -141,18 +156,29 @@ def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundar
             x = batch["x"].to(device)
             y = batch["y"].to(device)
             logits = model(x)
-            accumulator.update(logits, y, metadata=batch["metadata"], from_logits=True, update_groups=True)
+            if metric_grid_size is None:
+                metric_shape = y.shape[-2:]
+            else:
+                metric_shape = (metric_grid_size, metric_grid_size)
+            metadata = metric_cell_metadata(batch["metadata"], metric_shape)
+            accumulator.update(logits, y, metadata=metadata, from_logits=True, update_groups=True)
             if batch_index == 1 or batch_index == total_batches or batch_index % progress_every == 0:
                 print(f"[{label}] evaluated batch {batch_index}/{total_batches}", flush=True)
     return accumulator
 
 
-def sweep_thresholds_with_progress(outputs, targets, thresholds, metric_grid_size, label):
+def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label):
     rows = []
     total = len(thresholds)
+    output_tensor = torch.cat(outputs, dim=0)
+    target_tensor = torch.cat(targets, dim=0)
     for index, threshold in enumerate(thresholds, start=1):
         print(f"[{label}] threshold {index}/{total}: {threshold:.4f}", flush=True)
-        rows.extend(threshold_sweep(outputs, targets, [threshold], metric_grid_size=metric_grid_size))
+        accumulator = HeatmapMetricAccumulator(threshold=threshold, metric_grid_size=None)
+        accumulator.update(output_tensor, target_tensor, metadata=metadata, from_logits=False, update_groups=False)
+        row = {"threshold": float(threshold)}
+        row.update(accumulator.compute())
+        rows.append(row)
     return rows
 
 
@@ -201,7 +227,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--resize-height", type=int, default=320)
     parser.add_argument("--resize-width", type=int, default=320)
-    parser.add_argument("--grid-size", type=int, default=100)
+    parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=None,
+        help="Optional metric pooling size. Omit to evaluate at native resized resolution, usually 320x320.",
+    )
     parser.add_argument("--thresholds", type=float, nargs="*", default=[x / 100 for x in range(5, 96, 5)])
     parser.add_argument("--include-faults", nargs="*", default=None, help="Evaluate only these fault names.")
     parser.add_argument("--exclude-faults", nargs="*", default=None, help="Exclude these fault names from val/test.")
@@ -240,22 +271,24 @@ def main():
     print(f"Exclude faults: {args.exclude_faults}")
     print(f"Threshold candidates: {args.thresholds}")
     print(f"Selection metric: {args.select_metric}")
+    metric_resolution = f"{args.grid_size}x{args.grid_size}" if args.grid_size is not None else f"{args.resize_height}x{args.resize_width}"
+    print(f"Metric evaluation resolution: {metric_resolution}")
 
     print("[stage] Collecting validation probabilities", flush=True)
-    val_outputs, val_targets = collect_probabilities(
+    val_outputs, val_targets, val_metadata = collect_probabilities(
         model, val_loader, device, args.grid_size, "validation", max(args.progress_every, 1)
     )
     print("[stage] Sweeping validation thresholds", flush=True)
-    val_sweep_rows = sweep_thresholds_with_progress(val_outputs, val_targets, args.thresholds, None, "validation sweep")
+    val_sweep_rows = sweep_thresholds_with_progress(val_outputs, val_targets, val_metadata, args.thresholds, "validation sweep")
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
 
     print("[stage] Collecting test probabilities for all-threshold test sweep", flush=True)
-    test_outputs, test_targets = collect_probabilities(
+    test_outputs, test_targets, test_metadata = collect_probabilities(
         model, test_loader, device, args.grid_size, "test", max(args.progress_every, 1)
     )
     print("[stage] Sweeping test thresholds", flush=True)
-    test_sweep_rows = sweep_thresholds_with_progress(test_outputs, test_targets, args.thresholds, None, "test sweep")
+    test_sweep_rows = sweep_thresholds_with_progress(test_outputs, test_targets, test_metadata, args.thresholds, "test sweep")
 
     print(f"[stage] Evaluating grouped test metrics at selected threshold {selected_threshold:.6f}", flush=True)
     test_accumulator = evaluate_dataset(
@@ -291,6 +324,7 @@ def main():
         "resize_height": args.resize_height,
         "resize_width": args.resize_width,
         "metric_grid_size": args.grid_size,
+        "metric_evaluation_resolution": metric_resolution,
         "boundary_chamfer": args.boundary_chamfer,
     }
     with (output_root / "threshold_calibration_test_summary.json").open("w", encoding="utf-8") as file:
@@ -301,7 +335,7 @@ def main():
     print("Final calibrated threshold parameters")
     print(f"  selected_threshold: {selected_threshold:.6f}")
     print(f"  selected_metric: {args.select_metric}")
-    print(f"  metric_grid_size: {args.grid_size}")
+    print(f"  metric_evaluation_resolution: {metric_resolution}")
     print(f"  threshold_candidates: {args.thresholds}")
     print()
     print_metrics("Validation metrics at selected threshold", best_row)
