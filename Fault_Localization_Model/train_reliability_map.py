@@ -184,6 +184,59 @@ def add_reliability_colorbar(rgb):
     return np.array(image)
 
 
+def _matched_within_tolerance(query_mask, reference_mask, x_cell_size_m, y_cell_size_m, tolerance_m):
+    query = query_mask.astype(bool)
+    reference = reference_mask.astype(bool)
+    if not query.any() or not reference.any():
+        return np.zeros_like(query, dtype=bool)
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        distances = distance_transform_edt(~reference, sampling=(x_cell_size_m, y_cell_size_m))
+        return query & (distances <= tolerance_m)
+    except Exception:
+        query_points = np.argwhere(query).astype(np.float64)
+        reference_points = np.argwhere(reference).astype(np.float64)
+        query_points[:, 0] *= x_cell_size_m
+        query_points[:, 1] *= y_cell_size_m
+        reference_points[:, 0] *= x_cell_size_m
+        reference_points[:, 1] *= y_cell_size_m
+        matched = np.zeros(len(query_points), dtype=bool)
+        tolerance_sq = tolerance_m * tolerance_m
+        for start in range(0, len(query_points), 4096):
+            chunk = query_points[start : start + 4096]
+            diff = chunk[:, None, :] - reference_points[None, :, :]
+            matched[start : start + len(chunk)] = np.sum(diff * diff, axis=2).min(axis=1) <= tolerance_sq
+        output = np.zeros_like(query, dtype=bool)
+        rows_cols = np.argwhere(query)
+        output[rows_cols[:, 0], rows_cols[:, 1]] = matched
+        return output
+
+
+def localization_match_overlay(target, pred_map, metadata, threshold=0.5, tolerance_m=0.20):
+    target_mask = target >= threshold
+    pred_mask = pred_map >= threshold
+    x_range = metadata.get("x_range", [0.0, float(target.shape[0])])
+    y_range = metadata.get("y_range", [0.0, float(target.shape[1])])
+    x_cell_size_m = (float(x_range[1]) - float(x_range[0])) / float(target.shape[0])
+    y_cell_size_m = (float(y_range[1]) - float(y_range[0])) / float(target.shape[1])
+
+    pred_matched = _matched_within_tolerance(pred_mask, target_mask, x_cell_size_m, y_cell_size_m, tolerance_m)
+    target_matched = _matched_within_tolerance(target_mask, pred_mask, x_cell_size_m, y_cell_size_m, tolerance_m)
+    target_missed = target_mask & ~target_matched
+    pred_unmatched = pred_mask & ~pred_matched
+
+    rgb = np.zeros((*target.shape, 3), dtype=np.uint8)
+    rgb[:] = np.array([0, 0, 55], dtype=np.uint8)
+    rgb[target_missed] = np.array([255, 0, 0], dtype=np.uint8)
+    rgb[pred_unmatched] = np.array([255, 230, 0], dtype=np.uint8)
+    rgb[target_matched] = np.array([0, 255, 90], dtype=np.uint8)
+    rgb[pred_matched] = np.array([0, 210, 255], dtype=np.uint8)
+    both = target_matched & pred_matched
+    rgb[both] = np.array([255, 255, 255], dtype=np.uint8)
+    return rgb
+
+
 def side_by_side(images):
     max_height = max(image.shape[0] for image in images)
     padded = []
@@ -202,7 +255,16 @@ def save_image(path, image):
     Image.fromarray(image, mode="RGB").save(path)
 
 
-def save_predictions(model, loader, output_root, device, max_images):
+def save_predictions(
+    model,
+    loader,
+    output_root,
+    device,
+    max_images,
+    visual_grid_size=100,
+    localization_threshold=0.5,
+    localization_tolerance_m=0.20,
+):
     pred_dir = output_root / "val_predictions"
     rows = []
     saved = 0
@@ -216,10 +278,20 @@ def save_predictions(model, loader, output_root, device, max_images):
                 meta = batch["metadata"][i]
                 stem = f"{saved:04d}_{meta['fault']}_s{meta['severity']}_{meta['timestamp']}"
                 target = y[i, 0]
-                target = make_grid_like(target, grid_size=100)
-                pred_map = make_grid_like(pred[i, 0], grid_size=100)
-                target_rgb = draw_cell_boundaries(blue_red_reliability(target), grid_size=100)
-                pred_rgb = draw_cell_boundaries(blue_red_reliability(pred_map), grid_size=100)
+                target = make_grid_like(target, grid_size=visual_grid_size)
+                pred_map = make_grid_like(pred[i, 0], grid_size=visual_grid_size)
+                target_rgb = draw_cell_boundaries(blue_red_reliability(target), grid_size=visual_grid_size)
+                pred_rgb = draw_cell_boundaries(blue_red_reliability(pred_map), grid_size=visual_grid_size)
+                match_rgb = draw_cell_boundaries(
+                    localization_match_overlay(
+                        target,
+                        pred_map,
+                        meta,
+                        threshold=localization_threshold,
+                        tolerance_m=localization_tolerance_m,
+                    ),
+                    grid_size=visual_grid_size,
+                )
                 input_rgb = batch["rgb"][i]
                 if input_rgb.shape[:2] != target_rgb.shape[:2]:
                     input_rgb = np.array(
@@ -233,6 +305,10 @@ def save_predictions(model, loader, output_root, device, max_images):
                         add_label_above(input_rgb, f"faulty BEV input: {meta['fault']} S{meta['severity']}"),
                         add_reliability_colorbar(add_label_above(target_rgb, f"ideal reliability: {meta['fault']} S{meta['severity']}")),
                         add_reliability_colorbar(add_label_above(pred_rgb, f"learned reliability: {meta['fault']} S{meta['severity']}")),
+                        add_label_above(
+                            match_rgb,
+                            f"20cm match: white/both cyan=pred ok green=GT ok red=miss yellow=false",
+                        ),
                     ]
                 )
                 heatmap_panel = add_reliability_colorbar(
@@ -245,6 +321,7 @@ def save_predictions(model, loader, output_root, device, max_images):
                 )
                 save_image(pred_dir / f"{stem}_comparison.png", panel)
                 save_image(pred_dir / f"{stem}_ideal_vs_learned_heatmaps.png", heatmap_panel)
+                save_image(pred_dir / f"{stem}_localization_20cm_overlay.png", match_rgb)
                 save_image(pred_dir / f"{stem}_target_reliability.png", target_rgb)
                 save_image(pred_dir / f"{stem}_pred_reliability.png", pred_rgb)
                 rows.append(

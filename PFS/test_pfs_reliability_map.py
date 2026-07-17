@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-images", type=int, default=10)
+    parser.add_argument("--visual-grid-size", type=int, default=100)
+    parser.add_argument("--localization-threshold", type=float, default=0.5)
+    parser.add_argument("--localization-tolerance-m", type=float, default=0.20)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -70,7 +73,16 @@ def main():
 
     model = PFSReliabilityModel(in_channels=3, base_channels=base_channels, dropout=dropout).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    rows = save_predictions(model, loader, output_root, device, args.max_images)
+    rows = save_predictions(
+        model,
+        loader,
+        output_root,
+        device,
+        args.max_images,
+        visual_grid_size=args.visual_grid_size,
+        localization_threshold=args.localization_threshold,
+        localization_tolerance_m=args.localization_tolerance_m,
+    )
     print(f"Saved {len(rows)} PFS prediction comparisons: {output_root}")
 
 

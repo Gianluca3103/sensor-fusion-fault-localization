@@ -87,6 +87,92 @@ class ConfusionCounts:
         }
 
 
+@dataclass
+class LocalizationToleranceCounts:
+    """Accumulate many-to-one fault localization matches within a metric radius."""
+
+    tolerance_m: float = 0.20
+    pred_total: int = 0
+    target_total: int = 0
+    pred_matched: int = 0
+    target_matched: int = 0
+
+    def update(self, pred_mask: np.ndarray, target_mask: np.ndarray, x_cell_size_m: float, y_cell_size_m: float) -> None:
+        pred = pred_mask.astype(bool)
+        target = target_mask.astype(bool)
+        pred_count = int(pred.sum())
+        target_count = int(target.sum())
+        self.pred_total += pred_count
+        self.target_total += target_count
+
+        if pred_count == 0 or target_count == 0:
+            return
+
+        self.pred_matched += _count_points_with_neighbor_within_radius(
+            query_mask=pred,
+            reference_mask=target,
+            x_cell_size_m=x_cell_size_m,
+            y_cell_size_m=y_cell_size_m,
+            tolerance_m=self.tolerance_m,
+        )
+        self.target_matched += _count_points_with_neighbor_within_radius(
+            query_mask=target,
+            reference_mask=pred,
+            x_cell_size_m=x_cell_size_m,
+            y_cell_size_m=y_cell_size_m,
+            tolerance_m=self.tolerance_m,
+        )
+
+    def metrics(self) -> Dict[str, float]:
+        precision = self.pred_matched / max(self.pred_total, 1)
+        recall = self.target_matched / max(self.target_total, 1)
+        f1 = (2.0 * precision * recall) / max(precision + recall, EPS)
+        return {
+            "localization_precision": float(precision),
+            "localization_recall": float(recall),
+            "localization_f1": float(f1),
+            "localization_pred_total": float(self.pred_total),
+            "localization_target_total": float(self.target_total),
+            "localization_pred_matched": float(self.pred_matched),
+            "localization_target_matched": float(self.target_matched),
+            "localization_tolerance_m": float(self.tolerance_m),
+        }
+
+
+def _count_points_with_neighbor_within_radius(
+    query_mask: np.ndarray,
+    reference_mask: np.ndarray,
+    x_cell_size_m: float,
+    y_cell_size_m: float,
+    tolerance_m: float,
+) -> int:
+    """Count query cells that have at least one reference cell within tolerance."""
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        distances = distance_transform_edt(~reference_mask.astype(bool), sampling=(x_cell_size_m, y_cell_size_m))
+        return int((distances[query_mask.astype(bool)] <= tolerance_m).sum())
+    except Exception:
+        query_points = np.argwhere(query_mask).astype(np.float64)
+        reference_points = np.argwhere(reference_mask).astype(np.float64)
+        if len(query_points) == 0 or len(reference_points) == 0:
+            return 0
+        query_points[:, 0] *= x_cell_size_m
+        query_points[:, 1] *= y_cell_size_m
+        reference_points[:, 0] *= x_cell_size_m
+        reference_points[:, 1] *= y_cell_size_m
+
+        matched = 0
+        tolerance_sq = tolerance_m * tolerance_m
+        chunk_size = 4096
+        for start in range(0, len(query_points), chunk_size):
+            chunk = query_points[start : start + chunk_size]
+            diff = chunk[:, None, :] - reference_points[None, :, :]
+            min_sq = np.sum(diff * diff, axis=2).min(axis=1)
+            matched += int((min_sq <= tolerance_sq).sum())
+        return matched
+
+
 def _boundary(mask: np.ndarray) -> np.ndarray:
     """Extract a simple 4-connected binary boundary."""
     if not mask.any():
@@ -163,8 +249,10 @@ class HeatmapMetricAccumulator:
     y_cell_size_m: float = 0.64
     boundary_chamfer: bool = False
     compute_chamfer: bool = True
+    localization_tolerance_m: float = 0.20
     confusion: ConfusionCounts = field(default_factory=ConfusionCounts)
     faulty_confusion: ConfusionCounts = field(default_factory=ConfusionCounts)
+    localization: LocalizationToleranceCounts = field(default_factory=LocalizationToleranceCounts)
     brier_sum: float = 0.0
     mae_sum: float = 0.0
     cell_count: int = 0
@@ -184,6 +272,7 @@ class HeatmapMetricAccumulator:
             y_cell_size_m=self.y_cell_size_m,
             boundary_chamfer=self.boundary_chamfer,
             compute_chamfer=self.compute_chamfer,
+            localization_tolerance_m=self.localization_tolerance_m,
         )
 
     def update(
@@ -226,8 +315,10 @@ class HeatmapMetricAccumulator:
             self.error_sum = err.astype(np.float64) if self.error_sum is None else self.error_sum + err
 
             meta = metadata_list[index] if index < len(metadata_list) else {}
+            x_cell, y_cell = infer_cell_sizes(meta, self.x_cell_size_m, self.y_cell_size_m)
+            self.localization.tolerance_m = self.localization_tolerance_m
+            self.localization.update(pred_mask, target_mask, x_cell, y_cell)
             if self.compute_chamfer:
-                x_cell, y_cell = infer_cell_sizes(meta, self.x_cell_size_m, self.y_cell_size_m)
                 chamfer, mismatch = chamfer_distance_m(
                     pred_mask,
                     target_mask,
@@ -258,6 +349,7 @@ class HeatmapMetricAccumulator:
     def compute(self, prefix: str = "") -> Dict[str, float]:
         metrics = self.confusion.metrics()
         faulty_metrics = self.faulty_confusion.metrics() if self.faulty_sample_count else {}
+        localization_metrics = self.localization.metrics()
         output = {
             f"{prefix}iou": metrics["iou"],
             f"{prefix}f1": metrics["f1"],
@@ -273,6 +365,7 @@ class HeatmapMetricAccumulator:
             f"{prefix}faulty_sample_count": float(self.faulty_sample_count),
             f"{prefix}chamfer_valid_count": float(self.chamfer_count),
         }
+        output.update({f"{prefix}{key}": value for key, value in localization_metrics.items()})
         if faulty_metrics:
             output.update(
                 {

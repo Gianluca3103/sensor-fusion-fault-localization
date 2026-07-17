@@ -143,12 +143,24 @@ def collect_probabilities(model, loader, device, metric_grid_size, label, progre
     return outputs, targets, metadata_rows
 
 
-def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundary_chamfer, compute_chamfer, label, progress_every):
+def evaluate_dataset(
+    model,
+    loader,
+    device,
+    threshold,
+    metric_grid_size,
+    boundary_chamfer,
+    compute_chamfer,
+    localization_tolerance_m,
+    label,
+    progress_every,
+):
     accumulator = HeatmapMetricAccumulator(
         threshold=threshold,
         metric_grid_size=metric_grid_size,
         boundary_chamfer=boundary_chamfer,
         compute_chamfer=compute_chamfer,
+        localization_tolerance_m=localization_tolerance_m,
     )
     model.eval()
     total_batches = len(loader)
@@ -168,14 +180,19 @@ def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundar
     return accumulator
 
 
-def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label, compute_chamfer):
+def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label, compute_chamfer, localization_tolerance_m):
     rows = []
     total = len(thresholds)
     output_tensor = torch.cat(outputs, dim=0)
     target_tensor = torch.cat(targets, dim=0)
     for index, threshold in enumerate(thresholds, start=1):
         print(f"[{label}] threshold {index}/{total}: {threshold:.4f}", flush=True)
-        accumulator = HeatmapMetricAccumulator(threshold=threshold, metric_grid_size=None, compute_chamfer=compute_chamfer)
+        accumulator = HeatmapMetricAccumulator(
+            threshold=threshold,
+            metric_grid_size=None,
+            compute_chamfer=compute_chamfer,
+            localization_tolerance_m=localization_tolerance_m,
+        )
         accumulator.update(output_tensor, target_tensor, metadata=metadata, from_logits=False, update_groups=False)
         row = {"threshold": float(threshold)}
         row.update(accumulator.compute())
@@ -201,6 +218,10 @@ def print_metrics(title, metrics):
         "precision",
         "recall",
         "balanced_accuracy",
+        "localization_precision",
+        "localization_recall",
+        "localization_f1",
+        "localization_tolerance_m",
         "brier_score",
         "pixel_mae",
         "chamfer_distance_m",
@@ -240,9 +261,24 @@ def main():
     parser.add_argument("--progress-every", type=int, default=10, help="Print progress every N batches.")
     parser.add_argument(
         "--select-metric",
-        choices=["f1", "iou", "balanced_accuracy", "faulty_only_f1", "faulty_only_iou"],
+        choices=[
+            "f1",
+            "iou",
+            "balanced_accuracy",
+            "faulty_only_f1",
+            "faulty_only_iou",
+            "localization_precision",
+            "localization_recall",
+            "localization_f1",
+        ],
         default="f1",
         help="Validation metric maximized to choose the frozen test threshold.",
+    )
+    parser.add_argument(
+        "--localization-tolerance-m",
+        type=float,
+        default=0.20,
+        help="Metric tolerance in meters for predicted-vs-ground-truth fault localization matches.",
     )
     parser.add_argument("--boundary-chamfer", action="store_true")
     parser.add_argument("--disable-chamfer", action="store_true", help="Skip Chamfer distance for faster high-resolution evaluation.")
@@ -276,6 +312,7 @@ def main():
     metric_resolution = f"{args.grid_size}x{args.grid_size}" if args.grid_size is not None else f"{args.resize_height}x{args.resize_width}"
     print(f"Metric evaluation resolution: {metric_resolution}")
     print(f"Chamfer distance enabled: {not args.disable_chamfer}")
+    print(f"Localization tolerance: {args.localization_tolerance_m:.3f} m")
 
     print("[stage] Collecting validation probabilities", flush=True)
     val_outputs, val_targets, val_metadata = collect_probabilities(
@@ -289,6 +326,7 @@ def main():
         args.thresholds,
         "validation sweep",
         compute_chamfer=not args.disable_chamfer,
+        localization_tolerance_m=args.localization_tolerance_m,
     )
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
@@ -305,6 +343,7 @@ def main():
         args.thresholds,
         "test sweep",
         compute_chamfer=not args.disable_chamfer,
+        localization_tolerance_m=args.localization_tolerance_m,
     )
 
     print(f"[stage] Evaluating grouped test metrics at selected threshold {selected_threshold:.6f}", flush=True)
@@ -316,6 +355,7 @@ def main():
         metric_grid_size=args.grid_size,
         boundary_chamfer=args.boundary_chamfer,
         compute_chamfer=not args.disable_chamfer,
+        localization_tolerance_m=args.localization_tolerance_m,
         label="grouped test",
         progress_every=max(args.progress_every, 1),
     )
@@ -345,6 +385,7 @@ def main():
         "metric_evaluation_resolution": metric_resolution,
         "boundary_chamfer": args.boundary_chamfer,
         "chamfer_enabled": not args.disable_chamfer,
+        "localization_tolerance_m": args.localization_tolerance_m,
     }
     with (output_root / "threshold_calibration_test_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)
