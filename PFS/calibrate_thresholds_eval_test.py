@@ -143,11 +143,12 @@ def collect_probabilities(model, loader, device, metric_grid_size, label, progre
     return outputs, targets, metadata_rows
 
 
-def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundary_chamfer, label, progress_every):
+def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundary_chamfer, compute_chamfer, label, progress_every):
     accumulator = HeatmapMetricAccumulator(
         threshold=threshold,
         metric_grid_size=metric_grid_size,
         boundary_chamfer=boundary_chamfer,
+        compute_chamfer=compute_chamfer,
     )
     model.eval()
     total_batches = len(loader)
@@ -167,14 +168,14 @@ def evaluate_dataset(model, loader, device, threshold, metric_grid_size, boundar
     return accumulator
 
 
-def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label):
+def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label, compute_chamfer):
     rows = []
     total = len(thresholds)
     output_tensor = torch.cat(outputs, dim=0)
     target_tensor = torch.cat(targets, dim=0)
     for index, threshold in enumerate(thresholds, start=1):
         print(f"[{label}] threshold {index}/{total}: {threshold:.4f}", flush=True)
-        accumulator = HeatmapMetricAccumulator(threshold=threshold, metric_grid_size=None)
+        accumulator = HeatmapMetricAccumulator(threshold=threshold, metric_grid_size=None, compute_chamfer=compute_chamfer)
         accumulator.update(output_tensor, target_tensor, metadata=metadata, from_logits=False, update_groups=False)
         row = {"threshold": float(threshold)}
         row.update(accumulator.compute())
@@ -244,6 +245,7 @@ def main():
         help="Validation metric maximized to choose the frozen test threshold.",
     )
     parser.add_argument("--boundary-chamfer", action="store_true")
+    parser.add_argument("--disable-chamfer", action="store_true", help="Skip Chamfer distance for faster high-resolution evaluation.")
     parser.add_argument("--base-channels", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -273,13 +275,21 @@ def main():
     print(f"Selection metric: {args.select_metric}")
     metric_resolution = f"{args.grid_size}x{args.grid_size}" if args.grid_size is not None else f"{args.resize_height}x{args.resize_width}"
     print(f"Metric evaluation resolution: {metric_resolution}")
+    print(f"Chamfer distance enabled: {not args.disable_chamfer}")
 
     print("[stage] Collecting validation probabilities", flush=True)
     val_outputs, val_targets, val_metadata = collect_probabilities(
         model, val_loader, device, args.grid_size, "validation", max(args.progress_every, 1)
     )
     print("[stage] Sweeping validation thresholds", flush=True)
-    val_sweep_rows = sweep_thresholds_with_progress(val_outputs, val_targets, val_metadata, args.thresholds, "validation sweep")
+    val_sweep_rows = sweep_thresholds_with_progress(
+        val_outputs,
+        val_targets,
+        val_metadata,
+        args.thresholds,
+        "validation sweep",
+        compute_chamfer=not args.disable_chamfer,
+    )
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
 
@@ -288,7 +298,14 @@ def main():
         model, test_loader, device, args.grid_size, "test", max(args.progress_every, 1)
     )
     print("[stage] Sweeping test thresholds", flush=True)
-    test_sweep_rows = sweep_thresholds_with_progress(test_outputs, test_targets, test_metadata, args.thresholds, "test sweep")
+    test_sweep_rows = sweep_thresholds_with_progress(
+        test_outputs,
+        test_targets,
+        test_metadata,
+        args.thresholds,
+        "test sweep",
+        compute_chamfer=not args.disable_chamfer,
+    )
 
     print(f"[stage] Evaluating grouped test metrics at selected threshold {selected_threshold:.6f}", flush=True)
     test_accumulator = evaluate_dataset(
@@ -298,6 +315,7 @@ def main():
         threshold=selected_threshold,
         metric_grid_size=args.grid_size,
         boundary_chamfer=args.boundary_chamfer,
+        compute_chamfer=not args.disable_chamfer,
         label="grouped test",
         progress_every=max(args.progress_every, 1),
     )
@@ -326,6 +344,7 @@ def main():
         "metric_grid_size": args.grid_size,
         "metric_evaluation_resolution": metric_resolution,
         "boundary_chamfer": args.boundary_chamfer,
+        "chamfer_enabled": not args.disable_chamfer,
     }
     with (output_root / "threshold_calibration_test_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)

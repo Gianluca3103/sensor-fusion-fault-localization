@@ -162,6 +162,7 @@ class HeatmapMetricAccumulator:
     x_cell_size_m: float = 0.64
     y_cell_size_m: float = 0.64
     boundary_chamfer: bool = False
+    compute_chamfer: bool = True
     confusion: ConfusionCounts = field(default_factory=ConfusionCounts)
     faulty_confusion: ConfusionCounts = field(default_factory=ConfusionCounts)
     brier_sum: float = 0.0
@@ -182,6 +183,7 @@ class HeatmapMetricAccumulator:
             x_cell_size_m=self.x_cell_size_m,
             y_cell_size_m=self.y_cell_size_m,
             boundary_chamfer=self.boundary_chamfer,
+            compute_chamfer=self.compute_chamfer,
         )
 
     def update(
@@ -224,19 +226,20 @@ class HeatmapMetricAccumulator:
             self.error_sum = err.astype(np.float64) if self.error_sum is None else self.error_sum + err
 
             meta = metadata_list[index] if index < len(metadata_list) else {}
-            x_cell, y_cell = infer_cell_sizes(meta, self.x_cell_size_m, self.y_cell_size_m)
-            chamfer, mismatch = chamfer_distance_m(
-                pred_mask,
-                target_mask,
-                x_cell,
-                y_cell,
-                boundary_only=self.boundary_chamfer,
-            )
-            if mismatch:
-                self.empty_mismatch_count += 1
-            elif chamfer is not None:
-                self.chamfer_sum += chamfer
-                self.chamfer_count += 1
+            if self.compute_chamfer:
+                x_cell, y_cell = infer_cell_sizes(meta, self.x_cell_size_m, self.y_cell_size_m)
+                chamfer, mismatch = chamfer_distance_m(
+                    pred_mask,
+                    target_mask,
+                    x_cell,
+                    y_cell,
+                    boundary_only=self.boundary_chamfer,
+                )
+                if mismatch:
+                    self.empty_mismatch_count += 1
+                elif chamfer is not None:
+                    self.chamfer_sum += chamfer
+                    self.chamfer_count += 1
 
             if update_groups:
                 for group_key in group_keys_from_metadata(meta):
