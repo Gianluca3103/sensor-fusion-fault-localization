@@ -286,6 +286,11 @@ def main():
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if any(threshold <= 0.0 for threshold in args.thresholds):
+        raise ValueError(
+            "All thresholds must be greater than 0. "
+            "A threshold of 0 marks every cell as faulty and gives invalid perfect metrics."
+        )
 
     val_root = Path(args.val_root)
     test_root = Path(args.test_root)

@@ -125,6 +125,14 @@ def parse_args():
     )
     parser.add_argument("--num-samples", type=int, default=defaults["num_samples"])
     parser.add_argument("--frames", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--temporal-split",
+        choices=["train", "val", "test"],
+        default=None,
+        help="Use the first train ratio, next validation ratio, or final test ratio from every Aeva folder.",
+    )
+    parser.add_argument("--train-ratio", type=float, default=0.70)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--faults", nargs="*", default=defaults["faults"])
     parser.add_argument("--severities", type=int, nargs="*", default=defaults["severities"])
     parser.add_argument(
@@ -167,6 +175,10 @@ def validate_generation_args(args):
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
     require_positive(args.num_workers, "num_workers")
+    if args.train_ratio <= 0.0 or args.val_ratio <= 0.0:
+        raise ValueError("--train-ratio and --val-ratio must be positive.")
+    if args.train_ratio + args.val_ratio >= 1.0:
+        raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
     require_range(args.x_min, args.x_max, "x range")
     require_range(args.y_min, args.y_max, "y range")
     require_range(args.min_range, args.max_range, "point range")
@@ -409,6 +421,37 @@ def list_all_aeva_bins(data_root, dedupe=True, include_scenes=None, exclude_scen
                 unique_bins[key] = bin_path
         bins = sorted(unique_bins.values(), key=lambda path: str(path.relative_to(data_root)).lower())
     return bins, aeva_dirs
+
+
+def select_temporal_split_bins(bins, data_root, split_name, train_ratio=0.70, val_ratio=0.15):
+    """Select a chronological train/val/test slice inside each Aeva folder."""
+    grouped = {}
+    for bin_path in bins:
+        source_dir = hercules_source_metadata(bin_path, data_root)["source_aeva_dir"]
+        grouped.setdefault(source_dir, []).append(bin_path)
+
+    selected = []
+    split_counts = []
+    for source_dir, folder_bins in sorted(grouped.items()):
+        folder_bins = sorted(folder_bins, key=lambda path: path.stem)
+        count = len(folder_bins)
+        train_end = int(count * train_ratio)
+        val_end = int(count * (train_ratio + val_ratio))
+        if split_name == "train":
+            split_bins = folder_bins[:train_end]
+        elif split_name == "val":
+            split_bins = folder_bins[train_end:val_end]
+        elif split_name == "test":
+            split_bins = folder_bins[val_end:]
+        else:
+            raise ValueError(f"Unknown temporal split: {split_name}")
+        selected.extend(split_bins)
+        split_counts.append((source_dir, count, len(split_bins)))
+
+    selected = sorted(selected, key=lambda path: str(path.relative_to(data_root)).lower())
+    if not selected:
+        raise FileNotFoundError(f"No frames selected for temporal split {split_name!r}.")
+    return selected, split_counts
 
 
 def hercules_source_metadata(bin_path, data_root):
@@ -712,6 +755,30 @@ def main():
         if invalid_frames:
             raise ValueError(f"Requested frame indexes are out of range: {invalid_frames}")
         bins = [bins[frame - 1] for frame in args.frames]
+    if args.temporal_split:
+        bins, split_counts = select_temporal_split_bins(
+            bins,
+            data_root,
+            args.temporal_split,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+        )
+        LOGGER.info(
+            "Temporal split %s selected %d frames using train=%.3f val=%.3f test=%.3f",
+            args.temporal_split,
+            len(bins),
+            args.train_ratio,
+            args.val_ratio,
+            1.0 - args.train_ratio - args.val_ratio,
+        )
+        for source_dir, total_count, split_count in split_counts:
+            LOGGER.debug(
+                "Temporal split %s: %s -> %d/%d frames",
+                args.temporal_split,
+                source_dir,
+                split_count,
+                total_count,
+            )
     if not bins:
         raise FileNotFoundError("No Hercules Aeva frames selected.")
 
