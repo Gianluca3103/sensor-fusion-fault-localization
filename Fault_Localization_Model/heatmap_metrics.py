@@ -127,7 +127,9 @@ class LocalizationToleranceCounts:
         precision = self.pred_matched / max(self.pred_total, 1)
         recall = self.target_matched / max(self.target_total, 1)
         f1 = (2.0 * precision * recall) / max(precision + recall, EPS)
+        iou = f1 / max(2.0 - f1, EPS)
         return {
+            "localization_iou": float(iou),
             "localization_precision": float(precision),
             "localization_recall": float(recall),
             "localization_f1": float(f1),
