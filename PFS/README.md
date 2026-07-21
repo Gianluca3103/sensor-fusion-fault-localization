@@ -38,6 +38,11 @@ bypasses all three PFS blocks and disables the clean-feature stabilization and
 internal PFS reliability losses. It therefore trains only the final supervised
 fault-heatmap objective and provides a direct baseline for ablation studies.
 
+To measure the contribution of Block 3, pass `--model-variant pfs-block12`.
+This retains Shift Normalization and Spatial Reliability Estimation, applies
+`reliability * shifted_features`, and sends those filtered features directly
+to the decoder without either correction expert or the Block 3 spatial gate.
+
 ## Train
 
 From the repo root:

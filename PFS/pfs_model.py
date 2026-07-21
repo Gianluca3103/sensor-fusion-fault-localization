@@ -131,6 +131,21 @@ class PostFusionStabilizer(nn.Module):
         return corrected, reliability
 
 
+class PFSBlock12Stabilizer(nn.Module):
+    """PFS ablation retaining shift normalization and reliability filtering only."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.shift_norm = ShiftNormalization(channels)
+        self.reliability = SpatialReliabilityEstimator(channels)
+
+    def forward(self, features, lidar_features=None):
+        shifted = self.shift_norm(features)
+        reliability = self.reliability(shifted, lidar_features=lidar_features)
+        filtered = reliability * shifted
+        return filtered, reliability
+
+
 class LidarSpatialReliabilityEstimator(nn.Module):
     """Predict spatial reliability directly from a single LiDAR BEV feature map."""
 
@@ -282,6 +297,14 @@ class LidarOnlyReliabilityModel(PFSReliabilityModel):
         }
 
 
+class PFSBlock12ReliabilityModel(PFSReliabilityModel):
+    """Ablation model using PFS Blocks 1 and 2 without expert correction."""
+
+    def __init__(self, in_channels=3, base_channels=16, dropout=0.0):
+        super().__init__(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
+        self.pfs = PFSBlock12Stabilizer(base_channels * 16)
+
+
 class NoPFSReliabilityModel(PFSReliabilityModel):
     """Encoder-decoder baseline with no PFS blocks or PFS auxiliary outputs."""
 
@@ -306,6 +329,7 @@ class NoPFSReliabilityModel(PFSReliabilityModel):
 
 MODEL_VARIANTS = {
     "pfs": PFSReliabilityModel,
+    "pfs-block12": PFSBlock12ReliabilityModel,
     "lidar-only": LidarOnlyReliabilityModel,
     "no-pfs": NoPFSReliabilityModel,
 }

@@ -385,7 +385,7 @@ def main():
         "--model-variant",
         choices=sorted(MODEL_VARIANTS),
         default="pfs",
-        help="Select full PFS, the LiDAR-only blocks 2/3 adaptation, or the no-PFS baseline.",
+        help="Select full PFS, a PFS ablation, the LiDAR-only adaptation, or the no-PFS baseline.",
     )
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--val-ratio", type=float, default=0.2)
