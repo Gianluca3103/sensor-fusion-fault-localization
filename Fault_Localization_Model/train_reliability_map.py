@@ -213,9 +213,16 @@ def _matched_within_tolerance(query_mask, reference_mask, x_cell_size_m, y_cell_
         return output
 
 
-def localization_match_overlay(target, pred_map, metadata, threshold=0.5, tolerance_m=0.20):
-    target_mask = target >= threshold
-    pred_mask = pred_map >= threshold
+def localization_match_overlay(
+    target,
+    pred_map,
+    metadata,
+    prediction_threshold=0.5,
+    target_fault_threshold=0.0,
+    tolerance_m=0.20,
+):
+    target_mask = target > target_fault_threshold
+    pred_mask = pred_map >= prediction_threshold
     x_range = metadata.get("x_range", [0.0, float(target.shape[0])])
     y_range = metadata.get("y_range", [0.0, float(target.shape[1])])
     x_cell_size_m = (float(x_range[1]) - float(x_range[0])) / float(target.shape[0])
@@ -264,6 +271,7 @@ def save_predictions(
     visual_grid_size=100,
     localization_threshold=0.5,
     localization_tolerance_m=0.20,
+    target_fault_threshold=0.0,
 ):
     pred_dir = output_root / "val_predictions"
     rows = []
@@ -287,11 +295,13 @@ def save_predictions(
                         target,
                         pred_map,
                         meta,
-                        threshold=localization_threshold,
+                        prediction_threshold=localization_threshold,
+                        target_fault_threshold=target_fault_threshold,
                         tolerance_m=localization_tolerance_m,
                     ),
                     grid_size=visual_grid_size,
                 )
+                tolerance_cm = int(round(localization_tolerance_m * 100.0))
                 input_rgb = batch["rgb"][i]
                 if input_rgb.shape[:2] != target_rgb.shape[:2]:
                     input_rgb = np.array(
@@ -307,7 +317,7 @@ def save_predictions(
                         add_reliability_colorbar(add_label_above(pred_rgb, f"learned reliability: {meta['fault']} S{meta['severity']}")),
                         add_label_above(
                             match_rgb,
-                            f"20cm match: white/both cyan=pred ok green=GT ok red=miss yellow=false",
+                            f"{tolerance_cm}cm match: white=both cyan=pred ok green=GT ok red=miss yellow=false",
                         ),
                     ]
                 )
@@ -321,7 +331,7 @@ def save_predictions(
                 )
                 save_image(pred_dir / f"{stem}_comparison.png", panel)
                 save_image(pred_dir / f"{stem}_ideal_vs_learned_heatmaps.png", heatmap_panel)
-                save_image(pred_dir / f"{stem}_localization_20cm_overlay.png", match_rgb)
+                save_image(pred_dir / f"{stem}_localization_{tolerance_cm:03d}cm_overlay.png", match_rgb)
                 save_image(pred_dir / f"{stem}_target_reliability.png", target_rgb)
                 save_image(pred_dir / f"{stem}_pred_reliability.png", pred_rgb)
                 rows.append(

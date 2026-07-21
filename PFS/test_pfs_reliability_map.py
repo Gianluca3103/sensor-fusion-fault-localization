@@ -44,6 +44,12 @@ def main():
     parser.add_argument("--visual-grid-size", type=int, default=100)
     parser.add_argument("--localization-threshold", type=float, default=0.5)
     parser.add_argument("--localization-tolerance-m", type=float, default=0.20)
+    parser.add_argument("--target-fault-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--use-all-samples",
+        action="store_true",
+        help="Use the supplied folder directly instead of taking another random validation split.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -63,7 +69,10 @@ def main():
     dropout = args.dropout if args.dropout is not None else float(checkpoint_args.get("dropout", 0.0))
     model_variant = args.model_variant or checkpoint_args.get("model_variant", "pfs")
 
-    _, test_paths = split_paths(paths, args.val_ratio, args.seed)
+    if args.use_all_samples:
+        test_paths = paths
+    else:
+        _, test_paths = split_paths(paths, args.val_ratio, args.seed)
     resize_hw = (args.resize_height, args.resize_width)
     loader = DataLoader(
         PFSReliabilityDataset(test_paths, resize_hw),
@@ -89,6 +98,7 @@ def main():
         visual_grid_size=args.visual_grid_size,
         localization_threshold=args.localization_threshold,
         localization_tolerance_m=args.localization_tolerance_m,
+        target_fault_threshold=args.target_fault_threshold,
     )
     print(f"Saved {len(rows)} {model_variant} prediction comparisons: {output_root}")
 
