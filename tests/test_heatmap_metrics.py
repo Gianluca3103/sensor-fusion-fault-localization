@@ -95,6 +95,32 @@ class HeatmapMetricTests(unittest.TestCase):
         metrics_bchw = self._metrics(pred[:, None], target[:, None])
         self.assertEqual(metrics_bhw["f1"], metrics_bchw["f1"])
 
+    def test_fixed_target_threshold_is_independent_from_prediction_threshold(self):
+        pred = np.array([[[[0.2, 0.8]]]], dtype=np.float32)
+        target = np.array([[[[0.1, 0.4]]]], dtype=np.float32)
+
+        low = HeatmapMetricAccumulator(
+            threshold=0.5,
+            target_threshold=0.0,
+            metric_grid_size=None,
+            compute_chamfer=False,
+        )
+        high = HeatmapMetricAccumulator(
+            threshold=0.9,
+            target_threshold=0.0,
+            metric_grid_size=None,
+            compute_chamfer=False,
+        )
+        tensor_pred = torch.tensor(pred)
+        tensor_target = torch.tensor(target)
+        low.update(tensor_pred, tensor_target, from_logits=False)
+        high.update(tensor_pred, tensor_target, from_logits=False)
+
+        self.assertEqual(low.compute()["localization_target_total"], 2.0)
+        self.assertEqual(high.compute()["localization_target_total"], 2.0)
+        self.assertEqual(low.compute()["localization_pred_total"], 1.0)
+        self.assertEqual(high.compute()["localization_pred_total"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

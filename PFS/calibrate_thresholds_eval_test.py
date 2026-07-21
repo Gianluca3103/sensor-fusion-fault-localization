@@ -159,6 +159,7 @@ def evaluate_dataset(
     boundary_chamfer,
     compute_chamfer,
     localization_tolerance_m,
+    target_fault_threshold,
     label,
     progress_every,
 ):
@@ -168,6 +169,7 @@ def evaluate_dataset(
         boundary_chamfer=boundary_chamfer,
         compute_chamfer=compute_chamfer,
         localization_tolerance_m=localization_tolerance_m,
+        target_threshold=target_fault_threshold,
     )
     model.eval()
     total_batches = len(loader)
@@ -187,7 +189,16 @@ def evaluate_dataset(
     return accumulator
 
 
-def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label, compute_chamfer, localization_tolerance_m):
+def sweep_thresholds_with_progress(
+    outputs,
+    targets,
+    metadata,
+    thresholds,
+    label,
+    compute_chamfer,
+    localization_tolerance_m,
+    target_fault_threshold,
+):
     rows = []
     total = len(thresholds)
     output_tensor = torch.cat(outputs, dim=0)
@@ -199,6 +210,7 @@ def sweep_thresholds_with_progress(outputs, targets, metadata, thresholds, label
             metric_grid_size=None,
             compute_chamfer=compute_chamfer,
             localization_tolerance_m=localization_tolerance_m,
+            target_threshold=target_fault_threshold,
         )
         accumulator.update(output_tensor, target_tensor, metadata=metadata, from_logits=False, update_groups=False)
         row = {"threshold": float(threshold)}
@@ -289,6 +301,15 @@ def main():
         default=0.20,
         help="Metric tolerance in meters for predicted-vs-ground-truth fault localization matches.",
     )
+    parser.add_argument(
+        "--target-fault-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed ideal fault-map cutoff. Ground-truth cells are faulty when target > cutoff; "
+            "prediction threshold candidates do not change this mask."
+        ),
+    )
     parser.add_argument("--boundary-chamfer", action="store_true")
     parser.add_argument("--disable-chamfer", action="store_true", help="Skip Chamfer distance for faster high-resolution evaluation.")
     parser.add_argument("--base-channels", type=int, default=None)
@@ -301,6 +322,8 @@ def main():
             "All thresholds must be greater than 0. "
             "A threshold of 0 marks every cell as faulty and gives invalid perfect metrics."
         )
+    if not 0.0 <= args.target_fault_threshold < 1.0:
+        raise ValueError("--target-fault-threshold must be in [0, 1).")
 
     val_root = Path(args.val_root)
     test_root = Path(args.test_root)
@@ -335,6 +358,7 @@ def main():
     print(f"Metric evaluation resolution: {metric_resolution}")
     print(f"Chamfer distance enabled: {not args.disable_chamfer}")
     print(f"Localization tolerance: {args.localization_tolerance_m:.3f} m")
+    print(f"Fixed target fault threshold: > {args.target_fault_threshold:.6f}")
 
     print("[stage] Collecting validation probabilities", flush=True)
     val_outputs, val_targets, val_metadata = collect_probabilities(
@@ -349,6 +373,7 @@ def main():
         "validation sweep",
         compute_chamfer=not args.disable_chamfer,
         localization_tolerance_m=args.localization_tolerance_m,
+        target_fault_threshold=args.target_fault_threshold,
     )
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
@@ -366,6 +391,7 @@ def main():
         boundary_chamfer=args.boundary_chamfer,
         compute_chamfer=not args.disable_chamfer,
         localization_tolerance_m=args.localization_tolerance_m,
+        target_fault_threshold=args.target_fault_threshold,
         label="grouped test",
         progress_every=max(args.progress_every, 1),
     )
@@ -395,6 +421,7 @@ def main():
         "boundary_chamfer": args.boundary_chamfer,
         "chamfer_enabled": not args.disable_chamfer,
         "localization_tolerance_m": args.localization_tolerance_m,
+        "target_fault_threshold": args.target_fault_threshold,
     }
     with (output_root / "threshold_calibration_test_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)
@@ -406,6 +433,7 @@ def main():
     print(f"  selected_metric: {args.select_metric}")
     print(f"  metric_evaluation_resolution: {metric_resolution}")
     print(f"  threshold_candidates: {args.thresholds}")
+    print(f"  target_fault_threshold: > {args.target_fault_threshold:.6f}")
     print()
     print_metrics("Validation metrics at selected threshold", best_row)
     print()

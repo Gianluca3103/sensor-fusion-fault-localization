@@ -246,6 +246,7 @@ class HeatmapMetricAccumulator:
     """Accumulate validation metrics over a full epoch."""
 
     threshold: float = 0.5
+    target_threshold: Optional[float] = None
     metric_grid_size: Optional[int] = 100
     x_cell_size_m: float = 0.64
     y_cell_size_m: float = 0.64
@@ -269,6 +270,7 @@ class HeatmapMetricAccumulator:
     def _new_group_accumulator(self) -> "HeatmapMetricAccumulator":
         return HeatmapMetricAccumulator(
             threshold=self.threshold,
+            target_threshold=self.target_threshold,
             metric_grid_size=None,
             x_cell_size_m=self.x_cell_size_m,
             y_cell_size_m=self.y_cell_size_m,
@@ -300,7 +302,10 @@ class HeatmapMetricAccumulator:
             pred_values = prob[index]
             target_values = target_np[index]
             pred_mask = pred_values >= self.threshold
-            target_mask = target_values >= self.threshold
+            if self.target_threshold is None:
+                target_mask = target_values >= self.threshold
+            else:
+                target_mask = target_values > self.target_threshold
             self.confusion.update(pred_mask, target_mask)
 
             has_fault = bool(target_mask.any())
