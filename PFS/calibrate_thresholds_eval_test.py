@@ -25,7 +25,7 @@ from heatmap_metrics import (  # noqa: E402
     prepare_probability_target,
     save_group_metrics,
 )
-from pfs_model import PFSReliabilityModel  # noqa: E402
+from pfs_model import MODEL_VARIANTS, build_reliability_model  # noqa: E402
 from train_pfs_reliability_map import PFSReliabilityDataset, collate  # noqa: E402
 
 
@@ -75,19 +75,26 @@ def write_csv(path: Path, rows):
         writer.writerows(rows)
 
 
-def load_model(checkpoint_path: Path, device, base_channels=None, dropout=None):
+def load_model(checkpoint_path: Path, device, base_channels=None, dropout=None, model_variant=None):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_args = checkpoint.get("args", {})
     model_base_channels = base_channels or int(checkpoint_args.get("base_channels", 16))
     model_dropout = float(dropout if dropout is not None else checkpoint_args.get("dropout", 0.0))
-    model = PFSReliabilityModel(in_channels=3, base_channels=model_base_channels, dropout=model_dropout).to(device)
+    model_variant = model_variant or checkpoint_args.get("model_variant", "pfs")
+    model = build_reliability_model(
+        model_variant,
+        in_channels=3,
+        base_channels=model_base_channels,
+        dropout=model_dropout,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, {
         "base_channels": model_base_channels,
         "dropout": model_dropout,
+        "model_variant": model_variant,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "checkpoint_best_metric": checkpoint.get("best_checkpoint_metric", "unknown"),
         "checkpoint_best_score": checkpoint.get("best_checkpoint_score"),
@@ -285,6 +292,7 @@ def main():
     parser.add_argument("--boundary-chamfer", action="store_true")
     parser.add_argument("--disable-chamfer", action="store_true", help="Skip Chamfer distance for faster high-resolution evaluation.")
     parser.add_argument("--base-channels", type=int, default=None)
+    parser.add_argument("--model-variant", choices=sorted(MODEL_VARIANTS), default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -305,11 +313,18 @@ def main():
     resize_hw = (args.resize_height, args.resize_width)
     device = torch.device(args.device)
 
-    model, model_info = load_model(checkpoint_path, device, args.base_channels, args.dropout)
+    model, model_info = load_model(
+        checkpoint_path,
+        device,
+        args.base_channels,
+        args.dropout,
+        args.model_variant,
+    )
     val_loader = build_loader(val_paths, resize_hw, args.batch_size, args.num_workers)
     test_loader = build_loader(test_paths, resize_hw, args.batch_size, args.num_workers)
 
     print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Model variant: {model_info['model_variant']}")
     print(f"Validation samples: {len(val_paths)} from {val_root}")
     print(f"Test samples: {len(test_paths)} from {test_root}")
     print(f"Include faults: {args.include_faults}")

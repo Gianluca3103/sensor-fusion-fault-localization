@@ -113,14 +113,27 @@ def apply_fault(module, injector_root: Path, fault: str, points: np.ndarray, sev
     return safe_pointcloud(func(points.copy(), severity))
 
 
-def filter_pointcloud(points: np.ndarray, min_range: float, max_range: float) -> np.ndarray:
+def filter_pointcloud(
+    points: np.ndarray,
+    min_range: float,
+    max_range: float,
+    return_mask: bool = False,
+):
+    """Remove invalid/out-of-range returns and optionally expose the row mask."""
+    original_length = len(points)
     points = safe_pointcloud(points)
+    if len(points) != original_length and return_mask:
+        raise ValueError(
+            "Cannot return a source-aligned range mask after safe_pointcloud removed non-finite rows. "
+            "Validate finite rows before provenance-aware filtering."
+        )
     xyz = points[:, :3]
     distances = np.linalg.norm(xyz, axis=1)
     valid = distances >= min_range
     valid &= distances <= max_range
     valid &= ~np.all(np.isclose(xyz, 0.0), axis=1)
-    return points[valid]
+    filtered = points[valid]
+    return (filtered, valid) if return_mask else filtered
 
 
 def lisa_label_counts(points: np.ndarray) -> Dict[str, int]:

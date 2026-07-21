@@ -1,9 +1,12 @@
 import numpy as np
 
 
-def apply_old_laser_degradation(points, severity, rng_seed=0):
+def apply_old_laser_degradation(points, severity, rng_seed=0, return_mask=False):
+    """Apply range-dependent attenuation/dropout and optionally return kept rows."""
     if len(points) == 0:
-        return points.copy()
+        output = points.copy()
+        mask = np.zeros(0, dtype=bool)
+        return (output, mask) if return_mask else output
 
     severity_name = {
         0: "very_mild",
@@ -35,7 +38,9 @@ def apply_old_laser_degradation(points, severity, rng_seed=0):
         gamma = 3.0
         q_cap = 0.50
     elif severity_name == "extreme":
-        return np.empty((0, points.shape[1]), dtype=np.float32)
+        output = np.empty((0, points.shape[1]), dtype=np.float32)
+        mask = np.zeros(len(points), dtype=bool)
+        return (output, mask) if return_mask else output
     else:
         alpha = 0.6
         p_max = 0.8
@@ -61,4 +66,5 @@ def apply_old_laser_degradation(points, severity, rng_seed=0):
     output = points[mask].copy()
     if intens_att is not None and output.shape[1] > 3:
         output[:, 3] = intens_att[mask]
-    return output.astype(np.float32)
+    output = output.astype(np.float32)
+    return (output, mask) if return_mask else output

@@ -100,6 +100,7 @@ python Fault_Localization_Model\create_grid_reliability_heatmaps.py `
   --resolution 0.20 `
   --min-range 1.0 `
   --max-range 120.0 `
+  --movement-tolerance-m 0.05 `
   --seed 42 `
   --log-level INFO
 ```
@@ -108,14 +109,17 @@ If generation stops, rerun the same command. Existing `.npz` samples are skipped
 
 ## Reliability Map Definition
 
-For each grid cell, the ideal target is computed from clean and faulty point-cloud counts:
+Every clean return receives a frame-local ID before fault injection. Injectors preserve the ID relationship explicitly, so the target does not use fine-grid occupancy matching or nearest-neighbour correspondence.
+
+Each retained original point is compared directly with its clean coordinates. Displacement greater than the configured tolerance, which defaults to `0.05 m`, is classified as moved. Missing IDs are localized at their clean coordinates; moved points and source-less synthetic points are localized at their faulty coordinates.
 
 ```text
+faulty_points = missing_points + moved_points + added_points
 reliability = correct_points / (correct_points + faulty_points)
 fault_heatmap = 1 - reliability
 ```
 
-`faulty_points` includes missing points, newly added points, and count differences caused by moved or altered points. This avoids the old cancellation problem where added and missing points in the same grid cell could hide each other.
+LISA rain/snow and fog replacements receive new synthetic point IDs and no clean source ID. Their replaced clean IDs therefore become missing while their weather returns become added. Generated `.npz` files store clean IDs, faulty point IDs, faulty source IDs, injector labels, classified ID lists, and aligned status arrays (`0=correct`, `1=missing`, `2=moved`, `3=added`) for auditing.
 
 ## Train the PFS Model
 

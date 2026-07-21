@@ -23,7 +23,7 @@ if str(FAULT_MODEL_DIR) not in sys.path:
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pfs_model import PFSReliabilityModel
+from pfs_model import MODEL_VARIANTS, build_reliability_model
 from heatmap_metrics import (
     HeatmapMetricAccumulator,
     save_group_metrics,
@@ -121,13 +121,15 @@ def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliabil
     if outputs["clean_features"] is not None:
         stability = F.smooth_l1_loss(outputs["stabilized_features"], outputs["clean_features"])
 
-    reliability_target = 1.0 - target
-    reliability_target = F.interpolate(
-        reliability_target,
-        size=outputs["pfs_reliability"].shape[-2:],
-        mode="area",
-    )
-    pfs_reliability = F.binary_cross_entropy(outputs["pfs_reliability"], reliability_target)
+    pfs_reliability = logits.new_tensor(0.0)
+    if outputs["pfs_reliability"] is not None:
+        reliability_target = 1.0 - target
+        reliability_target = F.interpolate(
+            reliability_target,
+            size=outputs["pfs_reliability"].shape[-2:],
+            mode="area",
+        )
+        pfs_reliability = F.binary_cross_entropy(outputs["pfs_reliability"], reliability_target)
     total = heatmap + stability_weight * stability + pfs_reliability_weight * pfs_reliability
     return total, {
         "heatmap_loss": float(heatmap.detach().cpu()),
@@ -379,6 +381,12 @@ def main():
     parser.add_argument("--resize-height", type=int, default=320)
     parser.add_argument("--resize-width", type=int, default=320)
     parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument(
+        "--model-variant",
+        choices=sorted(MODEL_VARIANTS),
+        default="pfs",
+        help="Select full PFS, the LiDAR-only blocks 2/3 adaptation, or the no-PFS baseline.",
+    )
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
@@ -460,7 +468,12 @@ def main():
         collate_fn=collate,
     )
 
-    model = PFSReliabilityModel(in_channels=3, base_channels=args.base_channels, dropout=args.dropout).to(device)
+    model = build_reliability_model(
+        args.model_variant,
+        in_channels=3,
+        base_channels=args.base_channels,
+        dropout=args.dropout,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine_scheduler(
         optimizer,
@@ -491,7 +504,11 @@ def main():
         "val_loss": [row["val_loss"] for row in history],
     }
 
-    print(f"Training PFS reliability model on {len(train_paths)} train and {len(val_paths)} val samples.", flush=True)
+    print(
+        f"Training {args.model_variant} reliability model on "
+        f"{len(train_paths)} train and {len(val_paths)} val samples.",
+        flush=True,
+    )
     epochs_without_improvement = 0
     latest_val_artifacts = None
     for epoch in range(start_epoch, args.epochs + 1):
@@ -555,9 +572,12 @@ def main():
                     "best_val_loss": val_stats["loss"],
                     "best_checkpoint_metric": args.best_checkpoint_metric,
                     "best_checkpoint_score": best_score,
-                    "architecture": "PFSReliabilityModel",
+                    "architecture": type(model).__name__,
                     "input": "faulty_rgb_bev",
-                    "training_clean_input": "clean_rgb_bev used only for feature stabilization loss",
+                    "training_clean_input": (
+                        "unused" if args.model_variant == "no-pfs"
+                        else "clean_rgb_bev used only for feature stabilization loss"
+                    ),
                     "target": "fault_heatmap/unreliability; reliability=1-target",
                 },
                 checkpoint_dir / "best_model.pt",
@@ -585,9 +605,12 @@ def main():
                 "best_checkpoint_metric": args.best_checkpoint_metric,
                 "best_checkpoint_score": best_score,
                 "history": history,
-                "architecture": "PFSReliabilityModel",
+                "architecture": type(model).__name__,
                 "input": "faulty_rgb_bev",
-                "training_clean_input": "clean_rgb_bev used only for feature stabilization loss",
+                "training_clean_input": (
+                    "unused" if args.model_variant == "no-pfs"
+                    else "clean_rgb_bev used only for feature stabilization loss"
+                ),
                 "target": "fault_heatmap/unreliability; reliability=1-target",
             },
             checkpoint_dir / "last_checkpoint.pt",

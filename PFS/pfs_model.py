@@ -131,6 +131,68 @@ class PostFusionStabilizer(nn.Module):
         return corrected, reliability
 
 
+class LidarSpatialReliabilityEstimator(nn.Module):
+    """Predict spatial reliability directly from a single LiDAR BEV feature map."""
+
+    def __init__(self, channels):
+        super().__init__()
+        hidden = max(16, channels // 2)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        nn.init.constant_(self.net[-1].bias, 4.0)
+
+    def forward(self, lidar_features):
+        reliability = torch.sigmoid(self.net(lidar_features))
+        return F.interpolate(
+            reliability,
+            size=lidar_features.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+
+class LidarGeometricCorrection(nn.Module):
+    """Apply one gated geometric residual instead of camera/LiDAR experts."""
+
+    def __init__(self, channels):
+        super().__init__()
+        in_channels = channels + 1
+        self.geometric_expert = ConvBlock(in_channels, channels)
+        self.gate = nn.Conv2d(in_channels, 1, kernel_size=1)
+        nn.init.constant_(self.gate.bias, -4.0)
+
+    def forward(self, lidar_features, reliability):
+        reliable_features = reliability * lidar_features
+        expert_input = torch.cat([reliable_features, reliability], dim=1)
+        residual = self.geometric_expert(expert_input)
+        gate = torch.sigmoid(self.gate(expert_input))
+        return lidar_features + gate * residual
+
+
+class LidarFaultStabilizer(nn.Module):
+    """LiDAR-only adaptation of PFS blocks 2 and 3."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.reliability = LidarSpatialReliabilityEstimator(channels)
+        self.correction = LidarGeometricCorrection(channels)
+
+    def forward(self, lidar_features):
+        reliability = self.reliability(lidar_features)
+        corrected = self.correction(lidar_features, reliability)
+        return corrected, reliability
+
+
 class PFSReliabilityModel(nn.Module):
     """PFS-style BEV stabilizer adapted to dense fault-localization heatmaps."""
 
@@ -190,3 +252,69 @@ class PFSReliabilityModel(nn.Module):
             "clean_features": clean_bottleneck,
             "pfs_reliability": pfs_reliability,
         }
+
+
+class LidarOnlyReliabilityModel(PFSReliabilityModel):
+    """LiDAR-only fault localizer using spatial reliability and geometric correction."""
+
+    def __init__(self, in_channels=3, base_channels=16, dropout=0.0):
+        super().__init__(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
+        self.pfs = LidarFaultStabilizer(base_channels * 16)
+
+    def forward(self, faulty_bev, clean_bev=None, return_features=False):
+        e1, e2, e3, e4, bottleneck = self.encoder(faulty_bev)
+        stabilized, pfs_reliability = self.pfs(bottleneck)
+        logits = self.decode(stabilized, (e1, e2, e3, e4))
+
+        if not return_features:
+            return logits
+
+        clean_bottleneck = None
+        if clean_bev is not None:
+            with torch.no_grad():
+                clean_bottleneck = self.encoder(clean_bev)[-1]
+
+        return {
+            "logits": logits,
+            "stabilized_features": stabilized,
+            "clean_features": clean_bottleneck,
+            "pfs_reliability": pfs_reliability,
+        }
+
+
+class NoPFSReliabilityModel(PFSReliabilityModel):
+    """Encoder-decoder baseline with no PFS blocks or PFS auxiliary outputs."""
+
+    def __init__(self, in_channels=3, base_channels=16, dropout=0.0):
+        super().__init__(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
+        self.pfs = nn.Identity()
+
+    def forward(self, faulty_bev, clean_bev=None, return_features=False):
+        e1, e2, e3, e4, bottleneck = self.encoder(faulty_bev)
+        logits = self.decode(bottleneck, (e1, e2, e3, e4))
+
+        if not return_features:
+            return logits
+
+        return {
+            "logits": logits,
+            "stabilized_features": bottleneck,
+            "clean_features": None,
+            "pfs_reliability": None,
+        }
+
+
+MODEL_VARIANTS = {
+    "pfs": PFSReliabilityModel,
+    "lidar-only": LidarOnlyReliabilityModel,
+    "no-pfs": NoPFSReliabilityModel,
+}
+
+
+def build_reliability_model(model_variant="pfs", **kwargs):
+    try:
+        model_class = MODEL_VARIANTS[model_variant]
+    except KeyError as exc:
+        choices = ", ".join(sorted(MODEL_VARIANTS))
+        raise ValueError(f"Unknown model variant {model_variant!r}; choose one of: {choices}") from exc
+    return model_class(**kwargs)

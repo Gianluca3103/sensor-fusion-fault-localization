@@ -17,7 +17,7 @@ if str(FAULT_MODEL_DIR) not in sys.path:
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pfs_model import PFSReliabilityModel
+from pfs_model import MODEL_VARIANTS, build_reliability_model
 from train_pfs_reliability_map import PFSReliabilityDataset, collate
 from train_reliability_map import save_predictions, split_paths
 
@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--resize-height", type=int, default=320)
     parser.add_argument("--resize-width", type=int, default=320)
     parser.add_argument("--base-channels", type=int, default=None)
+    parser.add_argument("--model-variant", choices=sorted(MODEL_VARIANTS), default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
@@ -60,6 +61,7 @@ def main():
     checkpoint_args = checkpoint.get("args", {})
     base_channels = args.base_channels or int(checkpoint_args.get("base_channels", 16))
     dropout = args.dropout if args.dropout is not None else float(checkpoint_args.get("dropout", 0.0))
+    model_variant = args.model_variant or checkpoint_args.get("model_variant", "pfs")
 
     _, test_paths = split_paths(paths, args.val_ratio, args.seed)
     resize_hw = (args.resize_height, args.resize_width)
@@ -71,7 +73,12 @@ def main():
         collate_fn=collate,
     )
 
-    model = PFSReliabilityModel(in_channels=3, base_channels=base_channels, dropout=dropout).to(device)
+    model = build_reliability_model(
+        model_variant,
+        in_channels=3,
+        base_channels=base_channels,
+        dropout=dropout,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     rows = save_predictions(
         model,
@@ -83,7 +90,7 @@ def main():
         localization_threshold=args.localization_threshold,
         localization_tolerance_m=args.localization_tolerance_m,
     )
-    print(f"Saved {len(rows)} PFS prediction comparisons: {output_root}")
+    print(f"Saved {len(rows)} {model_variant} prediction comparisons: {output_root}")
 
 
 if __name__ == "__main__":

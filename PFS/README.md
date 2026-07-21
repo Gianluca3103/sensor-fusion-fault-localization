@@ -27,6 +27,17 @@ The original PFS paper places a lightweight feature stabilizer between a fused B
 
 The final heatmap decoder is U-Net-like, matching the current fault localization model style.
 
+For LiDAR-only experiments, pass `--model-variant lidar-only`. This variant
+removes `ShiftNormalization`, feeds the LiDAR bottleneck directly to a
+single-input spatial reliability estimator, and uses only one geometric
+correction expert. The default `--model-variant pfs` preserves the original
+three-block adaptation and remains compatible with existing checkpoints.
+
+For a plain encoder-decoder baseline, pass `--model-variant no-pfs`. This
+bypasses all three PFS blocks and disables the clean-feature stabilization and
+internal PFS reliability losses. It therefore trains only the final supervised
+fault-heatmap objective and provides a direct baseline for ablation studies.
+
 ## Train
 
 From the repo root:

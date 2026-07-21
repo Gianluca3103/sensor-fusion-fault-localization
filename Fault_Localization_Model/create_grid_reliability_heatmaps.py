@@ -48,7 +48,12 @@ FAULT_PLAN = [
     ("uniform_noise", 1),
     ("impulse_noise", 1),
 ]
-FINE_MATCH_FACTOR = 4
+GROUND_TRUTH_METHOD = "point_id_provenance_v1"
+VISUALIZATION_METHOD = "point_status_overlay_v1"
+POINT_STATUS_CORRECT = 0
+POINT_STATUS_MISSING = 1
+POINT_STATUS_MOVED = 2
+POINT_STATUS_ADDED = 3
 WORKER_CONTEXT = None
 
 
@@ -80,6 +85,7 @@ def config_defaults(config):
         "resolution": config_get(config, "bev.resolution", 0.20),
         "min_range": config_get(config, "bev.min_range", 1.0),
         "max_range": config_get(config, "bev.max_range", 120.0),
+        "movement_tolerance_m": config_get(config, "reliability.movement_tolerance_m", 0.05),
     }
 
 
@@ -155,6 +161,12 @@ def parse_args():
     parser.add_argument("--resolution", type=float, default=defaults["resolution"])
     parser.add_argument("--min-range", type=float, default=defaults["min_range"])
     parser.add_argument("--max-range", type=float, default=defaults["max_range"])
+    parser.add_argument(
+        "--movement-tolerance-m",
+        type=float,
+        default=defaults["movement_tolerance_m"],
+        help="Maximum clean-to-faulty displacement treated as unchanged. Defaults to 0.05 m.",
+    )
     parser.add_argument("--fog-noise", type=int, default=defaults["fog_noise"])
     parser.add_argument(
         "--num-workers",
@@ -175,6 +187,7 @@ def validate_generation_args(args):
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
     require_positive(args.num_workers, "num_workers")
+    require_positive(args.movement_tolerance_m, "movement_tolerance_m")
     if args.train_ratio <= 0.0 or args.val_ratio <= 0.0:
         raise ValueError("--train-ratio and --val-ratio must be positive.")
     if args.train_ratio + args.val_ratio >= 1.0:
@@ -199,51 +212,95 @@ def point_counts_grid(points, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
     return counts
 
 
-def label_grid(points, label, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
-    counts = np.zeros((grid_rows, grid_cols), dtype=np.float32)
-    if points.shape[1] < 5:
-        return counts
-    selected = points[points[:, 4].astype(np.int32) == label]
-    if len(selected) == 0:
-        return counts
-    return point_counts_grid(selected, x_min, x_max, y_min, y_max, grid_rows, grid_cols)
+def make_reliability_maps(
+    clean_points,
+    clean_point_ids,
+    faulty_points,
+    faulty_point_ids,
+    faulty_source_ids,
+    movement_tolerance_m,
+    x_min,
+    x_max,
+    y_min,
+    y_max,
+    grid_rows,
+    grid_cols,
+):
+    """Build reliability targets from exact point provenance rather than occupancy matching."""
+    clean_point_ids = np.asarray(clean_point_ids, dtype=np.int64)
+    faulty_point_ids = np.asarray(faulty_point_ids, dtype=np.int64)
+    faulty_source_ids = np.asarray(faulty_source_ids, dtype=np.int64)
+    if clean_point_ids.shape != (len(clean_points),):
+        raise ValueError("clean_point_ids must contain one ID per clean point.")
+    if faulty_point_ids.shape != (len(faulty_points),):
+        raise ValueError("faulty_point_ids must contain one ID per faulty point.")
+    if faulty_source_ids.shape != (len(faulty_points),):
+        raise ValueError("faulty_source_ids must contain one source ID per faulty point.")
+    if len(np.unique(clean_point_ids)) != len(clean_point_ids):
+        raise ValueError("clean_point_ids must be unique within a frame.")
+    if len(np.unique(faulty_point_ids)) != len(faulty_point_ids):
+        raise ValueError("faulty_point_ids must be unique within a frame.")
 
-
-def aggregate_fine_grid(fine_grid, grid_rows, grid_cols):
-    row_factor = fine_grid.shape[0] // grid_rows
-    col_factor = fine_grid.shape[1] // grid_cols
-    trimmed = fine_grid[: grid_rows * row_factor, : grid_cols * col_factor]
-    return trimmed.reshape(grid_rows, row_factor, grid_cols, col_factor).sum(axis=(1, 3))
-
-
-def make_reliability_maps(clean_points, faulty_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
     clean_counts = point_counts_grid(clean_points[:, :4], x_min, x_max, y_min, y_max, grid_rows, grid_cols)
     faulty_counts = point_counts_grid(faulty_points[:, :4], x_min, x_max, y_min, y_max, grid_rows, grid_cols)
 
-    fine_rows = grid_rows * FINE_MATCH_FACTOR
-    fine_cols = grid_cols * FINE_MATCH_FACTOR
-    clean_fine = point_counts_grid(clean_points[:, :4], x_min, x_max, y_min, y_max, fine_rows, fine_cols)
-    faulty_fine = point_counts_grid(faulty_points[:, :4], x_min, x_max, y_min, y_max, fine_rows, fine_cols)
+    clean_index_by_id = {int(point_id): index for index, point_id in enumerate(clean_point_ids)}
+    original_mask = faulty_source_ids >= 0
+    original_source_ids = faulty_source_ids[original_mask]
+    if len(np.unique(original_source_ids)) != len(original_source_ids):
+        raise ValueError("An injector produced duplicate rows for the same clean source ID.")
+    unknown_ids = sorted(set(map(int, original_source_ids)) - set(clean_index_by_id))
+    if unknown_ids:
+        raise ValueError(f"Faulty points reference unknown clean source IDs: {unknown_ids[:5]}")
 
-    correct = aggregate_fine_grid(np.minimum(clean_fine, faulty_fine), grid_rows, grid_cols)
-    missing = aggregate_fine_grid(np.maximum(clean_fine - faulty_fine, 0.0), grid_rows, grid_cols)
-    wrong_added = aggregate_fine_grid(np.maximum(faulty_fine - clean_fine, 0.0), grid_rows, grid_cols)
+    original_faulty_indices = np.flatnonzero(original_mask)
+    original_clean_indices = np.array(
+        [clean_index_by_id[int(source_id)] for source_id in original_source_ids],
+        dtype=np.int64,
+    )
+    displacement = np.zeros(len(original_faulty_indices), dtype=np.float32)
+    if len(original_faulty_indices):
+        coordinate_delta = (
+            faulty_points[original_faulty_indices, :3]
+            - clean_points[original_clean_indices, :3]
+        )
+        displacement = np.linalg.norm(coordinate_delta, axis=1)
+    moved_original = displacement > movement_tolerance_m
 
-    # Synthetic weather labels add extra localization evidence when available.
-    synthetic_scattered = aggregate_fine_grid(
-        label_grid(faulty_points, 2, x_min, x_max, y_min, y_max, fine_rows, fine_cols),
-        grid_rows,
-        grid_cols,
+    present_clean = np.zeros(len(clean_points), dtype=bool)
+    present_clean[original_clean_indices] = True
+    missing_clean = ~present_clean
+
+    correct_clean_indices = original_clean_indices[~moved_original]
+    moved_clean_indices = original_clean_indices[moved_original]
+    moved_faulty_indices = original_faulty_indices[moved_original]
+    added_faulty_indices = np.flatnonzero(~original_mask)
+
+    clean_point_status = np.full(len(clean_points), POINT_STATUS_MISSING, dtype=np.int8)
+    clean_point_status[correct_clean_indices] = POINT_STATUS_CORRECT
+    clean_point_status[moved_clean_indices] = POINT_STATUS_MOVED
+    faulty_point_status = np.full(len(faulty_points), POINT_STATUS_ADDED, dtype=np.int8)
+    faulty_point_status[original_faulty_indices[~moved_original]] = POINT_STATUS_CORRECT
+    faulty_point_status[moved_faulty_indices] = POINT_STATUS_MOVED
+
+    correct_points = clean_points[correct_clean_indices]
+    missing_points = clean_points[missing_clean]
+    moved_points = faulty_points[moved_faulty_indices]
+    added_points = faulty_points[added_faulty_indices]
+
+    clean_point_counts = point_counts_grid(
+        correct_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
     )
-    lisa_lost = aggregate_fine_grid(
-        label_grid(faulty_points, 0, x_min, x_max, y_min, y_max, fine_rows, fine_cols),
-        grid_rows,
-        grid_cols,
+    missing_faulty = point_counts_grid(
+        missing_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
     )
-    clean_point_counts = correct
-    missing_faulty = missing + lisa_lost
-    added_faulty = wrong_added + synthetic_scattered
-    faulty_point_counts = missing_faulty + added_faulty
+    moved_faulty = point_counts_grid(
+        moved_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
+    )
+    added_faulty = point_counts_grid(
+        added_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
+    )
+    faulty_point_counts = missing_faulty + moved_faulty + added_faulty
 
     denominator = clean_point_counts + faulty_point_counts
     reliability = np.ones_like(clean_counts, dtype=np.float32)
@@ -257,12 +314,21 @@ def make_reliability_maps(clean_points, faulty_points, x_min, x_max, y_min, y_ma
         "clean_point_counts": clean_point_counts,
         "faulty_point_counts": faulty_point_counts,
         "missing_faulty_counts": missing_faulty,
+        "moved_faulty_counts": moved_faulty,
         "added_faulty_counts": added_faulty,
         "correct_counts": clean_point_counts,
         "missing_counts": missing_faulty,
         "wrong_counts": added_faulty,
         "fault_heatmap": fault_heatmap.astype(np.float32),
         "reliability_map": reliability.astype(np.float32),
+        "correct_point_ids": clean_point_ids[correct_clean_indices],
+        "missing_point_ids": clean_point_ids[missing_clean],
+        "moved_point_ids": faulty_point_ids[moved_faulty_indices],
+        "moved_source_ids": faulty_source_ids[moved_faulty_indices],
+        "moved_displacement_m": displacement[moved_original],
+        "added_point_ids": faulty_point_ids[added_faulty_indices],
+        "clean_point_status": clean_point_status,
+        "faulty_point_status": faulty_point_status,
     }
 
 
@@ -342,37 +408,48 @@ def overlay_heatmap_on_counts(counts, heatmap):
     return np.clip(base.astype(np.float32) * (1.0 - alpha) + heat_rgb * alpha, 0, 255).astype(np.uint8)
 
 
-def mark_bev_changes(clean_layers, corrupted_layers, clean_point_count, corrupted_point_count):
-    clean_density = clean_layers["raw_density"]
-    corrupted_density = corrupted_layers["raw_density"]
-    clean_intensity = clean_layers["intensity"]
-    corrupted_intensity = corrupted_layers["intensity"]
-    clean_height = clean_layers["height"]
-    corrupted_height = corrupted_layers["height"]
+def mark_bev_point_statuses(
+    clean_points,
+    faulty_points,
+    clean_point_status,
+    faulty_point_status,
+    faulty_rgb,
+    x_min,
+    x_max,
+    y_min,
+    y_max,
+):
+    """Mark only missing, moved, and added evidence used by the reliability target."""
+    image_rows, image_cols = faulty_rgb.shape[:2]
+    missing_points = clean_points[clean_point_status == POINT_STATUS_MISSING]
+    moved_points = faulty_points[faulty_point_status == POINT_STATUS_MOVED]
+    added_points = faulty_points[faulty_point_status == POINT_STATUS_ADDED]
 
-    lost_density = (clean_density > 0) & (corrupted_density == 0)
-    gained_density = (clean_density == 0) & (corrupted_density > 0)
-    shared = (clean_density > 0) & (corrupted_density > 0)
-    intensity_changed = shared & (np.abs(clean_intensity - corrupted_intensity) > 0.10)
-    height_changed = shared & (np.abs(clean_height - corrupted_height) > 0.10)
-    changed = lost_density | gained_density | intensity_changed | height_changed
+    missing_mask = point_counts_grid(
+        missing_points, x_min, x_max, y_min, y_max, image_rows, image_cols
+    ) > 0
+    moved_mask = point_counts_grid(
+        moved_points, x_min, x_max, y_min, y_max, image_rows, image_cols
+    ) > 0
+    added_mask = point_counts_grid(
+        added_points, x_min, x_max, y_min, y_max, image_rows, image_cols
+    ) > 0
+    marked_mask = missing_mask | moved_mask | added_mask
 
-    overlay = corrupted_layers["rgb"].copy()
-    overlay[dilate_mask(changed, 2)] = np.array([0, 0, 0], dtype=np.uint8)
-    overlay[dilate_mask(lost_density, 1)] = np.array([255, 80, 0], dtype=np.uint8)
-    overlay[dilate_mask(gained_density, 1)] = np.array([255, 255, 0], dtype=np.uint8)
-    overlay[dilate_mask(intensity_changed | height_changed, 1)] = np.array([0, 255, 255], dtype=np.uint8)
+    overlay = faulty_rgb.copy()
+    overlay[dilate_mask(marked_mask, 2)] = np.array([0, 0, 0], dtype=np.uint8)
+    overlay[dilate_mask(missing_mask, 1)] = np.array([255, 80, 0], dtype=np.uint8)
+    overlay[dilate_mask(added_mask, 1)] = np.array([255, 255, 0], dtype=np.uint8)
+    overlay[dilate_mask(moved_mask, 1)] = np.array([0, 255, 255], dtype=np.uint8)
 
-    point_loss = clean_point_count - corrupted_point_count
-    point_loss_pct = 100.0 * point_loss / max(clean_point_count, 1)
     return overlay, {
-        "changed_bev_cells": int(changed.sum()),
-        "lost_density_cells": int(lost_density.sum()),
-        "gained_density_cells": int(gained_density.sum()),
-        "intensity_changed_cells": int(intensity_changed.sum()),
-        "height_changed_cells": int(height_changed.sum()),
-        "point_loss": int(point_loss),
-        "point_loss_percent": float(point_loss_pct),
+        "marked_status_cells": int(marked_mask.sum()),
+        "missing_point_cells": int(missing_mask.sum()),
+        "moved_point_cells": int(moved_mask.sum()),
+        "added_point_cells": int(added_mask.sum()),
+        "missing_points_marked": int(len(missing_points)),
+        "moved_points_marked": int(len(moved_points)),
+        "added_points_marked": int(len(added_points)),
     }
 
 
@@ -515,6 +592,9 @@ def existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severi
         "x_range": [cfg["x_min"], cfg["x_max"]],
         "y_range": [cfg["y_min"], cfg["y_max"]],
         "resolution": cfg["resolution"],
+        "ground_truth_method": GROUND_TRUTH_METHOD,
+        "visualization_method": VISUALIZATION_METHOD,
+        "movement_tolerance_m": cfg["movement_tolerance_m"],
     }
     for key, expected_value in expected.items():
         if metadata.get(key) != expected_value:
@@ -560,23 +640,35 @@ def create_one_sample(task):
 
     clean_raw = read_hercules_aeva_bin(bin_path)
     clean_points = filter_pointcloud(clean_raw, cfg["min_range"], cfg["max_range"])[:, :4]
+    clean_point_ids = np.arange(len(clean_points), dtype=np.int64)
     clean_rgb, clean_layers = clean_bev_rgb(
         clean_points,
         x_range=(cfg["x_min"], cfg["x_max"]),
         y_range=(cfg["y_min"], cfg["y_max"]),
         resolution=cfg["resolution"],
     )
-    faulty_raw, fog_counts = inject_fault(
+    injection, fog_counts = inject_fault(
         fault,
         clean_points,
+        clean_point_ids,
         severity,
         injector_root,
         fog_root,
         cfg["fog_noise"],
         cfg["lidar_corruptions"],
     )
-    label_counts = lisa_label_counts(faulty_raw)
-    faulty_points = filter_pointcloud(faulty_raw, cfg["min_range"], cfg["max_range"])
+    label_counts = lisa_label_counts(injection.points)
+    _, range_mask = filter_pointcloud(
+        injection.points,
+        cfg["min_range"],
+        cfg["max_range"],
+        return_mask=True,
+    )
+    active_mask = range_mask & (injection.injector_labels != 0)
+    faulty_points = injection.points[active_mask]
+    faulty_point_ids = injection.point_ids[active_mask]
+    faulty_source_ids = injection.source_ids[active_mask]
+    faulty_injector_labels = injection.injector_labels[active_mask]
     faulty_rgb, faulty_layers = clean_bev_rgb(
         faulty_points[:, :4],
         x_range=(cfg["x_min"], cfg["x_max"]),
@@ -586,7 +678,11 @@ def create_one_sample(task):
 
     maps = make_reliability_maps(
         clean_points,
+        clean_point_ids,
         faulty_points,
+        faulty_point_ids,
+        faulty_source_ids,
+        movement_tolerance_m=cfg["movement_tolerance_m"],
         x_min=cfg["x_min"],
         x_max=cfg["x_max"],
         y_min=cfg["y_min"],
@@ -606,11 +702,16 @@ def create_one_sample(task):
         cfg["image_height"],
         cfg["image_width"],
     )
-    marked_rgb, change_counts = mark_bev_changes(
-        {"rgb": clean_rgb, **clean_layers},
-        {"rgb": faulty_rgb, **faulty_layers},
-        clean_point_count=len(clean_points),
-        corrupted_point_count=len(faulty_points),
+    marked_rgb, change_counts = mark_bev_point_statuses(
+        clean_points,
+        faulty_points,
+        maps["clean_point_status"],
+        maps["faulty_point_status"],
+        faulty_rgb,
+        cfg["x_min"],
+        cfg["x_max"],
+        cfg["y_min"],
+        cfg["y_max"],
     )
 
     clean_labeled = add_legend_above(
@@ -623,7 +724,12 @@ def create_one_sample(task):
         "FAULT HEATMAP: 0=ok, 1=max fault",
         [
             f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
-            "reliability=clean/(clean+faulty), fault=1-reliability",
+            "reliability=correct/(correct+missing+moved+added)",
+            (
+                f"IDs: correct={len(maps['correct_point_ids'])}, missing={len(maps['missing_point_ids'])}, "
+                f"moved>{cfg['movement_tolerance_m']:g}m={len(maps['moved_point_ids'])}, "
+                f"added={len(maps['added_point_ids'])}"
+            ),
         ],
     )
     reliability_rgb = add_legend_above(
@@ -642,10 +748,16 @@ def create_one_sample(task):
     )
     marked_rgb = add_legend_above(
         marked_rgb,
-        "IDEAL BEV CHANGES",
+        "IDEAL ID-BASED POINT STATUS",
         [
-            f"YELLOW=gained {change_counts['gained_density_cells']} cells, ORANGE=lost {change_counts['lost_density_cells']}",
-            f"CYAN=changed {change_counts['intensity_changed_cells'] + change_counts['height_changed_cells']} cells, POINT LOSS={change_counts['point_loss']} ({change_counts['point_loss_percent']:.2f}%)",
+            (
+                f"ORANGE=missing {change_counts['missing_points_marked']} pts, "
+                f"YELLOW=added {change_counts['added_points_marked']} pts"
+            ),
+            (
+                f"CYAN=moved>{cfg['movement_tolerance_m']:g}m "
+                f"{change_counts['moved_points_marked']} pts"
+            ),
         ],
     )
     comparison_rgb = side_by_side([clean_labeled, marked_rgb, reliability_rgb])
@@ -663,6 +775,10 @@ def create_one_sample(task):
         clean_density=clean_layers["raw_density"],
         faulty_rgb=faulty_rgb,
         faulty_density=faulty_layers["raw_density"],
+        clean_point_ids=clean_point_ids,
+        faulty_point_ids=faulty_point_ids,
+        faulty_source_ids=faulty_source_ids,
+        faulty_injector_labels=faulty_injector_labels,
         metadata_json=json.dumps(
             {
                 "dataset": "Hercules",
@@ -682,7 +798,22 @@ def create_one_sample(task):
                 "x_range": [cfg["x_min"], cfg["x_max"]],
                 "y_range": [cfg["y_min"], cfg["y_max"]],
                 "resolution": cfg["resolution"],
-                "definition": "reliability=clean_point_counts/(clean_point_counts+faulty_point_counts), where faulty points are missing, moved/added, or synthetic/labeled faulty evidence",
+                "ground_truth_method": GROUND_TRUTH_METHOD,
+                "visualization_method": VISUALIZATION_METHOD,
+                "movement_tolerance_m": cfg["movement_tolerance_m"],
+                "definition": "reliability=correct/(correct+missing+moved+added), using exact source IDs; weather replacements have new point IDs and no source ID",
+                "classification_counts": {
+                    "correct": len(maps["correct_point_ids"]),
+                    "missing": len(maps["missing_point_ids"]),
+                    "moved": len(maps["moved_point_ids"]),
+                    "added": len(maps["added_point_ids"]),
+                },
+                "point_status_labels": {
+                    "0": "correct",
+                    "1": "missing",
+                    "2": "moved",
+                    "3": "added",
+                },
             },
             indent=2,
         ),
@@ -691,6 +822,7 @@ def create_one_sample(task):
     total_clean = float(np.sum(maps["clean_point_counts"]))
     total_faulty = float(np.sum(maps["faulty_point_counts"]))
     total_missing = float(np.sum(maps["missing_faulty_counts"]))
+    total_moved = float(np.sum(maps["moved_faulty_counts"]))
     total_added = float(np.sum(maps["added_faulty_counts"]))
     return {
         "index": index,
@@ -707,6 +839,7 @@ def create_one_sample(task):
         "total_clean_reliable_points": total_clean,
         "total_faulty_unreliable_points": total_faulty,
         "total_missing_faulty_points": total_missing,
+        "total_moved_faulty_points": total_moved,
         "total_added_faulty_points": total_added,
         "global_reliability": total_clean / max(total_clean + total_faulty, 1.0),
         "global_error_ratio": total_faulty / max(total_clean + total_faulty, 1.0),
@@ -802,6 +935,7 @@ def main():
         "resolution": args.resolution,
         "min_range": args.min_range,
         "max_range": args.max_range,
+        "movement_tolerance_m": args.movement_tolerance_m,
         "image_height": image_height,
         "image_width": image_width,
     }
