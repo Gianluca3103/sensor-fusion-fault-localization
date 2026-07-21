@@ -353,22 +353,10 @@ def main():
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
 
-    print("[stage] Collecting test probabilities for all-threshold test sweep", flush=True)
-    test_outputs, test_targets, test_metadata = collect_probabilities(
-        model, test_loader, device, args.grid_size, "test", max(args.progress_every, 1)
+    print(
+        f"[stage] Evaluating test set once at frozen validation threshold {selected_threshold:.6f}",
+        flush=True,
     )
-    print("[stage] Sweeping test thresholds", flush=True)
-    test_sweep_rows = sweep_thresholds_with_progress(
-        test_outputs,
-        test_targets,
-        test_metadata,
-        args.thresholds,
-        "test sweep",
-        compute_chamfer=not args.disable_chamfer,
-        localization_tolerance_m=args.localization_tolerance_m,
-    )
-
-    print(f"[stage] Evaluating grouped test metrics at selected threshold {selected_threshold:.6f}", flush=True)
     test_accumulator = evaluate_dataset(
         model,
         test_loader,
@@ -385,7 +373,6 @@ def main():
     test_metrics["threshold"] = selected_threshold
 
     write_csv(output_root / "validation_threshold_sweep.csv", val_sweep_rows)
-    write_csv(output_root / "test_threshold_sweep.csv", test_sweep_rows)
     save_group_metrics(test_accumulator.groups, output_root / "test_group_metrics")
 
     summary = {
@@ -394,7 +381,7 @@ def main():
         "validation_selected_metrics": best_row,
         "test_metrics": test_metrics,
         "threshold_candidates": args.thresholds,
-        "test_threshold_sweep": test_sweep_rows,
+        "test_evaluation_protocol": "single evaluation at validation-selected threshold",
         "include_faults": args.include_faults,
         "exclude_faults": args.exclude_faults,
         "validation_root": str(val_root),
