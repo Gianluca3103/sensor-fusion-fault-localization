@@ -153,6 +153,11 @@ def parse_args():
         default=not bool(defaults["shuffle"]),
         help="Keep frame/fault/severity order deterministic.",
     )
+    parser.add_argument(
+        "--no-previews",
+        action="store_true",
+        help="Skip the six diagnostic PNGs per sample and save only training data plus manifests.",
+    )
     parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
     parser.add_argument("--x-min", type=float, default=defaults["x_min"])
     parser.add_argument("--x-max", type=float, default=defaults["x_max"])
@@ -691,17 +696,6 @@ def create_one_sample(task):
         grid_cols=cfg["grid_size"],
     )
 
-    fault_rgb = resize_nearest(colorize_fault_heatmap(maps["fault_heatmap"]), cfg["image_height"], cfg["image_width"])
-    reliability_rgb = resize_nearest(
-        colorize_reliability(maps["reliability_map"]),
-        cfg["image_height"],
-        cfg["image_width"],
-    )
-    overlay_rgb = resize_nearest(
-        overlay_heatmap_on_counts(maps["clean_counts"], maps["fault_heatmap"]),
-        cfg["image_height"],
-        cfg["image_width"],
-    )
     marked_rgb, change_counts = mark_bev_point_statuses(
         clean_points,
         faulty_points,
@@ -714,60 +708,76 @@ def create_one_sample(task):
         cfg["y_max"],
     )
 
-    clean_labeled = add_legend_above(
-        clean_rgb,
-        "ORIGINAL CLEAN BEV",
-        [f"x={cfg['x_min']:g}..{cfg['x_max']:g}m, y={cfg['y_min']:g}..{cfg['y_max']:g}m"],
-    )
-    fault_rgb = add_legend_above(
-        fault_rgb,
-        "FAULT HEATMAP: 0=ok, 1=max fault",
-        [
-            f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
-            "reliability=correct/(correct+missing+moved+added)",
-            (
-                f"IDs: correct={len(maps['correct_point_ids'])}, missing={len(maps['missing_point_ids'])}, "
-                f"moved>{cfg['movement_tolerance_m']:g}m={len(maps['moved_point_ids'])}, "
-                f"added={len(maps['added_point_ids'])}"
-            ),
-        ],
-    )
-    reliability_rgb = add_legend_above(
-        reliability_rgb,
-        "IDEAL RELIABILITY MAP",
-        [
-            "blue=reliable, red=unreliable",
-            f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
-        ],
-    )
-    reliability_rgb = add_reliability_colorbar(reliability_rgb)
-    overlay_rgb = add_legend_above(
-        overlay_rgb,
-        "FAULT HEATMAP OVER CLEAN DENSITY",
-        [f"{fault} severity {severity}"],
-    )
-    marked_rgb = add_legend_above(
-        marked_rgb,
-        "IDEAL ID-BASED POINT STATUS",
-        [
-            (
-                f"ORANGE=missing {change_counts['missing_points_marked']} pts, "
-                f"YELLOW=added {change_counts['added_points_marked']} pts"
-            ),
-            (
-                f"CYAN=moved>{cfg['movement_tolerance_m']:g}m "
-                f"{change_counts['moved_points_marked']} pts"
-            ),
-        ],
-    )
-    comparison_rgb = side_by_side([clean_labeled, marked_rgb, reliability_rgb])
+    if cfg["save_previews"]:
+        fault_rgb = resize_nearest(
+            colorize_fault_heatmap(maps["fault_heatmap"]),
+            cfg["image_height"],
+            cfg["image_width"],
+        )
+        reliability_rgb = resize_nearest(
+            colorize_reliability(maps["reliability_map"]),
+            cfg["image_height"],
+            cfg["image_width"],
+        )
+        overlay_rgb = resize_nearest(
+            overlay_heatmap_on_counts(maps["clean_counts"], maps["fault_heatmap"]),
+            cfg["image_height"],
+            cfg["image_width"],
+        )
+        clean_labeled = add_legend_above(
+            clean_rgb,
+            "ORIGINAL CLEAN BEV",
+            [f"x={cfg['x_min']:g}..{cfg['x_max']:g}m, y={cfg['y_min']:g}..{cfg['y_max']:g}m"],
+        )
+        fault_rgb = add_legend_above(
+            fault_rgb,
+            "FAULT HEATMAP: 0=ok, 1=max fault",
+            [
+                f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
+                "reliability=correct/(correct+missing+moved+added)",
+                (
+                    f"IDs: correct={len(maps['correct_point_ids'])}, missing={len(maps['missing_point_ids'])}, "
+                    f"moved>{cfg['movement_tolerance_m']:g}m={len(maps['moved_point_ids'])}, "
+                    f"added={len(maps['added_point_ids'])}"
+                ),
+            ],
+        )
+        reliability_rgb = add_legend_above(
+            reliability_rgb,
+            "IDEAL RELIABILITY MAP",
+            [
+                "blue=reliable, red=unreliable",
+                f"{cfg['image_width']}x{cfg['image_height']} BEV split into {cfg['grid_size']}x{cfg['grid_size']} squares",
+            ],
+        )
+        reliability_rgb = add_reliability_colorbar(reliability_rgb)
+        overlay_rgb = add_legend_above(
+            overlay_rgb,
+            "FAULT HEATMAP OVER CLEAN DENSITY",
+            [f"{fault} severity {severity}"],
+        )
+        marked_rgb = add_legend_above(
+            marked_rgb,
+            "IDEAL ID-BASED POINT STATUS",
+            [
+                (
+                    f"ORANGE=missing {change_counts['missing_points_marked']} pts, "
+                    f"YELLOW=added {change_counts['added_points_marked']} pts"
+                ),
+                (
+                    f"CYAN=moved>{cfg['movement_tolerance_m']:g}m "
+                    f"{change_counts['moved_points_marked']} pts"
+                ),
+            ],
+        )
+        comparison_rgb = side_by_side([clean_labeled, marked_rgb, reliability_rgb])
 
-    write_image(clean_png, clean_labeled)
-    write_image(fault_png, fault_rgb)
-    write_image(reliability_png, reliability_rgb)
-    write_image(overlay_png, overlay_rgb)
-    write_image(marked_png, marked_rgb)
-    write_image(comparison_png, comparison_rgb)
+        write_image(clean_png, clean_labeled)
+        write_image(fault_png, fault_rgb)
+        write_image(reliability_png, reliability_rgb)
+        write_image(overlay_png, overlay_rgb)
+        write_image(marked_png, marked_rgb)
+        write_image(comparison_png, comparison_rgb)
     np.savez_compressed(
         npz_path,
         **maps,
@@ -845,12 +855,12 @@ def create_one_sample(task):
         "global_error_ratio": total_faulty / max(total_clean + total_faulty, 1.0),
         "mean_fault_heatmap": float(np.mean(maps["fault_heatmap"])),
         "max_fault_heatmap": float(np.max(maps["fault_heatmap"])),
-        "fault_heatmap_png": str(fault_png),
-        "reliability_png": str(reliability_png),
-        "overlay_png": str(overlay_png),
-        "clean_png": str(clean_png),
-        "marked_png": str(marked_png),
-        "comparison_png": str(comparison_png),
+        "fault_heatmap_png": str(fault_png) if cfg["save_previews"] else "",
+        "reliability_png": str(reliability_png) if cfg["save_previews"] else "",
+        "overlay_png": str(overlay_png) if cfg["save_previews"] else "",
+        "clean_png": str(clean_png) if cfg["save_previews"] else "",
+        "marked_png": str(marked_png) if cfg["save_previews"] else "",
+        "comparison_png": str(comparison_png) if cfg["save_previews"] else "",
         "npz": str(npz_path),
         **change_counts,
         **label_counts,
@@ -936,6 +946,7 @@ def main():
         "min_range": args.min_range,
         "max_range": args.max_range,
         "movement_tolerance_m": args.movement_tolerance_m,
+        "save_previews": not args.no_previews,
         "image_height": image_height,
         "image_width": image_width,
     }

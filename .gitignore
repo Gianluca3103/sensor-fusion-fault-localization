@@ -42,6 +42,7 @@ PFS/runs/
 
 # Local outputs
 outputs/
+/outputs_local/
 results*/
 
 # Archives/editor/system files

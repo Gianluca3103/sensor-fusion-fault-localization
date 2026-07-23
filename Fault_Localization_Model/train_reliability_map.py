@@ -131,6 +131,10 @@ def draw_cell_boundaries(rgb, grid_size=100):
     height, width = output.shape[:2]
     row_step = max(1, height // grid_size)
     col_step = max(1, width // grid_size)
+    # A one-pixel cell has no interior pixel. Drawing its border would cover
+    # the complete heatmap, so leave full-resolution maps unobstructed.
+    if row_step <= 1 or col_step <= 1:
+        return output
     line_color = np.array([18, 18, 18], dtype=np.uint8)
     for row in range(row_step, height, row_step):
         output[row : row + 1, :] = line_color
