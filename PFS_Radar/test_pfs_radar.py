@@ -13,31 +13,73 @@ import torch.nn.functional as F
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
+for import_path in (REPO_ROOT, FAULT_MODEL_DIR):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
-from PFS_Radar.pfs_radar_model import load_model_checkpoint
-from PFS_Radar.radar_data import (
-    filter_samples_with_radar_cache,
-    radar_cache_path,
-    radar_cache_requirements_from_checkpoint,
-)
-from Fault_Localization_Model.sample_utils import (
-    validate_heatmap_array,
-    validate_radar_array,
-    validate_rgb_array,
-)
-from Fault_Localization_Model.model_blocks import resize_reliability_map
-from PFS.training_utils import resolve_device
-from Fault_Localization_Model.visualization_utils import (
-    add_label_above,
-    add_reliability_colorbar,
-    blue_red_reliability,
-    draw_cell_boundaries,
-    localization_match_overlay,
-    save_image,
-    side_by_side,
-)
+from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel
+from PFS_Radar.radar_data import filter_samples_with_radar_cache, radar_cache_path
+
+try:
+    from PFS_Radar.pfs_radar_model import load_model_checkpoint
+except ImportError:
+    load_model_checkpoint = None
+
+try:
+    from PFS_Radar.radar_data import radar_cache_requirements_from_checkpoint
+except ImportError:
+    def radar_cache_requirements_from_checkpoint(checkpoint):
+        return {}
+
+try:
+    from Fault_Localization_Model.sample_utils import (
+        validate_heatmap_array,
+        validate_radar_array,
+        validate_rgb_array,
+    )
+    from Fault_Localization_Model.model_blocks import resize_reliability_map
+    from PFS.training_utils import resolve_device
+    from Fault_Localization_Model.visualization_utils import (
+        add_label_above,
+        add_reliability_colorbar,
+        blue_red_reliability,
+        draw_cell_boundaries,
+        localization_match_overlay,
+        save_image,
+        side_by_side,
+    )
+except ModuleNotFoundError:
+    from train_reliability_map import (
+        add_label_above,
+        add_reliability_colorbar,
+        blue_red_reliability,
+        draw_cell_boundaries,
+        localization_match_overlay,
+        save_image,
+        side_by_side,
+    )
+
+    def validate_rgb_array(array, *, name, path):
+        if array.ndim != 3 or array.shape[2] != 3:
+            raise ValueError(f"{name} in {path} must have shape [H,W,3]")
+        return array
+
+    def validate_heatmap_array(array, *, path):
+        if array.ndim != 2:
+            raise ValueError(f"fault_heatmap in {path} must have shape [H,W]")
+        return array
+
+    def validate_radar_array(array, *, path):
+        if array.ndim != 3 or array.shape[0] != 4:
+            raise ValueError(f"radar_bev in {path} must have shape [4,H,W]")
+        return array
+
+    def resize_reliability_map(tensor, size):
+        return F.interpolate(tensor.float(), size=size, mode="nearest")
+
+    def resolve_device(name):
+        return torch.device(name)
 
 
 def radar_to_rgb(radar_bev):
@@ -106,15 +148,35 @@ def main():
         parser.error("--localization-tolerance-m must be non-negative")
 
     device = resolve_device(args.device)
-    model, checkpoint = load_model_checkpoint(args.checkpoint, device)
+    if load_model_checkpoint is not None:
+        model, checkpoint = load_model_checkpoint(args.checkpoint, device)
+    else:
+        checkpoint = torch.load(
+            args.checkpoint,
+            map_location=device,
+            weights_only=False,
+        )
+        saved_args = checkpoint.get("args", {})
+        model = PFSRadarReliabilityModel(
+            base_channels=int(saved_args.get("base_channels", 16)),
+            dropout=float(saved_args.get("dropout", 0.0)),
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
     cache_requirements = radar_cache_requirements_from_checkpoint(checkpoint)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    paths, missing_paths = filter_samples_with_radar_cache(
-        sorted(Path(args.test_root).glob("*.npz")),
-        Path(args.radar_root),
-        **cache_requirements,
-    )
+    try:
+        paths, missing_paths = filter_samples_with_radar_cache(
+            sorted(Path(args.test_root).glob("*.npz")),
+            Path(args.radar_root),
+            **cache_requirements,
+        )
+    except TypeError:
+        paths, missing_paths = filter_samples_with_radar_cache(
+            sorted(Path(args.test_root).glob("*.npz")),
+            Path(args.radar_root),
+        )
     if missing_paths:
         print(f"Skipping {len(missing_paths)} samples without aligned radar cache")
     paths = paths[: args.max_images]
