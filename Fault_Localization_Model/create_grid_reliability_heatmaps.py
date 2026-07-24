@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import json
 import logging
+import os
 import sys
 
 import numpy as np
@@ -778,8 +779,11 @@ def create_one_sample(task):
         write_image(overlay_png, overlay_rgb)
         write_image(marked_png, marked_rgb)
         write_image(comparison_png, comparison_rgb)
+    temporary_npz_path = npz_path.with_name(
+        f".{npz_path.name}.{os.getpid()}.tmp.npz"
+    )
     np.savez_compressed(
-        npz_path,
+        temporary_npz_path,
         **maps,
         clean_rgb=clean_rgb,
         clean_density=clean_layers["raw_density"],
@@ -828,6 +832,7 @@ def create_one_sample(task):
             indent=2,
         ),
     )
+    temporary_npz_path.replace(npz_path)
 
     total_clean = float(np.sum(maps["clean_point_counts"]))
     total_faulty = float(np.sum(maps["faulty_point_counts"]))

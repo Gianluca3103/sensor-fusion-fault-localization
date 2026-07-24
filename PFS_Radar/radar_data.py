@@ -163,7 +163,7 @@ def nearest_radar_frame(scene_root: Path, lidar_timestamp: int, max_delta_ms: fl
     best = min(candidate_indices, key=lambda index: abs(timestamps[index] - lidar_timestamp))
     delta_ms = (timestamps[best] - lidar_timestamp) / 1_000_000.0
     if abs(delta_ms) > max_delta_ms:
-        raise ValueError(
+        raise RadarAlignmentUnavailableError(
             f"Nearest radar frame is {abs(delta_ms):.1f} ms from LiDAR frame; "
             f"limit is {max_delta_ms:.1f} ms"
         )
@@ -187,7 +187,7 @@ def historical_radar_frames(
     current_index = min(candidates, key=lambda index: abs(timestamps[index] - lidar_timestamp))
     delta_ms = (timestamps[current_index] - lidar_timestamp) / 1_000_000.0
     if abs(delta_ms) > max_delta_ms:
-        raise ValueError(
+        raise RadarAlignmentUnavailableError(
             f"Nearest radar frame is {abs(delta_ms):.1f} ms from LiDAR frame; "
             f"limit is {max_delta_ms:.1f} ms"
         )
