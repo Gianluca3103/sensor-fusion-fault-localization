@@ -3,7 +3,7 @@ import torch
 
 from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel, parameter_breakdown
 from PFS_Radar.radar_data import pose_matrix, project_radar_bev
-from PFS_Radar.train_pfs_radar import localization_surrogate_loss
+from PFS_Radar.train_pfs_radar import euclidean_dilate, localization_surrogate_loss
 
 
 def test_pose_matrix_uses_xyzw_quaternion_order():
@@ -71,3 +71,20 @@ def test_localization_loss_has_finite_gradients():
     assert torch.isfinite(loss)
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
+
+
+def test_euclidean_dilation_respects_twenty_centimeter_radius():
+    values = torch.zeros(1, 1, 5, 5)
+    values[:, :, 2, 2] = 1.0
+
+    dilated = euclidean_dilate(
+        values,
+        tolerance_m=0.20,
+        x_cell_size_m=0.20,
+        y_cell_size_m=0.20,
+    )
+
+    assert dilated[0, 0, 2, 2] == 1.0
+    assert dilated[0, 0, 1, 2] == 1.0
+    assert dilated[0, 0, 2, 1] == 1.0
+    assert dilated[0, 0, 1, 1] == 0.0

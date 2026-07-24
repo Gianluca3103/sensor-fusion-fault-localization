@@ -25,7 +25,6 @@ for path in (REPO_ROOT, PFS_DIR, FAULT_MODEL_DIR):
 from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel, parameter_breakdown
 from PFS_Radar.radar_data import filter_samples_with_radar_cache, radar_cache_path
 from heatmap_metrics import HeatmapMetricAccumulator
-from train_pfs_reliability_map import stable_heatmap_loss
 
 
 class RadarReliabilityDataset(Dataset):
@@ -74,6 +73,28 @@ class RadarReliabilityDataset(Dataset):
         return lidar_tensor, radar_tensor, clean_tensor, target_tensor, json.dumps(metadata)
 
 
+def load_fault_name(path: Path) -> str:
+    with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata_json"]))
+    return str(metadata.get("fault", "unknown"))
+
+
+def filter_paths_by_fault(paths, include_faults=None, exclude_faults=None):
+    include = set(include_faults or [])
+    exclude = set(exclude_faults or [])
+    selected = []
+    counts = {}
+    for path in paths:
+        fault = load_fault_name(path)
+        counts[fault] = counts.get(fault, 0) + 1
+        if include and fault not in include:
+            continue
+        if fault in exclude:
+            continue
+        selected.append(path)
+    return selected, counts
+
+
 def make_scheduler(optimizer, epochs, warmup_epochs, base_lr, min_lr):
     minimum_factor = min_lr / max(base_lr, 1e-12)
 
@@ -89,27 +110,73 @@ def make_scheduler(optimizer, epochs, warmup_epochs, base_lr, min_lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
+def euclidean_dilate(values, tolerance_m, x_cell_size_m, y_cell_size_m):
+    """Maximum-filter values using a metric Euclidean neighborhood."""
+    tolerance_m = max(float(tolerance_m), 0.0)
+    x_cell_size_m = max(float(x_cell_size_m), 1e-9)
+    y_cell_size_m = max(float(y_cell_size_m), 1e-9)
+    row_radius = int(math.floor(tolerance_m / x_cell_size_m + 1e-9))
+    col_radius = int(math.floor(tolerance_m / y_cell_size_m + 1e-9))
+    padded = F.pad(values, (col_radius, col_radius, row_radius, row_radius))
+    height, width = values.shape[-2:]
+    output = torch.zeros_like(values)
+    for row_offset in range(-row_radius, row_radius + 1):
+        for col_offset in range(-col_radius, col_radius + 1):
+            distance = math.hypot(
+                row_offset * x_cell_size_m,
+                col_offset * y_cell_size_m,
+            )
+            if distance > tolerance_m + 1e-9:
+                continue
+            row_start = row_radius + row_offset
+            col_start = col_radius + col_offset
+            shifted = padded[
+                ...,
+                row_start : row_start + height,
+                col_start : col_start + width,
+            ]
+            output = torch.maximum(output, shifted)
+    return output
+
+
 def localization_surrogate_loss(
     logits,
     target,
     radius_cells=1,
     false_positive_weight=0.70,
     target_fault_threshold=0.0,
+    tolerance_m=None,
+    x_cell_size_m=0.20,
+    y_cell_size_m=0.20,
 ):
     """Approximate tolerance-aware localization precision and recall."""
     probability = torch.sigmoid(logits)
     target_mask = (target > target_fault_threshold).to(probability.dtype)
-    kernel_size = 2 * max(int(radius_cells), 0) + 1
-    if kernel_size > 1:
-        target_neighborhood = F.max_pool2d(
-            target_mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
+    if tolerance_m is not None:
+        target_neighborhood = euclidean_dilate(
+            target_mask,
+            tolerance_m,
+            x_cell_size_m,
+            y_cell_size_m,
         )
-        prediction_neighborhood = F.max_pool2d(
-            probability, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
+        prediction_neighborhood = euclidean_dilate(
+            probability,
+            tolerance_m,
+            x_cell_size_m,
+            y_cell_size_m,
         )
     else:
-        target_neighborhood = target_mask
-        prediction_neighborhood = probability
+        kernel_size = 2 * max(int(radius_cells), 0) + 1
+        if kernel_size <= 1:
+            target_neighborhood = target_mask
+            prediction_neighborhood = probability
+        else:
+            target_neighborhood = F.max_pool2d(
+                target_mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
+            )
+            prediction_neighborhood = F.max_pool2d(
+                probability, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
+            )
 
     dimensions = tuple(range(1, probability.ndim))
     matched_prediction = (probability * target_neighborhood).sum(dim=dimensions)
@@ -133,6 +200,22 @@ def localization_surrogate_loss(
     ).mean()
 
 
+def stable_heatmap_loss_components(logits, target, grid_size):
+    probability = torch.sigmoid(logits)
+    weight = 1.0 + 3.0 * target
+    pixel_l1 = torch.mean(weight * torch.abs(probability - target))
+    prediction_grid = F.adaptive_avg_pool2d(
+        probability, output_size=(grid_size, grid_size)
+    )
+    target_grid = F.adaptive_avg_pool2d(
+        target, output_size=(grid_size, grid_size)
+    )
+    grid_l1 = F.smooth_l1_loss(prediction_grid, target_grid)
+    bce = F.binary_cross_entropy_with_logits(logits, target, weight=weight)
+    total = 0.50 * pixel_l1 + 1.25 * grid_l1 + 0.25 * bce
+    return total, pixel_l1, grid_l1, bce
+
+
 def compute_loss(
     outputs,
     target,
@@ -143,17 +226,27 @@ def compute_loss(
     false_positive_weight,
     localization_radius_cells,
     target_fault_threshold,
+    localization_tolerance_m=None,
+    x_cell_size_m=0.20,
+    y_cell_size_m=0.20,
 ):
     logits = outputs["logits"]
     if logits.shape[-2:] != target.shape[-2:]:
         logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
-    heatmap_loss = stable_heatmap_loss(logits, target, grid_size=grid_size)
+    heatmap_loss, pixel_l1, grid_l1, bce = stable_heatmap_loss_components(
+        logits,
+        target,
+        grid_size,
+    )
     localization_loss = localization_surrogate_loss(
         logits,
         target,
         radius_cells=localization_radius_cells,
         false_positive_weight=false_positive_weight,
         target_fault_threshold=target_fault_threshold,
+        tolerance_m=localization_tolerance_m,
+        x_cell_size_m=x_cell_size_m,
+        y_cell_size_m=y_cell_size_m,
     )
     stability_loss = F.smooth_l1_loss(outputs["stabilized_features"], outputs["clean_features"])
     reliability_target = 1.0 - F.adaptive_avg_pool2d(target, outputs["pfs_reliability"].shape[-2:])
@@ -164,18 +257,28 @@ def compute_loss(
             outputs["pfs_reliability"].float().clamp(1e-6, 1.0 - 1e-6),
             reliability_target.float(),
         )
-    total = (
-        heatmap_loss
-        + localization_weight * localization_loss
-        + stability_weight * stability_loss
-        + pfs_weight * pfs_loss
+    weighted_localization = localization_weight * localization_loss
+    weighted_stability = stability_weight * stability_loss
+    weighted_pfs = pfs_weight * pfs_loss
+    total = heatmap_loss + weighted_localization + weighted_stability + weighted_pfs
+    return (
+        total,
+        heatmap_loss,
+        localization_loss,
+        stability_loss,
+        pfs_loss,
+        pixel_l1,
+        grid_l1,
+        bce,
+        weighted_localization,
+        weighted_stability,
+        weighted_pfs,
     )
-    return total, heatmap_loss, localization_loss, stability_loss, pfs_loss
 
 
 def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_metrics=True):
     model.train(train)
-    totals = np.zeros(5, dtype=np.float64)
+    totals = np.zeros(11, dtype=np.float64)
     samples = 0
     description = "train" if train else "validation"
     metric_accumulator = None
@@ -205,6 +308,9 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                     args.false_positive_weight,
                     args.localization_radius_cells,
                     args.target_fault_threshold,
+                    localization_tolerance_m=args.localization_tolerance_m,
+                    x_cell_size_m=args.bev_x_span_m / target.shape[-2],
+                    y_cell_size_m=args.bev_y_span_m / target.shape[-1],
                 )
             if train:
                 scaler.scale(losses[0]).backward()
@@ -316,6 +422,10 @@ def main():
     parser.add_argument("--localization-loss-weight", type=float, default=0.25)
     parser.add_argument("--false-positive-weight", type=float, default=0.70)
     parser.add_argument("--localization-radius-cells", type=int, default=1)
+    parser.add_argument("--bev-x-span-m", type=float, default=64.0)
+    parser.add_argument("--bev-y-span-m", type=float, default=64.0)
+    parser.add_argument("--include-faults", nargs="*", default=None)
+    parser.add_argument("--exclude-faults", nargs="*", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -331,6 +441,24 @@ def main():
     val_paths = sorted(Path(args.val_root).glob("*.npz"))
     if not train_paths or not val_paths:
         raise FileNotFoundError("Both --train-root and --val-root must contain .npz files")
+    train_paths, train_fault_counts = filter_paths_by_fault(
+        train_paths,
+        include_faults=args.include_faults,
+        exclude_faults=args.exclude_faults,
+    )
+    val_paths, val_fault_counts = filter_paths_by_fault(
+        val_paths,
+        include_faults=args.include_faults,
+        exclude_faults=args.exclude_faults,
+    )
+    print(f"Available train fault counts: {json.dumps(train_fault_counts, sort_keys=True)}")
+    print(f"Available validation fault counts: {json.dumps(val_fault_counts, sort_keys=True)}")
+    if args.include_faults:
+        print(f"Including faults: {', '.join(args.include_faults)}")
+    if args.exclude_faults:
+        print(f"Excluding faults: {', '.join(args.exclude_faults)}")
+    if not train_paths or not val_paths:
+        raise FileNotFoundError("Fault filtering removed every train or validation sample")
     train_paths, missing_train = filter_samples_with_radar_cache(
         train_paths, Path(args.radar_root)
     )
@@ -402,6 +530,7 @@ def main():
     print("Parameters:", json.dumps(parameter_breakdown(model), indent=2))
     (output_root / "training_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_values, _ = run_epoch(model, train_loader, device, optimizer, scaler, args, train=True)
         calculate_metrics = epoch == 1 or epoch % args.metrics_every == 0
         with torch.no_grad():
@@ -418,17 +547,29 @@ def main():
         scheduler.step()
         row = {
             "epoch": epoch,
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": epoch_learning_rate,
             "train_loss": train_values[0],
             "train_heatmap": train_values[1],
             "train_localization": train_values[2],
             "train_stability": train_values[3],
             "train_pfs_reliability": train_values[4],
+            "train_heat_pixel_l1": train_values[5],
+            "train_heat_grid_l1": train_values[6],
+            "train_heat_bce": train_values[7],
+            "train_weighted_localization": train_values[8],
+            "train_weighted_stability": train_values[9],
+            "train_weighted_pfs": train_values[10],
             "val_loss": val_values[0],
             "val_heatmap": val_values[1],
             "val_localization": val_values[2],
             "val_stability": val_values[3],
             "val_pfs_reliability": val_values[4],
+            "val_heat_pixel_l1": val_values[5],
+            "val_heat_grid_l1": val_values[6],
+            "val_heat_bce": val_values[7],
+            "val_weighted_localization": val_values[8],
+            "val_weighted_stability": val_values[9],
+            "val_weighted_pfs": val_values[10],
             "val_localization_iou": (
                 val_metrics["localization_iou"] if val_metrics is not None else float("nan")
             ),
@@ -458,8 +599,15 @@ def main():
         print(
             f"epoch {epoch:03d}: train={row['train_loss']:.6f} val={row['val_loss']:.6f} "
             f"heat={row['val_heatmap']:.6f} loc_loss={row['val_localization']:.6f} "
-            f"pfs={row['val_pfs_reliability']:.6f} "
+            f"stable={row['val_stability']:.6f} pfs={row['val_pfs_reliability']:.6f} "
             f"lr={row['learning_rate']:.2e}"
+            f"\n  val heat: 0.50*pixel={0.50 * row['val_heat_pixel_l1']:.6f} "
+            f"+ 1.25*grid={1.25 * row['val_heat_grid_l1']:.6f} "
+            f"+ 0.25*bce={0.25 * row['val_heat_bce']:.6f}"
+            f"\n  val total: heat={row['val_heatmap']:.6f} "
+            f"+ loc={row['val_weighted_localization']:.6f} "
+            f"+ stable={row['val_weighted_stability']:.6f} "
+            f"+ pfs={row['val_weighted_pfs']:.6f}"
             f"{metric_message}"
         )
         localization_improved = (
