@@ -9,8 +9,19 @@ import sys
 try:
     from tqdm import tqdm
 except ImportError:  # Keep cache preparation usable in minimal environments.
-    def tqdm(iterable, **_kwargs):
-        return iterable
+    class tqdm:  # noqa: N801 - mirror tqdm's public class name
+        def __init__(self, iterable=None, total=None, **_kwargs):
+            self.iterable = iterable
+            self.total = total
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def update(self, _count):
+            return None
+
+        def close(self):
+            return None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +45,43 @@ def _build(task):
     return build_radar_cache_entry(*task)
 
 
+def _build_batch(tasks):
+    """Build a chronological scene batch while retaining worker-local caches."""
+
+    outcomes = []
+    for task in tasks:
+        try:
+            _build(task)
+            outcomes.append(("created", task[0], ""))
+        except RadarAlignmentUnavailableError as exc:
+            outcomes.append(("skipped", task[0], str(exc)))
+        except Exception as exc:
+            outcomes.append(
+                ("failed", task[0], f"{type(exc).__name__}: {exc}")
+            )
+    return outcomes
+
+
+def _scene_batches(keyed_tasks, batch_size):
+    """Keep each batch chronological and confined to one scene/session."""
+
+    batches = []
+    current = []
+    current_scene = None
+    for scene_key, task in sorted(keyed_tasks, key=lambda item: item[0]):
+        task_scene = scene_key[:2]
+        if current and (
+            task_scene != current_scene or len(current) >= batch_size
+        ):
+            batches.append(current)
+            current = []
+        current_scene = task_scene
+        current.append(task)
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -45,6 +93,25 @@ def _parse_args():
     parser.add_argument("--hercules-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help=(
+            "Chronological samples processed per worker job. Larger batches "
+            "increase reuse of scene metadata and overlapping radar frames."
+        ),
+    )
+    parser.add_argument(
+        "--max-pending-samples",
+        type=int,
+        default=0,
+        help=(
+            "Process at most this many currently uncached frames. Use 0 "
+            "(the default) for all pending frames; useful for timing a resumable "
+            "benchmark before a full run."
+        ),
+    )
     parser.add_argument("--max-delta-ms", type=float, default=30.0)
     parser.add_argument(
         "--max-frames",
@@ -81,6 +148,10 @@ def _parse_args():
     args = parser.parse_args()
     if args.num_workers < 1:
         parser.error("--num-workers must be at least 1")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if args.max_pending_samples < 0:
+        parser.error("--max-pending-samples must be non-negative")
     if not math.isfinite(args.max_delta_ms) or args.max_delta_ms < 0.0:
         parser.error("--max-delta-ms must be finite and non-negative")
     if args.max_frames < 0:
@@ -158,62 +229,91 @@ def main():
             tracking_config=tracking_config,
         ):
             continue
+        task = (
+            sample_path,
+            hercules_root,
+            output_root,
+            args.max_delta_ms,
+            stack_config,
+            tracking_config,
+        )
         pending.append(
             (
-                sample_path,
-                hercules_root,
-                output_root,
-                args.max_delta_ms,
-                stack_config,
-                tracking_config,
+                (
+                    str(metadata.get("scene") or metadata.get("day") or ""),
+                    str(metadata.get("session") or ""),
+                    int(metadata["timestamp"]),
+                ),
+                task,
             )
         )
+    pending = sorted(pending, key=lambda item: item[0])
+    total_pending = len(pending)
+    if args.max_pending_samples:
+        pending = pending[: args.max_pending_samples]
+    batches = _scene_batches(pending, args.batch_size)
+    pending_count = sum(len(batch) for batch in batches)
     print(
         f"Reliability samples: {len(sample_paths)} | "
         f"unique LiDAR frames: {len(unique)} | "
-        f"already cached: {len(unique) - len(pending)} | pending: {len(pending)}"
+        f"already cached: {len(unique) - total_pending} | "
+        f"pending: {total_pending} | scheduled now: {pending_count} | "
+        f"chronological batches: {len(batches)}"
     )
     skipped_path = output_root / "skipped_alignment_samples.txt"
     failure_path = output_root / "cache_failures.txt"
-    if not pending:
+    if not batches:
         skipped_path.unlink(missing_ok=True)
         failure_path.unlink(missing_ok=True)
         return
 
     skipped = []
 
-    def raise_cache_failure(sample_path, exc):
-        report = f"{sample_path}\t{type(exc).__name__}: {exc}"
+    def raise_cache_failure(sample_path, message):
+        report = f"{sample_path}\t{message}"
         atomic_write_text(failure_path, report)
         raise RuntimeError(
             f"Radar v2 cache failed for {sample_path}. Details: {failure_path}"
-        ) from exc
+        )
 
     if args.num_workers == 1:
-        for task in tqdm(pending, desc="Radar v2 cache"):
-            try:
-                _build(task)
-            except RadarAlignmentUnavailableError as exc:
-                skipped.append((task[0], exc))
-            except Exception as exc:
-                raise_cache_failure(task[0], exc)
+        progress = tqdm(total=pending_count, desc="Radar v2 cache")
+        try:
+            for batch in batches:
+                for status, sample_path, message in _build_batch(batch):
+                    if status == "skipped":
+                        skipped.append((sample_path, message))
+                    elif status == "failed":
+                        raise_cache_failure(sample_path, message)
+                    progress.update(1)
+        finally:
+            progress.close()
     else:
         with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
             futures = iter_bounded_futures(
                 executor,
-                _build,
-                pending,
+                _build_batch,
+                batches,
                 max_pending=max(args.num_workers * 3, 1),
             )
-            for future, task in tqdm(
-                futures, total=len(pending), desc="Radar v2 cache"
-            ):
-                try:
-                    future.result()
-                except RadarAlignmentUnavailableError as exc:
-                    skipped.append((task[0], exc))
-                except Exception as exc:
-                    raise_cache_failure(task[0], exc)
+            progress = tqdm(total=pending_count, desc="Radar v2 cache")
+            try:
+                for future, batch in futures:
+                    try:
+                        outcomes = future.result()
+                    except Exception as exc:
+                        raise_cache_failure(
+                            batch[0][0],
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    for status, sample_path, message in outcomes:
+                        if status == "skipped":
+                            skipped.append((sample_path, message))
+                        elif status == "failed":
+                            raise_cache_failure(sample_path, message)
+                    progress.update(len(batch))
+            finally:
+                progress.close()
 
     failure_path.unlink(missing_ok=True)
     if skipped:

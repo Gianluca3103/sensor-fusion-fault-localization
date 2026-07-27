@@ -46,6 +46,12 @@ def metric_to_grid(
     xyz_valid = xyz[valid]
     cols = np.floor((xyz_valid[:, 1] - y_min) / resolution).astype(np.int32)
     rows_from_bottom = np.floor((xyz_valid[:, 0] - x_min) / resolution).astype(np.int32)
+    # Float32 arithmetic can round a coordinate just below an exclusive range
+    # maximum onto width/height exactly (for example, column 320 in a
+    # 320-column grid). The metric validity check above already established
+    # that these points belong to the BEV, so keep them in the final edge cell.
+    cols = np.clip(cols, 0, width - 1)
+    rows_from_bottom = np.clip(rows_from_bottom, 0, height - 1)
     rows = height - 1 - rows_from_bottom
     return xyz_valid, rows, cols, valid, height, width
 

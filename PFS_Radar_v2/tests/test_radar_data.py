@@ -1,7 +1,10 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
+import PFS_Radar_v2.radar_data as radar_data
 from PFS_Radar_v2.radar_data import (
     AdaptiveStackConfig,
     ClusterObservation,
@@ -17,6 +20,21 @@ from PFS_Radar_v2.radar_data import (
 
 
 class PFSRadarV2Tests(unittest.TestCase):
+    def test_raw_radar_cache_reuses_overlapping_frame_reads(self):
+        path = Path("frame.bin")
+        expected = np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+        radar_data.read_continental_bin.cache_clear()
+        with patch.object(
+            radar_data,
+            "_read_continental_bin",
+            return_value=expected,
+        ) as reader:
+            first = radar_data.read_continental_bin(path)
+            second = radar_data.read_continental_bin(path)
+
+        self.assertIs(first, second)
+        reader.assert_called_once_with(path)
+
     def test_adaptive_stack_has_no_frame_cap_by_default(self):
         timestamps = [index * 10_000_000 for index in range(50)]
         poses = np.repeat(np.eye(4)[None], len(timestamps), axis=0)

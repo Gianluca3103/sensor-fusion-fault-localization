@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import json
 import math
 from pathlib import Path
@@ -12,13 +13,13 @@ from Fault_Localization_Model.io_utils import atomic_savez_compressed
 from Fault_Localization_Model.sample_utils import load_sample_metadata
 from PFS_Radar.radar_data import (
     RadarAlignmentUnavailableError,
-    find_named_file,
+    find_named_file as _find_named_file,
     load_ground_truth_poses,
-    load_lidar_to_radar_transform,
-    load_named_transform,
+    load_lidar_to_radar_transform as _load_lidar_to_radar_transform,
+    load_named_transform as _load_named_transform,
     nearest_ground_truth_pose,
     radar_cache_path,
-    read_continental_bin,
+    read_continental_bin as _read_continental_bin,
     scene_name_from_metadata,
     scene_radar_resources,
     scene_session_root,
@@ -35,6 +36,60 @@ CHANNELS = [
     "tracked_dynamic_speed",
     "dynamic_track_occupancy",
 ]
+SCENE_RESOURCE_NAMES = {
+    "continental_gt.txt",
+    "aeva_gt.txt",
+    "imu_lidar.txt",
+    "continental_lidar.txt",
+}
+
+
+@lru_cache(maxsize=256)
+def _scene_resource_index(root: Path) -> dict[str, Path]:
+    """Discover all Radar v2 scene resources in one recursive traversal."""
+
+    candidates: dict[str, list[Path]] = {}
+    for path in root.rglob("*"):
+        lowered = path.name.lower()
+        if lowered in SCENE_RESOURCE_NAMES and path.is_file():
+            candidates.setdefault(lowered, []).append(path)
+    return {
+        name: min(paths, key=lambda path: len(path.parts))
+        for name, paths in candidates.items()
+    }
+
+
+def find_named_file(root: Path, name: str) -> Path:
+    """Reuse a single scene-resource index within each worker."""
+
+    lowered = name.lower()
+    if lowered not in SCENE_RESOURCE_NAMES:
+        return _find_named_file(root, name)
+    try:
+        return _scene_resource_index(root)[lowered]
+    except KeyError as exc:
+        raise FileNotFoundError(f"No {name} under {root}") from exc
+
+
+@lru_cache(maxsize=256)
+def load_named_transform(path: Path, key: str) -> np.ndarray:
+    """Cache immutable calibration matrices within each worker."""
+
+    return _load_named_transform(path, key)
+
+
+@lru_cache(maxsize=128)
+def load_lidar_to_radar_transform(path: Path) -> np.ndarray:
+    """Cache the immutable Continental-to-LiDAR calibration."""
+
+    return _load_lidar_to_radar_transform(path)
+
+
+@lru_cache(maxsize=256)
+def read_continental_bin(path: Path) -> np.ndarray:
+    """Reuse raw radar frames across overlapping chronological windows."""
+
+    return _read_continental_bin(path)
 
 
 @dataclass(frozen=True)
