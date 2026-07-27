@@ -355,12 +355,25 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                 scaler.scale(losses[0]).backward()
                 scaler.unscale_(optimizer)
                 if args.grad_clip > 0.0:
-                    torch.nn.utils.clip_grad_norm_(
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
                         args.grad_clip,
-                        error_if_nonfinite=True,
+                        error_if_nonfinite=False,
                     )
-                scaler.step(optimizer)
+                    gradients_are_finite = bool(
+                        torch.isfinite(gradient_norm).item()
+                    )
+                else:
+                    gradients_are_finite = True
+                if gradients_are_finite:
+                    scaler.step(optimizer)
+                else:
+                    print(
+                        f"Warning: skipped {description} batch with non-finite "
+                        f"gradient norm at AMP scale {scaler.get_scale():.1f}",
+                        flush=True,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
                 scaler.update()
         if metric_accumulator is not None:
             metric_shape = (

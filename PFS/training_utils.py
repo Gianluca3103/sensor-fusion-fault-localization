@@ -58,9 +58,20 @@ def restore_rng_state(state):
         )
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
+    # map_location="cuda" moves RNG snapshots onto CUDA too, but PyTorch's
+    # RNG restoration APIs require CPU ByteTensors.
+    torch_cpu_state = torch.as_tensor(
+        state["torch_cpu"],
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    torch.set_rng_state(torch_cpu_state)
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        torch_cuda_states = [
+            torch.as_tensor(value, dtype=torch.uint8, device="cpu")
+            for value in state["torch_cuda"]
+        ]
+        torch.cuda.set_rng_state_all(torch_cuda_states)
     return True
 
 
