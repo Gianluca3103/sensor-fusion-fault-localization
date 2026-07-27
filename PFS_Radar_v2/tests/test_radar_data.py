@@ -17,6 +17,35 @@ from PFS_Radar_v2.radar_data import (
 
 
 class PFSRadarV2Tests(unittest.TestCase):
+    def test_adaptive_stack_has_no_frame_cap_by_default(self):
+        timestamps = [index * 10_000_000 for index in range(50)]
+        poses = np.repeat(np.eye(4)[None], len(timestamps), axis=0)
+        selected = select_adaptive_indices(
+            timestamps,
+            poses,
+            lidar_timestamp=timestamps[-1],
+            config=AdaptiveStackConfig(max_age_s=1.0),
+        )
+        self.assertEqual(len(selected), 50)
+        self.assertEqual(
+            [row["timestamp"] for row in selected],
+            timestamps,
+        )
+
+    def test_adaptive_stack_respects_an_explicit_frame_cap(self):
+        timestamps = [index * 10_000_000 for index in range(50)]
+        poses = np.repeat(np.eye(4)[None], len(timestamps), axis=0)
+        selected = select_adaptive_indices(
+            timestamps,
+            poses,
+            lidar_timestamp=timestamps[-1],
+            config=AdaptiveStackConfig(max_frames=20, max_age_s=1.0),
+        )
+        self.assertEqual(
+            [row["timestamp"] for row in selected],
+            timestamps[-20:],
+        )
+
     def test_adaptive_stack_stops_at_translation_gate(self):
         timestamps = [0, 100_000_000, 200_000_000, 300_000_000]
         poses = np.repeat(np.eye(4)[None], len(timestamps), axis=0)

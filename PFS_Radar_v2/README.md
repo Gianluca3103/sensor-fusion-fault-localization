@@ -11,7 +11,7 @@ reference and walks backward until any accuracy gate is crossed:
 - maximum history
 - maximum relative translation
 - maximum relative rotation
-- maximum number of frames
+- optional maximum number of frames (disabled by default)
 
 Every accepted frame is ego-motion compensated into the current Aeva LiDAR
 frame. Its contribution is softly weighted by age, translation, and rotation.
@@ -52,7 +52,7 @@ RADAR_V2_ROOT="/path/to/radar_cache_adaptive_doppler_v2"
   --output-root "$RADAR_V2_ROOT" \
   --num-workers 4 \
   --max-delta-ms 30 \
-  --max-frames 20 \
+  --max-frames 0 \
   --max-history-s 1.0 \
   --max-translation-m 4.0 \
   --max-rotation-deg 5.0 \
@@ -63,6 +63,11 @@ RADAR_V2_ROOT="/path/to/radar_cache_adaptive_doppler_v2"
   --association-distance-m 3.0 \
   --min-track-hits 2
 ```
+
+`--max-frames 0` removes the frame-count cap. The accepted causal history is
+still bounded by `--max-history-s`, `--max-translation-m`, and
+`--max-rotation-deg`, and older accepted frames receive smaller soft weights.
+Use a positive value only when a strict compute or memory ceiling is required.
 
 For training, use the existing `PFS_Radar/train_pfs_radar.py` with
 `--radar-root "$RADAR_V2_ROOT"`. Do not pass the v1 fixed-stack validation

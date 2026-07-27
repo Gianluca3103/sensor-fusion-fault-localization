@@ -41,7 +41,7 @@ CHANNELS = [
 class AdaptiveStackConfig:
     """Pose gates and soft weights for causal radar-frame accumulation."""
 
-    max_frames: int = 20
+    max_frames: int | None = None
     max_age_s: float = 1.0
     max_translation_m: float = 4.0
     max_rotation_deg: float = 5.0
@@ -50,8 +50,8 @@ class AdaptiveStackConfig:
     weight_rotation_deg: float = 3.0
 
     def validate(self) -> None:
-        if self.max_frames < 1:
-            raise ValueError("max_frames must be at least 1")
+        if self.max_frames is not None and self.max_frames < 1:
+            raise ValueError("max_frames must be None or at least 1")
         positive = {
             "max_age_s": self.max_age_s,
             "max_translation_m": self.max_translation_m,
@@ -194,7 +194,7 @@ def select_adaptive_indices(
     reference_from_world = np.linalg.inv(reference_pose)
     rows: list[dict] = []
     for index in range(current_index, -1, -1):
-        if len(rows) >= config.max_frames:
+        if config.max_frames is not None and len(rows) >= config.max_frames:
             break
         age_s = (int(lidar_timestamp) - timestamps[index]) / 1_000_000_000.0
         relative = reference_from_world @ poses[index]
@@ -633,7 +633,18 @@ def _select_scene_frames(
     continental_gt = find_named_file(scene_root, "Continental_gt.txt")
     selected_pose_rows: list[np.ndarray] = []
     pose_deltas: list[float] = []
-    candidate_start = max(0, current_index - config.max_frames + 1)
+    oldest_timestamp = lidar_timestamp - int(config.max_age_s * 1_000_000_000)
+    candidate_start = bisect_left(
+        timestamps,
+        oldest_timestamp,
+        0,
+        current_index + 1,
+    )
+    if config.max_frames is not None:
+        candidate_start = max(
+            candidate_start,
+            current_index - config.max_frames + 1,
+        )
     for index in range(candidate_start, current_index + 1):
         pose, pose_delta_ms = nearest_ground_truth_pose(
             continental_gt, timestamps[index]

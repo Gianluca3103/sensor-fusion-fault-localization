@@ -46,7 +46,15 @@ def _parse_args():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-delta-ms", type=float, default=30.0)
-    parser.add_argument("--max-frames", type=int, default=20)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help=(
+            "Maximum accepted causal frames. Use 0 (the default) for no "
+            "frame-count cap; history, translation, and rotation gates still apply."
+        ),
+    )
     parser.add_argument("--max-history-s", type=float, default=1.0)
     parser.add_argument("--max-translation-m", type=float, default=4.0)
     parser.add_argument("--max-rotation-deg", type=float, default=5.0)
@@ -75,13 +83,15 @@ def _parse_args():
         parser.error("--num-workers must be at least 1")
     if not math.isfinite(args.max_delta_ms) or args.max_delta_ms < 0.0:
         parser.error("--max-delta-ms must be finite and non-negative")
+    if args.max_frames < 0:
+        parser.error("--max-frames must be 0 (unlimited) or a positive integer")
     return parser, args
 
 
 def main():
     parser, args = _parse_args()
     stack_config = AdaptiveStackConfig(
-        max_frames=args.max_frames,
+        max_frames=None if args.max_frames == 0 else args.max_frames,
         max_age_s=args.max_history_s,
         max_translation_m=args.max_translation_m,
         max_rotation_deg=args.max_rotation_deg,
