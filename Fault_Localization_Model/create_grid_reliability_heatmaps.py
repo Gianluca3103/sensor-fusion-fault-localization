@@ -1,10 +1,8 @@
 from pathlib import Path
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import csv
+from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
-import os
 import sys
 
 import numpy as np
@@ -14,8 +12,8 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from bev_utils import make_rgb_preview, project_lidar_bev, write_image  # noqa: E402
-from config_utils import (  # noqa: E402
+from Fault_Localization_Model.bev_utils import make_rgb_preview, project_lidar_bev, write_image  # noqa: E402
+from Fault_Localization_Model.config_utils import (  # noqa: E402
     config_get,
     load_json_config,
     require_directory,
@@ -23,7 +21,8 @@ from config_utils import (  # noqa: E402
     require_range,
     setup_logging,
 )
-from data_injection_utils import (  # noqa: E402
+from Fault_Localization_Model.concurrency_utils import iter_bounded_futures  # noqa: E402
+from Fault_Localization_Model.data_injection_utils import (  # noqa: E402
     DEFAULT_FOG_ROOT,
     DEFAULT_HERCULES_ROOT,
     DEFAULT_INJECTOR_ROOT,
@@ -31,10 +30,11 @@ from data_injection_utils import (  # noqa: E402
     find_aeva_dir,
     filter_pointcloud,
     list_aeva_bins,
-    lisa_label_counts,
     read_hercules_aeva_bin,
 )
-from fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
+from Fault_Localization_Model.fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
+from Fault_Localization_Model.io_utils import atomic_savez_compressed, write_csv_rows  # noqa: E402
+from Fault_Localization_Model.visualization_utils import add_reliability_colorbar, side_by_side  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "grid_reliability_heatmaps"
@@ -49,8 +49,28 @@ FAULT_PLAN = [
     ("uniform_noise", 1),
     ("impulse_noise", 1),
 ]
-GROUND_TRUTH_METHOD = "point_id_provenance_v1"
+GROUND_TRUTH_METHOD = "point_id_provenance_v2"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
+GENERATOR_VERSION = 3
+RESUME_REQUIRED_ARRAYS = (
+    "fault_heatmap",
+    "reliability_map",
+    "clean_rgb",
+    "faulty_rgb",
+    "clean_point_ids",
+    "faulty_point_ids",
+    "faulty_source_ids",
+    "faulty_injector_labels",
+    "clean_point_counts",
+    "faulty_point_counts",
+    "missing_faulty_counts",
+    "moved_faulty_counts",
+    "added_faulty_counts",
+    "correct_point_ids",
+    "missing_point_ids",
+    "moved_point_ids",
+    "added_point_ids",
+)
 POINT_STATUS_CORRECT = 0
 POINT_STATUS_MISSING = 1
 POINT_STATUS_MOVED = 2
@@ -77,6 +97,7 @@ def config_defaults(config):
         "faults": config_get(config, "faults.names", None),
         "severities": config_get(config, "faults.severities", None),
         "fog_noise": config_get(config, "faults.fog_noise", 10),
+        "weather_threads": config_get(config, "faults.weather_threads", 1),
         "num_workers": config_get(config, "generation.num_workers", 1),
         "grid_size": config_get(config, "bev.grid_size", 100),
         "x_min": config_get(config, "bev.x_min", 0.0),
@@ -175,6 +196,15 @@ def parse_args():
     )
     parser.add_argument("--fog-noise", type=int, default=defaults["fog_noise"])
     parser.add_argument(
+        "--weather-threads",
+        type=int,
+        default=defaults["weather_threads"],
+        help=(
+            "LISA threads inside each generation worker. Keep at 1 when using "
+            "multiple --num-workers to avoid nested CPU oversubscription."
+        ),
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=defaults["num_workers"],
@@ -193,17 +223,64 @@ def validate_generation_args(args):
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
     require_positive(args.num_workers, "num_workers")
+    require_positive(args.weather_threads, "weather_threads")
     require_positive(args.movement_tolerance_m, "movement_tolerance_m")
-    if args.train_ratio <= 0.0 or args.val_ratio <= 0.0:
+    if args.fog_noise < 0:
+        raise ValueError("--fog-noise must be non-negative.")
+    if args.seed < 0:
+        raise ValueError("--seed must be non-negative.")
+    if (
+        not np.isfinite([args.train_ratio, args.val_ratio]).all()
+        or args.train_ratio <= 0.0
+        or args.val_ratio <= 0.0
+    ):
         raise ValueError("--train-ratio and --val-ratio must be positive.")
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
     require_range(args.x_min, args.x_max, "x range")
     require_range(args.y_min, args.y_max, "y range")
     require_range(args.min_range, args.max_range, "point range")
+    if args.frames and args.temporal_split:
+        raise ValueError(
+            "--frames cannot be combined with --temporal-split because frame "
+            "indexes are global while temporal splits are computed per folder."
+        )
+    include_scenes = normalize_scene_filter(args.include_scenes) or set()
+    exclude_scenes = normalize_scene_filter(args.exclude_scenes) or set()
+    overlap = include_scenes & exclude_scenes
+    if overlap:
+        raise ValueError(
+            "Scenes cannot be both included and excluded: "
+            + ", ".join(sorted(overlap))
+        )
+    if not args.all_scenes and (
+        include_scenes or exclude_scenes or args.keep_duplicate_frames
+    ):
+        raise ValueError(
+            "--include-scenes, --exclude-scenes, and --keep-duplicate-frames "
+            "require --all-scenes."
+        )
+    if args.fault_plan and (args.faults or args.severities):
+        raise ValueError(
+            "--fault-plan cannot be combined with --faults or --severities."
+        )
 
 
 def point_counts_grid(points, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] < 2:
+        raise ValueError(f"points must have shape [N,>=2], got {points.shape}")
+    if not np.isfinite(points[:, :2]).all():
+        raise ValueError("points contains non-finite XY coordinates")
+    if (
+        not isinstance(grid_rows, (int, np.integer))
+        or not isinstance(grid_cols, (int, np.integer))
+        or grid_rows < 1
+        or grid_cols < 1
+    ):
+        raise ValueError("grid_rows and grid_cols must be positive integers")
+    require_range(x_min, x_max, "x range")
+    require_range(y_min, y_max, "y range")
     counts = np.zeros((grid_rows, grid_cols), dtype=np.float32)
     if len(points) == 0:
         return counts
@@ -233,6 +310,21 @@ def make_reliability_maps(
     grid_cols,
 ):
     """Build reliability targets from exact point provenance rather than occupancy matching."""
+    clean_points = np.asarray(clean_points)
+    faulty_points = np.asarray(faulty_points)
+    for name, points in (
+        ("clean_points", clean_points),
+        ("faulty_points", faulty_points),
+    ):
+        if points.ndim != 2 or points.shape[1] < 3:
+            raise ValueError(f"{name} must have shape [N,>=3], got {points.shape}")
+        if not np.isfinite(points[:, :3]).all():
+            raise ValueError(f"{name} contains non-finite XYZ coordinates")
+    if (
+        not np.isfinite(movement_tolerance_m)
+        or movement_tolerance_m < 0.0
+    ):
+        raise ValueError("movement_tolerance_m must be finite and non-negative")
     clean_point_ids = np.asarray(clean_point_ids, dtype=np.int64)
     faulty_point_ids = np.asarray(faulty_point_ids, dtype=np.int64)
     faulty_source_ids = np.asarray(faulty_source_ids, dtype=np.int64)
@@ -289,7 +381,8 @@ def make_reliability_maps(
     faulty_point_status[original_faulty_indices[~moved_original]] = POINT_STATUS_CORRECT
     faulty_point_status[moved_faulty_indices] = POINT_STATUS_MOVED
 
-    correct_points = clean_points[correct_clean_indices]
+    correct_faulty_indices = original_faulty_indices[~moved_original]
+    correct_points = faulty_points[correct_faulty_indices]
     missing_points = clean_points[missing_clean]
     moved_points = faulty_points[moved_faulty_indices]
     added_points = faulty_points[added_faulty_indices]
@@ -371,36 +464,6 @@ def add_legend_above(rgb, title, details):
     for line in lines:
         draw.text((8, y), line, fill=(255, 255, 255), font=font)
         y += 18
-    return np.array(image)
-
-
-def add_reliability_colorbar(rgb):
-    bar_width = 34
-    label_width = 104
-    pad = 8
-    height = rgb.shape[0]
-    canvas = np.zeros((height, rgb.shape[1] + bar_width + label_width + pad, 3), dtype=np.uint8)
-    canvas[:, : rgb.shape[1]] = rgb
-    x0 = rgb.shape[1] + pad
-
-    values = np.linspace(1.0, 0.0, height, dtype=np.float32)
-    bar = np.zeros((height, bar_width, 3), dtype=np.uint8)
-    bar[..., 0] = np.clip((1.0 - values[:, None]) * 255, 0, 255).astype(np.uint8)
-    bar[..., 2] = np.clip(values[:, None] * 255, 0, 255).astype(np.uint8)
-    canvas[:, x0 : x0 + bar_width] = bar
-
-    image = Image.fromarray(canvas, mode="RGB")
-    draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.truetype("arial.ttf", 13)
-    except OSError:
-        font = ImageFont.load_default()
-    text_x = x0 + bar_width + 8
-    draw.text((text_x, 8), "Reliable", fill=(80, 160, 255), font=font)
-    draw.text((text_x, 26), "1.0", fill=(80, 160, 255), font=font)
-    draw.text((text_x, height // 2 - 9), "0.5", fill=(210, 120, 255), font=font)
-    draw.text((text_x, height - 42), "0.0", fill=(255, 90, 90), font=font)
-    draw.text((text_x, height - 24), "Unreliable", fill=(255, 90, 90), font=font)
     return np.array(image)
 
 
@@ -498,7 +561,11 @@ def list_all_aeva_bins(data_root, dedupe=True, include_scenes=None, exclude_scen
         unique_bins = {}
         for bin_path in bins:
             source_meta = hercules_source_metadata(bin_path, data_root)
-            key = (source_meta["scene"], bin_path.stem)
+            key = (
+                source_meta["scene"],
+                source_meta["session"],
+                bin_path.stem,
+            )
             current = unique_bins.get(key)
             if current is None or len(bin_path.parts) < len(current.parts):
                 unique_bins[key] = bin_path
@@ -556,19 +623,6 @@ def hercules_source_metadata(bin_path, data_root):
     }
 
 
-def side_by_side(images):
-    max_height = max(image.shape[0] for image in images)
-    padded = []
-    for image in images:
-        if image.shape[0] == max_height:
-            padded.append(image)
-            continue
-        canvas = np.zeros((max_height, image.shape[1], 3), dtype=np.uint8)
-        canvas[: image.shape[0]] = image
-        padded.append(canvas)
-    return np.concatenate(padded, axis=1)
-
-
 def worker_init(context):
     global WORKER_CONTEXT
     WORKER_CONTEXT = dict(context)
@@ -576,19 +630,110 @@ def worker_init(context):
     WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(injector_root)
 
 
-def existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severity):
+def load_matching_existing_sample(
+    npz_path,
+    cfg,
+    source_meta,
+    timestamp,
+    fault,
+    severity,
+    injection_seed,
+):
+    """Return validated metadata/arrays for a resumable sample, or None."""
     try:
         with np.load(npz_path, allow_pickle=False) as data:
+            missing = set(RESUME_REQUIRED_ARRAYS) - set(data.files)
+            if missing:
+                raise KeyError(
+                    "missing arrays: " + ", ".join(sorted(missing))
+                )
             metadata = json.loads(str(data["metadata_json"]))
-            _ = data["fault_heatmap"].shape
+            arrays = {
+                key: np.asarray(data[key])
+                for key in RESUME_REQUIRED_ARRAYS
+            }
+            if arrays["fault_heatmap"].shape != (
+                cfg["grid_size"],
+                cfg["grid_size"],
+            ):
+                raise ValueError(
+                    f"fault_heatmap has shape {arrays['fault_heatmap'].shape}"
+                )
+            for map_name in (
+                "reliability_map",
+                "clean_point_counts",
+                "faulty_point_counts",
+                "missing_faulty_counts",
+                "moved_faulty_counts",
+                "added_faulty_counts",
+            ):
+                if arrays[map_name].shape != arrays["fault_heatmap"].shape:
+                    raise ValueError(
+                        f"{map_name} has shape {arrays[map_name].shape}"
+                    )
+                if not np.isfinite(arrays[map_name]).all():
+                    raise ValueError(f"{map_name} contains non-finite values")
+            if (
+                not np.isfinite(arrays["fault_heatmap"]).all()
+                or float(arrays["fault_heatmap"].min()) < 0.0
+                or float(arrays["fault_heatmap"].max()) > 1.0
+            ):
+                raise ValueError("fault_heatmap must contain finite values in [0,1]")
+            if (
+                float(arrays["reliability_map"].min()) < 0.0
+                or float(arrays["reliability_map"].max()) > 1.0
+            ):
+                raise ValueError("reliability_map must contain values in [0,1]")
+            if arrays["clean_rgb"].shape != (
+                cfg["image_height"],
+                cfg["image_width"],
+                3,
+            ):
+                raise ValueError(
+                    f"clean_rgb has shape {arrays['clean_rgb'].shape}"
+                )
+            if arrays["faulty_rgb"].shape != arrays["clean_rgb"].shape:
+                raise ValueError(
+                    "faulty_rgb and clean_rgb shapes do not match"
+                )
+            if len(arrays["clean_point_ids"]) == 0:
+                raise ValueError("clean_point_ids is empty")
+            if (
+                len(arrays["faulty_point_ids"])
+                != len(arrays["faulty_source_ids"])
+            ):
+                raise ValueError(
+                    "faulty point IDs and source IDs have different lengths"
+                )
+            if (
+                len(arrays["faulty_point_ids"])
+                != len(arrays["faulty_injector_labels"])
+            ):
+                raise ValueError(
+                    "faulty point IDs and injector labels have different lengths"
+                )
+        if cfg["save_previews"]:
+            preview_suffixes = (
+                "_fault_heatmap.png",
+                "_reliability_map.png",
+                "_fault_overlay.png",
+                "_clean_bev.png",
+                "_ideal_bev_changes_marked.png",
+                "_comparison.png",
+            )
+            for suffix in preview_suffixes:
+                preview_path = npz_path.with_name(f"{npz_path.stem}{suffix}")
+                with Image.open(preview_path) as preview:
+                    preview.verify()
     except Exception as exc:
         LOGGER.warning("Regenerating unreadable existing sample %s: %s", npz_path.name, exc)
-        return False
+        return None
 
     expected = {
         "dataset": "Hercules",
         "scene": source_meta["scene"],
         "session": source_meta["session"],
+        "source_relative_path": source_meta["source_relative_path"],
         "timestamp": timestamp,
         "fault": fault,
         "severity": severity,
@@ -598,9 +743,16 @@ def existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severi
         "x_range": [cfg["x_min"], cfg["x_max"]],
         "y_range": [cfg["y_min"], cfg["y_max"]],
         "resolution": cfg["resolution"],
+        "min_range": cfg["min_range"],
+        "max_range": cfg["max_range"],
+        "fog_noise": cfg["fog_noise"],
         "ground_truth_method": GROUND_TRUTH_METHOD,
         "visualization_method": VISUALIZATION_METHOD,
         "movement_tolerance_m": cfg["movement_tolerance_m"],
+        "generator_version": GENERATOR_VERSION,
+        "generation_seed": cfg["generation_seed"],
+        "injection_seed": injection_seed,
+        "weather_threads": cfg["weather_threads"],
     }
     for key, expected_value in expected.items():
         if metadata.get(key) != expected_value:
@@ -611,8 +763,84 @@ def existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severi
                 metadata.get(key),
                 expected_value,
             )
-            return False
-    return True
+            return None
+    return {"metadata": metadata, "arrays": arrays}
+
+
+def build_manifest_row(
+    index,
+    npz_path,
+    cfg,
+    metadata,
+    arrays,
+    *,
+    reused_existing,
+):
+    """Build one stable manifest row from saved sample contents."""
+    total_clean = float(np.sum(arrays["clean_point_counts"]))
+    total_faulty = float(np.sum(arrays["faulty_point_counts"]))
+    total_missing = float(np.sum(arrays["missing_faulty_counts"]))
+    total_moved = float(np.sum(arrays["moved_faulty_counts"]))
+    total_added = float(np.sum(arrays["added_faulty_counts"]))
+    denominator = max(total_clean + total_faulty, 1.0)
+    labels = np.asarray(arrays["faulty_injector_labels"], dtype=np.int8)
+    injection_metadata = metadata.get("injection_metadata") or {}
+    if not isinstance(injection_metadata, dict):
+        injection_metadata = {"injection_metadata": str(injection_metadata)}
+
+    stem = Path(npz_path).stem
+    output_root = Path(cfg["output_root"])
+    preview_path = lambda suffix: (
+        str(output_root / f"{stem}_{suffix}.png")
+        if cfg["save_previews"]
+        else ""
+    )
+    return {
+        "index": int(index),
+        "reused_existing": bool(reused_existing),
+        "scene": metadata.get("scene", ""),
+        "day": metadata.get("day", ""),
+        "session": metadata.get("session", ""),
+        "source_relative_path": metadata.get("source_relative_path", ""),
+        "source_aeva_dir": metadata.get("source_aeva_dir", ""),
+        "timestamp": metadata.get("timestamp", ""),
+        "fault": metadata.get("fault", ""),
+        "severity": metadata.get("severity", ""),
+        "generator_version": metadata.get("generator_version", ""),
+        "generation_seed": metadata.get("generation_seed", ""),
+        "injection_seed": metadata.get("injection_seed", ""),
+        "weather_threads": metadata.get("weather_threads", ""),
+        "clean_points": int(len(arrays["clean_point_ids"])),
+        "faulty_points": int(len(arrays["faulty_point_ids"])),
+        "correct_points": int(len(arrays["correct_point_ids"])),
+        "missing_points": int(len(arrays["missing_point_ids"])),
+        "moved_points": int(len(arrays["moved_point_ids"])),
+        "added_points": int(len(arrays["added_point_ids"])),
+        "correct_grid_cells": int(np.count_nonzero(arrays["clean_point_counts"])),
+        "missing_grid_cells": int(np.count_nonzero(arrays["missing_faulty_counts"])),
+        "moved_grid_cells": int(np.count_nonzero(arrays["moved_faulty_counts"])),
+        "added_grid_cells": int(np.count_nonzero(arrays["added_faulty_counts"])),
+        "total_clean_reliable_points": total_clean,
+        "total_faulty_unreliable_points": total_faulty,
+        "total_missing_faulty_points": total_missing,
+        "total_moved_faulty_points": total_moved,
+        "total_added_faulty_points": total_added,
+        "global_reliability": total_clean / denominator,
+        "global_error_ratio": total_faulty / denominator,
+        "mean_fault_heatmap": float(np.mean(arrays["fault_heatmap"])),
+        "max_fault_heatmap": float(np.max(arrays["fault_heatmap"])),
+        "lisa_label0_lost_points": int(np.sum(labels == 0)),
+        "lisa_label1_non_scattered_points": int(np.sum(labels == 1)),
+        "lisa_label2_scattered_points": int(np.sum(labels == 2)),
+        "fault_heatmap_png": preview_path("fault_heatmap"),
+        "reliability_png": preview_path("reliability_map"),
+        "overlay_png": preview_path("fault_overlay"),
+        "clean_png": preview_path("clean_bev"),
+        "marked_png": preview_path("ideal_bev_changes_marked"),
+        "comparison_png": preview_path("comparison"),
+        "npz": str(npz_path),
+        **injection_metadata,
+    }
 
 
 def create_one_sample(task):
@@ -628,6 +856,7 @@ def create_one_sample(task):
     fog_root = Path(cfg["fog_root"])
     fault = task["fault"]
     severity = task["severity"]
+    injection_seed = task["injection_seed"]
 
     timestamp = bin_path.stem
     source_meta = hercules_source_metadata(bin_path, data_root)
@@ -641,11 +870,35 @@ def create_one_sample(task):
     comparison_png = output_root / f"{stem}_comparison.png"
     npz_path = output_root / f"{stem}.npz"
 
-    if npz_path.exists() and existing_sample_matches(npz_path, cfg, source_meta, timestamp, fault, severity):
-        return {"index": index, "skipped": True, "npz": str(npz_path)}
+    if npz_path.exists():
+        existing = load_matching_existing_sample(
+            npz_path,
+            cfg,
+            source_meta,
+            timestamp,
+            fault,
+            severity,
+            injection_seed,
+        )
+        if existing is not None:
+            return {
+                **build_manifest_row(
+                    index,
+                    npz_path,
+                    cfg,
+                    existing["metadata"],
+                    existing["arrays"],
+                    reused_existing=True,
+                ),
+                "skipped": True,
+            }
 
     clean_raw = read_hercules_aeva_bin(bin_path)
     clean_points = filter_pointcloud(clean_raw, cfg["min_range"], cfg["max_range"])[:, :4]
+    if len(clean_points) == 0:
+        raise ValueError(
+            f"No valid LiDAR points remain after range filtering {bin_path}"
+        )
     clean_point_ids = np.arange(len(clean_points), dtype=np.int64)
     clean_rgb, clean_layers = clean_bev_rgb(
         clean_points,
@@ -662,8 +915,9 @@ def create_one_sample(task):
         fog_root,
         cfg["fog_noise"],
         cfg["lidar_corruptions"],
+        rng_seed=injection_seed,
+        weather_threads=cfg["weather_threads"],
     )
-    label_counts = lisa_label_counts(injection.points)
     _, range_mask = filter_pointcloud(
         injection.points,
         cfg["min_range"],
@@ -779,11 +1033,54 @@ def create_one_sample(task):
         write_image(overlay_png, overlay_rgb)
         write_image(marked_png, marked_rgb)
         write_image(comparison_png, comparison_rgb)
-    temporary_npz_path = npz_path.with_name(
-        f".{npz_path.name}.{os.getpid()}.tmp.npz"
-    )
-    np.savez_compressed(
-        temporary_npz_path,
+    sample_metadata = {
+        "dataset": "Hercules",
+        "day": source_meta["day"],
+        "scene": source_meta["scene"],
+        "session": source_meta["session"],
+        "source_relative_path": source_meta["source_relative_path"],
+        "source_aeva_dir": source_meta["source_aeva_dir"],
+        "timestamp": timestamp,
+        "fault": fault,
+        "severity": severity,
+        "grid_size": cfg["grid_size"],
+        "image_height": cfg["image_height"],
+        "image_width": cfg["image_width"],
+        "x_cell_size_m": (cfg["x_max"] - cfg["x_min"]) / cfg["grid_size"],
+        "y_cell_size_m": (cfg["y_max"] - cfg["y_min"]) / cfg["grid_size"],
+        "x_range": [cfg["x_min"], cfg["x_max"]],
+        "y_range": [cfg["y_min"], cfg["y_max"]],
+        "resolution": cfg["resolution"],
+        "min_range": cfg["min_range"],
+        "max_range": cfg["max_range"],
+        "fog_noise": cfg["fog_noise"],
+        "ground_truth_method": GROUND_TRUTH_METHOD,
+        "visualization_method": VISUALIZATION_METHOD,
+        "movement_tolerance_m": cfg["movement_tolerance_m"],
+        "generator_version": GENERATOR_VERSION,
+        "generation_seed": cfg["generation_seed"],
+        "injection_seed": injection_seed,
+        "weather_threads": cfg["weather_threads"],
+        "injection_metadata": fog_counts,
+        "definition": (
+            "reliability=correct/(correct+missing+moved+added), using exact "
+            "source IDs; weather replacements have new point IDs and no source ID"
+        ),
+        "classification_counts": {
+            "correct": len(maps["correct_point_ids"]),
+            "missing": len(maps["missing_point_ids"]),
+            "moved": len(maps["moved_point_ids"]),
+            "added": len(maps["added_point_ids"]),
+        },
+        "point_status_labels": {
+            "0": "correct",
+            "1": "missing",
+            "2": "moved",
+            "3": "added",
+        },
+    }
+    atomic_savez_compressed(
+        npz_path,
         **maps,
         clean_rgb=clean_rgb,
         clean_density=clean_layers["raw_density"],
@@ -793,83 +1090,24 @@ def create_one_sample(task):
         faulty_point_ids=faulty_point_ids,
         faulty_source_ids=faulty_source_ids,
         faulty_injector_labels=faulty_injector_labels,
-        metadata_json=json.dumps(
-            {
-                "dataset": "Hercules",
-                "day": source_meta["day"],
-                "scene": source_meta["scene"],
-                "session": source_meta["session"],
-                "source_relative_path": source_meta["source_relative_path"],
-                "source_aeva_dir": source_meta["source_aeva_dir"],
-                "timestamp": timestamp,
-                "fault": fault,
-                "severity": severity,
-                "grid_size": cfg["grid_size"],
-                "image_height": cfg["image_height"],
-                "image_width": cfg["image_width"],
-                "x_cell_size_m": (cfg["x_max"] - cfg["x_min"]) / cfg["grid_size"],
-                "y_cell_size_m": (cfg["y_max"] - cfg["y_min"]) / cfg["grid_size"],
-                "x_range": [cfg["x_min"], cfg["x_max"]],
-                "y_range": [cfg["y_min"], cfg["y_max"]],
-                "resolution": cfg["resolution"],
-                "ground_truth_method": GROUND_TRUTH_METHOD,
-                "visualization_method": VISUALIZATION_METHOD,
-                "movement_tolerance_m": cfg["movement_tolerance_m"],
-                "definition": "reliability=correct/(correct+missing+moved+added), using exact source IDs; weather replacements have new point IDs and no source ID",
-                "classification_counts": {
-                    "correct": len(maps["correct_point_ids"]),
-                    "missing": len(maps["missing_point_ids"]),
-                    "moved": len(maps["moved_point_ids"]),
-                    "added": len(maps["added_point_ids"]),
-                },
-                "point_status_labels": {
-                    "0": "correct",
-                    "1": "missing",
-                    "2": "moved",
-                    "3": "added",
-                },
-            },
-            indent=2,
-        ),
+        metadata_json=json.dumps(sample_metadata, indent=2),
     )
-    temporary_npz_path.replace(npz_path)
-
-    total_clean = float(np.sum(maps["clean_point_counts"]))
-    total_faulty = float(np.sum(maps["faulty_point_counts"]))
-    total_missing = float(np.sum(maps["missing_faulty_counts"]))
-    total_moved = float(np.sum(maps["moved_faulty_counts"]))
-    total_added = float(np.sum(maps["added_faulty_counts"]))
     return {
-        "index": index,
-        "scene": source_meta["scene"],
-        "day": source_meta["day"],
-        "session": source_meta["session"],
-        "source_relative_path": source_meta["source_relative_path"],
-        "source_aeva_dir": source_meta["source_aeva_dir"],
-        "timestamp": timestamp,
-        "fault": fault,
-        "severity": severity,
-        "clean_points": len(clean_points),
-        "faulty_points": len(faulty_points),
-        "total_clean_reliable_points": total_clean,
-        "total_faulty_unreliable_points": total_faulty,
-        "total_missing_faulty_points": total_missing,
-        "total_moved_faulty_points": total_moved,
-        "total_added_faulty_points": total_added,
-        "global_reliability": total_clean / max(total_clean + total_faulty, 1.0),
-        "global_error_ratio": total_faulty / max(total_clean + total_faulty, 1.0),
-        "mean_fault_heatmap": float(np.mean(maps["fault_heatmap"])),
-        "max_fault_heatmap": float(np.max(maps["fault_heatmap"])),
-        "fault_heatmap_png": str(fault_png) if cfg["save_previews"] else "",
-        "reliability_png": str(reliability_png) if cfg["save_previews"] else "",
-        "overlay_png": str(overlay_png) if cfg["save_previews"] else "",
-        "clean_png": str(clean_png) if cfg["save_previews"] else "",
-        "marked_png": str(marked_png) if cfg["save_previews"] else "",
-        "comparison_png": str(comparison_png) if cfg["save_previews"] else "",
-        "npz": str(npz_path),
-        **change_counts,
-        **label_counts,
-        **fog_counts,
+        **build_manifest_row(
+            index,
+            npz_path,
+            cfg,
+            sample_metadata,
+            {
+                **maps,
+                "clean_point_ids": clean_point_ids,
+                "faulty_point_ids": faulty_point_ids,
+                "faulty_source_ids": faulty_source_ids,
+                "faulty_injector_labels": faulty_injector_labels,
+            },
+            reused_existing=False,
+        ),
+        "skipped": False,
     }
 
 
@@ -942,6 +1180,7 @@ def main():
         "injector_root": str(injector_root),
         "fog_root": str(fog_root),
         "fog_noise": args.fog_noise,
+        "weather_threads": args.weather_threads,
         "grid_size": args.grid_size,
         "x_min": args.x_min,
         "x_max": args.x_max,
@@ -954,9 +1193,20 @@ def main():
         "save_previews": not args.no_previews,
         "image_height": image_height,
         "image_width": image_width,
+        "generation_seed": args.seed,
     }
     tasks = [
-        {"index": index, "bin_path": str(bin_path), "fault": fault, "severity": severity}
+        {
+            "index": index,
+            "bin_path": str(bin_path),
+            "fault": fault,
+            "severity": severity,
+            "injection_seed": int(
+                np.random.SeedSequence([args.seed, index]).generate_state(
+                    1, dtype=np.uint32
+                )[0]
+            ),
+        }
         for index, (bin_path, fault, severity) in enumerate(samples)
     ]
     rows = []
@@ -967,6 +1217,7 @@ def main():
         worker_init(worker_context)
         for completed, task in enumerate(tasks, start=1):
             result = create_one_sample(task)
+            rows.append(result)
             if result.get("skipped"):
                 skipped += 1
                 LOGGER.info(
@@ -976,7 +1227,6 @@ def main():
                     Path(result["npz"]).name,
                 )
             else:
-                rows.append(result)
                 LOGGER.info(
                     "Created %04d/%04d: %s",
                     completed,
@@ -990,11 +1240,16 @@ def main():
             initializer=worker_init,
             initargs=(worker_context,),
         ) as executor:
-            future_to_task = {executor.submit(create_one_sample, task): task for task in tasks}
             completed = 0
-            for future in as_completed(future_to_task):
+            for future, _ in iter_bounded_futures(
+                executor,
+                create_one_sample,
+                tasks,
+                max_pending=max(args.num_workers * 3, 1),
+            ):
                 completed += 1
                 result = future.result()
+                rows.append(result)
                 if result.get("skipped"):
                     skipped += 1
                     LOGGER.info(
@@ -1004,7 +1259,6 @@ def main():
                         Path(result["npz"]).name,
                     )
                 else:
-                    rows.append(result)
                     LOGGER.info(
                         "Created %04d/%04d: %s",
                         completed,
@@ -1016,12 +1270,11 @@ def main():
     if skipped:
         LOGGER.info("Skipped %d existing samples", skipped)
 
-    if rows:
-        manifest_path = output_root / "manifest.csv"
-        with manifest_path.open("w", encoding="utf-8", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
+    write_csv_rows(
+        output_root / "manifest.csv",
+        rows,
+        fieldnames=list(rows[0]) if rows else None,
+    )
     LOGGER.info("Saved grid heatmaps: %s", output_root)
 
 

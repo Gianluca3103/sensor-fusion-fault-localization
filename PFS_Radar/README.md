@@ -29,7 +29,9 @@ frame share one radar tensor.
 
 Strict cache preparation rejects sequence-start samples that do not have 20
 real historical radar frames or a valid ground-truth pose. It never fills the
-window with future frames.
+window with future frames. Cache format version 3 also includes the exact
+Hercules scene/session in its path and metadata, preventing same-timestamp
+collisions across sessions. Rebuild caches produced by earlier versions.
 
 ## PFS adaptation
 
@@ -38,6 +40,10 @@ window with future frames.
 - **Block 3 - expert correction:** uses reliability as a hole map; the former camera/semantic expert becomes a radar-supported correction expert.
 
 The final decoder predicts the supervised LiDAR fault heatmap. The internal PFS reliability output is supervised with `1 - fault_heatmap`.
+For feature stabilization, clean LiDAR is encoded by a frozen reference
+forward pass and fused with the same detached radar bottleneck used by the
+degraded branch. The clean target therefore cannot update BatchNorm statistics
+and lives in the same fused feature space as the prediction.
 
 ## 1. Prepare radar cache
 
@@ -45,7 +51,7 @@ The final decoder predicts the supervised LiDAR fault heatmap. The internal PFS 
 PYTHON="/home/arrubuntu20/anaconda3/envs/sensor-fusion/bin/python"
 REPO_ROOT="/mnt/3D10B36523559581/Gianluca/sensor-fusion-fault-localization"
 HERCULES_ROOT="/mnt/3D10B36523559581/HeRCULES"
-DATASET_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/grid_reliability_20k_grid320_id_v1"
+DATASET_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/grid_reliability_20k_grid320_id_v3"
 RADAR_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/radar_cache_20k_stack20"
 
 cd "$REPO_ROOT"
@@ -59,9 +65,11 @@ cd "$REPO_ROOT"
   --require-full-stack
 ```
 
-Use a new cache root and retrain from scratch when changing from one radar
-frame to 20. The tensor still has four channels, but its data distribution is
-substantially denser.
+The cache builder records and verifies its stack length, BEV geometry,
+normalization, and alignment settings. Reusing a cache root is safe: corrupt
+or incompatible entries are rebuilt. Retrain from scratch when changing from
+one radar frame to 20 because the four-channel tensor becomes substantially
+denser.
 
 ## 2. Train
 
@@ -74,34 +82,40 @@ RUN_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/pfs_radar_20k_gri
   --radar-root "$RADAR_ROOT" \
   --output-root "$RUN_ROOT" \
   --epochs 100 \
-  --batch-size 16 \
-  --num-workers 8 \
+  --batch-size 64 \
+  --num-workers 12 \
   --base-channels 16 \
   --dropout 0.15 \
-  --learning-rate 2e-4 \
+  --learning-rate 7.5e-5 \
   --min-learning-rate 1e-6 \
   --warmup-epochs 10 \
   --weight-decay 2e-3 \
   --stability-weight 0.05 \
   --pfs-reliability-weight 0.10 \
   --localization-loss-weight 0.25 \
-  --false-positive-weight 0.70 \
-  --localization-radius-cells 1 \
-  --early-stop-patience 10 \
+  --false-positive-weight 0.65 \
+  --early-stop-patience 20 \
+  --min-delta 1e-4 \
   --metric-threshold 0.15 \
   --metric-grid-size 320 \
-  --metrics-every 1 \
+  --metrics-every 5 \
   --localization-tolerance-m 0.20 \
   --target-fault-threshold 0.0 \
   --grid-size 320 \
+  --exclude-faults rain_sim snow_sim \
   --device cuda
 ```
 
-Validation prints localization IoU, precision, recall, and F1 each epoch. Early
-stopping monitors validation loss with a default patience of 10. Training saves
+Validation prints localization IoU, precision, recall, and F1 at the configured
+`--metrics-every` interval. Early stopping monitors validation loss. Training saves
 both `best_model.pt` (validation loss) and `best_localization_iou.pt`
 (localization IoU). Increase `--false-positive-weight` cautiously if predictions
 remain too broad.
+
+`--resume` restores one interrupted run exactly and requires a current
+training-semantics version. A checkpoint made before the frozen/fused clean
+reference correction is deliberately rejected. Use `--init-checkpoint` only
+for an intentional weights-only refinement with fresh optimizer state.
 
 ## 3. Visualize test predictions
 
@@ -146,6 +160,9 @@ set once with that frozen threshold:
 
 The command prints progress and final validation/test metrics. It also saves the
 threshold sweep, aggregate test metrics, and per-fault test metrics.
+Localization uses one-to-one matching within the metric tolerance, so one
+ground-truth cell cannot validate several nearby predictions. Thresholds are
+selected only on validation data and then frozen for the single test pass.
 
 ## 5. Locate overfitting
 

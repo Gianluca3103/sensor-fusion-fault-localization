@@ -4,13 +4,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import csv
-import json
-
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import distance_transform_edt
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import maximum_bipartite_matching
+from scipy.spatial import cKDTree
 import torch
 import torch.nn.functional as F
+
+from Fault_Localization_Model.io_utils import atomic_write_json, write_csv_rows
 
 
 EPS = 1e-8
@@ -28,9 +31,13 @@ def _as_bchw(tensor: torch.Tensor, name: str) -> torch.Tensor:
 def probabilities_from_output(output: torch.Tensor, from_logits: bool = True) -> torch.Tensor:
     """Convert model output to probabilities without applying sigmoid twice."""
     output = _as_bchw(output, "output")
+    if not torch.isfinite(output).all():
+        raise ValueError("output contains non-finite values")
     if from_logits:
         return torch.sigmoid(output)
-    return output.clamp(0.0, 1.0)
+    if torch.any((output < 0.0) | (output > 1.0)):
+        raise ValueError("Probability output values must lie in [0,1]")
+    return output
 
 
 def prepare_probability_target(
@@ -42,9 +49,15 @@ def prepare_probability_target(
     """Validate shapes and return detached probability and target tensors."""
     prob = probabilities_from_output(output, from_logits=from_logits)
     target = _as_bchw(target, "target").float()
+    if not torch.isfinite(target).all():
+        raise ValueError("target contains non-finite values")
+    if torch.any((target < 0.0) | (target > 1.0)):
+        raise ValueError("target values must lie in [0,1]")
     if prob.shape[-2:] != target.shape[-2:]:
         prob = F.interpolate(prob, size=target.shape[-2:], mode="bilinear", align_corners=False)
     if metric_grid_size is not None:
+        if int(metric_grid_size) != metric_grid_size or metric_grid_size <= 0:
+            raise ValueError("metric_grid_size must be a positive integer or None")
         size = (metric_grid_size, metric_grid_size)
         prob = F.adaptive_avg_pool2d(prob, output_size=size)
         target = F.adaptive_avg_pool2d(target, output_size=size)
@@ -61,6 +74,10 @@ class ConfusionCounts:
     def update(self, pred_mask: np.ndarray, target_mask: np.ndarray) -> None:
         pred = pred_mask.astype(bool)
         target = target_mask.astype(bool)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Prediction and target masks must match, got {pred.shape} and {target.shape}"
+            )
         self.tp += int(np.logical_and(pred, target).sum())
         self.fp += int(np.logical_and(pred, ~target).sum())
         self.tn += int(np.logical_and(~pred, ~target).sum())
@@ -89,7 +106,7 @@ class ConfusionCounts:
 
 @dataclass
 class LocalizationToleranceCounts:
-    """Accumulate many-to-one fault localization matches within a metric radius."""
+    """Accumulate one-to-one fault localization matches within a metric radius."""
 
     tolerance_m: float = 0.20
     pred_total: int = 0
@@ -100,6 +117,10 @@ class LocalizationToleranceCounts:
     def update(self, pred_mask: np.ndarray, target_mask: np.ndarray, x_cell_size_m: float, y_cell_size_m: float) -> None:
         pred = pred_mask.astype(bool)
         target = target_mask.astype(bool)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Prediction and target masks must match, got {pred.shape} and {target.shape}"
+            )
         pred_count = int(pred.sum())
         target_count = int(target.sum())
         self.pred_total += pred_count
@@ -108,26 +129,33 @@ class LocalizationToleranceCounts:
         if pred_count == 0 or target_count == 0:
             return
 
-        self.pred_matched += _count_points_with_neighbor_within_radius(
-            query_mask=pred,
-            reference_mask=target,
+        pred_matched, target_matched = one_to_one_match_masks(
+            pred,
+            target,
             x_cell_size_m=x_cell_size_m,
             y_cell_size_m=y_cell_size_m,
             tolerance_m=self.tolerance_m,
         )
-        self.target_matched += _count_points_with_neighbor_within_radius(
-            query_mask=target,
-            reference_mask=pred,
-            x_cell_size_m=x_cell_size_m,
-            y_cell_size_m=y_cell_size_m,
-            tolerance_m=self.tolerance_m,
-        )
+        matched_count = int(pred_matched.sum())
+        if matched_count != int(target_matched.sum()):
+            raise RuntimeError("One-to-one localization matching produced unequal match counts")
+        self.pred_matched += matched_count
+        self.target_matched += matched_count
 
     def metrics(self) -> Dict[str, float]:
-        precision = self.pred_matched / max(self.pred_total, 1)
-        recall = self.target_matched / max(self.target_total, 1)
-        f1 = (2.0 * precision * recall) / max(precision + recall, EPS)
-        iou = f1 / max(2.0 - f1, EPS)
+        true_positive = self.pred_matched
+        false_positive = self.pred_total - true_positive
+        false_negative = self.target_total - true_positive
+        precision = true_positive / max(true_positive + false_positive, 1)
+        recall = true_positive / max(true_positive + false_negative, 1)
+        f1 = (2 * true_positive) / max(
+            2 * true_positive + false_positive + false_negative,
+            1,
+        )
+        iou = true_positive / max(
+            true_positive + false_positive + false_negative,
+            1,
+        )
         return {
             "localization_iou": float(iou),
             "localization_precision": float(precision),
@@ -141,38 +169,76 @@ class LocalizationToleranceCounts:
         }
 
 
-def _count_points_with_neighbor_within_radius(
-    query_mask: np.ndarray,
-    reference_mask: np.ndarray,
+def one_to_one_match_masks(
+    prediction_mask: np.ndarray,
+    target_mask: np.ndarray,
     x_cell_size_m: float,
     y_cell_size_m: float,
     tolerance_m: float,
-) -> int:
-    """Count query cells that have at least one reference cell within tolerance."""
-    try:
-        from scipy.ndimage import distance_transform_edt
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return maximum-cardinality one-to-one matches within a metric radius."""
+    prediction = np.asarray(prediction_mask, dtype=bool)
+    target = np.asarray(target_mask, dtype=bool)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Prediction and target masks must match, got "
+            f"{prediction.shape} and {target.shape}"
+        )
+    if (
+        not np.isfinite([x_cell_size_m, y_cell_size_m, tolerance_m]).all()
+        or x_cell_size_m <= 0.0
+        or y_cell_size_m <= 0.0
+        or tolerance_m < 0.0
+    ):
+        raise ValueError("Cell sizes must be positive and tolerance must be non-negative")
 
-        distances = distance_transform_edt(~reference_mask.astype(bool), sampling=(x_cell_size_m, y_cell_size_m))
-        return int((distances[query_mask.astype(bool)] <= tolerance_m).sum())
-    except Exception:
-        query_points = np.argwhere(query_mask).astype(np.float64)
-        reference_points = np.argwhere(reference_mask).astype(np.float64)
-        if len(query_points) == 0 or len(reference_points) == 0:
-            return 0
-        query_points[:, 0] *= x_cell_size_m
-        query_points[:, 1] *= y_cell_size_m
-        reference_points[:, 0] *= x_cell_size_m
-        reference_points[:, 1] *= y_cell_size_m
+    prediction_matched = np.zeros_like(prediction, dtype=bool)
+    target_matched = np.zeros_like(target, dtype=bool)
+    prediction_indices = np.argwhere(prediction)
+    target_indices = np.argwhere(target)
+    if len(prediction_indices) == 0 or len(target_indices) == 0:
+        return prediction_matched, target_matched
 
-        matched = 0
-        tolerance_sq = tolerance_m * tolerance_m
-        chunk_size = 4096
-        for start in range(0, len(query_points), chunk_size):
-            chunk = query_points[start : start + chunk_size]
-            diff = chunk[:, None, :] - reference_points[None, :, :]
-            min_sq = np.sum(diff * diff, axis=2).min(axis=1)
-            matched += int((min_sq <= tolerance_sq).sum())
-        return matched
+    scale = np.asarray([x_cell_size_m, y_cell_size_m], dtype=np.float64)
+    prediction_coordinates = prediction_indices.astype(np.float64) * scale
+    target_coordinates = target_indices.astype(np.float64) * scale
+    target_tree = cKDTree(target_coordinates)
+    neighborhoods = target_tree.query_ball_point(
+        prediction_coordinates,
+        r=float(tolerance_m) + 1e-12,
+    )
+    edge_counts = np.fromiter(
+        (len(neighbors) for neighbors in neighborhoods),
+        dtype=np.int64,
+        count=len(neighborhoods),
+    )
+    if not np.any(edge_counts):
+        return prediction_matched, target_matched
+
+    row_indices = np.repeat(np.arange(len(neighborhoods)), edge_counts)
+    column_indices = np.concatenate(
+        [
+            np.asarray(neighbors, dtype=np.int64)
+            for neighbors in neighborhoods
+            if neighbors
+        ]
+    )
+    graph = csr_matrix(
+        (
+            np.ones(len(row_indices), dtype=np.uint8),
+            (row_indices, column_indices),
+        ),
+        shape=(len(prediction_indices), len(target_indices)),
+    )
+    matched_target_by_prediction = maximum_bipartite_matching(
+        graph,
+        perm_type="column",
+    )
+    matched_prediction_rows = np.flatnonzero(matched_target_by_prediction >= 0)
+    matched_target_rows = matched_target_by_prediction[matched_prediction_rows]
+    prediction_matched[tuple(prediction_indices[matched_prediction_rows].T)] = True
+    target_matched[tuple(target_indices[matched_target_rows].T)] = True
+    return prediction_matched, target_matched
 
 
 def _boundary(mask: np.ndarray) -> np.ndarray:
@@ -205,6 +271,16 @@ def chamfer_distance_m(
     """
     pred = pred_mask.astype(bool)
     target = target_mask.astype(bool)
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"Prediction and target masks must match, got {pred.shape} and {target.shape}"
+        )
+    if (
+        not np.isfinite([x_cell_size_m, y_cell_size_m]).all()
+        or x_cell_size_m <= 0.0
+        or y_cell_size_m <= 0.0
+    ):
+        raise ValueError("Chamfer cell sizes must be finite and positive")
     if boundary_only:
         pred = _boundary(pred)
         target = _boundary(target)
@@ -216,29 +292,34 @@ def chamfer_distance_m(
     if pred_empty != target_empty:
         return None, True
 
-    pred_points = np.argwhere(pred).astype(np.float64)
-    target_points = np.argwhere(target).astype(np.float64)
-    pred_points[:, 0] *= x_cell_size_m
-    pred_points[:, 1] *= y_cell_size_m
-    target_points[:, 0] *= x_cell_size_m
-    target_points[:, 1] *= y_cell_size_m
-
-    def mean_min_distance(a: np.ndarray, b: np.ndarray, chunk_size: int = 4096) -> float:
-        distances = []
-        for start in range(0, len(a), chunk_size):
-            chunk = a[start : start + chunk_size]
-            diff = chunk[:, None, :] - b[None, :, :]
-            distances.append(np.sqrt(np.sum(diff * diff, axis=2)).min(axis=1))
-        return float(np.concatenate(distances).mean())
-
-    return 0.5 * (mean_min_distance(pred_points, target_points) + mean_min_distance(target_points, pred_points)), False
+    distance_to_target = distance_transform_edt(
+        ~target, sampling=(x_cell_size_m, y_cell_size_m)
+    )
+    distance_to_prediction = distance_transform_edt(
+        ~pred, sampling=(x_cell_size_m, y_cell_size_m)
+    )
+    return (
+        0.5
+        * (
+            float(distance_to_target[pred].mean())
+            + float(distance_to_prediction[target].mean())
+        ),
+        False,
+    )
 
 
 def infer_cell_sizes(metadata: Dict, default_x: float, default_y: float) -> Tuple[float, float]:
     """Infer metric cell sizes from metadata, falling back to configured defaults."""
     x_cell = metadata.get("x_cell_size_m", default_x)
     y_cell = metadata.get("y_cell_size_m", default_y)
-    return float(x_cell), float(y_cell)
+    x_cell, y_cell = float(x_cell), float(y_cell)
+    if (
+        not np.isfinite([x_cell, y_cell]).all()
+        or x_cell <= 0.0
+        or y_cell <= 0.0
+    ):
+        raise ValueError(f"Metric cell sizes must be positive, got {x_cell}, {y_cell}")
+    return x_cell, y_cell
 
 
 @dataclass
@@ -266,6 +347,29 @@ class HeatmapMetricAccumulator:
     empty_mismatch_count: int = 0
     error_sum: Optional[np.ndarray] = None
     groups: Dict[str, "HeatmapMetricAccumulator"] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not 0.0 < self.threshold < 1.0:
+            raise ValueError(f"threshold must be strictly between 0 and 1, got {self.threshold}")
+        if self.target_threshold is not None and not 0.0 <= self.target_threshold < 1.0:
+            raise ValueError(
+                "target_threshold must lie in [0,1), "
+                f"got {self.target_threshold}"
+            )
+        if self.metric_grid_size is not None and self.metric_grid_size <= 0:
+            raise ValueError("metric_grid_size must be positive or None")
+        if (
+            not np.isfinite([self.x_cell_size_m, self.y_cell_size_m]).all()
+            or self.x_cell_size_m <= 0.0
+            or self.y_cell_size_m <= 0.0
+        ):
+            raise ValueError("Metric cell sizes must be finite and positive")
+        if (
+            not np.isfinite(self.localization_tolerance_m)
+            or self.localization_tolerance_m < 0.0
+        ):
+            raise ValueError("localization_tolerance_m must be finite and non-negative")
+        self.localization.tolerance_m = self.localization_tolerance_m
 
     def _new_group_accumulator(self) -> "HeatmapMetricAccumulator":
         return HeatmapMetricAccumulator(
@@ -296,7 +400,15 @@ class HeatmapMetricAccumulator:
             )
         prob = prob_t.squeeze(1).cpu().numpy()
         target_np = target_t.squeeze(1).cpu().numpy()
-        metadata_list = list(metadata or [{} for _ in range(prob.shape[0])])
+        metadata_list = (
+            [{} for _ in range(prob.shape[0])]
+            if metadata is None
+            else list(metadata)
+        )
+        if len(metadata_list) != prob.shape[0]:
+            raise ValueError(
+                f"Expected {prob.shape[0]} metadata records, got {len(metadata_list)}"
+            )
 
         for index in range(prob.shape[0]):
             pred_values = prob[index]
@@ -321,7 +433,11 @@ class HeatmapMetricAccumulator:
             self.cell_count += int(err.size)
             self.error_sum = err.astype(np.float64) if self.error_sum is None else self.error_sum + err
 
-            meta = metadata_list[index] if index < len(metadata_list) else {}
+            meta = metadata_list[index]
+            if not isinstance(meta, dict):
+                raise TypeError(
+                    f"Metadata record {index} must be a dictionary, got {type(meta).__name__}"
+                )
             x_cell, y_cell = infer_cell_sizes(meta, self.x_cell_size_m, self.y_cell_size_m)
             self.localization.tolerance_m = self.localization_tolerance_m
             self.localization.update(pred_mask, target_mask, x_cell, y_cell)
@@ -366,12 +482,19 @@ class HeatmapMetricAccumulator:
             f"{prefix}balanced_accuracy": metrics["balanced_accuracy"],
             f"{prefix}brier_score": self.brier_sum / max(self.cell_count, 1),
             f"{prefix}pixel_mae": self.mae_sum / max(self.cell_count, 1),
-            f"{prefix}chamfer_distance_m": self.chamfer_sum / max(self.chamfer_count, 1),
-            f"{prefix}empty_mask_mismatch_rate": self.empty_mismatch_count / max(self.sample_count, 1),
             f"{prefix}sample_count": float(self.sample_count),
             f"{prefix}faulty_sample_count": float(self.faulty_sample_count),
-            f"{prefix}chamfer_valid_count": float(self.chamfer_count),
         }
+        if self.compute_chamfer:
+            output.update(
+                {
+                    f"{prefix}chamfer_distance_m": self.chamfer_sum
+                    / max(self.chamfer_count, 1),
+                    f"{prefix}empty_mask_mismatch_rate": self.empty_mismatch_count
+                    / max(self.sample_count, 1),
+                    f"{prefix}chamfer_valid_count": float(self.chamfer_count),
+                }
+            )
         output.update({f"{prefix}{key}": value for key, value in localization_metrics.items()})
         if faulty_metrics:
             output.update(
@@ -407,39 +530,22 @@ def group_keys_from_metadata(metadata: Dict) -> List[str]:
     return keys
 
 
-def threshold_sweep(
-    outputs: List[torch.Tensor],
-    targets: List[torch.Tensor],
-    thresholds: Iterable[float],
-    metric_grid_size: int,
-) -> List[Dict[str, float]]:
-    """Compute thresholded validation metrics for a saved validation epoch."""
-    rows = []
-    output_tensor = torch.cat(outputs, dim=0)
-    target_tensor = torch.cat(targets, dim=0)
-    for threshold in thresholds:
-        acc = HeatmapMetricAccumulator(threshold=threshold, metric_grid_size=metric_grid_size)
-        acc.update(output_tensor, target_tensor, from_logits=False, update_groups=False)
-        row = {"threshold": float(threshold)}
-        row.update(acc.compute())
-        rows.append(row)
-    return rows
-
-
 def save_threshold_sweep(rows: List[Dict[str, float]], output_dir: Path) -> None:
     """Save threshold sweep CSV and JSON summary."""
     if not rows:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "threshold_sweep.csv"
-    with csv_path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    write_csv_rows(
+        output_dir / "threshold_sweep.csv",
+        rows,
+        fieldnames=list(rows[0]),
+    )
     best_f1 = max(rows, key=lambda row: row["f1"])
     best_iou = max(rows, key=lambda row: row["iou"])
-    with (output_dir / "threshold_sweep_summary.json").open("w", encoding="utf-8") as file:
-        json.dump({"best_by_f1": best_f1, "best_by_iou": best_iou}, file, indent=2)
+    atomic_write_json(
+        output_dir / "threshold_sweep_summary.json",
+        {"best_by_f1": best_f1, "best_by_iou": best_iou},
+    )
 
 
 def save_group_metrics(groups: Dict[str, HeatmapMetricAccumulator], output_dir: Path) -> None:
@@ -452,10 +558,11 @@ def save_group_metrics(groups: Dict[str, HeatmapMetricAccumulator], output_dir: 
         row = {"group": key}
         row.update(accumulator.compute())
         rows.append(row)
-    with (output_dir / "group_metrics.csv").open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    write_csv_rows(
+        output_dir / "group_metrics.csv",
+        rows,
+        fieldnames=list(rows[0]),
+    )
 
 
 def save_spatial_error_map(

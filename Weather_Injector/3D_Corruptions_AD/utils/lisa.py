@@ -336,11 +336,25 @@ class LISA:
 
         else:
 
-            pool = mp.pool.ThreadPool(mp.cpu_count())
-
-            pc_new[:, :] = pool.map(functools.partial(multi_lisa, Rr, fixed_seed, r_min, r_max, beam_divergence,
-                                                      min_diameter, refractive_index, range_accuracy, a, signal,
-                                                      density, diameters), point_list)
+            with mp.pool.ThreadPool(mp.cpu_count()) as pool:
+                pc_new[:, :] = pool.map(
+                    functools.partial(
+                        multi_lisa,
+                        Rr,
+                        fixed_seed,
+                        r_min,
+                        r_max,
+                        beam_divergence,
+                        min_diameter,
+                        refractive_index,
+                        range_accuracy,
+                        a,
+                        signal,
+                        density,
+                        diameters,
+                    ),
+                    point_list,
+                )
 
         return pc_new
 

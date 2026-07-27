@@ -4,12 +4,24 @@ from pathlib import Path
 
 import numpy as np
 
-from data_injection_utils import apply_fault, apply_fog_simulator, import_lidar_corruptions
-from old_laser_fault_injector import apply_old_laser_degradation
+from Fault_Localization_Model.data_injection_utils import (
+    apply_fault,
+    apply_fog_simulator,
+    import_lidar_corruptions,
+    validate_fault_spec,
+)
+from Fault_Localization_Model.old_laser_fault_injector import apply_old_laser_degradation
 
 
-EMPTY_FOG_METADATA = {"fog_alpha": "", "fog_soft_response_points": 0, "fog_info_json": ""}
+EMPTY_FOG_METADATA = {
+    "fog_alpha": "",
+    "fog_soft_response_points": 0,
+    "fog_info_json": "",
+    "fov_center_deg": "",
+    "fov_retained_width_deg": "",
+}
 NO_SOURCE_ID = -1
+INJECTION_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -40,6 +52,8 @@ def _row_aligned_result(points, clean_point_ids, fault):
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] < 4:
         raise ValueError(f"Injector {fault!r} returned an invalid point-cloud shape: {points.shape}")
+    if not np.isfinite(points).all():
+        raise ValueError(f"Injector {fault!r} returned non-finite point values")
     if len(points) != len(clean_point_ids):
         raise ValueError(
             f"Injector {fault!r} returned {len(points)} rows for {len(clean_point_ids)} inputs. "
@@ -48,7 +62,18 @@ def _row_aligned_result(points, clean_point_ids, fault):
 
     labels = np.ones(len(points), dtype=np.int8)
     if points.shape[1] > 4:
-        labels = points[:, 4].astype(np.int8)
+        raw_labels = points[:, 4]
+        if not np.isfinite(raw_labels).all():
+            raise ValueError(f"Injector {fault!r} returned non-finite provenance labels")
+        if not np.all(np.equal(raw_labels, np.round(raw_labels))):
+            raise ValueError(f"Injector {fault!r} returned non-integral provenance labels")
+        labels = raw_labels.astype(np.int8)
+        unexpected = set(np.unique(labels)) - {0, 1, 2}
+        if unexpected:
+            raise ValueError(
+                f"Injector {fault!r} returned unsupported provenance labels: "
+                f"{sorted(unexpected)}"
+            )
 
     source_ids = clean_point_ids.copy()
     point_ids = clean_point_ids.copy()
@@ -66,16 +91,32 @@ def _subset_result(points, clean_point_ids, keep_mask):
     keep_mask = np.asarray(keep_mask, dtype=bool)
     if keep_mask.shape != (len(clean_point_ids),):
         raise ValueError(f"Injector keep mask has shape {keep_mask.shape}, expected {(len(clean_point_ids),)}")
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 4:
+        raise ValueError(f"Subset injector returned an invalid point-cloud shape: {points.shape}")
+    if len(points) != int(keep_mask.sum()):
+        raise ValueError(
+            f"Subset injector returned {len(points)} rows but its keep mask selects "
+            f"{int(keep_mask.sum())}"
+        )
+    if not np.isfinite(points).all():
+        raise ValueError("Subset injector returned non-finite point values")
     kept_ids = clean_point_ids[keep_mask]
     labels = np.ones(len(kept_ids), dtype=np.int8)
-    return FaultInjectionResult(np.asarray(points, dtype=np.float32), kept_ids.copy(), kept_ids, labels)
+    return FaultInjectionResult(points, kept_ids.copy(), kept_ids, labels)
 
 
-def _fov_keep_mask(points, severity):
-    angle1 = [-105, -90, -75, -60, -45][int(severity) - 1]
-    angle2 = [105, 90, 75, 60, 45][int(severity) - 1]
+def _fov_keep_mask(points, severity, rng_seed=None):
+    retained_width_deg = [210.0, 180.0, 150.0, 120.0, 90.0][int(severity) - 1]
+    center_deg = (
+        0.0
+        if rng_seed is None
+        else float(np.random.default_rng(rng_seed).uniform(-180.0, 180.0))
+    )
     angles = np.degrees(np.arctan2(points[:, 0], points[:, 1]))
-    return (angles >= angle1) & (angles <= angle2)
+    relative_angles = (angles - center_deg + 180.0) % 360.0 - 180.0
+    keep_mask = np.abs(relative_angles) <= retained_width_deg / 2.0
+    return keep_mask, center_deg, retained_width_deg
 
 
 def parse_fault_plan(items):
@@ -91,7 +132,7 @@ def parse_fault_plan(items):
             severity = int(severity_text)
         except ValueError as exc:
             raise ValueError(f"Severity must be an integer in plan item {item!r}") from exc
-        plan.append((fault, severity))
+        plan.append(validate_fault_spec(fault, severity))
     if not plan:
         raise ValueError("--fault-plan was provided but no valid items were parsed.")
     return plan
@@ -109,11 +150,19 @@ def build_fault_plan(fault_plan_items, faults, severities, default_fault_plan):
         if not selected_severities:
             selected_severities = [default_by_fault.get(fault, 5 if fault in {"rain_sim", "snow_sim", "fog_sim"} else 1)]
         for severity in selected_severities:
-            plan.append((fault, severity))
+            plan.append(validate_fault_spec(fault, severity))
+    if not plan:
+        raise ValueError("At least one fault/severity pair is required.")
     return plan
 
 
 def choose_samples(bins, num_samples, seed, plan, shuffle=True):
+    if int(num_samples) <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+    if not bins:
+        raise ValueError("At least one LiDAR frame is required.")
+    if not plan:
+        raise ValueError("At least one fault-plan item is required.")
     rng = random.Random(seed)
     bin_order = list(bins)
     if shuffle:
@@ -144,27 +193,59 @@ def inject_fault(
     fog_root,
     fog_noise,
     lidar_corruptions,
+    rng_seed=None,
+    weather_threads=1,
 ):
     """Inject one fault while preserving exact clean-to-faulty point provenance."""
+    fault, severity = validate_fault_spec(fault, severity)
     clean_point_ids = _validate_clean_ids(clean_points, clean_point_ids)
+    metadata = {
+        **EMPTY_FOG_METADATA,
+        "injection_version": INJECTION_VERSION,
+        "injection_seed": "" if rng_seed is None else int(rng_seed),
+        "weather_threads": int(weather_threads),
+    }
 
     if fault == "fog_sim":
-        faulty_raw, metadata = apply_fog_simulator(fog_root, clean_points, severity, noise=fog_noise)
+        faulty_raw, fog_metadata = apply_fog_simulator(
+            fog_root,
+            clean_points,
+            severity,
+            noise=fog_noise,
+            rng_seed=rng_seed,
+        )
+        metadata.update(fog_metadata)
         return _row_aligned_result(faulty_raw, clean_point_ids, fault), metadata
 
     if fault in {"old_laser_degradation", "laser_device_failure"}:
         faulty_raw, keep_mask = apply_old_laser_degradation(
             clean_points,
             severity,
-            rng_seed=1000 + int(severity),
+            rng_seed=0 if rng_seed is None else rng_seed,
             return_mask=True,
         )
-        return _subset_result(faulty_raw, clean_point_ids, keep_mask), EMPTY_FOG_METADATA.copy()
+        return _subset_result(faulty_raw, clean_point_ids, keep_mask), metadata
 
     if fault == "fov_filter":
-        keep_mask = _fov_keep_mask(clean_points, severity)
+        keep_mask, center_deg, retained_width_deg = _fov_keep_mask(
+            clean_points, severity, rng_seed=rng_seed
+        )
         faulty_raw = clean_points[keep_mask].copy()
-        return _subset_result(faulty_raw, clean_point_ids, keep_mask), EMPTY_FOG_METADATA.copy()
+        metadata.update(
+            {
+                "fov_center_deg": center_deg,
+                "fov_retained_width_deg": retained_width_deg,
+            }
+        )
+        return _subset_result(faulty_raw, clean_point_ids, keep_mask), metadata
 
-    faulty_raw = apply_fault(lidar_corruptions, injector_root, fault, clean_points, severity)
-    return _row_aligned_result(faulty_raw, clean_point_ids, fault), EMPTY_FOG_METADATA.copy()
+    faulty_raw = apply_fault(
+        lidar_corruptions,
+        injector_root,
+        fault,
+        clean_points,
+        severity,
+        rng_seed=rng_seed,
+        weather_threads=weather_threads,
+    )
+    return _row_aligned_result(faulty_raw, clean_point_ids, fault), metadata

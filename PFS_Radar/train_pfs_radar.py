@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 from pathlib import Path
@@ -10,89 +9,140 @@ import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-PFS_DIR = REPO_ROOT / "PFS"
-FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
-for path in (REPO_ROOT, PFS_DIR, FAULT_MODEL_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel, parameter_breakdown
-from PFS_Radar.radar_data import filter_samples_with_radar_cache, radar_cache_path
-from heatmap_metrics import HeatmapMetricAccumulator
+from PFS_Radar.datasets import RadarReliabilityDataset
+from PFS_Radar.radar_data import filter_samples_with_radar_cache
+from Fault_Localization_Model.heatmap_metrics import HeatmapMetricAccumulator
+from Fault_Localization_Model.io_utils import (
+    atomic_torch_save,
+    atomic_write_json,
+    write_csv_rows,
+)
+from Fault_Localization_Model.sample_utils import (
+    filter_paths_by_fault,
+    require_disjoint_splits,
+)
+from PFS.training_utils import (
+    capture_rng_state,
+    require_checkpoint_args_match,
+    require_checkpoint_semantics,
+    resolve_device,
+    restore_rng_state,
+    seed_everything,
+)
+
+TRAINING_SEMANTICS_VERSION = 2
 
 
-class RadarReliabilityDataset(Dataset):
-    def __init__(self, paths, radar_root: Path, resize_hw=(320, 320)):
-        self.paths = list(paths)
-        self.radar_root = Path(radar_root)
-        self.resize_hw = resize_hw
-        if not self.paths:
-            raise FileNotFoundError("No reliability-map samples were provided")
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, index):
-        path = self.paths[index]
-        with np.load(path, allow_pickle=False) as data:
-            faulty = data["faulty_rgb"].astype(np.float32) / 255.0
-            clean = data["clean_rgb"].astype(np.float32) / 255.0
-            target = data["fault_heatmap"].astype(np.float32)
-            metadata = json.loads(str(data["metadata_json"]))
-        cache_path = radar_cache_path(self.radar_root, metadata)
-        if not cache_path.exists():
-            raise FileNotFoundError(
-                f"Radar cache missing for {path}: {cache_path}. Run prepare_radar_cache.py first."
-            )
-        with np.load(cache_path, allow_pickle=False) as radar_data:
-            radar = radar_data["radar_bev"].astype(np.float32)
-
-        lidar_tensor = torch.from_numpy(faulty.transpose(2, 0, 1))
-        clean_tensor = torch.from_numpy(clean.transpose(2, 0, 1))
-        radar_tensor = torch.from_numpy(radar)
-        target_tensor = torch.from_numpy(target).unsqueeze(0)
-        if self.resize_hw:
-            lidar_tensor = F.interpolate(
-                lidar_tensor.unsqueeze(0), size=self.resize_hw, mode="bilinear", align_corners=False
-            ).squeeze(0)
-            clean_tensor = F.interpolate(
-                clean_tensor.unsqueeze(0), size=self.resize_hw, mode="bilinear", align_corners=False
-            ).squeeze(0)
-            radar_tensor = F.interpolate(
-                radar_tensor.unsqueeze(0), size=self.resize_hw, mode="bilinear", align_corners=False
-            ).squeeze(0)
-            target_tensor = F.interpolate(
-                target_tensor.unsqueeze(0), size=self.resize_hw, mode="nearest"
-            ).squeeze(0)
-        return lidar_tensor, radar_tensor, clean_tensor, target_tensor, json.dumps(metadata)
-
-
-def load_fault_name(path: Path) -> str:
-    with np.load(path, allow_pickle=False) as data:
-        metadata = json.loads(str(data["metadata_json"]))
-    return str(metadata.get("fault", "unknown"))
-
-
-def filter_paths_by_fault(paths, include_faults=None, exclude_faults=None):
-    include = set(include_faults or [])
-    exclude = set(exclude_faults or [])
-    selected = []
-    counts = {}
-    for path in paths:
-        fault = load_fault_name(path)
-        counts[fault] = counts.get(fault, 0) + 1
-        if include and fault not in include:
-            continue
-        if fault in exclude:
-            continue
-        selected.append(path)
-    return selected, counts
+def validate_training_args(parser, args):
+    finite_values = {
+        "--dropout": args.dropout,
+        "--learning-rate": args.learning_rate,
+        "--min-learning-rate": args.min_learning_rate,
+        "--weight-decay": args.weight_decay,
+        "--stability-weight": args.stability_weight,
+        "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--grad-clip": args.grad_clip,
+        "--metric-threshold": args.metric_threshold,
+        "--localization-tolerance-m": args.localization_tolerance_m,
+        "--target-fault-threshold": args.target_fault_threshold,
+        "--localization-loss-weight": args.localization_loss_weight,
+        "--false-positive-weight": args.false_positive_weight,
+        "--min-delta": args.min_delta,
+        "--bev-x-span-m": args.bev_x_span_m,
+        "--bev-y-span-m": args.bev_y_span_m,
+    }
+    optional_finite_values = {
+        "--max-radar-delta-ms": args.max_radar_delta_ms,
+        "--radar-max-abs-velocity": args.radar_max_abs_velocity,
+    }
+    for name, value in finite_values.items():
+        if not math.isfinite(float(value)):
+            parser.error(f"{name} must be finite")
+    for name, value in optional_finite_values.items():
+        if value is not None and not math.isfinite(float(value)):
+            parser.error(f"{name} must be finite when provided")
+    positive_integers = {
+        "--epochs": args.epochs,
+        "--batch-size": args.batch_size,
+        "--base-channels": args.base_channels,
+        "--resize-height": args.resize_height,
+        "--resize-width": args.resize_width,
+        "--grid-size": args.grid_size,
+        "--metrics-every": args.metrics_every,
+    }
+    for name, value in positive_integers.items():
+        if value < 1:
+            parser.error(f"{name} must be at least 1")
+    if args.grid_size > min(args.resize_height, args.resize_width):
+        parser.error(
+            "--grid-size cannot exceed the smaller resized input dimension"
+        )
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
+    if args.metric_grid_size is not None and args.metric_grid_size < 1:
+        parser.error("--metric-grid-size must be positive or omitted")
+    if (
+        args.metric_grid_size is not None
+        and args.metric_grid_size > min(args.resize_height, args.resize_width)
+    ):
+        parser.error(
+            "--metric-grid-size cannot exceed the smaller resized input dimension"
+        )
+    if args.radar_frame_count is not None and args.radar_frame_count < 1:
+        parser.error("--radar-frame-count must be positive or omitted")
+    if not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout must lie in [0,1)")
+    if args.learning_rate <= 0.0 or args.min_learning_rate <= 0.0:
+        parser.error("Learning rates must be positive")
+    if args.min_learning_rate > args.learning_rate:
+        parser.error("--min-learning-rate cannot exceed --learning-rate")
+    if not 0 <= args.warmup_epochs <= args.epochs:
+        parser.error("--warmup-epochs must lie between 0 and --epochs")
+    non_negative = {
+        "--weight-decay": args.weight_decay,
+        "--stability-weight": args.stability_weight,
+        "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--grad-clip": args.grad_clip,
+        "--early-stop-patience": args.early_stop_patience,
+        "--localization-tolerance-m": args.localization_tolerance_m,
+        "--localization-loss-weight": args.localization_loss_weight,
+    }
+    for name, value in non_negative.items():
+        if value < 0.0:
+            parser.error(f"{name} must be non-negative")
+    if not 0.0 < args.metric_threshold < 1.0:
+        parser.error("--metric-threshold must lie strictly between 0 and 1")
+    if not 0.0 <= args.target_fault_threshold < 1.0:
+        parser.error("--target-fault-threshold must lie in [0,1)")
+    if not 0.0 <= args.false_positive_weight <= 1.0:
+        parser.error("--false-positive-weight must lie in [0,1]")
+    if args.min_delta < 0.0:
+        parser.error("--min-delta must be non-negative")
+    if args.bev_x_span_m <= 0.0 or args.bev_y_span_m <= 0.0:
+        parser.error("BEV spans must be positive")
+    if args.max_radar_delta_ms is not None and args.max_radar_delta_ms < 0.0:
+        parser.error("--max-radar-delta-ms must be non-negative")
+    if (
+        args.radar_max_abs_velocity is not None
+        and args.radar_max_abs_velocity <= 0.0
+    ):
+        parser.error("--radar-max-abs-velocity must be positive")
+    if args.require_full_radar_stack and args.radar_frame_count is None:
+        parser.error(
+            "--require-full-radar-stack requires --radar-frame-count"
+        )
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
 
 
 def make_scheduler(optimizer, epochs, warmup_epochs, base_lr, min_lr):
@@ -142,41 +192,27 @@ def euclidean_dilate(values, tolerance_m, x_cell_size_m, y_cell_size_m):
 def localization_surrogate_loss(
     logits,
     target,
-    radius_cells=1,
     false_positive_weight=0.70,
     target_fault_threshold=0.0,
-    tolerance_m=None,
+    tolerance_m=0.20,
     x_cell_size_m=0.20,
     y_cell_size_m=0.20,
 ):
     """Approximate tolerance-aware localization precision and recall."""
     probability = torch.sigmoid(logits)
     target_mask = (target > target_fault_threshold).to(probability.dtype)
-    if tolerance_m is not None:
-        target_neighborhood = euclidean_dilate(
-            target_mask,
-            tolerance_m,
-            x_cell_size_m,
-            y_cell_size_m,
-        )
-        prediction_neighborhood = euclidean_dilate(
-            probability,
-            tolerance_m,
-            x_cell_size_m,
-            y_cell_size_m,
-        )
-    else:
-        kernel_size = 2 * max(int(radius_cells), 0) + 1
-        if kernel_size <= 1:
-            target_neighborhood = target_mask
-            prediction_neighborhood = probability
-        else:
-            target_neighborhood = F.max_pool2d(
-                target_mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
-            )
-            prediction_neighborhood = F.max_pool2d(
-                probability, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
-            )
+    target_neighborhood = euclidean_dilate(
+        target_mask,
+        tolerance_m,
+        x_cell_size_m,
+        y_cell_size_m,
+    )
+    prediction_neighborhood = euclidean_dilate(
+        probability,
+        tolerance_m,
+        x_cell_size_m,
+        y_cell_size_m,
+    )
 
     dimensions = tuple(range(1, probability.ndim))
     matched_prediction = (probability * target_neighborhood).sum(dim=dimensions)
@@ -224,9 +260,8 @@ def compute_loss(
     pfs_weight,
     localization_weight,
     false_positive_weight,
-    localization_radius_cells,
     target_fault_threshold,
-    localization_tolerance_m=None,
+    localization_tolerance_m=0.20,
     x_cell_size_m=0.20,
     y_cell_size_m=0.20,
 ):
@@ -241,7 +276,6 @@ def compute_loss(
     localization_loss = localization_surrogate_loss(
         logits,
         target,
-        radius_cells=localization_radius_cells,
         false_positive_weight=false_positive_weight,
         target_fault_threshold=target_fault_threshold,
         tolerance_m=localization_tolerance_m,
@@ -306,16 +340,26 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                     args.pfs_reliability_weight,
                     args.localization_loss_weight,
                     args.false_positive_weight,
-                    args.localization_radius_cells,
                     args.target_fault_threshold,
                     localization_tolerance_m=args.localization_tolerance_m,
                     x_cell_size_m=args.bev_x_span_m / target.shape[-2],
                     y_cell_size_m=args.bev_y_span_m / target.shape[-1],
                 )
+            loss_values = torch.stack([value.detach().float() for value in losses])
+            if not torch.isfinite(loss_values).all():
+                raise FloatingPointError(
+                    f"Non-finite {description} loss detected: "
+                    f"{loss_values.cpu().tolist()}"
+                )
             if train:
                 scaler.scale(losses[0]).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if args.grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        args.grad_clip,
+                        error_if_nonfinite=True,
+                    )
                 scaler.step(optimizer)
                 scaler.update()
         if metric_accumulator is not None:
@@ -344,7 +388,7 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                 update_groups=False,
             )
         batch_size = faulty.shape[0]
-        totals += np.asarray([float(loss.detach()) for loss in losses]) * batch_size
+        totals += loss_values.cpu().numpy().astype(np.float64) * batch_size
         samples += batch_size
     metrics = metric_accumulator.compute() if metric_accumulator is not None else None
     return totals / max(samples, 1), metrics
@@ -364,8 +408,9 @@ def save_checkpoint(
     best_localization_iou=float("-inf"),
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    atomic_torch_save(
         {
+            "training_semantics_version": TRAINING_SEMANTICS_VERSION,
             "epoch": epoch,
             "best_val": best_val,
             "best_localization_iou": best_localization_iou,
@@ -376,6 +421,7 @@ def save_checkpoint(
             "scaler_state_dict": scaler.state_dict(),
             "args": vars(args),
             "history": history,
+            "rng_state": capture_rng_state(),
         },
         path,
     )
@@ -409,6 +455,12 @@ def main():
     parser.add_argument("--resize-width", type=int, default=320)
     parser.add_argument("--grid-size", type=int, default=320)
     parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation-loss decrease required to reset early stopping.",
+    )
     parser.add_argument("--metric-threshold", type=float, default=0.15)
     parser.add_argument("--metric-grid-size", type=int, default=None)
     parser.add_argument(
@@ -421,9 +473,31 @@ def main():
     parser.add_argument("--target-fault-threshold", type=float, default=0.0)
     parser.add_argument("--localization-loss-weight", type=float, default=0.25)
     parser.add_argument("--false-positive-weight", type=float, default=0.70)
-    parser.add_argument("--localization-radius-cells", type=int, default=1)
     parser.add_argument("--bev-x-span-m", type=float, default=64.0)
     parser.add_argument("--bev-y-span-m", type=float, default=64.0)
+    parser.add_argument(
+        "--radar-frame-count",
+        type=int,
+        default=None,
+        help="Require cache entries built from this many causal radar frames.",
+    )
+    parser.add_argument(
+        "--require-full-radar-stack",
+        action="store_true",
+        help="Reject cache entries with fewer frames than --radar-frame-count.",
+    )
+    parser.add_argument(
+        "--max-radar-delta-ms",
+        type=float,
+        default=None,
+        help="Reject cache entries whose nearest radar frame exceeds this offset.",
+    )
+    parser.add_argument(
+        "--radar-max-abs-velocity",
+        type=float,
+        default=None,
+        help="Require this radar velocity normalization limit in m/s.",
+    )
     parser.add_argument("--include-faults", nargs="*", default=None)
     parser.add_argument("--exclude-faults", nargs="*", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -431,12 +505,10 @@ def main():
     args = parser.parse_args()
     if args.resume and args.init_checkpoint:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
-    if args.metrics_every < 1:
-        parser.error("--metrics-every must be at least 1")
+    validate_training_args(parser, args)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device(args.device)
+    seed_everything(args.seed)
+    device = resolve_device(args.device)
     train_paths = sorted(Path(args.train_root).glob("*.npz"))
     val_paths = sorted(Path(args.val_root).glob("*.npz"))
     if not train_paths or not val_paths:
@@ -445,11 +517,13 @@ def main():
         train_paths,
         include_faults=args.include_faults,
         exclude_faults=args.exclude_faults,
+        strict_fault_names=True,
     )
     val_paths, val_fault_counts = filter_paths_by_fault(
         val_paths,
         include_faults=args.include_faults,
         exclude_faults=args.exclude_faults,
+        strict_fault_names=True,
     )
     print(f"Available train fault counts: {json.dumps(train_fault_counts, sort_keys=True)}")
     print(f"Available validation fault counts: {json.dumps(val_fault_counts, sort_keys=True)}")
@@ -459,10 +533,23 @@ def main():
         print(f"Excluding faults: {', '.join(args.exclude_faults)}")
     if not train_paths or not val_paths:
         raise FileNotFoundError("Fault filtering removed every train or validation sample")
+    require_disjoint_splits({"train": train_paths, "validation": val_paths})
+    cache_requirements = {
+        "max_delta_ms": args.max_radar_delta_ms,
+        "max_abs_velocity": args.radar_max_abs_velocity,
+        "radar_frame_count": args.radar_frame_count,
+        "require_full_stack": args.require_full_radar_stack,
+    }
     train_paths, missing_train = filter_samples_with_radar_cache(
-        train_paths, Path(args.radar_root)
+        train_paths,
+        Path(args.radar_root),
+        **cache_requirements,
     )
-    val_paths, missing_val = filter_samples_with_radar_cache(val_paths, Path(args.radar_root))
+    val_paths, missing_val = filter_samples_with_radar_cache(
+        val_paths,
+        Path(args.radar_root),
+        **cache_requirements,
+    )
     if missing_train or missing_val:
         print(
             f"Skipping samples without aligned radar cache: "
@@ -489,6 +576,14 @@ def main():
             map_location=device,
             weights_only=False,
         )
+        source_args = initialization.get("args", {})
+        for key in ("base_channels",):
+            source_value = source_args.get(key)
+            if source_value is not None and source_value != getattr(args, key):
+                raise ValueError(
+                    f"Initialization checkpoint {key}={source_value} does not "
+                    f"match requested {key}={getattr(args, key)}"
+                )
         model.load_state_dict(initialization["model_state_dict"])
         print(
             f"Initialized model weights from {args.init_checkpoint} "
@@ -513,6 +608,56 @@ def main():
         # This is a trusted checkpoint produced by this training script and
         # includes optimizer, scheduler, scaler, and history objects.
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        require_checkpoint_semantics(
+            checkpoint,
+            TRAINING_SEMANTICS_VERSION,
+            "PFS-Radar",
+        )
+        saved_args = checkpoint.get("args", {})
+        require_checkpoint_args_match(
+            saved_args,
+            args,
+            (
+                "base_channels",
+                "dropout",
+                "learning_rate",
+                "min_learning_rate",
+                "warmup_epochs",
+                "weight_decay",
+                "stability_weight",
+                "pfs_reliability_weight",
+                "localization_loss_weight",
+                "false_positive_weight",
+                "min_delta",
+                "grid_size",
+                "resize_height",
+                "resize_width",
+                "metric_grid_size",
+                "metric_threshold",
+                "localization_tolerance_m",
+                "target_fault_threshold",
+                "bev_x_span_m",
+                "bev_y_span_m",
+                "include_faults",
+                "exclude_faults",
+                "radar_frame_count",
+                "require_full_radar_stack",
+                "max_radar_delta_ms",
+                "radar_max_abs_velocity",
+            ),
+        )
+        required_state = {
+            "model_state_dict",
+            "optimizer_state_dict",
+            "scheduler_state_dict",
+            "epoch",
+        }
+        missing_state = required_state - set(checkpoint)
+        if missing_state:
+            raise ValueError(
+                f"Checkpoint {args.resume} cannot be resumed because it lacks: "
+                + ", ".join(sorted(missing_state))
+            )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -525,10 +670,12 @@ def main():
         )
         early_stop_counter = int(checkpoint.get("early_stop_counter", 0))
         history = list(checkpoint.get("history", []))
+        restore_rng_state(checkpoint.get("rng_state"))
+        print(f"Resumed {args.resume} at epoch {start_epoch}", flush=True)
 
     print(f"Device: {device} | train: {len(train_dataset)} | validation: {len(val_dataset)}")
     print("Parameters:", json.dumps(parameter_breakdown(model), indent=2))
-    (output_root / "training_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+    atomic_write_json(output_root / "training_config.json", vars(args))
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_values, _ = run_epoch(model, train_loader, device, optimizer, scaler, args, train=True)
@@ -616,7 +763,7 @@ def main():
         )
         if localization_improved:
             best_localization_iou = row["val_localization_iou"]
-        improved = row["val_loss"] < best_val
+        improved = row["val_loss"] < best_val - args.min_delta
         if improved:
             best_val = row["val_loss"]
             early_stop_counter = 0
@@ -662,11 +809,11 @@ def main():
             history,
             best_localization_iou=best_localization_iou,
         )
-        with (output_root / "history.csv").open("w", newline="", encoding="utf-8") as file:
-            fieldnames = list(dict.fromkeys(key for item in history for key in item))
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(history)
+        write_csv_rows(
+            output_root / "history.csv",
+            history,
+            fieldnames=list(dict.fromkeys(key for item in history for key in item)),
+        )
         if args.early_stop_patience > 0 and early_stop_counter >= args.early_stop_patience:
             print(
                 f"Early stopping after {early_stop_counter} epochs without validation-loss improvement. "

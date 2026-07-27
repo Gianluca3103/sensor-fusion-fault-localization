@@ -1,17 +1,22 @@
 from pathlib import Path
-import sys
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 
-CURRENT_DIR = Path(__file__).resolve().parent
-FAULT_MODEL_DIR = CURRENT_DIR.parent / "Fault_Localization_Model"
-if str(FAULT_MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(FAULT_MODEL_DIR))
+from Fault_Localization_Model.model_blocks import ConvBlock, frozen_reference_forward
 
-from model_v5_like import ConvBlock
+
+def match_spatial(x, target):
+    if x.shape[-2:] != target.shape[-2:]:
+        return F.interpolate(
+            x,
+            size=target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    return x
 
 
 class BEVEncoder(nn.Module):
@@ -228,23 +233,18 @@ class PFSReliabilityModel(nn.Module):
         self.dec1 = ConvBlock(base_channels * 2, base_channels)
         self.head = nn.Conv2d(base_channels, 1, kernel_size=1)
 
-    def _match(self, x, target):
-        if x.shape[-2:] != target.shape[-2:]:
-            x = F.interpolate(x, size=target.shape[-2:], mode="bilinear", align_corners=False)
-        return x
-
     def decode(self, stabilized, skips):
         e1, e2, e3, e4 = skips
         stabilized = self.dropout(stabilized)
-        d4 = self._match(self.up4(stabilized), e4)
+        d4 = match_spatial(self.up4(stabilized), e4)
         d4 = self.dec4(torch.cat([d4, e4], dim=1))
         d4 = self.dropout(d4)
-        d3 = self._match(self.up3(d4), e3)
+        d3 = match_spatial(self.up3(d4), e3)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
         d3 = self.dropout(d3)
-        d2 = self._match(self.up2(d3), e2)
+        d2 = match_spatial(self.up2(d3), e2)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self._match(self.up1(d2), e1)
+        d1 = match_spatial(self.up1(d2), e1)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         return self.head(d1)
 
@@ -258,8 +258,7 @@ class PFSReliabilityModel(nn.Module):
 
         clean_bottleneck = None
         if clean_bev is not None:
-            with torch.no_grad():
-                clean_bottleneck = self.encoder(clean_bev)[-1]
+            clean_bottleneck = frozen_reference_forward(self.encoder, clean_bev)[-1]
 
         return {
             "logits": logits,
@@ -275,26 +274,6 @@ class LidarOnlyReliabilityModel(PFSReliabilityModel):
     def __init__(self, in_channels=3, base_channels=16, dropout=0.0):
         super().__init__(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
         self.pfs = LidarFaultStabilizer(base_channels * 16)
-
-    def forward(self, faulty_bev, clean_bev=None, return_features=False):
-        e1, e2, e3, e4, bottleneck = self.encoder(faulty_bev)
-        stabilized, pfs_reliability = self.pfs(bottleneck)
-        logits = self.decode(stabilized, (e1, e2, e3, e4))
-
-        if not return_features:
-            return logits
-
-        clean_bottleneck = None
-        if clean_bev is not None:
-            with torch.no_grad():
-                clean_bottleneck = self.encoder(clean_bev)[-1]
-
-        return {
-            "logits": logits,
-            "stabilized_features": stabilized,
-            "clean_features": clean_bottleneck,
-            "pfs_reliability": pfs_reliability,
-        }
 
 
 class PFSBlock12ReliabilityModel(PFSReliabilityModel):
@@ -342,3 +321,50 @@ def build_reliability_model(model_variant="pfs", **kwargs):
         choices = ", ".join(sorted(MODEL_VARIANTS))
         raise ValueError(f"Unknown model variant {model_variant!r}; choose one of: {choices}") from exc
     return model_class(**kwargs)
+
+
+def load_model_checkpoint(
+    path,
+    device,
+    *,
+    base_channels=None,
+    dropout=None,
+    model_variant=None,
+):
+    """Load a trusted PFS checkpoint using its recorded architecture settings."""
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_args = checkpoint.get("args", {})
+    resolved_base_channels = (
+        int(base_channels)
+        if base_channels is not None
+        else int(checkpoint_args.get("base_channels", 16))
+    )
+    resolved_dropout = (
+        float(dropout)
+        if dropout is not None
+        else float(checkpoint_args.get("dropout", 0.0))
+    )
+    resolved_variant = model_variant or checkpoint_args.get("model_variant", "pfs")
+    model = build_reliability_model(
+        resolved_variant,
+        in_channels=3,
+        base_channels=resolved_base_channels,
+        dropout=resolved_dropout,
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    model_info = {
+        "base_channels": resolved_base_channels,
+        "dropout": resolved_dropout,
+        "model_variant": resolved_variant,
+        "checkpoint_epoch": checkpoint.get("epoch"),
+        "checkpoint_best_metric": checkpoint.get(
+            "best_checkpoint_metric",
+            "unknown",
+        ),
+        "checkpoint_best_score": checkpoint.get("best_checkpoint_score"),
+    }
+    return model, checkpoint, model_info

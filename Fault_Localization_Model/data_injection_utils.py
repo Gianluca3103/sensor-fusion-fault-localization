@@ -1,8 +1,10 @@
+from contextlib import contextmanager
+from functools import lru_cache
+import hashlib
 from pathlib import Path
-from typing import Dict
-import copy
 import importlib.util
 import json
+import random
 import sys
 import types
 
@@ -16,11 +18,60 @@ DEFAULT_FOG_ROOT = REPO_ROOT / "Weather_Injector" / "LiDAR_fog_sim"
 
 AEVA_RECORD_BYTES = 29
 FOG_ALPHA_BY_SEVERITY = [0.005, 0.01, 0.02, 0.03, 0.06]
+ROW_ALIGNED_CORRUPTIONS = {
+    "scene_glare_noise",
+    "lidar_crosstalk_noise",
+    "gaussian_noise",
+    "uniform_noise",
+    "impulse_noise",
+}
+SPECIAL_CORRUPTIONS = {
+    "fog_sim",
+    "rain_sim",
+    "snow_sim",
+    "fov_filter",
+    "old_laser_degradation",
+    "laser_device_failure",
+}
+SUPPORTED_CORRUPTIONS = ROW_ALIGNED_CORRUPTIONS | SPECIAL_CORRUPTIONS
+
+
+def validate_fault_spec(fault: str, severity: int) -> tuple[str, int]:
+    fault = str(fault).strip()
+    if fault not in SUPPORTED_CORRUPTIONS:
+        raise ValueError(
+            f"Unsupported provenance-aware fault {fault!r}. Supported faults: "
+            + ", ".join(sorted(SUPPORTED_CORRUPTIONS))
+        )
+    severity = int(severity)
+    minimum = 0 if fault in {"old_laser_degradation", "laser_device_failure"} else 1
+    if not minimum <= severity <= 5:
+        raise ValueError(
+            f"Severity for {fault!r} must be between {minimum} and 5, got {severity}"
+        )
+    return fault, severity
+
+
+@contextmanager
+def temporary_random_seed(seed):
+    """Seed legacy NumPy/Python RNG users without leaking state to later samples."""
+    if seed is None:
+        yield
+        return
+    numpy_state = np.random.get_state()
+    python_state = random.getstate()
+    np.random.seed(int(seed) % (2**32))
+    random.seed(int(seed))
+    try:
+        yield
+    finally:
+        np.random.set_state(numpy_state)
+        random.setstate(python_state)
 
 
 def patch_compatibility_modules() -> None:
     for name in ["open3d", "h5py", "distortion"]:
-        if name not in sys.modules:
+        if name not in sys.modules and importlib.util.find_spec(name) is None:
             sys.modules[name] = types.ModuleType(name)
 
     try:
@@ -56,9 +107,9 @@ def patch_compatibility_modules() -> None:
 
 
 def import_lidar_corruptions(injector_root: Path):
-    patch_compatibility_modules()
     if str(injector_root) not in sys.path:
         sys.path.insert(0, str(injector_root))
+    patch_compatibility_modules()
 
     module_path = injector_root / "LiDAR_corruptions.py"
     if not module_path.exists():
@@ -68,7 +119,12 @@ def import_lidar_corruptions(injector_root: Path):
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load module spec for {module_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -76,41 +132,104 @@ def safe_pointcloud(points: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] < 4:
         raise ValueError(f"Expected a point cloud with at least 4 columns, got {points.shape}")
-    finite = np.isfinite(points[:, :4]).all(axis=1)
+    finite = np.isfinite(points).all(axis=1)
     return points[finite]
 
 
-def apply_rain_wrapper(injector_root: Path, points: np.ndarray, severity: int) -> np.ndarray:
-    patch_compatibility_modules()
+@lru_cache(maxsize=8)
+def _load_lisa_model(module_path_text: str, mode: str):
+    module_path = Path(module_path_text)
+    digest = hashlib.sha256(str(module_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    module_name = f"weather_lisa_{digest}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load LISA module spec from {module_path}")
+    lisa = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = lisa
+    try:
+        spec.loader.exec_module(lisa)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    model = (
+        lisa.LISA(mode="gunn", show_progressbar=False)
+        if mode == "snow"
+        else lisa.LISA(show_progressbar=False)
+    )
+    return lisa, model
+
+
+def _apply_lisa_weather(
+    injector_root: Path,
+    points: np.ndarray,
+    severity: int,
+    mode: str,
+    rng_seed=None,
+    weather_threads: int = 1,
+) -> np.ndarray:
+    validate_fault_spec(f"{mode}_sim", severity)
+    if int(weather_threads) < 1:
+        raise ValueError("weather_threads must be at least 1")
     if str(injector_root) not in sys.path:
         sys.path.insert(0, str(injector_root))
-    from utils import lisa
-
-    rain_model = lisa.LISA(show_progressbar=False)
-    rain_rate = [0.20, 0.73, 1.5625, 3.125, 7.29][severity - 1]
-    return rain_model.augment(points, rain_rate)
-
-
-def apply_snow_wrapper(injector_root: Path, points: np.ndarray, severity: int) -> np.ndarray:
     patch_compatibility_modules()
-    if str(injector_root) not in sys.path:
-        sys.path.insert(0, str(injector_root))
-    from utils import lisa
+    module_path = (injector_root / "utils" / "lisa.py").resolve()
+    if not module_path.exists():
+        raise FileNotFoundError(f"Could not find LISA weather model at {module_path}")
+    lisa, model = _load_lisa_model(
+        str(module_path),
+        mode,
+    )
+    rate = [0.20, 0.73, 1.5625, 3.125, 7.29][severity - 1]
+    original_cpu_count = lisa.mp.cpu_count
+    lisa.mp.cpu_count = lambda: int(weather_threads)
+    try:
+        with temporary_random_seed(rng_seed):
+            return model.augment(points, rate)
+    finally:
+        lisa.mp.cpu_count = original_cpu_count
 
-    snow_model = lisa.LISA(mode="gunn", show_progressbar=False)
-    snowfall_rate = [0.20, 0.73, 1.5625, 3.125, 7.29][severity - 1]
-    return snow_model.augment(points, snowfall_rate)
 
-
-def apply_fault(module, injector_root: Path, fault: str, points: np.ndarray, severity: int) -> np.ndarray:
+def apply_fault(
+    module,
+    injector_root: Path,
+    fault: str,
+    points: np.ndarray,
+    severity: int,
+    rng_seed=None,
+    weather_threads: int = 1,
+) -> np.ndarray:
+    fault, severity = validate_fault_spec(fault, severity)
     if fault == "rain_sim":
-        return safe_pointcloud(apply_rain_wrapper(injector_root, points.copy(), severity))
+        return safe_pointcloud(
+            _apply_lisa_weather(
+                injector_root,
+                points.copy(),
+                severity,
+                "rain",
+                rng_seed=rng_seed,
+                weather_threads=weather_threads,
+            )
+        )
     if fault == "snow_sim":
-        return safe_pointcloud(apply_snow_wrapper(injector_root, points.copy(), severity))
+        return safe_pointcloud(
+            _apply_lisa_weather(
+                injector_root,
+                points.copy(),
+                severity,
+                "snow",
+                rng_seed=rng_seed,
+                weather_threads=weather_threads,
+            )
+        )
+    if fault not in ROW_ALIGNED_CORRUPTIONS:
+        raise ValueError(f"Fault {fault!r} requires a dedicated provenance wrapper")
 
-    func = getattr(module, fault)
-    np.random.seed(1000 + severity)
-    return safe_pointcloud(func(points.copy(), severity))
+    func = getattr(module, fault, None)
+    if not callable(func):
+        raise AttributeError(f"The 3D corruptions module does not define {fault!r}")
+    with temporary_random_seed(rng_seed):
+        return safe_pointcloud(func(points.copy(), severity))
 
 
 def filter_pointcloud(
@@ -120,6 +239,8 @@ def filter_pointcloud(
     return_mask: bool = False,
 ):
     """Remove invalid/out-of-range returns and optionally expose the row mask."""
+    if not np.isfinite([min_range, max_range]).all() or max_range <= min_range:
+        raise ValueError("Point range must be finite and max_range must exceed min_range")
     original_length = len(points)
     points = safe_pointcloud(points)
     if len(points) != original_length and return_mask:
@@ -134,21 +255,6 @@ def filter_pointcloud(
     valid &= ~np.all(np.isclose(xyz, 0.0), axis=1)
     filtered = points[valid]
     return (filtered, valid) if return_mask else filtered
-
-
-def lisa_label_counts(points: np.ndarray) -> Dict[str, int]:
-    counts = {
-        "lisa_label0_lost_points": 0,
-        "lisa_label1_non_scattered_points": 0,
-        "lisa_label2_scattered_points": 0,
-    }
-    if points.shape[1] < 5:
-        return counts
-    labels = points[:, 4].astype(np.int32)
-    counts["lisa_label0_lost_points"] = int(np.sum(labels == 0))
-    counts["lisa_label1_non_scattered_points"] = int(np.sum(labels == 1))
-    counts["lisa_label2_scattered_points"] = int(np.sum(labels == 2))
-    return counts
 
 
 def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
@@ -188,6 +294,11 @@ def list_aeva_bins(aeva_dir: Path):
 
 def read_hercules_aeva_bin(path: Path) -> np.ndarray:
     raw = path.read_bytes()
+    if len(raw) % AEVA_RECORD_BYTES:
+        raise ValueError(
+            f"Malformed Aeva file {path}: {len(raw)} bytes is not divisible by "
+            f"the {AEVA_RECORD_BYTES}-byte record size"
+        )
     n_points = len(raw) // AEVA_RECORD_BYTES
     if n_points == 0:
         return np.empty((0, 4), dtype=np.float32)
@@ -205,7 +316,16 @@ def read_hercules_aeva_bin(path: Path) -> np.ndarray:
     return xyzi[plausible].astype(np.float32, copy=False)
 
 
-def apply_fog_simulator(fog_root: Path, points: np.ndarray, severity: int, noise: int):
+def apply_fog_simulator(
+    fog_root: Path,
+    points: np.ndarray,
+    severity: int,
+    noise: int,
+    rng_seed=None,
+):
+    validate_fault_spec("fog_sim", severity)
+    if int(noise) < 0:
+        raise ValueError(f"Fog noise must be non-negative, got {noise}")
     if str(fog_root) not in sys.path:
         sys.path.insert(0, str(fog_root))
 
@@ -213,16 +333,17 @@ def apply_fog_simulator(fog_root: Path, points: np.ndarray, severity: int, noise
 
     alpha = FOG_ALPHA_BY_SEVERITY[severity - 1]
     parameter_set = ParameterSet(alpha=alpha, gamma=0.000001)
-    original_intensity = copy.deepcopy(points[:, 3])
-    hard_pc = P_R_fog_hard(parameter_set, copy.deepcopy(points))
-    augmented_pc, simulated_fog_pc, info = P_R_fog_soft(
-        parameter_set,
-        copy.deepcopy(hard_pc),
-        original_intensity,
-        noise=noise,
-        gain=False,
-        noise_variant="v1",
-    )
+    original_intensity = points[:, 3].copy()
+    with temporary_random_seed(rng_seed):
+        hard_pc = P_R_fog_hard(parameter_set, points.copy())
+        augmented_pc, _, info = P_R_fog_soft(
+            parameter_set,
+            hard_pc.copy(),
+            original_intensity,
+            noise=noise,
+            gain=False,
+            noise_variant="v1",
+        )
     soft_mask = np.linalg.norm(augmented_pc[:, :3] - hard_pc[:, :3], axis=1) > 1e-4
     labels = np.ones((augmented_pc.shape[0], 1), dtype=np.float32)
     labels[soft_mask, 0] = 2.0

@@ -3,6 +3,17 @@ import numpy as np
 
 def apply_old_laser_degradation(points, severity, rng_seed=0, return_mask=False):
     """Apply range-dependent attenuation/dropout and optionally return kept rows."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] < 4:
+        raise ValueError(f"points must have shape [N,>=4], got {points.shape}")
+    if not np.isfinite(points[:, :4]).all():
+        raise ValueError("points contains non-finite XYZ/intensity values")
+    severity = int(severity)
+    if not 0 <= severity <= 5:
+        raise ValueError(f"severity must lie in [0,5], got {severity}")
+    if not isinstance(rng_seed, (int, np.integer)) or int(rng_seed) < 0:
+        raise ValueError(f"rng_seed must be non-negative, got {rng_seed}")
+    rng_seed = int(rng_seed)
     if len(points) == 0:
         output = points.copy()
         mask = np.zeros(0, dtype=bool)
@@ -15,10 +26,10 @@ def apply_old_laser_degradation(points, severity, rng_seed=0, return_mask=False)
         3: "severe",
         4: "extreme",
         5: "extreme",
-    }.get(int(severity), "mild")
+    }[severity]
 
     xyz = points[:, :3]
-    intens = points[:, 3] if points.shape[1] > 3 else None
+    intensity = points[:, 3]
     rng = np.random.default_rng(rng_seed)
     ranges = np.linalg.norm(xyz, axis=1)
 
@@ -51,12 +62,9 @@ def apply_old_laser_degradation(points, severity, rng_seed=0, return_mask=False)
     r1 = np.quantile(ranges, q_cap)
     mask = ranges <= r1
 
-    if intens is not None:
-        intens_att = alpha * intens
-        threshold = np.quantile(intens, 0.10)
-        mask &= intens_att >= threshold
-    else:
-        intens_att = None
+    attenuated_intensity = alpha * intensity
+    threshold = np.quantile(intensity, 0.10)
+    mask &= attenuated_intensity >= threshold
 
     denom = max(r1 - r0, 1e-6)
     normalized_range = np.clip((ranges - r0) / denom, 0.0, 1.0)
@@ -64,7 +72,6 @@ def apply_old_laser_degradation(points, severity, rng_seed=0, return_mask=False)
     mask &= rng.random(len(xyz)) > drop_probability
 
     output = points[mask].copy()
-    if intens_att is not None and output.shape[1] > 3:
-        output[:, 3] = intens_att[mask]
+    output[:, 3] = attenuated_intensity[mask]
     output = output.astype(np.float32)
     return (output, mask) if return_mask else output
