@@ -4,8 +4,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import matplotlib
-matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import distance_transform_edt

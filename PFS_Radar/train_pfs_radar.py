@@ -168,7 +168,82 @@ def sample_paths_from_root(root: Path) -> list[Path]:
     return flat_paths[val_end:]
 
 
-def make_scheduler(optimizer, epochs, warmup_epochs, base_lr, min_lr):
+class WarmupThenPlateau:
+    def __init__(
+        self,
+        optimizer,
+        warmup_epochs,
+        base_lr,
+        min_lr,
+        factor,
+        patience,
+        threshold,
+    ):
+        self.optimizer = optimizer
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.base_lr = float(base_lr)
+        self.last_epoch = 0
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(factor),
+            patience=int(patience),
+            threshold=float(threshold),
+            threshold_mode="abs",
+            min_lr=float(min_lr),
+        )
+        if self.warmup_epochs > 0:
+            self._set_lr(self.base_lr / self.warmup_epochs)
+
+    def _set_lr(self, value):
+        for group in self.optimizer.param_groups:
+            group["lr"] = float(value)
+
+    def step(self, metric=None):
+        self.last_epoch += 1
+        if self.warmup_epochs > 0 and self.last_epoch < self.warmup_epochs:
+            self._set_lr(self.base_lr * (self.last_epoch + 1) / self.warmup_epochs)
+            return
+        if self.warmup_epochs > 0 and self.last_epoch == self.warmup_epochs:
+            self._set_lr(self.base_lr)
+            return
+        if metric is None:
+            raise ValueError("Plateau scheduler requires a validation metric")
+        self.plateau.step(float(metric))
+
+    def state_dict(self):
+        return {
+            "last_epoch": self.last_epoch,
+            "plateau": self.plateau.state_dict(),
+        }
+
+    def load_state_dict(self, state):
+        self.last_epoch = int(state.get("last_epoch", 0))
+        self.plateau.load_state_dict(state["plateau"])
+
+
+def make_scheduler(
+    optimizer,
+    scheduler_name,
+    epochs,
+    warmup_epochs,
+    base_lr,
+    min_lr,
+    plateau_factor,
+    plateau_patience,
+    plateau_threshold,
+):
+    if scheduler_name == "plateau":
+        return WarmupThenPlateau(
+            optimizer,
+            warmup_epochs,
+            base_lr,
+            min_lr,
+            plateau_factor,
+            plateau_patience,
+            plateau_threshold,
+        )
+
     minimum_factor = min_lr / max(base_lr, 1e-12)
 
     def schedule(epoch_index):
@@ -483,6 +558,15 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
     parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument(
+        "--scheduler",
+        choices=["cosine", "plateau"],
+        default="cosine",
+        help="Learning-rate schedule. 'plateau' reduces LR when validation loss stalls.",
+    )
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--plateau-patience", type=int, default=8)
+    parser.add_argument("--plateau-threshold", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--stability-weight", type=float, default=0.05)
     parser.add_argument("--pfs-reliability-weight", type=float, default=0.10)
@@ -627,7 +711,15 @@ def main():
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = make_scheduler(
-        optimizer, args.epochs, args.warmup_epochs, args.learning_rate, args.min_learning_rate
+        optimizer,
+        args.scheduler,
+        args.epochs,
+        args.warmup_epochs,
+        args.learning_rate,
+        args.min_learning_rate,
+        args.plateau_factor,
+        args.plateau_patience,
+        args.plateau_threshold,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     output_root = Path(args.output_root)
@@ -659,6 +751,10 @@ def main():
                 "learning_rate",
                 "min_learning_rate",
                 "warmup_epochs",
+                "scheduler",
+                "plateau_factor",
+                "plateau_patience",
+                "plateau_threshold",
                 "weight_decay",
                 "stability_weight",
                 "pfs_reliability_weight",
@@ -727,7 +823,6 @@ def main():
                 train=False,
                 compute_metrics=calculate_metrics,
             )
-        scheduler.step()
         row = {
             "epoch": epoch,
             "learning_rate": epoch_learning_rate,
@@ -768,6 +863,10 @@ def main():
             "metric_threshold": args.metric_threshold,
             "localization_tolerance_m": args.localization_tolerance_m,
         }
+        if args.scheduler == "plateau":
+            scheduler.step(row["val_loss"])
+        else:
+            scheduler.step()
         history.append(row)
         metric_message = (
             f"\n  localization@{args.localization_tolerance_m:.2f}m "
