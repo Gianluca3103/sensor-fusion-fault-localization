@@ -68,6 +68,8 @@ def validate_training_args(parser, args):
         "--val-ratio": args.val_ratio,
         "--stability-weight": args.stability_weight,
         "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--localization-loss-weight": args.localization_loss_weight,
+        "--false-positive-weight": args.false_positive_weight,
         "--weight-decay": args.weight_decay,
         "--grad-clip": args.grad_clip,
         "--min-delta": args.min_delta,
@@ -115,6 +117,7 @@ def validate_training_args(parser, args):
     non_negative = {
         "--stability-weight": args.stability_weight,
         "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--localization-loss-weight": args.localization_loss_weight,
         "--weight-decay": args.weight_decay,
         "--grad-clip": args.grad_clip,
         "--early-stop-patience": args.early_stop_patience,
@@ -135,6 +138,8 @@ def validate_training_args(parser, args):
         parser.error("--target-fault-threshold must lie in [0,1)")
     if args.localization_tolerance_m < 0.0:
         parser.error("--localization-tolerance-m must be non-negative")
+    if not 0.0 <= args.false_positive_weight <= 1.0:
+        parser.error("--false-positive-weight must lie in [0, 1]")
     if (
         args.disable_metrics
         and args.best_checkpoint_metric != "val_loss"
@@ -155,7 +160,99 @@ def stable_heatmap_loss(logits, target, grid_size=100):
     return 0.50 * pixel_l1 + 1.25 * grid_l1 + 0.25 * bce
 
 
-def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliability_weight, loss_mode):
+def euclidean_dilate(values, tolerance_m, x_cell_size_m, y_cell_size_m):
+    tolerance_m = max(float(tolerance_m), 0.0)
+    x_cell_size_m = max(float(x_cell_size_m), 1e-9)
+    y_cell_size_m = max(float(y_cell_size_m), 1e-9)
+    row_radius = int(math.floor(tolerance_m / x_cell_size_m + 1e-9))
+    col_radius = int(math.floor(tolerance_m / y_cell_size_m + 1e-9))
+    if row_radius == 0 and col_radius == 0:
+        return values
+    padded = F.pad(
+        values,
+        (col_radius, col_radius, row_radius, row_radius),
+        mode="constant",
+        value=0.0,
+    )
+    output = torch.zeros_like(values)
+    height, width = values.shape[-2:]
+    for row_offset in range(-row_radius, row_radius + 1):
+        for col_offset in range(-col_radius, col_radius + 1):
+            distance = math.hypot(
+                row_offset * x_cell_size_m,
+                col_offset * y_cell_size_m,
+            )
+            if distance > tolerance_m + 1e-9:
+                continue
+            row_start = row_radius + row_offset
+            col_start = col_radius + col_offset
+            shifted = padded[
+                ...,
+                row_start : row_start + height,
+                col_start : col_start + width,
+            ]
+            output = torch.maximum(output, shifted)
+    return output
+
+
+def localization_surrogate_loss(
+    logits,
+    target,
+    false_positive_weight=0.70,
+    target_fault_threshold=0.0,
+    tolerance_m=0.20,
+    x_cell_size_m=0.20,
+    y_cell_size_m=0.20,
+):
+    probability = torch.sigmoid(logits)
+    target_mask = (target > target_fault_threshold).to(probability.dtype)
+    target_neighborhood = euclidean_dilate(
+        target_mask,
+        tolerance_m,
+        x_cell_size_m,
+        y_cell_size_m,
+    )
+    prediction_neighborhood = euclidean_dilate(
+        probability,
+        tolerance_m,
+        x_cell_size_m,
+        y_cell_size_m,
+    )
+
+    dimensions = tuple(range(1, probability.ndim))
+    matched_prediction = (probability * target_neighborhood).sum(dim=dimensions)
+    false_positive = (probability * (1.0 - target_neighborhood)).sum(dim=dimensions)
+    covered_target = (target_mask * prediction_neighborhood).sum(dim=dimensions)
+    false_negative = (target_mask * (1.0 - prediction_neighborhood)).sum(dim=dimensions)
+
+    precision_loss = false_positive / (matched_prediction + false_positive + 1e-6)
+    recall_loss = false_negative / (covered_target + false_negative + 1e-6)
+    empty_target = target_mask.sum(dim=dimensions) == 0
+    precision_loss = torch.where(
+        empty_target,
+        probability.mean(dim=dimensions),
+        precision_loss,
+    )
+    recall_loss = torch.where(empty_target, torch.zeros_like(recall_loss), recall_loss)
+    false_positive_weight = float(np.clip(false_positive_weight, 0.0, 1.0))
+    return (
+        false_positive_weight * precision_loss
+        + (1.0 - false_positive_weight) * recall_loss
+    ).mean()
+
+
+def pfs_training_loss(
+    outputs,
+    target,
+    grid_size,
+    stability_weight,
+    pfs_reliability_weight,
+    localization_weight,
+    false_positive_weight,
+    target_fault_threshold,
+    localization_tolerance_m,
+    loss_mode,
+):
     logits = outputs["logits"]
     if logits.shape[-2:] != target.shape[-2:]:
         logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
@@ -164,6 +261,15 @@ def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliabil
         heatmap = original_reliability_loss(logits, target, grid_size=grid_size)
     else:
         heatmap = stable_heatmap_loss(logits, target, grid_size=grid_size)
+    localization = localization_surrogate_loss(
+        logits,
+        target,
+        false_positive_weight=false_positive_weight,
+        target_fault_threshold=target_fault_threshold,
+        tolerance_m=localization_tolerance_m,
+        x_cell_size_m=64.0 / target.shape[-2],
+        y_cell_size_m=64.0 / target.shape[-1],
+    )
     stability = logits.new_tensor(0.0)
     if outputs["clean_features"] is not None:
         stability = F.smooth_l1_loss(outputs["stabilized_features"], outputs["clean_features"])
@@ -177,9 +283,15 @@ def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliabil
             mode="area",
         )
         pfs_reliability = F.binary_cross_entropy(outputs["pfs_reliability"], reliability_target)
-    total = heatmap + stability_weight * stability + pfs_reliability_weight * pfs_reliability
+    total = (
+        heatmap
+        + localization_weight * localization
+        + stability_weight * stability
+        + pfs_reliability_weight * pfs_reliability
+    )
     return total, {
         "heatmap_loss": float(heatmap.detach().cpu()),
+        "localization_loss": float(localization.detach().cpu()),
         "stability_loss": float(stability.detach().cpu()),
         "pfs_reliability_loss": float(pfs_reliability.detach().cpu()),
     }
@@ -271,7 +383,13 @@ def checkpoint_improved(score, best_score, metric_name, min_delta):
 
 def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=True):
     model.train(train)
-    totals = {"loss": 0.0, "heatmap_loss": 0.0, "stability_loss": 0.0, "pfs_reliability_loss": 0.0}
+    totals = {
+        "loss": 0.0,
+        "heatmap_loss": 0.0,
+        "localization_loss": 0.0,
+        "stability_loss": 0.0,
+        "pfs_reliability_loss": 0.0,
+    }
     count = 0
     metric_accumulator = None
     examples = []
@@ -291,6 +409,10 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
                 grid_size=args.grid_size,
                 stability_weight=args.stability_weight,
                 pfs_reliability_weight=args.pfs_reliability_weight,
+                localization_weight=args.localization_loss_weight,
+                false_positive_weight=args.false_positive_weight,
+                target_fault_threshold=args.target_fault_threshold,
+                localization_tolerance_m=args.localization_tolerance_m,
                 loss_mode=args.loss_mode,
             )
             if not torch.isfinite(loss):
@@ -394,6 +516,8 @@ def load_resume_checkpoint(path, model, optimizer, scheduler, device, current_ar
             "grid_size",
             "stability_weight",
             "pfs_reliability_weight",
+            "localization_loss_weight",
+            "false_positive_weight",
             "loss_mode",
             "best_checkpoint_metric",
             "metric_threshold",
@@ -541,6 +665,13 @@ def main():
     parser.add_argument("--grid-size", type=int, default=100)
     parser.add_argument("--stability-weight", type=float, default=0.25)
     parser.add_argument("--pfs-reliability-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--localization-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for tolerance-aware IoU-style localization surrogate loss.",
+    )
+    parser.add_argument("--false-positive-weight", type=float, default=0.70)
     parser.add_argument("--loss-mode", choices=["stable", "original"], default="stable")
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -702,6 +833,8 @@ def main():
             "val_loss": val_stats["loss"],
             "train_heatmap_loss": train_stats["heatmap_loss"],
             "val_heatmap_loss": val_stats["heatmap_loss"],
+            "train_localization_loss": train_stats["localization_loss"],
+            "val_localization_loss": val_stats["localization_loss"],
             "train_stability_loss": train_stats["stability_loss"],
             "val_stability_loss": val_stats["stability_loss"],
             "train_pfs_reliability_loss": train_stats["pfs_reliability_loss"],
@@ -709,7 +842,13 @@ def main():
             "learning_rate": epoch_learning_rate,
         }
         for metric_key, metric_value in val_stats.items():
-            if metric_key not in {"loss", "heatmap_loss", "stability_loss", "pfs_reliability_loss"}:
+            if metric_key not in {
+                "loss",
+                "heatmap_loss",
+                "localization_loss",
+                "stability_loss",
+                "pfs_reliability_loss",
+            }:
                 row[f"val_{metric_key}"] = metric_value
         history.append(row)
         curve_history["epoch"].append(epoch)
@@ -719,7 +858,8 @@ def main():
         print(
             "epoch "
             f"{epoch:03d}: train={train_stats['loss']:.6f} val={val_stats['loss']:.6f} "
-            f"heat={val_stats['heatmap_loss']:.6f} stable={val_stats['stability_loss']:.6f} "
+            f"heat={val_stats['heatmap_loss']:.6f} loc={val_stats['localization_loss']:.6f} "
+            f"stable={val_stats['stability_loss']:.6f} "
             f"pfs_rel={val_stats['pfs_reliability_loss']:.6f} "
             f"iou={val_stats.get('iou', 0.0):.4f} f1={val_stats.get('f1', 0.0):.4f} "
             f"brier={val_stats.get('brier_score', 0.0):.5f} mae={val_stats.get('pixel_mae', 0.0):.5f} "
