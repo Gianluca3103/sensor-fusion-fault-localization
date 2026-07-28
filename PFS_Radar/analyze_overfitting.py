@@ -18,9 +18,18 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel
-from PFS_Radar.radar_data import filter_samples_with_radar_cache
-from PFS_Radar.train_pfs_radar import RadarReliabilityDataset
+from PFS_Radar.pfs_radar_model import load_model_checkpoint
+from PFS_Radar.datasets import RadarReliabilityDataset
+from PFS_Radar.radar_data import (
+    filter_samples_with_radar_cache,
+    radar_cache_requirements_from_checkpoint,
+)
+from Fault_Localization_Model.io_utils import (
+    atomic_savez_compressed,
+    atomic_write_json,
+)
+from Fault_Localization_Model.sample_utils import require_disjoint_splits
+from PFS.training_utils import resolve_device
 
 
 def parse_args():
@@ -41,9 +50,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_paths(root, radar_root, maximum):
+def load_paths(root, radar_root, maximum, cache_requirements):
     paths = sorted(Path(root).glob("*.npz"))
-    paths, missing = filter_samples_with_radar_cache(paths, Path(radar_root))
+    paths, missing = filter_samples_with_radar_cache(
+        paths,
+        Path(radar_root),
+        **cache_requirements,
+    )
     if missing:
         print(f"Skipping {len(missing)} samples without radar cache under {root}")
     if maximum > 0:
@@ -167,24 +180,35 @@ def save_spatial_figure(train_maps, val_maps, output_path):
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if args.batch_size < 1 or args.num_workers < 0:
+        raise ValueError("batch_size must be positive and num_workers non-negative")
+    if args.max_samples_per_split < 0:
+        raise ValueError("--max-samples-per-split must be non-negative")
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError("--threshold must lie strictly between 0 and 1")
+    if not 0.0 <= args.target_fault_threshold < 1.0:
+        raise ValueError("--target-fault-threshold must lie in [0,1)")
+    device = resolve_device(args.device)
+    model, checkpoint = load_model_checkpoint(args.checkpoint, device)
     saved_args = checkpoint.get("args", {})
+    cache_requirements = radar_cache_requirements_from_checkpoint(checkpoint)
     resize_hw = (
         int(saved_args.get("resize_height", 320)),
         int(saved_args.get("resize_width", 320)),
     )
-    model = PFSRadarReliabilityModel(
-        base_channels=int(saved_args.get("base_channels", 16)),
-        dropout=float(saved_args.get("dropout", 0.15)),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
     train_paths = load_paths(
-        args.train_root, args.radar_root, args.max_samples_per_split
+        args.train_root,
+        args.radar_root,
+        args.max_samples_per_split,
+        cache_requirements,
     )
-    val_paths = load_paths(args.val_root, args.radar_root, args.max_samples_per_split)
+    val_paths = load_paths(
+        args.val_root,
+        args.radar_root,
+        args.max_samples_per_split,
+        cache_requirements,
+    )
+    require_disjoint_splits({"train": train_paths, "validation": val_paths})
     loader_options = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -237,7 +261,7 @@ def main():
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    atomic_savez_compressed(
         output_root / "spatial_overfitting_maps.npz",
         **{f"train_{key}": value for key, value in train_maps.items()},
         **{f"val_{key}": value for key, value in val_maps.items()},
@@ -259,9 +283,7 @@ def main():
         "validation_by_fault": val_groups,
         "validation_minus_train_by_fault": fault_gaps,
     }
-    (output_root / "overfitting_summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(output_root / "overfitting_summary.json", summary)
     print(json.dumps(summary, indent=2))
     print(f"Saved diagnostics to {output_root}")
 

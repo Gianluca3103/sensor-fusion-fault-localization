@@ -145,6 +145,29 @@ def validate_training_args(parser, args):
         parser.error("--seed must be non-negative")
 
 
+def sample_paths_from_root(root: Path) -> list[Path]:
+    """Read a split folder or derive train/val/test from a flat dataset root."""
+
+    root = Path(root)
+    direct_paths = sorted(root.glob("*.npz"))
+    if direct_paths:
+        return direct_paths
+
+    split_name = root.name
+    if split_name not in {"train", "val", "test"}:
+        return []
+    flat_paths = sorted(root.parent.glob("*.npz"))
+    if not flat_paths:
+        return []
+    train_end = int(len(flat_paths) * 0.70)
+    val_end = train_end + int(len(flat_paths) * 0.15)
+    if split_name == "train":
+        return flat_paths[:train_end]
+    if split_name == "val":
+        return flat_paths[train_end:val_end]
+    return flat_paths[val_end:]
+
+
 def make_scheduler(optimizer, epochs, warmup_epochs, base_lr, min_lr):
     minimum_factor = min_lr / max(base_lr, 1e-12)
 
@@ -522,8 +545,8 @@ def main():
 
     seed_everything(args.seed)
     device = resolve_device(args.device)
-    train_paths = sorted(Path(args.train_root).glob("*.npz"))
-    val_paths = sorted(Path(args.val_root).glob("*.npz"))
+    train_paths = sample_paths_from_root(Path(args.train_root))
+    val_paths = sample_paths_from_root(Path(args.val_root))
     if not train_paths or not val_paths:
         raise FileNotFoundError("Both --train-root and --val-root must contain .npz files")
     train_paths, train_fault_counts = filter_paths_by_fault(

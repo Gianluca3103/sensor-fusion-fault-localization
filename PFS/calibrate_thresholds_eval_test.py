@@ -1,7 +1,6 @@
 from pathlib import Path
 import argparse
-import csv
-import json
+import math
 import os
 import sys
 
@@ -9,33 +8,26 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".ma
 
 import torch
 from torch.utils.data import DataLoader
-import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
-if str(FAULT_MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(FAULT_MODEL_DIR))
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from heatmap_metrics import (  # noqa: E402
+from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch  # noqa: E402
+from Fault_Localization_Model.heatmap_metrics import (  # noqa: E402
     HeatmapMetricAccumulator,
     prepare_probability_target,
     save_group_metrics,
 )
-from pfs_model import MODEL_VARIANTS, build_reliability_model  # noqa: E402
-from train_pfs_reliability_map import PFSReliabilityDataset, collate  # noqa: E402
+from Fault_Localization_Model.io_utils import atomic_write_json, write_csv_rows  # noqa: E402
+from PFS.pfs_model import MODEL_VARIANTS, load_model_checkpoint  # noqa: E402
+from Fault_Localization_Model.sample_utils import filter_paths_by_fault, require_disjoint_splits  # noqa: E402
+from PFS.training_utils import resolve_device  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "runs" / "threshold_calibration_test_eval"
-
-
-def metadata_fault(npz_path: Path) -> str:
-    with np.load(npz_path, allow_pickle=False) as data:
-        metadata = json.loads(str(data["metadata_json"]))
-    return str(metadata.get("fault", ""))
 
 
 def list_npz(root: Path, include_faults=None, exclude_faults=None):
@@ -47,67 +39,34 @@ def list_npz(root: Path, include_faults=None, exclude_faults=None):
     if not include and not exclude:
         return paths
 
-    kept = []
-    removed = {}
-    for path in paths:
-        fault = metadata_fault(path)
-        should_keep = (not include or fault in include) and fault not in exclude
-        if should_keep:
-            kept.append(path)
-        else:
-            removed[fault] = removed.get(fault, 0) + 1
+    kept, counts = filter_paths_by_fault(
+        paths,
+        include,
+        exclude,
+        strict_fault_names=True,
+    )
     if not kept:
         raise FileNotFoundError(f"No .npz files remain in {root} after fault filtering.")
     print(f"Fault filter for {root}: kept {len(kept)} / {len(paths)} samples", flush=True)
+    removed = {
+        fault: count
+        for fault, count in counts.items()
+        if (include and fault not in include) or fault in exclude
+    }
     if removed:
         print(f"  removed by fault: {removed}", flush=True)
     return kept
 
 
-def write_csv(path: Path, rows):
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def load_model(checkpoint_path: Path, device, base_channels=None, dropout=None, model_variant=None):
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    checkpoint_args = checkpoint.get("args", {})
-    model_base_channels = base_channels or int(checkpoint_args.get("base_channels", 16))
-    model_dropout = float(dropout if dropout is not None else checkpoint_args.get("dropout", 0.0))
-    model_variant = model_variant or checkpoint_args.get("model_variant", "pfs")
-    model = build_reliability_model(
-        model_variant,
-        in_channels=3,
-        base_channels=model_base_channels,
-        dropout=model_dropout,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model, {
-        "base_channels": model_base_channels,
-        "dropout": model_dropout,
-        "model_variant": model_variant,
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_best_metric": checkpoint.get("best_checkpoint_metric", "unknown"),
-        "checkpoint_best_score": checkpoint.get("best_checkpoint_score"),
-    }
-
-
-def build_loader(paths, resize_hw, batch_size, num_workers):
+def build_loader(paths, resize_hw, batch_size, num_workers, device):
     return DataLoader(
         PFSReliabilityDataset(paths, resize_hw),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate,
+        collate_fn=collate_reliability_batch,
+        pin_memory=device.type == "cuda",
+        persistent_workers=num_workers > 0,
     )
 
 
@@ -123,31 +82,6 @@ def metric_cell_metadata(metadata, metric_shape):
             meta["y_cell_size_m"] = (float(y_range[1]) - float(y_range[0])) / float(cols)
         adjusted.append(meta)
     return adjusted
-
-
-def collect_probabilities(model, loader, device, metric_grid_size, label, progress_every):
-    outputs = []
-    targets = []
-    metadata_rows = []
-    model.eval()
-    total_batches = len(loader)
-    with torch.no_grad():
-        for batch_index, batch in enumerate(loader, start=1):
-            x = batch["x"].to(device)
-            y = batch["y"].to(device)
-            logits = model(x)
-            prob, target = prepare_probability_target(
-                logits,
-                y,
-                from_logits=True,
-                metric_grid_size=metric_grid_size,
-            )
-            outputs.append(prob.cpu())
-            targets.append(target.cpu())
-            metadata_rows.extend(metric_cell_metadata(batch["metadata"], prob.shape[-2:]))
-            if batch_index == 1 or batch_index == total_batches or batch_index % progress_every == 0:
-                print(f"[{label}] collected batch {batch_index}/{total_batches}", flush=True)
-    return outputs, targets, metadata_rows
 
 
 def evaluate_dataset(
@@ -173,7 +107,7 @@ def evaluate_dataset(
     )
     model.eval()
     total_batches = len(loader)
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_index, batch in enumerate(loader, start=1):
             x = batch["x"].to(device)
             y = batch["y"].to(device)
@@ -189,33 +123,73 @@ def evaluate_dataset(
     return accumulator
 
 
-def sweep_thresholds_with_progress(
-    outputs,
-    targets,
-    metadata,
+def evaluate_validation_thresholds(
+    model,
+    loader,
+    device,
     thresholds,
-    label,
-    compute_chamfer,
+    metric_grid_size,
     localization_tolerance_m,
     target_fault_threshold,
+    progress_every,
 ):
-    rows = []
-    total = len(thresholds)
-    output_tensor = torch.cat(outputs, dim=0)
-    target_tensor = torch.cat(targets, dim=0)
-    for index, threshold in enumerate(thresholds, start=1):
-        print(f"[{label}] threshold {index}/{total}: {threshold:.4f}", flush=True)
-        accumulator = HeatmapMetricAccumulator(
+    """Calibrate thresholds in one bounded-memory pass without artifact metrics."""
+    accumulators = [
+        HeatmapMetricAccumulator(
             threshold=threshold,
             metric_grid_size=None,
-            compute_chamfer=compute_chamfer,
+            compute_chamfer=False,
             localization_tolerance_m=localization_tolerance_m,
             target_threshold=target_fault_threshold,
         )
-        accumulator.update(output_tensor, target_tensor, metadata=metadata, from_logits=False, update_groups=False)
+        for threshold in thresholds
+    ]
+    model.eval()
+    with torch.inference_mode():
+        for batch_index, batch in enumerate(loader, start=1):
+            logits = model(batch["x"].to(device, non_blocking=True))
+            probability, target = prepare_probability_target(
+                logits,
+                batch["y"].to(device, non_blocking=True),
+                from_logits=True,
+                metric_grid_size=metric_grid_size,
+            )
+            metadata = metric_cell_metadata(
+                batch["metadata"], probability.shape[-2:]
+            )
+            probability = probability.cpu()
+            target = target.cpu()
+            for accumulator in accumulators:
+                accumulator.update(
+                    probability,
+                    target,
+                    metadata=metadata,
+                    from_logits=False,
+                    update_groups=False,
+                )
+            if (
+                batch_index == 1
+                or batch_index == len(loader)
+                or batch_index % progress_every == 0
+            ):
+                print(
+                    f"[validation calibration] batch {batch_index}/{len(loader)}",
+                    flush=True,
+                )
+
+    rows = []
+    for index, (threshold, accumulator) in enumerate(
+        zip(thresholds, accumulators), start=1
+    ):
         row = {"threshold": float(threshold)}
         row.update(accumulator.compute())
         rows.append(row)
+        print(
+            f"[validation result] threshold {index}/{len(thresholds)} "
+            f"({threshold:.4f}): iou={row['iou']:.4f} "
+            f"loc_iou={row['localization_iou']:.4f}",
+            flush=True,
+        )
     return rows
 
 
@@ -317,13 +291,43 @@ def main():
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    if any(threshold <= 0.0 for threshold in args.thresholds):
-        raise ValueError(
-            "All thresholds must be greater than 0. "
+    if not args.thresholds or any(
+        not 0.0 < threshold < 1.0 for threshold in args.thresholds
+    ):
+        parser.error(
+            "All thresholds must be strictly between 0 and 1. "
             "A threshold of 0 marks every cell as faulty and gives invalid perfect metrics."
         )
+    if len(set(args.thresholds)) != len(args.thresholds):
+        parser.error("--thresholds must not contain duplicates")
     if not 0.0 <= args.target_fault_threshold < 1.0:
-        raise ValueError("--target-fault-threshold must be in [0, 1).")
+        parser.error("--target-fault-threshold must be in [0, 1).")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
+    if args.resize_height < 1 or args.resize_width < 1:
+        parser.error("Resize dimensions must be positive")
+    if args.grid_size is not None and args.grid_size < 1:
+        parser.error("--grid-size must be positive or omitted")
+    if (
+        args.grid_size is not None
+        and args.grid_size > min(args.resize_height, args.resize_width)
+    ):
+        parser.error(
+            "--grid-size cannot exceed the smaller resized input dimension"
+        )
+    if args.progress_every < 1:
+        parser.error("--progress-every must be at least 1")
+    if (
+        not math.isfinite(args.localization_tolerance_m)
+        or args.localization_tolerance_m < 0.0
+    ):
+        parser.error("--localization-tolerance-m must be non-negative")
+    if args.base_channels is not None and args.base_channels < 1:
+        parser.error("--base-channels must be positive")
+    if args.dropout is not None and not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout must lie in [0,1)")
 
     val_root = Path(args.val_root)
     test_root = Path(args.test_root)
@@ -333,18 +337,23 @@ def main():
 
     val_paths = list_npz(val_root, include_faults=args.include_faults, exclude_faults=args.exclude_faults)
     test_paths = list_npz(test_root, include_faults=args.include_faults, exclude_faults=args.exclude_faults)
+    require_disjoint_splits({"validation": val_paths, "test": test_paths})
     resize_hw = (args.resize_height, args.resize_width)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
 
-    model, model_info = load_model(
+    model, _, model_info = load_model_checkpoint(
         checkpoint_path,
         device,
-        args.base_channels,
-        args.dropout,
-        args.model_variant,
+        base_channels=args.base_channels,
+        dropout=args.dropout,
+        model_variant=args.model_variant,
     )
-    val_loader = build_loader(val_paths, resize_hw, args.batch_size, args.num_workers)
-    test_loader = build_loader(test_paths, resize_hw, args.batch_size, args.num_workers)
+    val_loader = build_loader(
+        val_paths, resize_hw, args.batch_size, args.num_workers, device
+    )
+    test_loader = build_loader(
+        test_paths, resize_hw, args.batch_size, args.num_workers, device
+    )
 
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Model variant: {model_info['model_variant']}")
@@ -360,23 +369,40 @@ def main():
     print(f"Localization tolerance: {args.localization_tolerance_m:.3f} m")
     print(f"Fixed target fault threshold: > {args.target_fault_threshold:.6f}")
 
-    print("[stage] Collecting validation probabilities", flush=True)
-    val_outputs, val_targets, val_metadata = collect_probabilities(
-        model, val_loader, device, args.grid_size, "validation", max(args.progress_every, 1)
-    )
-    print("[stage] Sweeping validation thresholds", flush=True)
-    val_sweep_rows = sweep_thresholds_with_progress(
-        val_outputs,
-        val_targets,
-        val_metadata,
+    print("[stage] Calibrating validation thresholds", flush=True)
+    val_sweep_rows = evaluate_validation_thresholds(
+        model,
+        val_loader,
+        device,
         args.thresholds,
-        "validation sweep",
-        compute_chamfer=not args.disable_chamfer,
+        args.grid_size,
         localization_tolerance_m=args.localization_tolerance_m,
         target_fault_threshold=args.target_fault_threshold,
+        progress_every=args.progress_every,
     )
     best_row = select_threshold(val_sweep_rows, args.select_metric)
     selected_threshold = float(best_row["threshold"])
+
+    print(
+        f"[stage] Evaluating validation set once at selected threshold "
+        f"{selected_threshold:.6f}",
+        flush=True,
+    )
+    val_accumulator = evaluate_dataset(
+        model,
+        val_loader,
+        device,
+        threshold=selected_threshold,
+        metric_grid_size=args.grid_size,
+        boundary_chamfer=args.boundary_chamfer,
+        compute_chamfer=not args.disable_chamfer,
+        localization_tolerance_m=args.localization_tolerance_m,
+        target_fault_threshold=args.target_fault_threshold,
+        label="grouped validation",
+        progress_every=max(args.progress_every, 1),
+    )
+    validation_metrics = val_accumulator.compute()
+    validation_metrics["threshold"] = selected_threshold
 
     print(
         f"[stage] Evaluating test set once at frozen validation threshold {selected_threshold:.6f}",
@@ -398,13 +424,17 @@ def main():
     test_metrics = test_accumulator.compute()
     test_metrics["threshold"] = selected_threshold
 
-    write_csv(output_root / "validation_threshold_sweep.csv", val_sweep_rows)
+    write_csv_rows(output_root / "validation_threshold_sweep.csv", val_sweep_rows)
+    save_group_metrics(
+        val_accumulator.groups,
+        output_root / "validation_group_metrics",
+    )
     save_group_metrics(test_accumulator.groups, output_root / "test_group_metrics")
 
     summary = {
         "selected_threshold": selected_threshold,
         "selected_metric": args.select_metric,
-        "validation_selected_metrics": best_row,
+        "validation_selected_metrics": validation_metrics,
         "test_metrics": test_metrics,
         "threshold_candidates": args.thresholds,
         "test_evaluation_protocol": "single evaluation at validation-selected threshold",
@@ -423,9 +453,11 @@ def main():
         "localization_tolerance_m": args.localization_tolerance_m,
         "target_fault_threshold": args.target_fault_threshold,
     }
-    with (output_root / "threshold_calibration_test_summary.json").open("w", encoding="utf-8") as file:
-        json.dump(summary, file, indent=2)
-    write_csv(output_root / "test_metrics.csv", [test_metrics])
+    atomic_write_json(
+        output_root / "threshold_calibration_test_summary.json",
+        summary,
+    )
+    write_csv_rows(output_root / "test_metrics.csv", [test_metrics])
 
     print()
     print("Final calibrated threshold parameters")
@@ -435,7 +467,7 @@ def main():
     print(f"  threshold_candidates: {args.thresholds}")
     print(f"  target_fault_threshold: > {args.target_fault_threshold:.6f}")
     print()
-    print_metrics("Validation metrics at selected threshold", best_row)
+    print_metrics("Validation metrics at selected threshold", validation_metrics)
     print()
     print_metrics("Frozen-threshold test metrics", test_metrics)
     print()

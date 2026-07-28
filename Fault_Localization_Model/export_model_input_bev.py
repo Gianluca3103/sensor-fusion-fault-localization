@@ -1,22 +1,40 @@
 from pathlib import Path
 import argparse
 import json
+import sys
 
 import numpy as np
 from PIL import Image
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from Fault_Localization_Model.sample_utils import InvalidSampleError, validate_rgb_array
+
 
 def load_faulty_rgb(npz_path: Path) -> tuple[np.ndarray, dict]:
-    with np.load(npz_path, allow_pickle=False) as data:
-        if "faulty_rgb" not in data:
-            raise KeyError(f"{npz_path} does not contain 'faulty_rgb'")
-        rgb = data["faulty_rgb"]
-        metadata = json.loads(str(data["metadata_json"])) if "metadata_json" in data else {}
-    if rgb.dtype != np.uint8:
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise ValueError(f"Expected faulty_rgb shape [H, W, 3], got {rgb.shape}")
-    return rgb, metadata
+    try:
+        with np.load(npz_path, allow_pickle=False) as data:
+            if "faulty_rgb" not in data:
+                raise KeyError("faulty_rgb is missing")
+            rgb = validate_rgb_array(
+                data["faulty_rgb"],
+                name="faulty_rgb",
+                path=npz_path,
+            )
+            metadata = (
+                json.loads(str(data["metadata_json"]))
+                if "metadata_json" in data
+                else {}
+            )
+    except InvalidSampleError:
+        raise
+    except Exception as exc:
+        raise InvalidSampleError(f"Cannot load model input {npz_path}: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise InvalidSampleError(f"metadata_json in {npz_path} must decode to an object")
+    return rgb.astype(np.uint8), metadata
 
 
 def main():

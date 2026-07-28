@@ -12,14 +12,12 @@ from torch.utils.data import DataLoader
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
-if str(FAULT_MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(FAULT_MODEL_DIR))
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from pfs_model import MODEL_VARIANTS, build_reliability_model
-from train_pfs_reliability_map import PFSReliabilityDataset, collate
-from train_reliability_map import save_predictions, split_paths
+from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch
+from PFS.pfs_model import MODEL_VARIANTS, load_model_checkpoint
+from PFS.training_utils import resolve_device, save_predictions, split_paths
 
 
 DEFAULT_DATASET_ROOT = FAULT_MODEL_DIR / "grid_reliability_7500_fog_s3_x64_y32"
@@ -52,6 +50,32 @@ def main():
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.batch_size < 1 or args.max_images < 1:
+        parser.error("--batch-size and --max-images must be at least 1")
+    if (
+        args.resize_height < 1
+        or args.resize_width < 1
+        or args.visual_grid_size < 1
+    ):
+        parser.error("Resize dimensions and --visual-grid-size must be positive")
+    if args.visual_grid_size > min(args.resize_height, args.resize_width):
+        parser.error(
+            "--visual-grid-size cannot exceed the smaller resized input dimension"
+        )
+    if not 0.0 < args.val_ratio < 1.0:
+        parser.error("--val-ratio must lie strictly between 0 and 1")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    if not 0.0 < args.localization_threshold < 1.0:
+        parser.error("--localization-threshold must lie strictly between 0 and 1")
+    if args.localization_tolerance_m < 0.0:
+        parser.error("--localization-tolerance-m must be non-negative")
+    if not 0.0 <= args.target_fault_threshold < 1.0:
+        parser.error("--target-fault-threshold must lie in [0,1)")
+    if args.base_channels is not None and args.base_channels < 1:
+        parser.error("--base-channels must be positive")
+    if args.dropout is not None and not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout must lie in [0,1)")
 
     dataset_root = Path(args.dataset_root)
     checkpoint_path = Path(args.checkpoint)
@@ -59,15 +83,14 @@ def main():
     paths = sorted(dataset_root.glob("*.npz"))
     if not paths:
         raise FileNotFoundError(f"No .npz files found in {dataset_root}")
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    device = torch.device(args.device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    checkpoint_args = checkpoint.get("args", {})
-    base_channels = args.base_channels or int(checkpoint_args.get("base_channels", 16))
-    dropout = args.dropout if args.dropout is not None else float(checkpoint_args.get("dropout", 0.0))
-    model_variant = args.model_variant or checkpoint_args.get("model_variant", "pfs")
+    device = resolve_device(args.device)
+    model, _, model_info = load_model_checkpoint(
+        checkpoint_path,
+        device,
+        base_channels=args.base_channels,
+        dropout=args.dropout,
+        model_variant=args.model_variant,
+    )
 
     if args.use_all_samples:
         test_paths = paths
@@ -79,16 +102,10 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=collate,
+        collate_fn=collate_reliability_batch,
+        pin_memory=device.type == "cuda",
     )
 
-    model = build_reliability_model(
-        model_variant,
-        in_channels=3,
-        base_channels=base_channels,
-        dropout=dropout,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
     rows = save_predictions(
         model,
         loader,
@@ -100,7 +117,10 @@ def main():
         localization_tolerance_m=args.localization_tolerance_m,
         target_fault_threshold=args.target_fault_threshold,
     )
-    print(f"Saved {len(rows)} {model_variant} prediction comparisons: {output_root}")
+    print(
+        f"Saved {len(rows)} {model_info['model_variant']} "
+        f"prediction comparisons: {output_root}"
+    )
 
 
 if __name__ == "__main__":

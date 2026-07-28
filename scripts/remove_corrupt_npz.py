@@ -32,6 +32,12 @@ def validate_npz(path: Path) -> tuple[Path, str | None]:
 
 def main() -> None:
     args = parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if not args.dataset_root.is_dir():
+        raise FileNotFoundError(
+            f"Dataset root does not exist or is not a directory: {args.dataset_root}"
+        )
     paths = sorted(args.dataset_root.rglob("*.npz"))
     if not paths:
         raise FileNotFoundError(f"No .npz files found under {args.dataset_root}")

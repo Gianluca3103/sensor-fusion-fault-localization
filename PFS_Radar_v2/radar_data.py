@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from functools import lru_cache
 import json
 import math
@@ -17,7 +17,6 @@ from PFS_Radar.radar_data import (
     load_ground_truth_poses,
     load_lidar_to_radar_transform as _load_lidar_to_radar_transform,
     load_named_transform as _load_named_transform,
-    nearest_ground_truth_pose,
     radar_cache_path,
     read_continental_bin as _read_continental_bin,
     scene_name_from_metadata,
@@ -26,10 +25,29 @@ from PFS_Radar.radar_data import (
     session_name_from_metadata,
     transform_xyz,
 )
+from PFS_Radar_v2.pose import (
+    interpolated_pose_from_sequence,
+    pose_velocity,
+    select_adaptive_indices,
+)
+from PFS_Radar_v2.tracking import (
+    associate_tracks,
+    compensate_doppler,
+    dbscan_labels,
+    make_observations,
+)
+from PFS_Radar_v2.radar_types import (
+    AdaptiveStackConfig,
+    ClusterObservation,
+    DopplerTrackingConfig,
+    ProcessedFrame,
+    SelectedFrame,
+    TrackState,
+)
 
 
-RADAR_CACHE_VERSION = 4
-POLICY_NAME = "adaptive_pose_doppler_tracking_v2"
+RADAR_CACHE_VERSION = 5
+POLICY_NAME = "adaptive_pose_doppler_tracking_interpolated_v3"
 CHANNELS = [
     "static_occupancy",
     "support_normalized_static_density",
@@ -90,471 +108,6 @@ def read_continental_bin(path: Path) -> np.ndarray:
     """Reuse raw radar frames across overlapping chronological windows."""
 
     return _read_continental_bin(path)
-
-
-@dataclass(frozen=True)
-class AdaptiveStackConfig:
-    """Pose gates and soft weights for causal radar-frame accumulation."""
-
-    max_frames: int | None = None
-    max_age_s: float = 1.0
-    max_translation_m: float = 4.0
-    max_rotation_deg: float = 5.0
-    weight_time_s: float = 0.5
-    weight_translation_m: float = 2.0
-    weight_rotation_deg: float = 3.0
-
-    def validate(self) -> None:
-        if self.max_frames is not None and self.max_frames < 1:
-            raise ValueError("max_frames must be None or at least 1")
-        positive = {
-            "max_age_s": self.max_age_s,
-            "max_translation_m": self.max_translation_m,
-            "max_rotation_deg": self.max_rotation_deg,
-            "weight_time_s": self.weight_time_s,
-            "weight_translation_m": self.weight_translation_m,
-            "weight_rotation_deg": self.weight_rotation_deg,
-        }
-        for name, value in positive.items():
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive")
-
-
-@dataclass(frozen=True)
-class DopplerTrackingConfig:
-    """Ego-Doppler compensation, clustering, and short-window tracking."""
-
-    dynamic_threshold_mps: float = 1.0
-    doppler_sign: str = "auto"
-    sign_inference_min_speed_mps: float = 0.5
-    cluster_eps_m: float = 1.2
-    cluster_min_samples: int = 2
-    association_distance_m: float = 3.0
-    min_track_hits: int = 2
-    velocity_smoothing: float = 0.5
-    max_abs_velocity_mps: float = 30.0
-
-    def validate(self) -> None:
-        if self.doppler_sign not in {"auto", "1", "-1"}:
-            raise ValueError("doppler_sign must be one of: auto, 1, -1")
-        positive = {
-            "dynamic_threshold_mps": self.dynamic_threshold_mps,
-            "sign_inference_min_speed_mps": self.sign_inference_min_speed_mps,
-            "cluster_eps_m": self.cluster_eps_m,
-            "association_distance_m": self.association_distance_m,
-            "max_abs_velocity_mps": self.max_abs_velocity_mps,
-        }
-        for name, value in positive.items():
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive")
-        if self.cluster_min_samples < 1:
-            raise ValueError("cluster_min_samples must be at least 1")
-        if self.min_track_hits < 1:
-            raise ValueError("min_track_hits must be at least 1")
-        if not 0.0 <= self.velocity_smoothing < 1.0:
-            raise ValueError("velocity_smoothing must lie in [0, 1)")
-
-
-@dataclass
-class SelectedFrame:
-    path: Path
-    timestamp: int
-    pose: np.ndarray
-    age_s: float
-    translation_m: float
-    rotation_deg: float
-    weight: float
-    pose_delta_ms: float
-
-
-@dataclass
-class ProcessedFrame:
-    timestamp: int
-    points: np.ndarray
-    doppler_residual_mps: np.ndarray
-    dynamic_mask: np.ndarray
-    cluster_labels: np.ndarray
-    weight: float
-    doppler_sign: int
-    sensor_speed_mps: float
-    yaw_rate_dps: float
-
-
-@dataclass
-class ClusterObservation:
-    frame_index: int
-    timestamp: int
-    label: int
-    point_indices: np.ndarray
-    centroid: np.ndarray
-    doppler_velocity: np.ndarray
-    track_id: int = -1
-
-
-@dataclass
-class TrackState:
-    track_id: int
-    position: np.ndarray
-    velocity: np.ndarray
-    last_timestamp: int
-    hits: int
-
-
-def rotation_angle_rad(rotation: np.ndarray) -> float:
-    rotation = np.asarray(rotation, dtype=np.float64)
-    if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
-        raise ValueError("rotation must be a finite 3x3 matrix")
-    cosine = np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)
-    return float(np.arccos(cosine))
-
-
-def _frame_weight(
-    age_s: float,
-    translation_m: float,
-    rotation_deg: float,
-    config: AdaptiveStackConfig,
-) -> float:
-    exponent = (
-        -age_s / config.weight_time_s
-        - translation_m / config.weight_translation_m
-        - rotation_deg / config.weight_rotation_deg
-    )
-    return float(np.exp(exponent))
-
-
-def select_adaptive_indices(
-    radar_timestamps: tuple[int, ...] | list[int],
-    radar_poses: np.ndarray,
-    lidar_timestamp: int,
-    config: AdaptiveStackConfig,
-) -> list[dict]:
-    """Select the longest newest-first causal history satisfying all pose gates."""
-
-    config.validate()
-    timestamps = tuple(int(value) for value in radar_timestamps)
-    poses = np.asarray(radar_poses, dtype=np.float64)
-    if poses.shape != (len(timestamps), 4, 4):
-        raise ValueError(
-            f"radar_poses must have shape [{len(timestamps)},4,4], got {poses.shape}"
-        )
-    if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
-        raise ValueError("radar_timestamps must be strictly increasing")
-    current_index = bisect_right(timestamps, int(lidar_timestamp)) - 1
-    if current_index < 0:
-        raise RadarAlignmentUnavailableError(
-            f"No causal radar frame exists at or before LiDAR timestamp {lidar_timestamp}"
-        )
-
-    reference_pose = poses[current_index]
-    reference_from_world = np.linalg.inv(reference_pose)
-    rows: list[dict] = []
-    for index in range(current_index, -1, -1):
-        if config.max_frames is not None and len(rows) >= config.max_frames:
-            break
-        age_s = (int(lidar_timestamp) - timestamps[index]) / 1_000_000_000.0
-        relative = reference_from_world @ poses[index]
-        translation_m = float(np.linalg.norm(relative[:3, 3]))
-        rotation_deg = math.degrees(rotation_angle_rad(relative[:3, :3]))
-        if (
-            age_s > config.max_age_s
-            or translation_m > config.max_translation_m
-            or rotation_deg > config.max_rotation_deg
-        ):
-            break
-        rows.append(
-            {
-                "index": index,
-                "timestamp": timestamps[index],
-                "age_s": age_s,
-                "translation_m": translation_m,
-                "rotation_deg": rotation_deg,
-                "weight": _frame_weight(
-                    age_s, translation_m, rotation_deg, config
-                ),
-            }
-        )
-    rows.reverse()
-    return rows
-
-
-def _nearest_pose_index(timestamps: tuple[int, ...], timestamp: int) -> int:
-    insertion = bisect_left(timestamps, timestamp)
-    candidates = [
-        index
-        for index in (insertion - 1, insertion)
-        if 0 <= index < len(timestamps)
-    ]
-    if not candidates:
-        raise RadarAlignmentUnavailableError(f"No pose is available for {timestamp}")
-    return min(candidates, key=lambda index: abs(timestamps[index] - timestamp))
-
-
-def _pose_velocity(
-    pose_timestamps: tuple[int, ...],
-    poses: np.ndarray,
-    timestamp: int,
-    imu_from_radar_rotation: np.ndarray,
-) -> tuple[np.ndarray, float]:
-    """Estimate radar-origin velocity in radar axes plus ego yaw rate."""
-
-    center = _nearest_pose_index(pose_timestamps, timestamp)
-    left = max(0, center - 1)
-    right = min(len(pose_timestamps) - 1, center + 1)
-    if left == right:
-        return np.zeros(3, dtype=np.float64), 0.0
-    dt_s = (pose_timestamps[right] - pose_timestamps[left]) / 1_000_000_000.0
-    if dt_s <= 0.0:
-        return np.zeros(3, dtype=np.float64), 0.0
-    velocity_world = (poses[right, :3, 3] - poses[left, :3, 3]) / dt_s
-    world_from_radar_rotation = poses[center, :3, :3] @ imu_from_radar_rotation
-    velocity_radar = world_from_radar_rotation.T @ velocity_world
-    relative_rotation = poses[left, :3, :3].T @ poses[right, :3, :3]
-    yaw_delta = math.atan2(relative_rotation[1, 0], relative_rotation[0, 0])
-    return velocity_radar, yaw_delta / dt_s
-
-
-def compensate_doppler(
-    points: np.ndarray,
-    sensor_velocity: np.ndarray,
-    doppler_sign: str = "auto",
-    sign_inference_min_speed_mps: float = 0.5,
-) -> tuple[np.ndarray, int, np.ndarray]:
-    """Subtract the radial Doppler expected from ego motion.
-
-    Returns residual velocity, the applied raw-measurement sign, and expected
-    static radial velocity. Auto sign selection assumes static detections are
-    the majority and chooses the convention with the lower median residual.
-    """
-
-    points = np.asarray(points, dtype=np.float64)
-    sensor_velocity = np.asarray(sensor_velocity, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] < 4:
-        raise ValueError(f"points must have shape [N,>=4], got {points.shape}")
-    if sensor_velocity.shape != (3,) or not np.isfinite(sensor_velocity).all():
-        raise ValueError("sensor_velocity must be a finite 3-vector")
-    if doppler_sign not in {"auto", "1", "-1"}:
-        raise ValueError("doppler_sign must be one of: auto, 1, -1")
-    ranges = np.linalg.norm(points[:, :3], axis=1)
-    valid = ranges > 1e-6
-    line_of_sight = np.zeros((len(points), 3), dtype=np.float64)
-    line_of_sight[valid] = points[valid, :3] / ranges[valid, None]
-    expected_static = -(line_of_sight @ sensor_velocity)
-    measured = points[:, 3]
-
-    if doppler_sign == "auto":
-        if np.linalg.norm(sensor_velocity) < sign_inference_min_speed_mps or not np.any(valid):
-            sign = 1
-        else:
-            positive_score = float(
-                np.median(np.abs(measured[valid] - expected_static[valid]))
-            )
-            negative_score = float(
-                np.median(np.abs(-measured[valid] - expected_static[valid]))
-            )
-            sign = 1 if positive_score <= negative_score else -1
-    else:
-        sign = int(doppler_sign)
-    residual = sign * measured - expected_static
-    residual[~valid] = 0.0
-    return residual.astype(np.float32), sign, expected_static.astype(np.float32)
-
-
-def dbscan_labels(
-    xy: np.ndarray,
-    candidate_mask: np.ndarray,
-    eps_m: float,
-    min_samples: int,
-) -> np.ndarray:
-    """Small dependency-free 2-D DBSCAN for sparse radar detections."""
-
-    xy = np.asarray(xy, dtype=np.float64)
-    candidate_mask = np.asarray(candidate_mask, dtype=bool)
-    if xy.ndim != 2 or xy.shape[1] != 2:
-        raise ValueError(f"xy must have shape [N,2], got {xy.shape}")
-    if candidate_mask.shape != (len(xy),):
-        raise ValueError("candidate_mask must contain one value per point")
-    if eps_m <= 0.0 or min_samples < 1:
-        raise ValueError("eps_m must be positive and min_samples at least 1")
-
-    labels = np.full(len(xy), -1, dtype=np.int32)
-    candidates = np.flatnonzero(candidate_mask & np.isfinite(xy).all(axis=1))
-    if not len(candidates):
-        return labels
-    cells: dict[tuple[int, int], list[int]] = {}
-    point_cells: dict[int, tuple[int, int]] = {}
-    for index in candidates:
-        cell = tuple(np.floor(xy[index] / eps_m).astype(np.int64))
-        point_cells[int(index)] = cell
-        cells.setdefault(cell, []).append(int(index))
-
-    eps_squared = eps_m * eps_m
-
-    def neighbors(index: int) -> list[int]:
-        cell = point_cells[index]
-        nearby: list[int] = []
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for other in cells.get((cell[0] + dx, cell[1] + dy), ()):
-                    if float(np.sum((xy[index] - xy[other]) ** 2)) <= eps_squared:
-                        nearby.append(other)
-        return nearby
-
-    visited: set[int] = set()
-    cluster_id = 0
-    for seed in candidates:
-        seed = int(seed)
-        if seed in visited:
-            continue
-        visited.add(seed)
-        seed_neighbors = neighbors(seed)
-        if len(seed_neighbors) < min_samples:
-            continue
-        labels[seed] = cluster_id
-        queue = list(seed_neighbors)
-        queued = set(queue)
-        cursor = 0
-        while cursor < len(queue):
-            point = queue[cursor]
-            cursor += 1
-            if point not in visited:
-                visited.add(point)
-                point_neighbors = neighbors(point)
-                if len(point_neighbors) >= min_samples:
-                    for neighbor in point_neighbors:
-                        if neighbor not in queued:
-                            queued.add(neighbor)
-                            queue.append(neighbor)
-            if labels[point] < 0:
-                labels[point] = cluster_id
-        cluster_id += 1
-    return labels
-
-
-def estimate_planar_doppler_velocity(
-    radar_points: np.ndarray,
-    residual_mps: np.ndarray,
-    radar_to_current_rotation: np.ndarray,
-) -> np.ndarray:
-    radar_points = np.asarray(radar_points, dtype=np.float64)
-    residual_mps = np.asarray(residual_mps, dtype=np.float64)
-    if len(radar_points) == 0:
-        return np.zeros(2, dtype=np.float64)
-    planar_range = np.linalg.norm(radar_points[:, :2], axis=1)
-    valid = planar_range > 1e-6
-    if not np.any(valid):
-        return np.zeros(2, dtype=np.float64)
-    design = radar_points[valid, :2] / planar_range[valid, None]
-    target = residual_mps[valid]
-    regularization = 0.05 * np.eye(2, dtype=np.float64)
-    velocity_radar = np.linalg.solve(
-        design.T @ design + regularization,
-        design.T @ target,
-    )
-    rotation = np.asarray(radar_to_current_rotation, dtype=np.float64)
-    velocity_current_3d = rotation @ np.asarray(
-        [velocity_radar[0], velocity_radar[1], 0.0]
-    )
-    return velocity_current_3d[:2]
-
-
-def _make_observations(
-    frames: list[ProcessedFrame],
-    raw_frames: list[np.ndarray],
-    radar_to_current_rotations: list[np.ndarray],
-) -> list[list[ClusterObservation]]:
-    observations: list[list[ClusterObservation]] = []
-    for frame_index, frame in enumerate(frames):
-        frame_observations: list[ClusterObservation] = []
-        for label in sorted(set(frame.cluster_labels.tolist()) - {-1}):
-            indices = np.flatnonzero(frame.cluster_labels == label)
-            frame_observations.append(
-                ClusterObservation(
-                    frame_index=frame_index,
-                    timestamp=frame.timestamp,
-                    label=int(label),
-                    point_indices=indices,
-                    centroid=np.mean(frame.points[indices, :2], axis=0).astype(
-                        np.float64
-                    ),
-                    doppler_velocity=estimate_planar_doppler_velocity(
-                        raw_frames[frame_index][indices],
-                        frame.doppler_residual_mps[indices],
-                        radar_to_current_rotations[frame_index],
-                    ),
-                )
-            )
-        observations.append(frame_observations)
-    return observations
-
-
-def associate_tracks(
-    observations: list[list[ClusterObservation]],
-    association_distance_m: float,
-    velocity_smoothing: float,
-) -> dict[int, TrackState]:
-    """Associate cluster centroids chronologically with a predictive greedy match."""
-
-    tracks: dict[int, TrackState] = {}
-    next_track_id = 0
-    for frame_observations in observations:
-        if not frame_observations:
-            continue
-        timestamp = frame_observations[0].timestamp
-        candidate_pairs: list[tuple[float, int, int]] = []
-        for track_id, track in tracks.items():
-            dt_s = (timestamp - track.last_timestamp) / 1_000_000_000.0
-            if dt_s <= 0.0:
-                continue
-            predicted = track.position + track.velocity * dt_s
-            for observation_index, observation in enumerate(frame_observations):
-                distance = float(np.linalg.norm(observation.centroid - predicted))
-                if distance <= association_distance_m:
-                    candidate_pairs.append((distance, track_id, observation_index))
-
-        matched_tracks: set[int] = set()
-        matched_observations: set[int] = set()
-        for _, track_id, observation_index in sorted(candidate_pairs):
-            if (
-                track_id in matched_tracks
-                or observation_index in matched_observations
-            ):
-                continue
-            track = tracks[track_id]
-            observation = frame_observations[observation_index]
-            dt_s = (observation.timestamp - track.last_timestamp) / 1_000_000_000.0
-            centroid_velocity = (
-                (observation.centroid - track.position) / dt_s
-                if dt_s > 1e-6
-                else observation.doppler_velocity
-            )
-            measurement_velocity = (
-                0.5 * centroid_velocity + 0.5 * observation.doppler_velocity
-            )
-            track.velocity = (
-                velocity_smoothing * track.velocity
-                + (1.0 - velocity_smoothing) * measurement_velocity
-            )
-            track.position = observation.centroid.copy()
-            track.last_timestamp = observation.timestamp
-            track.hits += 1
-            observation.track_id = track_id
-            matched_tracks.add(track_id)
-            matched_observations.add(observation_index)
-
-        for observation_index, observation in enumerate(frame_observations):
-            if observation_index in matched_observations:
-                continue
-            track_id = next_track_id
-            next_track_id += 1
-            observation.track_id = track_id
-            tracks[track_id] = TrackState(
-                track_id=track_id,
-                position=observation.centroid.copy(),
-                velocity=observation.doppler_velocity.copy(),
-                last_timestamp=observation.timestamp,
-                hits=1,
-            )
-    return tracks
 
 
 def _grid_indices(
@@ -686,6 +239,14 @@ def _select_scene_frames(
         )
 
     continental_gt = find_named_file(scene_root, "Continental_gt.txt")
+    pose_timestamps, continental_poses = load_ground_truth_poses(
+        str(continental_gt.resolve())
+    )
+    lidar_reference_pose, lidar_reference_delta_ms = interpolated_pose_from_sequence(
+        pose_timestamps,
+        continental_poses,
+        lidar_timestamp,
+    )
     selected_pose_rows: list[np.ndarray] = []
     pose_deltas: list[float] = []
     oldest_timestamp = lidar_timestamp - int(config.max_age_s * 1_000_000_000)
@@ -701,8 +262,10 @@ def _select_scene_frames(
             current_index - config.max_frames + 1,
         )
     for index in range(candidate_start, current_index + 1):
-        pose, pose_delta_ms = nearest_ground_truth_pose(
-            continental_gt, timestamps[index]
+        pose, pose_delta_ms = interpolated_pose_from_sequence(
+            pose_timestamps,
+            continental_poses,
+            timestamps[index],
         )
         selected_pose_rows.append(pose)
         pose_deltas.append(pose_delta_ms)
@@ -712,6 +275,7 @@ def _select_scene_frames(
         np.stack(selected_pose_rows),
         lidar_timestamp,
         config,
+        reference_pose=lidar_reference_pose,
     )
     selected: list[SelectedFrame] = []
     for row in selection_rows:
@@ -726,7 +290,10 @@ def _select_scene_frames(
                 translation_m=float(row["translation_m"]),
                 rotation_deg=float(row["rotation_deg"]),
                 weight=float(row["weight"]),
-                pose_delta_ms=float(pose_deltas[local_index]),
+                pose_delta_ms=max(
+                    float(pose_deltas[local_index]),
+                    float(abs(lidar_reference_delta_ms)),
+                ),
             )
         )
     if not selected:
@@ -764,8 +331,13 @@ def _process_frames(
     imu_from_lidar_rotation = lidar_to_imu[:3, :3]
     imu_from_radar_rotation = imu_from_lidar_rotation @ radar_to_lidar[:3, :3]
 
-    lidar_pose, lidar_pose_delta_ms = nearest_ground_truth_pose(
-        aeva_gt, lidar_timestamp
+    aeva_pose_timestamps, aeva_poses = load_ground_truth_poses(
+        str(aeva_gt.resolve())
+    )
+    lidar_pose, lidar_pose_delta_ms = interpolated_pose_from_sequence(
+        aeva_pose_timestamps,
+        aeva_poses,
+        lidar_timestamp,
     )
     world_from_current_lidar = np.eye(4, dtype=np.float64)
     world_from_current_lidar[:3, :3] = (
@@ -781,7 +353,7 @@ def _process_frames(
     latest_yaw_rate = 0.0
     for selected_frame in selected:
         raw = read_continental_bin(selected_frame.path)
-        velocity_radar, yaw_rate = _pose_velocity(
+        velocity_radar, yaw_rate = pose_velocity(
             pose_timestamps,
             continental_poses,
             selected_frame.timestamp,
@@ -961,7 +533,7 @@ def build_radar_cache_entry(
         selected,
         tracking_config,
     )
-    observations = _make_observations(
+    observations = make_observations(
         frames, raw_frames, radar_to_current_rotations
     )
     tracks = associate_tracks(
@@ -1033,8 +605,11 @@ def build_radar_cache_entry(
         "alignment_rows": alignment_rows,
         "confirmed_dynamic_track_count": len(confirmed_tracks),
         "dynamic_tracks": confirmed_tracks,
+        "pose_interpolation": (
+            "linear translation plus SLERP rotation at radar and LiDAR timestamps"
+        ),
         "temporal_alignment": (
-            "adaptive pose-gated ego compensation into the current Aeva frame"
+            "adaptive pose-gated ego compensation into the interpolated current Aeva frame"
         ),
         "doppler_processing": (
             "ego-compensated radial residuals, spatial clustering, causal "

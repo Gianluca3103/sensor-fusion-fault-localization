@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache
 import json
 import logging
 import sys
@@ -34,6 +35,14 @@ from Fault_Localization_Model.data_injection_utils import (  # noqa: E402
 )
 from Fault_Localization_Model.fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
 from Fault_Localization_Model.io_utils import atomic_savez_compressed, write_csv_rows  # noqa: E402
+from Fault_Localization_Model.reliability_maps import (  # noqa: E402
+    POINT_STATUS_ADDED,
+    POINT_STATUS_MISSING,
+    POINT_STATUS_MOVED,
+    canonical_maps_for_storage,
+    make_reliability_maps,
+    point_counts_grid,
+)
 from Fault_Localization_Model.visualization_utils import add_reliability_colorbar, side_by_side  # noqa: E402
 
 
@@ -71,10 +80,6 @@ RESUME_REQUIRED_ARRAYS = (
     "moved_point_ids",
     "added_point_ids",
 )
-POINT_STATUS_CORRECT = 0
-POINT_STATUS_MISSING = 1
-POINT_STATUS_MOVED = 2
-POINT_STATUS_ADDED = 3
 WORKER_CONTEXT = None
 
 
@@ -210,6 +215,15 @@ def parse_args():
         default=defaults["num_workers"],
         help="Number of parallel sample-generation worker processes. Use 1 for the original sequential behavior.",
     )
+    parser.add_argument(
+        "--source-batch-size",
+        type=int,
+        default=32,
+        help=(
+            "Maximum samples per chronological worker batch. Random sample "
+            "selection, indexes, seeds, and filenames remain unchanged."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=defaults["seed"])
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -223,6 +237,7 @@ def validate_generation_args(args):
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
     require_positive(args.num_workers, "num_workers")
+    require_positive(args.source_batch_size, "source_batch_size")
     require_positive(args.weather_threads, "weather_threads")
     require_positive(args.movement_tolerance_m, "movement_tolerance_m")
     if args.fog_noise < 0:
@@ -264,171 +279,6 @@ def validate_generation_args(args):
         raise ValueError(
             "--fault-plan cannot be combined with --faults or --severities."
         )
-
-
-def point_counts_grid(points, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
-    points = np.asarray(points)
-    if points.ndim != 2 or points.shape[1] < 2:
-        raise ValueError(f"points must have shape [N,>=2], got {points.shape}")
-    if not np.isfinite(points[:, :2]).all():
-        raise ValueError("points contains non-finite XY coordinates")
-    if (
-        not isinstance(grid_rows, (int, np.integer))
-        or not isinstance(grid_cols, (int, np.integer))
-        or grid_rows < 1
-        or grid_cols < 1
-    ):
-        raise ValueError("grid_rows and grid_cols must be positive integers")
-    require_range(x_min, x_max, "x range")
-    require_range(y_min, y_max, "y range")
-    counts = np.zeros((grid_rows, grid_cols), dtype=np.float32)
-    if len(points) == 0:
-        return counts
-
-    x_cell_size = (x_max - x_min) / grid_rows
-    y_cell_size = (y_max - y_min) / grid_cols
-    cols = np.floor((points[:, 1] - y_min) / y_cell_size).astype(np.int32)
-    rows_from_bottom = np.floor((points[:, 0] - x_min) / x_cell_size).astype(np.int32)
-    rows = grid_rows - 1 - rows_from_bottom
-    valid = (rows >= 0) & (rows < grid_rows) & (cols >= 0) & (cols < grid_cols)
-    np.add.at(counts, (rows[valid], cols[valid]), 1.0)
-    return counts
-
-
-def make_reliability_maps(
-    clean_points,
-    clean_point_ids,
-    faulty_points,
-    faulty_point_ids,
-    faulty_source_ids,
-    movement_tolerance_m,
-    x_min,
-    x_max,
-    y_min,
-    y_max,
-    grid_rows,
-    grid_cols,
-):
-    """Build reliability targets from exact point provenance rather than occupancy matching."""
-    clean_points = np.asarray(clean_points)
-    faulty_points = np.asarray(faulty_points)
-    for name, points in (
-        ("clean_points", clean_points),
-        ("faulty_points", faulty_points),
-    ):
-        if points.ndim != 2 or points.shape[1] < 3:
-            raise ValueError(f"{name} must have shape [N,>=3], got {points.shape}")
-        if not np.isfinite(points[:, :3]).all():
-            raise ValueError(f"{name} contains non-finite XYZ coordinates")
-    if (
-        not np.isfinite(movement_tolerance_m)
-        or movement_tolerance_m < 0.0
-    ):
-        raise ValueError("movement_tolerance_m must be finite and non-negative")
-    clean_point_ids = np.asarray(clean_point_ids, dtype=np.int64)
-    faulty_point_ids = np.asarray(faulty_point_ids, dtype=np.int64)
-    faulty_source_ids = np.asarray(faulty_source_ids, dtype=np.int64)
-    if clean_point_ids.shape != (len(clean_points),):
-        raise ValueError("clean_point_ids must contain one ID per clean point.")
-    if faulty_point_ids.shape != (len(faulty_points),):
-        raise ValueError("faulty_point_ids must contain one ID per faulty point.")
-    if faulty_source_ids.shape != (len(faulty_points),):
-        raise ValueError("faulty_source_ids must contain one source ID per faulty point.")
-    if len(np.unique(clean_point_ids)) != len(clean_point_ids):
-        raise ValueError("clean_point_ids must be unique within a frame.")
-    if len(np.unique(faulty_point_ids)) != len(faulty_point_ids):
-        raise ValueError("faulty_point_ids must be unique within a frame.")
-
-    clean_counts = point_counts_grid(clean_points[:, :4], x_min, x_max, y_min, y_max, grid_rows, grid_cols)
-    faulty_counts = point_counts_grid(faulty_points[:, :4], x_min, x_max, y_min, y_max, grid_rows, grid_cols)
-
-    clean_index_by_id = {int(point_id): index for index, point_id in enumerate(clean_point_ids)}
-    original_mask = faulty_source_ids >= 0
-    original_source_ids = faulty_source_ids[original_mask]
-    if len(np.unique(original_source_ids)) != len(original_source_ids):
-        raise ValueError("An injector produced duplicate rows for the same clean source ID.")
-    unknown_ids = sorted(set(map(int, original_source_ids)) - set(clean_index_by_id))
-    if unknown_ids:
-        raise ValueError(f"Faulty points reference unknown clean source IDs: {unknown_ids[:5]}")
-
-    original_faulty_indices = np.flatnonzero(original_mask)
-    original_clean_indices = np.array(
-        [clean_index_by_id[int(source_id)] for source_id in original_source_ids],
-        dtype=np.int64,
-    )
-    displacement = np.zeros(len(original_faulty_indices), dtype=np.float32)
-    if len(original_faulty_indices):
-        coordinate_delta = (
-            faulty_points[original_faulty_indices, :3]
-            - clean_points[original_clean_indices, :3]
-        )
-        displacement = np.linalg.norm(coordinate_delta, axis=1)
-    moved_original = displacement > movement_tolerance_m
-
-    present_clean = np.zeros(len(clean_points), dtype=bool)
-    present_clean[original_clean_indices] = True
-    missing_clean = ~present_clean
-
-    correct_clean_indices = original_clean_indices[~moved_original]
-    moved_clean_indices = original_clean_indices[moved_original]
-    moved_faulty_indices = original_faulty_indices[moved_original]
-    added_faulty_indices = np.flatnonzero(~original_mask)
-
-    clean_point_status = np.full(len(clean_points), POINT_STATUS_MISSING, dtype=np.int8)
-    clean_point_status[correct_clean_indices] = POINT_STATUS_CORRECT
-    clean_point_status[moved_clean_indices] = POINT_STATUS_MOVED
-    faulty_point_status = np.full(len(faulty_points), POINT_STATUS_ADDED, dtype=np.int8)
-    faulty_point_status[original_faulty_indices[~moved_original]] = POINT_STATUS_CORRECT
-    faulty_point_status[moved_faulty_indices] = POINT_STATUS_MOVED
-
-    correct_faulty_indices = original_faulty_indices[~moved_original]
-    correct_points = faulty_points[correct_faulty_indices]
-    missing_points = clean_points[missing_clean]
-    moved_points = faulty_points[moved_faulty_indices]
-    added_points = faulty_points[added_faulty_indices]
-
-    clean_point_counts = point_counts_grid(
-        correct_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
-    )
-    missing_faulty = point_counts_grid(
-        missing_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
-    )
-    moved_faulty = point_counts_grid(
-        moved_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
-    )
-    added_faulty = point_counts_grid(
-        added_points, x_min, x_max, y_min, y_max, grid_rows, grid_cols
-    )
-    faulty_point_counts = missing_faulty + moved_faulty + added_faulty
-
-    denominator = clean_point_counts + faulty_point_counts
-    reliability = np.ones_like(clean_counts, dtype=np.float32)
-    occupied = denominator > 0
-    reliability[occupied] = clean_point_counts[occupied] / denominator[occupied]
-    fault_heatmap = 1.0 - np.clip(reliability, 0.0, 1.0)
-
-    return {
-        "clean_counts": clean_counts,
-        "faulty_counts": faulty_counts,
-        "clean_point_counts": clean_point_counts,
-        "faulty_point_counts": faulty_point_counts,
-        "missing_faulty_counts": missing_faulty,
-        "moved_faulty_counts": moved_faulty,
-        "added_faulty_counts": added_faulty,
-        "correct_counts": clean_point_counts,
-        "missing_counts": missing_faulty,
-        "wrong_counts": added_faulty,
-        "fault_heatmap": fault_heatmap.astype(np.float32),
-        "reliability_map": reliability.astype(np.float32),
-        "correct_point_ids": clean_point_ids[correct_clean_indices],
-        "missing_point_ids": clean_point_ids[missing_clean],
-        "moved_point_ids": faulty_point_ids[moved_faulty_indices],
-        "moved_source_ids": faulty_source_ids[moved_faulty_indices],
-        "moved_displacement_m": displacement[moved_original],
-        "added_point_ids": faulty_point_ids[added_faulty_indices],
-        "clean_point_status": clean_point_status,
-        "faulty_point_status": faulty_point_status,
-    }
 
 
 def colorize_fault_heatmap(values):
@@ -626,8 +476,70 @@ def hercules_source_metadata(bin_path, data_root):
 def worker_init(context):
     global WORKER_CONTEXT
     WORKER_CONTEXT = dict(context)
+    _load_clean_artifacts.cache_clear()
     injector_root = Path(WORKER_CONTEXT["injector_root"])
     WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(injector_root)
+
+
+@lru_cache(maxsize=2)
+def _load_clean_artifacts(bin_path_text):
+    """Load and project one immutable clean source frame per worker."""
+
+    if WORKER_CONTEXT is None:
+        raise RuntimeError("Worker context was not initialized.")
+    cfg = WORKER_CONTEXT
+    bin_path = Path(bin_path_text)
+    clean_raw = read_hercules_aeva_bin(bin_path)
+    clean_points = filter_pointcloud(
+        clean_raw,
+        cfg["min_range"],
+        cfg["max_range"],
+    )[:, :4]
+    if len(clean_points) == 0:
+        raise ValueError(
+            f"No valid LiDAR points remain after range filtering {bin_path}"
+        )
+    clean_point_ids = np.arange(len(clean_points), dtype=np.int64)
+    clean_rgb, clean_layers = clean_bev_rgb(
+        clean_points,
+        x_range=(cfg["x_min"], cfg["x_max"]),
+        y_range=(cfg["y_min"], cfg["y_max"]),
+        resolution=cfg["resolution"],
+    )
+    return (
+        clean_points,
+        clean_point_ids,
+        clean_rgb,
+        clean_layers["raw_density"],
+    )
+
+
+def chronological_source_batches(tasks, batch_size):
+    """Reorder execution only, keeping duplicate source frames in one batch."""
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    groups = {}
+    for task in tasks:
+        groups.setdefault(task["bin_path"], []).append(task)
+
+    batches = []
+    current = []
+    for bin_path in sorted(groups, key=lambda value: value.lower()):
+        group = sorted(groups[bin_path], key=lambda task: task["index"])
+        if current and len(current) + len(group) > batch_size:
+            batches.append(current)
+            current = []
+        current.extend(group)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def create_sample_batch(tasks):
+    """Create a chronological batch inside one persistent worker process."""
+
+    return [create_one_sample(task) for task in tasks]
 
 
 def load_matching_existing_sample(
@@ -893,19 +805,16 @@ def create_one_sample(task):
                 "skipped": True,
             }
 
-    clean_raw = read_hercules_aeva_bin(bin_path)
-    clean_points = filter_pointcloud(clean_raw, cfg["min_range"], cfg["max_range"])[:, :4]
-    if len(clean_points) == 0:
-        raise ValueError(
-            f"No valid LiDAR points remain after range filtering {bin_path}"
-        )
-    clean_point_ids = np.arange(len(clean_points), dtype=np.int64)
-    clean_rgb, clean_layers = clean_bev_rgb(
-        clean_points,
-        x_range=(cfg["x_min"], cfg["x_max"]),
-        y_range=(cfg["y_min"], cfg["y_max"]),
-        resolution=cfg["resolution"],
-    )
+    (
+        cached_clean_points,
+        cached_clean_point_ids,
+        clean_rgb,
+        clean_density,
+    ) = _load_clean_artifacts(str(bin_path))
+    # Fault injectors receive per-sample copies so cached clean artifacts cannot
+    # leak mutations between different fault realizations of the same frame.
+    clean_points = cached_clean_points.copy()
+    clean_point_ids = cached_clean_point_ids.copy()
     injection, fog_counts = inject_fault(
         fault,
         clean_points,
@@ -951,19 +860,18 @@ def create_one_sample(task):
         grid_cols=cfg["grid_size"],
     )
 
-    marked_rgb, change_counts = mark_bev_point_statuses(
-        clean_points,
-        faulty_points,
-        maps["clean_point_status"],
-        maps["faulty_point_status"],
-        faulty_rgb,
-        cfg["x_min"],
-        cfg["x_max"],
-        cfg["y_min"],
-        cfg["y_max"],
-    )
-
     if cfg["save_previews"]:
+        marked_rgb, change_counts = mark_bev_point_statuses(
+            clean_points,
+            faulty_points,
+            maps["clean_point_status"],
+            maps["faulty_point_status"],
+            faulty_rgb,
+            cfg["x_min"],
+            cfg["x_max"],
+            cfg["y_min"],
+            cfg["y_max"],
+        )
         fault_rgb = resize_nearest(
             colorize_fault_heatmap(maps["fault_heatmap"]),
             cfg["image_height"],
@@ -1081,9 +989,9 @@ def create_one_sample(task):
     }
     atomic_savez_compressed(
         npz_path,
-        **maps,
+        **canonical_maps_for_storage(maps),
         clean_rgb=clean_rgb,
-        clean_density=clean_layers["raw_density"],
+        clean_density=clean_density,
         faulty_rgb=faulty_rgb,
         faulty_density=faulty_layers["raw_density"],
         clean_point_ids=clean_point_ids,
@@ -1209,46 +1117,25 @@ def main():
         }
         for index, (bin_path, fault, severity) in enumerate(samples)
     ]
+    task_batches = chronological_source_batches(
+        tasks,
+        args.source_batch_size,
+    )
+    LOGGER.info(
+        "Execution reordered into %d chronological source batches; "
+        "sample membership, indexes, seeds, and filenames are unchanged",
+        len(task_batches),
+    )
     rows = []
     skipped = 0
 
     if args.num_workers == 1:
         LOGGER.info("Creating samples sequentially")
         worker_init(worker_context)
-        for completed, task in enumerate(tasks, start=1):
-            result = create_one_sample(task)
-            rows.append(result)
-            if result.get("skipped"):
-                skipped += 1
-                LOGGER.info(
-                    "Skipping existing %04d/%04d: %s",
-                    completed,
-                    len(tasks),
-                    Path(result["npz"]).name,
-                )
-            else:
-                LOGGER.info(
-                    "Created %04d/%04d: %s",
-                    completed,
-                    len(tasks),
-                    Path(result["npz"]).name,
-                )
-    else:
-        LOGGER.info("Creating samples with %d worker processes", args.num_workers)
-        with ProcessPoolExecutor(
-            max_workers=args.num_workers,
-            initializer=worker_init,
-            initargs=(worker_context,),
-        ) as executor:
-            completed = 0
-            for future, _ in iter_bounded_futures(
-                executor,
-                create_one_sample,
-                tasks,
-                max_pending=max(args.num_workers * 3, 1),
-            ):
+        completed = 0
+        for batch in task_batches:
+            for result in create_sample_batch(batch):
                 completed += 1
-                result = future.result()
                 rows.append(result)
                 if result.get("skipped"):
                     skipped += 1
@@ -1265,6 +1152,38 @@ def main():
                         len(tasks),
                         Path(result["npz"]).name,
                     )
+    else:
+        LOGGER.info("Creating samples with %d worker processes", args.num_workers)
+        with ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=worker_init,
+            initargs=(worker_context,),
+        ) as executor:
+            completed = 0
+            for future, _ in iter_bounded_futures(
+                executor,
+                create_sample_batch,
+                task_batches,
+                max_pending=max(args.num_workers * 3, 1),
+            ):
+                for result in future.result():
+                    completed += 1
+                    rows.append(result)
+                    if result.get("skipped"):
+                        skipped += 1
+                        LOGGER.info(
+                            "Skipping existing %04d/%04d: %s",
+                            completed,
+                            len(tasks),
+                            Path(result["npz"]).name,
+                        )
+                    else:
+                        LOGGER.info(
+                            "Created %04d/%04d: %s",
+                            completed,
+                            len(tasks),
+                            Path(result["npz"]).name,
+                        )
 
     rows = sorted(rows, key=lambda row: row["index"])
     if skipped:

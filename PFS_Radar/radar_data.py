@@ -20,6 +20,12 @@ CONTINENTAL_DTYPE = np.dtype(
     }
 )
 RADAR_CACHE_VERSION = 3
+SCENE_RESOURCE_NAMES = {
+    "continental_gt.txt",
+    "aeva_gt.txt",
+    "imu_lidar.txt",
+    "continental_lidar.txt",
+}
 
 
 class RadarAlignmentUnavailableError(ValueError):
@@ -89,7 +95,9 @@ def scene_session_root(hercules_root: Path, metadata: dict) -> Path:
     return source_root
 
 
-def read_continental_bin(path: Path) -> np.ndarray:
+@lru_cache(maxsize=2048)
+def _read_continental_bin_cached(path_text: str) -> np.ndarray:
+    path = Path(path_text)
     byte_count = path.stat().st_size
     if byte_count % CONTINENTAL_DTYPE.itemsize:
         raise ValueError(
@@ -103,6 +111,10 @@ def read_continental_bin(path: Path) -> np.ndarray:
         np.float32
     )
     return points[np.isfinite(points).all(axis=1)]
+
+
+def read_continental_bin(path: Path) -> np.ndarray:
+    return _read_continental_bin_cached(str(Path(path).resolve())).copy()
 
 
 def load_named_transform(path: Path, key: str) -> np.ndarray:
@@ -216,7 +228,27 @@ def find_named_directory(root: Path, name: str) -> Path:
     return min(candidates, key=lambda path: len(path.parts))
 
 
+@lru_cache(maxsize=256)
+def _scene_resource_index(root_text: str) -> dict[str, Path]:
+    root = Path(root_text)
+    candidates: dict[str, list[Path]] = {}
+    for path in root.rglob("*"):
+        lowered = path.name.lower()
+        if lowered in SCENE_RESOURCE_NAMES and path.is_file():
+            candidates.setdefault(lowered, []).append(path)
+    return {
+        name: min(paths, key=lambda path: len(path.parts))
+        for name, paths in candidates.items()
+    }
+
+
 def find_named_file(root: Path, name: str) -> Path:
+    lowered = name.lower()
+    if lowered in SCENE_RESOURCE_NAMES:
+        try:
+            return _scene_resource_index(str(Path(root).resolve()))[lowered]
+        except KeyError as exc:
+            raise FileNotFoundError(f"No {name} under {root}") from exc
     candidates = [path for path in root.rglob("*") if path.is_file() and path.name.lower() == name.lower()]
     if not candidates:
         raise FileNotFoundError(f"No {name} under {root}")

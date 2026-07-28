@@ -1,7 +1,5 @@
 from pathlib import Path
 import argparse
-import csv
-import json
 import math
 import os
 import sys
@@ -11,90 +9,139 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".ma
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
-if str(FAULT_MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(FAULT_MODEL_DIR))
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from pfs_model import MODEL_VARIANTS, build_reliability_model
-from heatmap_metrics import (
+from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch
+from PFS.pfs_model import MODEL_VARIANTS, build_reliability_model
+from Fault_Localization_Model.heatmap_metrics import (
     HeatmapMetricAccumulator,
     save_group_metrics,
     save_spatial_error_map,
     save_threshold_sweep,
-    threshold_sweep,
 )
-from train_reliability_map import (
+from Fault_Localization_Model.io_utils import (
+    atomic_torch_save,
+    atomic_write_json,
+    write_csv_rows,
+)
+from Fault_Localization_Model.sample_utils import require_disjoint_splits
+from PFS.training_utils import (
+    capture_rng_state,
+    original_reliability_loss,
+    require_checkpoint_args_match,
+    require_checkpoint_semantics,
+    resolve_device,
+    restore_rng_state,
+    save_curve,
+    save_predictions,
+    seed_everything,
+    split_paths,
+)
+from Fault_Localization_Model.visualization_utils import (
     add_label_above,
     add_reliability_colorbar,
     blue_red_reliability,
     draw_cell_boundaries,
-    reliability_loss,
-    save_curve,
     save_image,
-    save_predictions,
     side_by_side,
-    split_paths,
 )
 
 
 DEFAULT_DATASET_ROOT = FAULT_MODEL_DIR / "grid_reliability_change_marks"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "runs" / "pfs_reliability_map"
+TRAINING_SEMANTICS_VERSION = 2
 
 
-class PFSReliabilityDataset(Dataset):
-    def __init__(self, paths, resize_hw):
-        self.paths = list(paths)
-        self.resize_hw = resize_hw
-        if not self.paths:
-            raise FileNotFoundError("No .npz reliability-map samples found.")
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        path = self.paths[idx]
-        with np.load(path, allow_pickle=False) as data:
-            if "clean_rgb" not in data:
-                raise KeyError(f"{path} does not contain clean_rgb. Regenerate the reliability-map dataset first.")
-            faulty_rgb = data["faulty_rgb"].astype(np.float32) / 255.0
-            clean_rgb = data["clean_rgb"].astype(np.float32) / 255.0
-            target = data["fault_heatmap"].astype(np.float32)
-            metadata = json.loads(str(data["metadata_json"]))
-
-        x = torch.from_numpy(np.transpose(faulty_rgb, (2, 0, 1)))
-        clean = torch.from_numpy(np.transpose(clean_rgb, (2, 0, 1)))
-        y = torch.from_numpy(target).unsqueeze(0)
-        if self.resize_hw:
-            x = F.interpolate(x.unsqueeze(0), size=self.resize_hw, mode="bilinear", align_corners=False).squeeze(0)
-            clean = F.interpolate(clean.unsqueeze(0), size=self.resize_hw, mode="bilinear", align_corners=False).squeeze(0)
-            y = F.interpolate(y.unsqueeze(0), size=self.resize_hw, mode="nearest").squeeze(0)
-        return {
-            "x": x,
-            "clean": clean,
-            "y": y,
-            "rgb": (faulty_rgb * 255).astype(np.uint8),
-            "path": str(path),
-            "metadata": metadata,
-        }
-
-
-def collate(batch):
-    return {
-        "x": torch.stack([item["x"] for item in batch]),
-        "clean": torch.stack([item["clean"] for item in batch]),
-        "y": torch.stack([item["y"] for item in batch]),
-        "rgb": [item["rgb"] for item in batch],
-        "path": [item["path"] for item in batch],
-        "metadata": [item["metadata"] for item in batch],
+def validate_training_args(parser, args):
+    finite_values = {
+        "--dropout": args.dropout,
+        "--learning-rate": args.learning_rate,
+        "--min-learning-rate": args.min_learning_rate,
+        "--val-ratio": args.val_ratio,
+        "--stability-weight": args.stability_weight,
+        "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--weight-decay": args.weight_decay,
+        "--grad-clip": args.grad_clip,
+        "--min-delta": args.min_delta,
+        "--metric-threshold": args.metric_threshold,
+        "--metric-x-cell-size": args.metric_x_cell_size,
+        "--metric-y-cell-size": args.metric_y_cell_size,
+        "--target-fault-threshold": args.target_fault_threshold,
+        "--localization-tolerance-m": args.localization_tolerance_m,
     }
+    for name, value in finite_values.items():
+        if not math.isfinite(float(value)):
+            parser.error(f"{name} must be finite")
+    positive_integers = {
+        "--epochs": args.epochs,
+        "--batch-size": args.batch_size,
+        "--resize-height": args.resize_height,
+        "--resize-width": args.resize_width,
+        "--base-channels": args.base_channels,
+        "--grid-size": args.grid_size,
+        "--metrics-every": args.metrics_every,
+    }
+    for name, value in positive_integers.items():
+        if value < 1:
+            parser.error(f"{name} must be at least 1")
+    if args.grid_size > min(args.resize_height, args.resize_width):
+        parser.error(
+            "--grid-size cannot exceed the smaller resized input dimension"
+        )
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
+    if args.max_val_images < 0 or args.metric_example_count < 0:
+        parser.error("Image/example counts must be non-negative")
+    if not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout must lie in [0,1)")
+    if args.learning_rate <= 0.0 or args.min_learning_rate <= 0.0:
+        parser.error("Learning rates must be positive")
+    if args.min_learning_rate > args.learning_rate:
+        parser.error("--min-learning-rate cannot exceed --learning-rate")
+    if not 0 <= args.warmup_epochs <= args.epochs:
+        parser.error("--warmup-epochs must lie between 0 and --epochs")
+    if not 0.0 < args.val_ratio < 1.0:
+        parser.error("--val-ratio must lie strictly between 0 and 1")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    non_negative = {
+        "--stability-weight": args.stability_weight,
+        "--pfs-reliability-weight": args.pfs_reliability_weight,
+        "--weight-decay": args.weight_decay,
+        "--grad-clip": args.grad_clip,
+        "--early-stop-patience": args.early_stop_patience,
+        "--min-delta": args.min_delta,
+    }
+    for name, value in non_negative.items():
+        if value < 0.0:
+            parser.error(f"{name} must be non-negative")
+    if not 0.0 < args.metric_threshold < 1.0:
+        parser.error("--metric-threshold must lie strictly between 0 and 1")
+    if any(not 0.0 < value < 1.0 for value in args.metric_thresholds):
+        parser.error("--metric-thresholds values must lie strictly between 0 and 1")
+    if len(set(args.metric_thresholds)) != len(args.metric_thresholds):
+        parser.error("--metric-thresholds must not contain duplicates")
+    if args.metric_x_cell_size <= 0.0 or args.metric_y_cell_size <= 0.0:
+        parser.error("Metric cell sizes must be positive")
+    if not 0.0 <= args.target_fault_threshold < 1.0:
+        parser.error("--target-fault-threshold must lie in [0,1)")
+    if args.localization_tolerance_m < 0.0:
+        parser.error("--localization-tolerance-m must be non-negative")
+    if (
+        args.disable_metrics
+        and args.best_checkpoint_metric != "val_loss"
+    ):
+        parser.error(
+            "--best-checkpoint-metric must be val_loss when --disable-metrics is used"
+        )
 
 
 def stable_heatmap_loss(logits, target, grid_size=100):
@@ -114,7 +161,7 @@ def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliabil
         logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
 
     if loss_mode == "original":
-        heatmap = reliability_loss(logits, target, grid_size=grid_size)
+        heatmap = original_reliability_loss(logits, target, grid_size=grid_size)
     else:
         heatmap = stable_heatmap_loss(logits, target, grid_size=grid_size)
     stability = logits.new_tensor(0.0)
@@ -138,30 +185,24 @@ def pfs_training_loss(outputs, target, grid_size, stability_weight, pfs_reliabil
     }
 
 
-def write_metrics_csv(rows, path):
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def metric_cell_sizes_from_batch(batch, args):
-    metadata = batch["metadata"][0] if batch["metadata"] else {}
-    x_cell = metadata.get("x_cell_size_m")
-    y_cell = metadata.get("y_cell_size_m")
-    if x_cell is None:
+def metric_metadata_from_batch(batch, args):
+    adjusted = []
+    for item in batch["metadata"]:
+        metadata = dict(item)
         x_range = metadata.get("x_range")
-        if x_range:
-            x_cell = (float(x_range[1]) - float(x_range[0])) / args.grid_size
-    if y_cell is None:
         y_range = metadata.get("y_range")
-        if y_range:
-            y_cell = (float(y_range[1]) - float(y_range[0])) / args.grid_size
-    return float(x_cell or args.metric_x_cell_size), float(y_cell or args.metric_y_cell_size)
+        metadata["x_cell_size_m"] = (
+            (float(x_range[1]) - float(x_range[0])) / args.grid_size
+            if x_range
+            else args.metric_x_cell_size
+        )
+        metadata["y_cell_size_m"] = (
+            (float(y_range[1]) - float(y_range[0])) / args.grid_size
+            if y_range
+            else args.metric_y_cell_size
+        )
+        adjusted.append(metadata)
+    return adjusted
 
 
 def save_error_examples(examples, output_dir, grid_size):
@@ -233,8 +274,6 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
     totals = {"loss": 0.0, "heatmap_loss": 0.0, "stability_loss": 0.0, "pfs_reliability_loss": 0.0}
     count = 0
     metric_accumulator = None
-    sweep_outputs = []
-    sweep_targets = []
     examples = []
     x_range = None
     y_range = None
@@ -242,6 +281,8 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
         x = batch["x"].to(device)
         clean = batch["clean"].to(device)
         y = batch["y"].to(device)
+        if train:
+            optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(train):
             outputs = model(x, clean_bev=clean, return_features=True)
             loss, parts = pfs_training_loss(
@@ -252,32 +293,47 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
                 pfs_reliability_weight=args.pfs_reliability_weight,
                 loss_mode=args.loss_mode,
             )
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite {'training' if train else 'validation'} loss detected"
+                )
             if train:
-                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if args.grad_clip > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        args.grad_clip,
+                        error_if_nonfinite=True,
+                    )
                 optimizer.step()
         if not train and compute_metrics and not args.disable_metrics:
             logits = outputs["logits"]
-            x_cell, y_cell = metric_cell_sizes_from_batch(batch, args)
+            metric_metadata = metric_metadata_from_batch(batch, args)
+            first_metadata = metric_metadata[0] if metric_metadata else {}
+            x_cell = first_metadata.get(
+                "x_cell_size_m", args.metric_x_cell_size
+            )
+            y_cell = first_metadata.get(
+                "y_cell_size_m", args.metric_y_cell_size
+            )
             if metric_accumulator is None:
                 metric_accumulator = HeatmapMetricAccumulator(
                     threshold=args.metric_threshold,
+                    target_threshold=args.target_fault_threshold,
                     metric_grid_size=args.grid_size,
                     x_cell_size_m=x_cell,
                     y_cell_size_m=y_cell,
-                    boundary_chamfer=args.boundary_chamfer,
+                    boundary_chamfer=False,
+                    compute_chamfer=False,
+                    localization_tolerance_m=args.localization_tolerance_m,
                 )
-            metric_accumulator.update(logits, y, metadata=batch["metadata"], from_logits=True)
-            if args.threshold_sweep:
-                prob = torch.sigmoid(logits.detach())
-                if prob.shape[-2:] != y.shape[-2:]:
-                    prob = F.interpolate(prob, size=y.shape[-2:], mode="bilinear", align_corners=False)
-                prob = F.adaptive_avg_pool2d(prob, output_size=(args.grid_size, args.grid_size)).cpu()
-                target_grid = F.adaptive_avg_pool2d(y.detach(), output_size=(args.grid_size, args.grid_size)).cpu()
-                sweep_outputs.append(prob)
-                sweep_targets.append(target_grid)
+            metric_accumulator.update(
+                logits,
+                y,
+                metadata=metric_metadata,
+                from_logits=True,
+                update_groups=False,
+            )
             if len(examples) < args.metric_example_count:
                 prob = torch.sigmoid(logits.detach())
                 if prob.shape[-2:] != y.shape[-2:]:
@@ -306,12 +362,9 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
     stats = {key: value / max(count, 1) for key, value in totals.items()}
     if metric_accumulator is not None:
         stats.update(metric_accumulator.compute())
-    sweep_rows = []
-    if sweep_outputs and sweep_targets:
-        sweep_rows = threshold_sweep(sweep_outputs, sweep_targets, args.metric_thresholds, args.grid_size)
     artifacts = {
         "accumulator": metric_accumulator,
-        "threshold_sweep": sweep_rows,
+        "threshold_sweep": [],
         "examples": examples,
         "x_range": tuple(x_range) if x_range else None,
         "y_range": tuple(y_range) if y_range else None,
@@ -319,26 +372,119 @@ def run_epoch(model, loader, optimizer, device, train, args, compute_metrics=Tru
     return stats, artifacts
 
 
-def write_history(history, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as file:
-        fieldnames = sorted({key for row in history for key in row.keys()})
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(history)
-
-
-def load_resume_checkpoint(path, model, optimizer, scheduler, device):
-    checkpoint = torch.load(path, map_location=device)
+def load_resume_checkpoint(path, model, optimizer, scheduler, device, current_args):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    require_checkpoint_semantics(
+        checkpoint,
+        TRAINING_SEMANTICS_VERSION,
+        "PFS",
+    )
+    saved_args = checkpoint.get("args", {})
+    require_checkpoint_args_match(
+        saved_args,
+        current_args,
+        (
+            "model_variant",
+            "base_channels",
+            "dropout",
+            "learning_rate",
+            "min_learning_rate",
+            "warmup_epochs",
+            "weight_decay",
+            "grid_size",
+            "stability_weight",
+            "pfs_reliability_weight",
+            "loss_mode",
+            "best_checkpoint_metric",
+            "metric_threshold",
+            "target_fault_threshold",
+            "localization_tolerance_m",
+        ),
+    )
+    required_state = {
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "epoch",
+    }
+    missing_state = required_state - set(checkpoint)
+    if missing_state:
+        raise ValueError(
+            f"Checkpoint {path} cannot be resumed because it lacks: "
+            + ", ".join(sorted(missing_state))
+        )
+    saved_metric = checkpoint.get(
+        "best_checkpoint_metric",
+        saved_args.get("best_checkpoint_metric"),
+    )
+    if saved_metric is None and current_args.best_checkpoint_metric != "val_loss":
+        raise ValueError(
+            "This legacy checkpoint does not record its selection metric. "
+            "Resume it with --best-checkpoint-metric val_loss or initialize a new run."
+        )
+    if (
+        saved_metric is not None
+        and saved_metric != current_args.best_checkpoint_metric
+    ):
+        raise ValueError(
+            f"Checkpoint selection metric {saved_metric!r} does not match requested "
+            f"metric {current_args.best_checkpoint_metric!r}. Use the original metric "
+            "for an exact resume."
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
-    if "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if "scheduler_state_dict" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     start_epoch = int(checkpoint.get("epoch", 0)) + 1
-    best_val = float(checkpoint.get("best_val_loss", float("inf")))
-    history = checkpoint.get("history", [])
-    return start_epoch, best_val, history
+    best_score = float(
+        checkpoint.get(
+            "best_checkpoint_score",
+            checkpoint.get("best_val_loss", float("inf")),
+        )
+    )
+    history = list(checkpoint.get("history", []))
+    early_stop_counter = int(checkpoint.get("early_stop_counter", 0))
+    restore_rng_state(checkpoint.get("rng_state"))
+    return start_epoch, best_score, history, early_stop_counter
+
+
+def build_checkpoint_payload(
+    model,
+    optimizer,
+    scheduler,
+    args,
+    epoch,
+    best_score,
+    val_loss,
+    history,
+    early_stop_counter,
+):
+    return {
+        "training_semantics_version": TRAINING_SEMANTICS_VERSION,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "args": vars(args),
+        "epoch": epoch,
+        "validation_loss": val_loss,
+        "best_val_loss": (
+            best_score
+            if args.best_checkpoint_metric == "val_loss"
+            else None
+        ),
+        "best_checkpoint_metric": args.best_checkpoint_metric,
+        "best_checkpoint_score": best_score,
+        "early_stop_counter": early_stop_counter,
+        "history": history,
+        "rng_state": capture_rng_state(),
+        "architecture": type(model).__name__,
+        "input": "faulty_rgb_bev",
+        "training_clean_input": (
+            "unused"
+            if args.model_variant == "no-pfs"
+            else "clean_rgb_bev used only for feature stabilization loss"
+        ),
+        "target": "fault_heatmap/unreliability; reliability=1-target",
+    }
 
 
 def build_warmup_cosine_scheduler(optimizer, epochs, warmup_epochs, min_lr, base_lr):
@@ -410,6 +556,8 @@ def main():
     parser.add_argument("--metric-thresholds", type=float, nargs="*", default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     parser.add_argument("--metric-x-cell-size", type=float, default=0.64)
     parser.add_argument("--metric-y-cell-size", type=float, default=0.64)
+    parser.add_argument("--target-fault-threshold", type=float, default=0.0)
+    parser.add_argument("--localization-tolerance-m", type=float, default=0.20)
     parser.add_argument("--metric-example-count", type=int, default=5)
     parser.add_argument(
         "--metrics-every",
@@ -417,9 +565,10 @@ def main():
         default=1,
         help="Compute expensive validation metrics every N epochs. Validation loss still runs every epoch.",
     )
-    parser.add_argument("--threshold-sweep", action="store_true", default=True)
+    parser.add_argument("--threshold-sweep", action="store_true", default=False)
     parser.add_argument("--disable-threshold-sweep", action="store_false", dest="threshold_sweep")
     parser.add_argument("--boundary-chamfer", action="store_true")
+    parser.add_argument("--disable-chamfer", action="store_true")
     parser.add_argument("--disable-metrics", action="store_true")
     parser.add_argument("--disable-validation-artifacts", action="store_true")
     parser.add_argument("--disable-plots", action="store_true")
@@ -431,6 +580,8 @@ def main():
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    validate_training_args(parser, args)
+    seed_everything(args.seed)
 
     output_root = Path(args.output_root)
     if args.train_root or args.val_root:
@@ -450,22 +601,28 @@ def main():
         if not paths:
             raise FileNotFoundError(f"No .npz files found in {dataset_root}")
         train_paths, val_paths = split_paths(paths, args.val_ratio, args.seed)
+    require_disjoint_splits({"train": train_paths, "validation": val_paths})
     resize_hw = (args.resize_height, args.resize_width)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    output_root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output_root / "training_config.json", vars(args))
 
+    loader_options = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_reliability_batch,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": args.num_workers > 0,
+    }
     train_loader = DataLoader(
         PFSReliabilityDataset(train_paths, resize_hw),
-        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate,
+        **loader_options,
     )
     val_loader = DataLoader(
         PFSReliabilityDataset(val_paths, resize_hw),
-        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate,
+        **loader_options,
     )
 
     model = build_reliability_model(
@@ -488,10 +645,18 @@ def main():
     start_epoch = 1
     best_score = float("-inf") if args.best_checkpoint_metric in {"val_f1", "val_iou"} else float("inf")
     history = []
+    epochs_without_improvement = 0
     if args.resume:
-        start_epoch, resumed_best, history = load_resume_checkpoint(Path(args.resume), model, optimizer, scheduler, device)
-        if args.best_checkpoint_metric == "val_loss":
-            best_score = resumed_best
+        start_epoch, best_score, history, epochs_without_improvement = (
+            load_resume_checkpoint(
+                Path(args.resume),
+                model,
+                optimizer,
+                scheduler,
+                device,
+                args,
+            )
+        )
         print(
             f"Resumed from {args.resume} at epoch {start_epoch}; "
             f"best_{args.best_checkpoint_metric}={best_score:.6f}",
@@ -509,9 +674,9 @@ def main():
         f"{len(train_paths)} train and {len(val_paths)} val samples.",
         flush=True,
     )
-    epochs_without_improvement = 0
     latest_val_artifacts = None
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_stats, _ = run_epoch(model, train_loader, optimizer, device, train=True, args=args)
         compute_val_metrics = (
             not args.disable_metrics
@@ -541,7 +706,7 @@ def main():
             "val_stability_loss": val_stats["stability_loss"],
             "train_pfs_reliability_loss": train_stats["pfs_reliability_loss"],
             "val_pfs_reliability_loss": val_stats["pfs_reliability_loss"],
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": epoch_learning_rate,
         }
         for metric_key, metric_value in val_stats.items():
             if metric_key not in {"loss", "heatmap_loss", "stability_loss", "pfs_reliability_loss"}:
@@ -558,28 +723,25 @@ def main():
             f"pfs_rel={val_stats['pfs_reliability_loss']:.6f} "
             f"iou={val_stats.get('iou', 0.0):.4f} f1={val_stats.get('f1', 0.0):.4f} "
             f"brier={val_stats.get('brier_score', 0.0):.5f} mae={val_stats.get('pixel_mae', 0.0):.5f} "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}",
+            f"lr={epoch_learning_rate:.2e}",
             flush=True,
         )
         score = checkpoint_score(val_stats, args.best_checkpoint_metric)
         if score is not None and checkpoint_improved(score, best_score, args.best_checkpoint_metric, args.min_delta):
             best_score = score
             epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "args": vars(args),
-                    "best_val_loss": val_stats["loss"],
-                    "best_checkpoint_metric": args.best_checkpoint_metric,
-                    "best_checkpoint_score": best_score,
-                    "architecture": type(model).__name__,
-                    "input": "faulty_rgb_bev",
-                    "training_clean_input": (
-                        "unused" if args.model_variant == "no-pfs"
-                        else "clean_rgb_bev used only for feature stabilization loss"
-                    ),
-                    "target": "fault_heatmap/unreliability; reliability=1-target",
-                },
+            atomic_torch_save(
+                build_checkpoint_payload(
+                    model,
+                    optimizer,
+                    scheduler,
+                    args,
+                    epoch,
+                    best_score,
+                    val_stats["loss"],
+                    history,
+                    epochs_without_improvement,
+                ),
                 checkpoint_dir / "best_model.pt",
             )
             if not args.disable_validation_artifacts and val_artifacts["accumulator"] is not None:
@@ -594,25 +756,18 @@ def main():
                 )
         elif score is not None:
             epochs_without_improvement += 1
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "args": vars(args),
-                "epoch": epoch,
-                "best_val_loss": val_stats["loss"],
-                "best_checkpoint_metric": args.best_checkpoint_metric,
-                "best_checkpoint_score": best_score,
-                "history": history,
-                "architecture": type(model).__name__,
-                "input": "faulty_rgb_bev",
-                "training_clean_input": (
-                    "unused" if args.model_variant == "no-pfs"
-                    else "clean_rgb_bev used only for feature stabilization loss"
-                ),
-                "target": "fault_heatmap/unreliability; reliability=1-target",
-            },
+        atomic_torch_save(
+            build_checkpoint_payload(
+                model,
+                optimizer,
+                scheduler,
+                args,
+                epoch,
+                best_score,
+                val_stats["loss"],
+                history,
+                epochs_without_improvement,
+            ),
             checkpoint_dir / "last_checkpoint.pt",
         )
         if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
@@ -625,8 +780,7 @@ def main():
 
     if not args.disable_plots:
         save_curve(curve_history, output_root / "plots" / "training_curve.png")
-    write_history(history, output_root / "training_history.csv")
-    write_metrics_csv(history, output_root / "validation_metrics" / "epoch_metrics.csv")
+    write_csv_rows(output_root / "training_history.csv", history)
     if not args.disable_validation_artifacts and latest_val_artifacts and latest_val_artifacts["accumulator"] is not None:
         save_validation_artifacts(
             latest_val_artifacts["accumulator"],
@@ -639,14 +793,43 @@ def main():
         )
 
     if not args.disable_final_predictions and args.max_val_images > 0:
-        checkpoint = torch.load(checkpoint_dir / "best_model.pt", map_location=device)
+        checkpoint_candidates = [checkpoint_dir / "best_model.pt"]
+        if args.resume:
+            resume_path = Path(args.resume)
+            checkpoint_candidates.extend(
+                [resume_path.parent / "best_model.pt", resume_path]
+            )
+        checkpoint_candidates.append(checkpoint_dir / "last_checkpoint.pt")
+        prediction_checkpoint = next(
+            (path for path in checkpoint_candidates if path.exists()),
+            None,
+        )
+        if prediction_checkpoint is None:
+            raise FileNotFoundError(
+                "No checkpoint is available for final validation predictions."
+            )
+        checkpoint = torch.load(
+            prediction_checkpoint,
+            map_location=device,
+            weights_only=False,
+        )
         model.load_state_dict(checkpoint["model_state_dict"])
-        rows = save_predictions(model, val_loader, output_root, device, args.max_val_images)
-        if rows:
-            with (output_root / "val_predictions" / "prediction_metrics.csv").open("w", encoding="utf-8", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(rows)
+        rows = save_predictions(
+            model,
+            val_loader,
+            output_root,
+            device,
+            args.max_val_images,
+            visual_grid_size=args.grid_size,
+            localization_threshold=args.metric_threshold,
+            localization_tolerance_m=args.localization_tolerance_m,
+            target_fault_threshold=args.target_fault_threshold,
+        )
+        write_csv_rows(
+            output_root / "val_predictions" / "prediction_metrics.csv",
+            rows,
+            fieldnames=list(rows[0]) if rows else None,
+        )
     print(f"Saved PFS run: {output_root}", flush=True)
 
 

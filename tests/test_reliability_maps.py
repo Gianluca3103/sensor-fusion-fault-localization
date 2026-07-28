@@ -1,13 +1,8 @@
-from pathlib import Path
-import sys
 import unittest
 
 import numpy as np
 
-MODEL_DIR = Path(__file__).resolve().parents[1] / "Fault_Localization_Model"
-sys.path.insert(0, str(MODEL_DIR))
-
-from create_grid_reliability_heatmaps import (
+from Fault_Localization_Model.create_grid_reliability_heatmaps import (
     make_reliability_maps,
     mark_bev_point_statuses,
     point_counts_grid,
@@ -15,6 +10,34 @@ from create_grid_reliability_heatmaps import (
 
 
 class ReliabilityMapTests(unittest.TestCase):
+    def test_tolerated_motion_counts_as_correct_at_observed_location(self):
+        clean = np.asarray([[0.99, 0.5, 0.0, 1.0]], dtype=np.float32)
+        faulty = np.asarray(
+            [
+                [1.01, 0.5, 0.0, 1.0],
+                [1.01, 0.5, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        result = make_reliability_maps(
+            clean,
+            np.asarray([0], dtype=np.int64),
+            faulty,
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([0, -1], dtype=np.int64),
+            movement_tolerance_m=0.05,
+            x_min=0.0,
+            x_max=2.0,
+            y_min=0.0,
+            y_max=1.0,
+            grid_rows=2,
+            grid_cols=1,
+        )
+
+        self.assertEqual(float(result["clean_point_counts"][0, 0]), 1.0)
+        self.assertEqual(float(result["added_faulty_counts"][0, 0]), 1.0)
+        self.assertAlmostEqual(float(result["reliability_map"][0, 0]), 0.5)
+
     def test_missing_and_wrong_added_do_not_cancel(self):
         clean = np.array(
             [

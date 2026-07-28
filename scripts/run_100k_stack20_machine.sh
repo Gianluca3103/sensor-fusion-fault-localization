@@ -2,19 +2,19 @@
 set -Eeuo pipefail
 
 PYTHON="${PYTHON:-/home/arrubuntu20/anaconda3/envs/sensor-fusion/bin/python}"
-REPO_ROOT="${REPO_ROOT:-/mnt/3D10B36523559581/Gianluca/sensor-fusion-fault-localization-100k}"
+REPO_ROOT="${REPO_ROOT:-/mnt/3D10B36523559581/Gianluca/sensor-fusion-fault-localization}"
 HERCULES_ROOT="${HERCULES_ROOT:-/mnt/3D10B36523559581/HeRCULES}"
 OUTPUT_BASE="${OUTPUT_BASE:-/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs}"
 
-DATASET_ROOT="${DATASET_ROOT:-$OUTPUT_BASE/grid_reliability_100k_grid320_id_v1}"
+DATASET_ROOT="${DATASET_ROOT:-$OUTPUT_BASE/grid_reliability_100k_grid320_id_v3}"
 RADAR_ROOT="${RADAR_ROOT:-$OUTPUT_BASE/radar_cache_100k_stack20}"
-RUN_ROOT="${RUN_ROOT:-$OUTPUT_BASE/pfs_radar_100k_stack20_localigned}"
+RUN_ROOT="${RUN_ROOT:-$OUTPUT_BASE/pfs_radar_100k_v3_no_rain_snow_b64_lr7p5e5}"
 LOG_ROOT="${LOG_ROOT:-$OUTPUT_BASE/logs}"
 
 GEN_WORKERS="${GEN_WORKERS:-24}"
 CACHE_WORKERS="${CACHE_WORKERS:-16}"
 TRAIN_WORKERS="${TRAIN_WORKERS:-12}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-48}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 
 mkdir -p "$DATASET_ROOT" "$RADAR_ROOT" "$RUN_ROOT" "$LOG_ROOT"
 LOG_FILE="$LOG_ROOT/100k_stack20_$(date +%Y%m%d_%H%M%S).log"
@@ -25,11 +25,14 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
 
 test -x "$PYTHON"
 test -d "$REPO_ROOT"
 test -d "$HERCULES_ROOT"
 cd "$REPO_ROOT"
+
+"$PYTHON" -c "import numpy, scipy, torch, tqdm; assert torch.cuda.is_available(), 'CUDA is unavailable'; print('Python dependencies OK'); print('PyTorch:', torch.__version__); print('GPU:', torch.cuda.get_device_name(0))"
 
 available_kb="$(df -Pk "$OUTPUT_BASE" | awk 'NR==2 {print $4}')"
 required_kb="$((100 * 1024 * 1024))"
@@ -59,6 +62,7 @@ generate_split() {
     --resolution 0.20 \
     --movement-tolerance-m 0.05 \
     --num-workers "$GEN_WORKERS" \
+    --weather-threads 1 \
     --no-previews \
     --seed "$seed"
 
@@ -103,17 +107,17 @@ echo "Starting RTX 4090 training..."
   --num-workers "$TRAIN_WORKERS" \
   --base-channels 16 \
   --dropout 0.15 \
-  --learning-rate 1e-4 \
+  --learning-rate 7.5e-5 \
   --min-learning-rate 1e-6 \
-  --warmup-epochs 5 \
+  --warmup-epochs 10 \
   --weight-decay 2e-3 \
   --stability-weight 0.05 \
   --pfs-reliability-weight 0.10 \
   --localization-loss-weight 0.25 \
-  --false-positive-weight 0.70 \
-  --localization-radius-cells 1 \
+  --false-positive-weight 0.65 \
   --grad-clip 1.0 \
   --early-stop-patience 20 \
+  --min-delta 1e-4 \
   --resize-height 320 \
   --resize-width 320 \
   --grid-size 320 \
@@ -122,6 +126,11 @@ echo "Starting RTX 4090 training..."
   --metrics-every 5 \
   --localization-tolerance-m 0.20 \
   --target-fault-threshold 0.0 \
+  --radar-frame-count 20 \
+  --require-full-radar-stack \
+  --max-radar-delta-ms 30 \
+  --radar-max-abs-velocity 30 \
+  --exclude-faults rain_sim snow_sim \
   --device cuda
 
 echo "Completed. Best checkpoints:"
