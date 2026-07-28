@@ -5,6 +5,7 @@ import os
 import sys
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".matplotlib"))
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 import torch
