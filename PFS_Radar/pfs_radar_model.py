@@ -44,6 +44,22 @@ class ReliabilityDecoder(nn.Module):
         return self.head(d1)
 
 
+class SkipFusion(nn.Module):
+    """Fuse same-resolution LiDAR and radar skip features without widening the decoder."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, lidar_skip, radar_skip):
+        radar_skip = match_spatial(radar_skip, lidar_skip)
+        return self.fusion(torch.cat([lidar_skip, radar_skip], dim=1))
+
+
 class PFSRadarReliabilityModel(nn.Module):
     """Predict LiDAR fault heatmaps from degraded LiDAR and uncorrupted radar BEVs."""
 
@@ -64,14 +80,30 @@ class PFSRadarReliabilityModel(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.pfs = PostFusionStabilizer(channels)
+        self.radar_skip_fusion = nn.ModuleList(
+            [
+                SkipFusion(base_channels),
+                SkipFusion(base_channels * 2),
+                SkipFusion(base_channels * 4),
+                SkipFusion(base_channels * 8),
+            ]
+        )
         self.decoder = ReliabilityDecoder(base_channels, dropout)
 
     def forward(self, faulty_lidar_bev, radar_bev, clean_lidar_bev=None, return_features=False):
         e1, e2, e3, e4, lidar_bottleneck = self.lidar_encoder(faulty_lidar_bev)
-        radar_bottleneck = self.radar_encoder(radar_bev)[-1]
+        radar_e1, radar_e2, radar_e3, radar_e4, radar_bottleneck = self.radar_encoder(radar_bev)
         fused = self.fusion(torch.cat([lidar_bottleneck, radar_bottleneck], dim=1))
         stabilized, pfs_reliability = self.pfs(fused, lidar_bottleneck)
-        logits = self.decoder(stabilized, (e1, e2, e3, e4))
+        skips = tuple(
+            fusion(lidar_skip, radar_skip)
+            for fusion, lidar_skip, radar_skip in zip(
+                self.radar_skip_fusion,
+                (e1, e2, e3, e4),
+                (radar_e1, radar_e2, radar_e3, radar_e4),
+            )
+        )
+        logits = self.decoder(stabilized, skips)
 
         if not return_features:
             return logits
@@ -106,6 +138,7 @@ def parameter_breakdown(model: PFSRadarReliabilityModel) -> dict[str, int]:
         "radar_encoder": model.radar_encoder,
         "fusion": model.fusion,
         "pfs": model.pfs,
+        "radar_skip_fusion": model.radar_skip_fusion,
         "decoder": model.decoder,
     }
     breakdown = {name: sum(parameter.numel() for parameter in module.parameters()) for name, module in components.items()}
