@@ -100,6 +100,11 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.15)
     parser.add_argument("--localization-tolerance-m", type=float, default=0.20)
     parser.add_argument("--target-fault-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--no-match-overlay",
+        action="store_true",
+        help="Skip the expensive one-to-one localization overlay and export only input/ideal/predicted panels.",
+    )
     parser.add_argument("--include-faults", nargs="*", default=None)
     parser.add_argument("--exclude-faults", nargs="*", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -182,17 +187,19 @@ def main() -> None:
                     blue_red_reliability(prediction_map),
                     grid_size=args.visual_grid_size,
                 )
-                match_rgb = draw_cell_boundaries(
-                    localization_match_overlay(
-                        target_map,
-                        prediction_map,
-                        metadata,
-                        prediction_threshold=args.threshold,
-                        target_fault_threshold=args.target_fault_threshold,
-                        tolerance_m=args.localization_tolerance_m,
-                    ),
-                    grid_size=args.visual_grid_size,
-                )
+                match_rgb = None
+                if not args.no_match_overlay:
+                    match_rgb = draw_cell_boundaries(
+                        localization_match_overlay(
+                            target_map,
+                            prediction_map,
+                            metadata,
+                            prediction_threshold=args.threshold,
+                            target_fault_threshold=args.target_fault_threshold,
+                            tolerance_m=args.localization_tolerance_m,
+                        ),
+                        grid_size=args.visual_grid_size,
+                    )
                 input_rgb = tensor_rgb(lidar[index])
 
                 fault = metadata.get("fault", "unknown_fault")
@@ -201,8 +208,7 @@ def main() -> None:
                 stem = f"{written:04d}_{fault}_s{severity}_{timestamp}"
                 label = f"{fault} S{severity}"
 
-                comparison = side_by_side(
-                    [
+                panels = [
                         add_label_above(input_rgb, f"LiDAR input: {label}"),
                         add_reliability_colorbar(
                             add_label_above(target_rgb, "ideal / target")
@@ -210,12 +216,15 @@ def main() -> None:
                         add_reliability_colorbar(
                             add_label_above(prediction_rgb, "predicted")
                         ),
+                ]
+                if match_rgb is not None:
+                    panels.append(
                         add_label_above(
                             match_rgb,
                             "match: white=both cyan=pred green=target red=miss yellow=false",
-                        ),
-                    ]
-                )
+                        )
+                    )
+                comparison = side_by_side(panels)
                 save_image(image_dir / f"{stem}_ideal_vs_predicted.png", comparison)
                 rows.append(
                     {
