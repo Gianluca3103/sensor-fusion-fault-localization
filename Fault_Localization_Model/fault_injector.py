@@ -19,9 +19,11 @@ EMPTY_FOG_METADATA = {
     "fog_info_json": "",
     "fov_center_deg": "",
     "fov_retained_width_deg": "",
+    "fov_missing_center_deg": "",
+    "fov_missing_width_deg": "",
 }
 NO_SOURCE_ID = -1
-INJECTION_VERSION = 2
+INJECTION_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -108,15 +110,23 @@ def _subset_result(points, clean_point_ids, keep_mask):
 
 def _fov_keep_mask(points, severity, rng_seed=None):
     retained_width_deg = [210.0, 180.0, 150.0, 120.0, 90.0][int(severity) - 1]
-    center_deg = (
-        0.0
+    missing_width_deg = 360.0 - retained_width_deg
+    # The BEV target used by the fault-localization model is forward-facing
+    # (x > 0).  The previous implementation randomized the retained-FOV center
+    # over the full 360 degrees, which often placed the missing sector behind or
+    # outside the BEV.  Those samples were labelled fov_filter but had an empty
+    # target heatmap.  Randomize the missing sector around the forward direction
+    # instead, while still varying its lateral position.
+    missing_center_deg = (
+        90.0
         if rng_seed is None
-        else float(np.random.default_rng(rng_seed).uniform(-180.0, 180.0))
+        else float(np.random.default_rng(rng_seed).uniform(45.0, 135.0))
     )
+    center_deg = ((missing_center_deg + 360.0) % 360.0) - 180.0
     angles = np.degrees(np.arctan2(points[:, 0], points[:, 1]))
-    relative_angles = (angles - center_deg + 180.0) % 360.0 - 180.0
-    keep_mask = np.abs(relative_angles) <= retained_width_deg / 2.0
-    return keep_mask, center_deg, retained_width_deg
+    relative_to_missing = (angles - missing_center_deg + 180.0) % 360.0 - 180.0
+    keep_mask = np.abs(relative_to_missing) > missing_width_deg / 2.0
+    return keep_mask, center_deg, retained_width_deg, missing_center_deg, missing_width_deg
 
 
 def parse_fault_plan(items):
@@ -227,7 +237,13 @@ def inject_fault(
         return _subset_result(faulty_raw, clean_point_ids, keep_mask), metadata
 
     if fault == "fov_filter":
-        keep_mask, center_deg, retained_width_deg = _fov_keep_mask(
+        (
+            keep_mask,
+            center_deg,
+            retained_width_deg,
+            missing_center_deg,
+            missing_width_deg,
+        ) = _fov_keep_mask(
             clean_points, severity, rng_seed=rng_seed
         )
         faulty_raw = clean_points[keep_mask].copy()
@@ -235,6 +251,8 @@ def inject_fault(
             {
                 "fov_center_deg": center_deg,
                 "fov_retained_width_deg": retained_width_deg,
+                "fov_missing_center_deg": missing_center_deg,
+                "fov_missing_width_deg": missing_width_deg,
             }
         )
         return _subset_result(faulty_raw, clean_point_ids, keep_mask), metadata

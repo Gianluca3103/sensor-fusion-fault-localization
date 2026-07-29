@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+from bisect import bisect_right
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import json
@@ -44,6 +45,11 @@ from Fault_Localization_Model.reliability_maps import (  # noqa: E402
     point_counts_grid,
 )
 from Fault_Localization_Model.visualization_utils import add_reliability_colorbar, side_by_side  # noqa: E402
+from PFS_Radar.radar_data import (  # noqa: E402
+    RadarAlignmentUnavailableError,
+    scene_radar_resources,
+    scene_session_root,
+)
 
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "grid_reliability_heatmaps"
@@ -60,7 +66,7 @@ FAULT_PLAN = [
 ]
 GROUND_TRUTH_METHOD = "point_id_provenance_v2"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
-GENERATOR_VERSION = 3
+GENERATOR_VERSION = 4
 RESUME_REQUIRED_ARRAYS = (
     "fault_heatmap",
     "reliability_map",
@@ -166,6 +172,16 @@ def parse_args():
     )
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--require-causal-radar-max-delta-ms",
+        type=float,
+        default=None,
+        help=(
+            "Before sampling, keep only raw LiDAR frames whose scene has a causal "
+            "Continental radar frame at or before the LiDAR timestamp within this "
+            "many milliseconds. Use the same value as Radar V2 --max-delta-ms."
+        ),
+    )
     parser.add_argument("--faults", nargs="*", default=defaults["faults"])
     parser.add_argument("--severities", type=int, nargs="*", default=defaults["severities"])
     parser.add_argument(
@@ -252,6 +268,11 @@ def validate_generation_args(args):
         raise ValueError("--train-ratio and --val-ratio must be positive.")
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
+    if args.require_causal_radar_max_delta_ms is not None and (
+        not np.isfinite(args.require_causal_radar_max_delta_ms)
+        or args.require_causal_radar_max_delta_ms < 0.0
+    ):
+        raise ValueError("--require-causal-radar-max-delta-ms must be non-negative.")
     require_range(args.x_min, args.x_max, "x range")
     require_range(args.y_min, args.y_max, "y range")
     require_range(args.min_range, args.max_range, "point range")
@@ -452,6 +473,38 @@ def select_temporal_split_bins(bins, data_root, split_name, train_ratio=0.70, va
     if not selected:
         raise FileNotFoundError(f"No frames selected for temporal split {split_name!r}.")
     return selected, split_counts
+
+
+def has_causal_radar_within_delta(bin_path, data_root, max_delta_ms):
+    """Return whether a raw Aeva frame has the same causal radar anchor as Radar V2."""
+
+    timestamp = int(Path(bin_path).stem)
+    source_meta = hercules_source_metadata(Path(bin_path), Path(data_root))
+    try:
+        scene_root = scene_session_root(Path(data_root), source_meta)
+        radar_timestamps, _, _ = scene_radar_resources(str(scene_root.resolve()))
+        current_index = bisect_right(radar_timestamps, timestamp) - 1
+        if current_index < 0:
+            return False
+        age_ms = (timestamp - radar_timestamps[current_index]) / 1_000_000.0
+        return age_ms <= float(max_delta_ms)
+    except (FileNotFoundError, ValueError, RadarAlignmentUnavailableError):
+        return False
+
+
+def filter_bins_with_causal_radar(bins, data_root, max_delta_ms):
+    eligible = [
+        bin_path
+        for bin_path in bins
+        if has_causal_radar_within_delta(bin_path, data_root, max_delta_ms)
+    ]
+    skipped = len(bins) - len(eligible)
+    if not eligible:
+        raise FileNotFoundError(
+            "No LiDAR frames remain after requiring causal radar within "
+            f"{max_delta_ms:g} ms."
+        )
+    return eligible, skipped
 
 
 def hercules_source_metadata(bin_path, data_root):
@@ -1075,6 +1128,21 @@ def main():
             )
     if not bins:
         raise FileNotFoundError("No Hercules Aeva frames selected.")
+    if args.require_causal_radar_max_delta_ms is not None:
+        before_count = len(bins)
+        bins, skipped_no_radar = filter_bins_with_causal_radar(
+            bins,
+            data_root,
+            args.require_causal_radar_max_delta_ms,
+        )
+        LOGGER.info(
+            "Causal radar prefilter <= %.1f ms kept %d/%d raw LiDAR frames "
+            "and removed %d before sample generation",
+            args.require_causal_radar_max_delta_ms,
+            len(bins),
+            before_count,
+            skipped_no_radar,
+        )
 
     plan = build_fault_plan(args.fault_plan, args.faults, args.severities, FAULT_PLAN)
     LOGGER.info("Selected %d frame candidates from %s", len(bins), source_description)

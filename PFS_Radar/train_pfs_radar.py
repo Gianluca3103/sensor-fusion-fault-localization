@@ -55,6 +55,7 @@ def validate_training_args(parser, args):
         "--metric-threshold": args.metric_threshold,
         "--localization-tolerance-m": args.localization_tolerance_m,
         "--target-fault-threshold": args.target_fault_threshold,
+        "--heatmap-loss-weight": args.heatmap_loss_weight,
         "--localization-loss-weight": args.localization_loss_weight,
         "--false-positive-weight": args.false_positive_weight,
         "--min-delta": args.min_delta,
@@ -115,6 +116,7 @@ def validate_training_args(parser, args):
         "--grad-clip": args.grad_clip,
         "--early-stop-patience": args.early_stop_patience,
         "--localization-tolerance-m": args.localization_tolerance_m,
+        "--heatmap-loss-weight": args.heatmap_loss_weight,
         "--localization-loss-weight": args.localization_loss_weight,
     }
     for name, value in non_negative.items():
@@ -356,6 +358,7 @@ def compute_loss(
     grid_size,
     stability_weight,
     pfs_weight,
+    heatmap_weight,
     localization_weight,
     false_positive_weight,
     target_fault_threshold,
@@ -389,10 +392,11 @@ def compute_loss(
             outputs["pfs_reliability"].float().clamp(1e-6, 1.0 - 1e-6),
             reliability_target.float(),
         )
+    weighted_heatmap = heatmap_weight * heatmap_loss
     weighted_localization = localization_weight * localization_loss
     weighted_stability = stability_weight * stability_loss
     weighted_pfs = pfs_weight * pfs_loss
-    total = heatmap_loss + weighted_localization + weighted_stability + weighted_pfs
+    total = weighted_heatmap + weighted_localization + weighted_stability + weighted_pfs
     return (
         total,
         heatmap_loss,
@@ -402,6 +406,7 @@ def compute_loss(
         pixel_l1,
         grid_l1,
         bce,
+        weighted_heatmap,
         weighted_localization,
         weighted_stability,
         weighted_pfs,
@@ -410,7 +415,7 @@ def compute_loss(
 
 def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_metrics=True):
     model.train(train)
-    totals = np.zeros(11, dtype=np.float64)
+    totals = np.zeros(12, dtype=np.float64)
     samples = 0
     description = "train" if train else "validation"
     metric_accumulator = None
@@ -436,6 +441,7 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                     args.grid_size,
                     args.stability_weight,
                     args.pfs_reliability_weight,
+                    args.heatmap_loss_weight,
                     args.localization_loss_weight,
                     args.false_positive_weight,
                     args.target_fault_threshold,
@@ -570,6 +576,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--stability-weight", type=float, default=0.05)
     parser.add_argument("--pfs-reliability-weight", type=float, default=0.10)
+    parser.add_argument("--heatmap-loss-weight", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--resize-height", type=int, default=320)
     parser.add_argument("--resize-width", type=int, default=320)
@@ -758,6 +765,7 @@ def main():
                 "weight_decay",
                 "stability_weight",
                 "pfs_reliability_weight",
+                "heatmap_loss_weight",
                 "localization_loss_weight",
                 "false_positive_weight",
                 "min_delta",
@@ -834,9 +842,10 @@ def main():
             "train_heat_pixel_l1": train_values[5],
             "train_heat_grid_l1": train_values[6],
             "train_heat_bce": train_values[7],
-            "train_weighted_localization": train_values[8],
-            "train_weighted_stability": train_values[9],
-            "train_weighted_pfs": train_values[10],
+            "train_weighted_heatmap": train_values[8],
+            "train_weighted_localization": train_values[9],
+            "train_weighted_stability": train_values[10],
+            "train_weighted_pfs": train_values[11],
             "val_loss": val_values[0],
             "val_heatmap": val_values[1],
             "val_localization": val_values[2],
@@ -845,9 +854,10 @@ def main():
             "val_heat_pixel_l1": val_values[5],
             "val_heat_grid_l1": val_values[6],
             "val_heat_bce": val_values[7],
-            "val_weighted_localization": val_values[8],
-            "val_weighted_stability": val_values[9],
-            "val_weighted_pfs": val_values[10],
+            "val_weighted_heatmap": val_values[8],
+            "val_weighted_localization": val_values[9],
+            "val_weighted_stability": val_values[10],
+            "val_weighted_pfs": val_values[11],
             "val_localization_iou": (
                 val_metrics["localization_iou"] if val_metrics is not None else float("nan")
             ),
@@ -886,7 +896,7 @@ def main():
             f"\n  val heat: 0.50*pixel={0.50 * row['val_heat_pixel_l1']:.6f} "
             f"+ 1.25*grid={1.25 * row['val_heat_grid_l1']:.6f} "
             f"+ 0.25*bce={0.25 * row['val_heat_bce']:.6f}"
-            f"\n  val total: heat={row['val_heatmap']:.6f} "
+            f"\n  val total: heat={row['val_weighted_heatmap']:.6f} "
             f"+ loc={row['val_weighted_localization']:.6f} "
             f"+ stable={row['val_weighted_stability']:.6f} "
             f"+ pfs={row['val_weighted_pfs']:.6f}"
