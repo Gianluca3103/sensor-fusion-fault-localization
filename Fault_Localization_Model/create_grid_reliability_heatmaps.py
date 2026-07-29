@@ -64,9 +64,9 @@ FAULT_PLAN = [
     ("uniform_noise", 1),
     ("impulse_noise", 1),
 ]
-GROUND_TRUTH_METHOD = "point_id_provenance_v2"
+GROUND_TRUTH_METHOD = "point_id_provenance_v2_literature_fov"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
-GENERATOR_VERSION = 4
+GENERATOR_VERSION = 6
 RESUME_REQUIRED_ARRAYS = (
     "fault_heatmap",
     "reliability_map",
@@ -912,7 +912,6 @@ def create_one_sample(task):
         grid_rows=cfg["grid_size"],
         grid_cols=cfg["grid_size"],
     )
-
     if cfg["save_previews"]:
         marked_rgb, change_counts = mark_bev_point_statuses(
             clean_points,
