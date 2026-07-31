@@ -12,6 +12,12 @@ from Fault_Localization_Model.fault_injector import (
 )
 
 
+class FakeLidarCorruptions:
+    @staticmethod
+    def fov_filter(points, severity):
+        return points[[0, 2]]
+
+
 class FaultInjectorTests(unittest.TestCase):
     def test_parse_fault_plan(self):
         self.assertEqual(parse_fault_plan(["fog_sim:4", "rain_sim:5"]), [("fog_sim", 4), ("rain_sim", 5)])
@@ -72,13 +78,22 @@ class FaultInjectorTests(unittest.TestCase):
         )
         ids = np.array([10, 11, 12], dtype=np.int64)
 
-        result, _ = inject_fault("fov_filter", clean, ids, 1, Path("."), Path("."), 10, None)
+        result, _ = inject_fault(
+            "fov_filter",
+            clean,
+            ids,
+            1,
+            Path("."),
+            Path("."),
+            10,
+            FakeLidarCorruptions,
+        )
 
         self.assertEqual(len(result.points), len(result.source_ids))
         np.testing.assert_array_equal(result.point_ids, result.source_ids)
-        self.assertTrue(set(result.source_ids).issubset(set(ids)))
+        np.testing.assert_array_equal(result.source_ids, np.array([10, 12]))
 
-    def test_fov_filter_is_reproducible_but_varies_by_sample_seed(self):
+    def test_fov_filter_uses_literature_subset_deterministically(self):
         angles = np.deg2rad(np.arange(-180.0, 180.0, 2.0))
         clean = np.column_stack(
             [
@@ -98,7 +113,7 @@ class FaultInjectorTests(unittest.TestCase):
             Path("."),
             Path("."),
             10,
-            None,
+            FakeLidarCorruptions,
             rng_seed=100,
         )
         repeated, repeated_meta = inject_fault(
@@ -109,7 +124,7 @@ class FaultInjectorTests(unittest.TestCase):
             Path("."),
             Path("."),
             10,
-            None,
+            FakeLidarCorruptions,
             rng_seed=100,
         )
         different, different_meta = inject_fault(
@@ -120,14 +135,14 @@ class FaultInjectorTests(unittest.TestCase):
             Path("."),
             Path("."),
             10,
-            None,
+            FakeLidarCorruptions,
             rng_seed=101,
         )
 
         np.testing.assert_array_equal(first.source_ids, repeated.source_ids)
-        self.assertEqual(first_meta["fov_center_deg"], repeated_meta["fov_center_deg"])
-        self.assertNotEqual(first_meta["fov_center_deg"], different_meta["fov_center_deg"])
-        self.assertFalse(np.array_equal(first.source_ids, different.source_ids))
+        np.testing.assert_array_equal(first.source_ids, different.source_ids)
+        self.assertEqual(first_meta["fov_source"], repeated_meta["fov_source"])
+        self.assertEqual(first_meta["fov_source"], different_meta["fov_source"])
 
     def test_old_laser_subset_preserves_source_ids(self):
         clean = np.array(

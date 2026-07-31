@@ -181,8 +181,9 @@ class PFSRadarTests(unittest.TestCase):
                 "radar_encoder": 1_179_904,
                 "fusion": 131_584,
                 "pfs": 3_351_686,
+                "radar_skip_fusion": 44_000,
                 "decoder": 762_817,
-                "total": 6_605_751,
+                "total": 6_649_751,
             },
         )
 

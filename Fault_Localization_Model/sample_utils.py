@@ -67,15 +67,16 @@ def filter_paths_by_fault(
 
 def sample_frame_identity(metadata):
     """Return the physical source-frame identity used for split leakage checks."""
+    relative = str(metadata.get("source_relative_path", "")).strip()
+    if relative:
+        return ("source_relative_path", relative.replace("\\", "/").casefold())
+
     timestamp = str(metadata.get("timestamp", "")).strip()
     scene = str(metadata.get("scene") or metadata.get("day") or "").strip()
     session = str(metadata.get("session", "")).strip()
     if timestamp and scene:
         return ("scene_timestamp", scene.casefold(), session.casefold(), timestamp)
 
-    relative = str(metadata.get("source_relative_path", "")).strip()
-    if relative:
-        return ("source_relative_path", relative.replace("\\", "/").casefold())
     raise InvalidSampleError(
         "Sample metadata must contain source_relative_path or scene/day plus timestamp"
     )
