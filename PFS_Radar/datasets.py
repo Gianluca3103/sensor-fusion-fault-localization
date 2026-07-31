@@ -27,13 +27,15 @@ def _resize(tensor, size, mode):
     return F.interpolate(tensor[None], **options)[0]
 
 
-def _load_sample(path: Path, radar_root: Path, resize_hw, include_clean):
+def _load_sample(path: Path, radar_root: Path, resize_hw, include_clean, include_evidence=False):
     path = Path(path)
     try:
         with np.load(path, allow_pickle=False) as data:
             required = {"faulty_rgb", "fault_heatmap", "metadata_json"}
             if include_clean:
                 required.add("clean_rgb")
+            if include_evidence:
+                required.update({"clean_point_counts", "faulty_point_counts"})
             missing = required - set(data.files)
             if missing:
                 raise KeyError(f"missing arrays: {', '.join(sorted(missing))}")
@@ -48,6 +50,12 @@ def _load_sample(path: Path, radar_root: Path, resize_hw, include_clean):
                 if include_clean
                 else None
             )
+            evidence_count = None
+            if include_evidence:
+                evidence_count = (
+                    np.asarray(data["clean_point_counts"], dtype=np.float32)
+                    + np.asarray(data["faulty_point_counts"], dtype=np.float32)
+                )
     except InvalidSampleError:
         raise
     except Exception as exc:
@@ -92,11 +100,27 @@ def _load_sample(path: Path, radar_root: Path, resize_hw, include_clean):
         torch.from_numpy(target)[None],
         resize_hw,
     )[0]
+    evidence_tensor = None
+    if evidence_count is not None:
+        evidence_tensor = _resize(
+            torch.from_numpy(evidence_count.astype(np.float32)[None]),
+            resize_hw,
+            "nearest",
+        )
     clean_tensor = (
         _resize(torch.from_numpy(clean), resize_hw, "bilinear")
         if clean is not None
         else None
     )
+    if include_evidence:
+        return (
+            faulty_tensor,
+            radar_tensor,
+            clean_tensor,
+            target_tensor,
+            metadata_json,
+            evidence_tensor,
+        )
     return faulty_tensor, radar_tensor, clean_tensor, target_tensor, metadata_json
 
 
@@ -115,12 +139,17 @@ class _BaseRadarDataset(Dataset):
 class RadarReliabilityDataset(_BaseRadarDataset):
     """Training dataset with the clean LiDAR feature-stabilization reference."""
 
+    def __init__(self, paths, radar_root: Path, resize_hw=(320, 320), include_evidence=False):
+        super().__init__(paths, radar_root, resize_hw)
+        self.include_evidence = bool(include_evidence)
+
     def __getitem__(self, index):
         return _load_sample(
             self.paths[index],
             self.radar_root,
             self.resize_hw,
             include_clean=True,
+            include_evidence=self.include_evidence,
         )
 
 

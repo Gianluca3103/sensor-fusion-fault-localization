@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel, parameter_breakdown
+from PFS_Radar.boundary_losses import BoundaryWeightedBCELoss
 from PFS_Radar.datasets import RadarReliabilityDataset
 from PFS_Radar.radar_data import filter_samples_with_radar_cache
 from Fault_Localization_Model.heatmap_metrics import HeatmapMetricAccumulator
@@ -40,7 +41,28 @@ from PFS.training_utils import (
     seed_everything,
 )
 
-TRAINING_SEMANTICS_VERSION = 2
+TRAINING_SEMANTICS_VERSION = 3
+LOSS_VALUE_NAMES = (
+    "loss",
+    "heatmap",
+    "localization",
+    "stability",
+    "pfs_reliability",
+    "heat_pixel_l1",
+    "heat_grid_l1",
+    "heat_bce",
+    "weighted_heatmap",
+    "weighted_localization",
+    "weighted_stability",
+    "weighted_pfs",
+    "boundary_bce",
+    "weighted_boundary_bce",
+    "boundary_strength_mean",
+    "boundary_weight_mean",
+    "boundary_weight_max",
+    "boundary_cell_fraction",
+    "valid_boundary_fraction",
+)
 
 
 def validate_training_args(parser, args):
@@ -56,6 +78,9 @@ def validate_training_args(parser, args):
         "--localization-tolerance-m": args.localization_tolerance_m,
         "--target-fault-threshold": args.target_fault_threshold,
         "--heatmap-loss-weight": args.heatmap_loss_weight,
+        "--boundary-bce-weight": args.boundary_bce_weight,
+        "--boundary-evidence-n-ref": args.boundary_evidence_n_ref,
+        "--boundary-eps": args.boundary_eps,
         "--localization-loss-weight": args.localization_loss_weight,
         "--false-positive-weight": args.false_positive_weight,
         "--min-delta": args.min_delta,
@@ -80,6 +105,7 @@ def validate_training_args(parser, args):
         "--resize-width": args.resize_width,
         "--grid-size": args.grid_size,
         "--metrics-every": args.metrics_every,
+        "--boundary-kernel-size": args.boundary_kernel_size,
     }
     for name, value in positive_integers.items():
         if value < 1:
@@ -117,6 +143,7 @@ def validate_training_args(parser, args):
         "--early-stop-patience": args.early_stop_patience,
         "--localization-tolerance-m": args.localization_tolerance_m,
         "--heatmap-loss-weight": args.heatmap_loss_weight,
+        "--boundary-bce-weight": args.boundary_bce_weight,
         "--localization-loss-weight": args.localization_loss_weight,
     }
     for name, value in non_negative.items():
@@ -128,6 +155,12 @@ def validate_training_args(parser, args):
         parser.error("--target-fault-threshold must lie in [0,1)")
     if not 0.0 <= args.false_positive_weight <= 1.0:
         parser.error("--false-positive-weight must lie in [0,1]")
+    if args.boundary_kernel_size < 1 or args.boundary_kernel_size % 2 != 1:
+        parser.error("--boundary-kernel-size must be a positive odd integer")
+    if args.boundary_eps <= 0.0:
+        parser.error("--boundary-eps must be positive")
+    if args.boundary_evidence_n_ref <= 0.0:
+        parser.error("--boundary-evidence-n-ref must be positive")
     if args.min_delta < 0.0:
         parser.error("--min-delta must be non-negative")
     if args.bev_x_span_m <= 0.0 or args.bev_y_span_m <= 0.0:
@@ -352,6 +385,19 @@ def stable_heatmap_loss_components(logits, target, grid_size):
     return total, pixel_l1, grid_l1, bce
 
 
+def heatmap_loss_components(logits, target, grid_size, mode):
+    total, pixel_l1, grid_l1, bce = stable_heatmap_loss_components(
+        logits,
+        target,
+        grid_size,
+    )
+    if mode == "stable":
+        return total, pixel_l1, grid_l1, bce
+    if mode == "bce":
+        return bce, pixel_l1, grid_l1, bce
+    raise ValueError(f"Unsupported heatmap loss mode: {mode!r}")
+
+
 def compute_loss(
     outputs,
     target,
@@ -359,6 +405,10 @@ def compute_loss(
     stability_weight,
     pfs_weight,
     heatmap_weight,
+    heatmap_mode,
+    boundary_loss_fn,
+    boundary_weight,
+    evidence_count,
     localization_weight,
     false_positive_weight,
     target_fault_threshold,
@@ -369,10 +419,11 @@ def compute_loss(
     logits = outputs["logits"]
     if logits.shape[-2:] != target.shape[-2:]:
         logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
-    heatmap_loss, pixel_l1, grid_l1, bce = stable_heatmap_loss_components(
+    heatmap_loss, pixel_l1, grid_l1, bce = heatmap_loss_components(
         logits,
         target,
         grid_size,
+        heatmap_mode,
     )
     localization_loss = localization_surrogate_loss(
         logits,
@@ -396,7 +447,29 @@ def compute_loss(
     weighted_localization = localization_weight * localization_loss
     weighted_stability = stability_weight * stability_loss
     weighted_pfs = pfs_weight * pfs_loss
-    total = weighted_heatmap + weighted_localization + weighted_stability + weighted_pfs
+    if boundary_loss_fn is not None and boundary_weight > 0.0:
+        boundary_bce, boundary_diagnostics = boundary_loss_fn(
+            logits,
+            target,
+            evidence_count=evidence_count,
+        )
+    else:
+        boundary_bce = logits.new_zeros(())
+        boundary_diagnostics = {
+            "boundary_strength_mean": logits.new_zeros(()),
+            "boundary_weight_mean": logits.new_zeros(()),
+            "boundary_weight_max": logits.new_zeros(()),
+            "boundary_cell_fraction": logits.new_zeros(()),
+            "valid_boundary_fraction": logits.new_zeros(()),
+        }
+    weighted_boundary = boundary_weight * boundary_bce
+    total = (
+        weighted_heatmap
+        + weighted_localization
+        + weighted_stability
+        + weighted_pfs
+        + weighted_boundary
+    )
     return (
         total,
         heatmap_loss,
@@ -410,14 +483,29 @@ def compute_loss(
         weighted_localization,
         weighted_stability,
         weighted_pfs,
+        boundary_bce,
+        weighted_boundary,
+        boundary_diagnostics["boundary_strength_mean"],
+        boundary_diagnostics["boundary_weight_mean"],
+        boundary_diagnostics["boundary_weight_max"],
+        boundary_diagnostics["boundary_cell_fraction"],
+        boundary_diagnostics["valid_boundary_fraction"],
     )
 
 
 def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_metrics=True):
     model.train(train)
-    totals = np.zeros(12, dtype=np.float64)
+    totals = np.zeros(len(LOSS_VALUE_NAMES), dtype=np.float64)
     samples = 0
     description = "train" if train else "validation"
+    boundary_loss_fn = None
+    if args.use_boundary_bce:
+        boundary_loss_fn = BoundaryWeightedBCELoss(
+            kernel_size=args.boundary_kernel_size,
+            eps=args.boundary_eps,
+            use_evidence_confidence=args.use_boundary_evidence_confidence,
+            evidence_n_ref=args.boundary_evidence_n_ref,
+        )
     metric_accumulator = None
     if not train and compute_metrics:
         metric_accumulator = HeatmapMetricAccumulator(
@@ -427,9 +515,16 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
             compute_chamfer=False,
             localization_tolerance_m=args.localization_tolerance_m,
         )
-    for faulty, radar, clean, target, metadata_jsons in tqdm(loader, desc=description, leave=False):
+    for batch in tqdm(loader, desc=description, leave=False):
+        evidence_count = None
+        if len(batch) == 6:
+            faulty, radar, clean, target, metadata_jsons, evidence_count = batch
+        else:
+            faulty, radar, clean, target, metadata_jsons = batch
         faulty, radar = faulty.to(device, non_blocking=True), radar.to(device, non_blocking=True)
         clean, target = clean.to(device, non_blocking=True), target.to(device, non_blocking=True)
+        if evidence_count is not None:
+            evidence_count = evidence_count.to(device, non_blocking=True)
         if train:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(train):
@@ -442,6 +537,10 @@ def run_epoch(model, loader, device, optimizer, scaler, args, train, compute_met
                     args.stability_weight,
                     args.pfs_reliability_weight,
                     args.heatmap_loss_weight,
+                    args.heatmap_loss_mode,
+                    boundary_loss_fn,
+                    args.boundary_bce_weight,
+                    evidence_count,
                     args.localization_loss_weight,
                     args.false_positive_weight,
                     args.target_fault_threshold,
@@ -577,6 +676,33 @@ def main():
     parser.add_argument("--stability-weight", type=float, default=0.05)
     parser.add_argument("--pfs-reliability-weight", type=float, default=0.10)
     parser.add_argument("--heatmap-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--heatmap-loss-mode",
+        choices=["stable", "bce"],
+        default="stable",
+        help="'stable' uses 0.50*pixel + 1.25*grid + 0.25*BCE; 'bce' uses pure weighted BCE.",
+    )
+    parser.add_argument(
+        "--use-boundary-bce",
+        action="store_true",
+        help="Add boundary-weighted BCE as an auxiliary loss.",
+    )
+    parser.add_argument("--boundary-bce-weight", type=float, default=0.10)
+    parser.add_argument("--boundary-kernel-size", type=int, default=3)
+    parser.add_argument("--boundary-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--use-boundary-evidence-confidence",
+        action="store_true",
+        default=True,
+        help="Scale boundary BCE by local point-evidence confidence.",
+    )
+    parser.add_argument(
+        "--no-boundary-evidence-confidence",
+        action="store_false",
+        dest="use_boundary_evidence_confidence",
+        help="Use ordinary boundary-weighted BCE without point-evidence confidence.",
+    )
+    parser.add_argument("--boundary-evidence-n-ref", type=float, default=10.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--resize-height", type=int, default=320)
     parser.add_argument("--resize-width", type=int, default=320)
@@ -685,8 +811,19 @@ def main():
     if not train_paths or not val_paths:
         raise FileNotFoundError("No train/validation samples have aligned radar cache entries")
     resize_hw = (args.resize_height, args.resize_width)
-    train_dataset = RadarReliabilityDataset(train_paths, Path(args.radar_root), resize_hw)
-    val_dataset = RadarReliabilityDataset(val_paths, Path(args.radar_root), resize_hw)
+    include_evidence = args.use_boundary_bce and args.use_boundary_evidence_confidence
+    train_dataset = RadarReliabilityDataset(
+        train_paths,
+        Path(args.radar_root),
+        resize_hw,
+        include_evidence=include_evidence,
+    )
+    val_dataset = RadarReliabilityDataset(
+        val_paths,
+        Path(args.radar_root),
+        resize_hw,
+        include_evidence=include_evidence,
+    )
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -766,6 +903,13 @@ def main():
                 "stability_weight",
                 "pfs_reliability_weight",
                 "heatmap_loss_weight",
+                "heatmap_loss_mode",
+                "use_boundary_bce",
+                "boundary_bce_weight",
+                "boundary_kernel_size",
+                "boundary_eps",
+                "use_boundary_evidence_confidence",
+                "boundary_evidence_n_ref",
                 "localization_loss_weight",
                 "false_positive_weight",
                 "min_delta",
@@ -834,30 +978,6 @@ def main():
         row = {
             "epoch": epoch,
             "learning_rate": epoch_learning_rate,
-            "train_loss": train_values[0],
-            "train_heatmap": train_values[1],
-            "train_localization": train_values[2],
-            "train_stability": train_values[3],
-            "train_pfs_reliability": train_values[4],
-            "train_heat_pixel_l1": train_values[5],
-            "train_heat_grid_l1": train_values[6],
-            "train_heat_bce": train_values[7],
-            "train_weighted_heatmap": train_values[8],
-            "train_weighted_localization": train_values[9],
-            "train_weighted_stability": train_values[10],
-            "train_weighted_pfs": train_values[11],
-            "val_loss": val_values[0],
-            "val_heatmap": val_values[1],
-            "val_localization": val_values[2],
-            "val_stability": val_values[3],
-            "val_pfs_reliability": val_values[4],
-            "val_heat_pixel_l1": val_values[5],
-            "val_heat_grid_l1": val_values[6],
-            "val_heat_bce": val_values[7],
-            "val_weighted_heatmap": val_values[8],
-            "val_weighted_localization": val_values[9],
-            "val_weighted_stability": val_values[10],
-            "val_weighted_pfs": val_values[11],
             "val_localization_iou": (
                 val_metrics["localization_iou"] if val_metrics is not None else float("nan")
             ),
@@ -873,6 +993,9 @@ def main():
             "metric_threshold": args.metric_threshold,
             "localization_tolerance_m": args.localization_tolerance_m,
         }
+        for index, name in enumerate(LOSS_VALUE_NAMES):
+            row[f"train_{name}"] = train_values[index]
+            row[f"val_{name}"] = val_values[index]
         if args.scheduler == "plateau":
             scheduler.step(row["val_loss"])
         else:
@@ -888,18 +1011,29 @@ def main():
             if val_metrics is not None
             else f"\n  localization metrics skipped (every {args.metrics_every} epochs)"
         )
+        if args.heatmap_loss_mode == "bce":
+            heat_message = f"bce={row['val_heat_bce']:.6f}"
+        else:
+            heat_message = (
+                f"0.50*pixel={0.50 * row['val_heat_pixel_l1']:.6f} "
+                f"+ 1.25*grid={1.25 * row['val_heat_grid_l1']:.6f} "
+                f"+ 0.25*bce={0.25 * row['val_heat_bce']:.6f}"
+            )
         print(
             f"epoch {epoch:03d}: train={row['train_loss']:.6f} val={row['val_loss']:.6f} "
             f"heat={row['val_heatmap']:.6f} loc_loss={row['val_localization']:.6f} "
+            f"boundary={row['val_boundary_bce']:.6f} "
             f"stable={row['val_stability']:.6f} pfs={row['val_pfs_reliability']:.6f} "
             f"lr={row['learning_rate']:.2e}"
-            f"\n  val heat: 0.50*pixel={0.50 * row['val_heat_pixel_l1']:.6f} "
-            f"+ 1.25*grid={1.25 * row['val_heat_grid_l1']:.6f} "
-            f"+ 0.25*bce={0.25 * row['val_heat_bce']:.6f}"
+            f"\n  val heat ({args.heatmap_loss_mode}): {heat_message}"
             f"\n  val total: heat={row['val_weighted_heatmap']:.6f} "
             f"+ loc={row['val_weighted_localization']:.6f} "
+            f"+ boundary={row['val_weighted_boundary_bce']:.6f} "
             f"+ stable={row['val_weighted_stability']:.6f} "
             f"+ pfs={row['val_weighted_pfs']:.6f}"
+            f"\n  val boundary: strength_mean={row['val_boundary_strength_mean']:.6f} "
+            f"weight_mean={row['val_boundary_weight_mean']:.6f} "
+            f"cells={row['val_boundary_cell_fraction']:.6f}"
             f"{metric_message}"
         )
         localization_improved = (
