@@ -7,14 +7,26 @@ import json
 import random
 import sys
 import types
-
 import numpy as np
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[1] #Defines the repo root as one level above this script
+#Builds folder path relative to repo root
 DEFAULT_HERCULES_ROOT = REPO_ROOT / "data" / "HerculesFiles" / "Data"
 DEFAULT_INJECTOR_ROOT = REPO_ROOT / "Weather_Injector" / "3D_Corruptions_AD"
 DEFAULT_FOG_ROOT = REPO_ROOT / "Weather_Injector" / "LiDAR_fog_sim"
+_FOG_SIMULATION_PATH = DEFAULT_FOG_ROOT / "fog_simulation.py"
+_FOG_SIMULATION_SPEC = importlib.util.spec_from_file_location(
+    "weather_injector_fog_simulation",
+    _FOG_SIMULATION_PATH,
+)
+if _FOG_SIMULATION_SPEC is None or _FOG_SIMULATION_SPEC.loader is None:
+    raise ImportError(f"Could not load fog simulation module from {_FOG_SIMULATION_PATH}")
+_FOG_SIMULATION_MODULE = importlib.util.module_from_spec(_FOG_SIMULATION_SPEC)
+_FOG_SIMULATION_SPEC.loader.exec_module(_FOG_SIMULATION_MODULE)
+ParameterSet = _FOG_SIMULATION_MODULE.ParameterSet
+P_R_fog_hard = _FOG_SIMULATION_MODULE.P_R_fog_hard
+P_R_fog_soft = _FOG_SIMULATION_MODULE.P_R_fog_soft
 
 AEVA_RECORD_BYTES = 29
 FOG_ALPHA_BY_SEVERITY = [0.005, 0.01, 0.02, 0.03, 0.06]
@@ -329,7 +341,6 @@ def apply_fog_simulator(
     if str(fog_root) not in sys.path:
         sys.path.insert(0, str(fog_root))
 
-    from fog_simulation import ParameterSet, P_R_fog_hard, P_R_fog_soft
 
     alpha = FOG_ALPHA_BY_SEVERITY[severity - 1]
     parameter_set = ParameterSet(alpha=alpha, gamma=0.000001)
