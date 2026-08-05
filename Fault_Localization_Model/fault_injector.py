@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 
 from Fault_Localization_Model.data_injection_utils import (
+    DEFAULT_FOG_SIMULATOR_NOISE,
+    DEFAULT_WEATHER_THREADS,
     apply_fault,
     apply_fog_simulator,
     import_lidar_corruptions,
@@ -215,10 +217,10 @@ def inject_fault(
     severity,
     injector_root,
     fog_root,
-    fog_noise,
-    lidar_corruptions,
+    fog_noise=DEFAULT_FOG_SIMULATOR_NOISE,
+    lidar_corruptions=None,
     rng_seed=None,
-    weather_threads=1,
+    weather_threads=DEFAULT_WEATHER_THREADS,
 ):
     """Inject one fault while preserving exact clean-to-faulty point provenance."""
     fault, severity = validate_fault_spec(fault, severity)
@@ -227,6 +229,7 @@ def inject_fault(
         **EMPTY_FOG_METADATA,
         "injection_version": INJECTION_VERSION,
         "injection_seed": "" if rng_seed is None else int(rng_seed),
+        "fog_noise": int(fog_noise),
         "weather_threads": int(weather_threads),
     }
 

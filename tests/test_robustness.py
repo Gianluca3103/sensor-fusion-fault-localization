@@ -13,9 +13,9 @@ from Fault_Localization_Model.create_grid_reliability_heatmaps import (
     GROUND_TRUTH_METHOD,
     VISUALIZATION_METHOD,
     build_manifest_row,
-    list_all_aeva_bins,
     load_matching_existing_sample,
 )
+from Fault_Localization_Model.aeva_dataset import list_all_aeva_bins
 from Fault_Localization_Model.concurrency_utils import iter_bounded_futures
 from Fault_Localization_Model.io_utils import (
     atomic_savez_compressed,
@@ -53,7 +53,7 @@ def write_sample(path, source_relative_path):
 
 
 class RobustnessTests(unittest.TestCase):
-    def test_all_scene_discovery_does_not_deduplicate_across_sessions(self):
+    def test_all_scene_discovery_keeps_frames_across_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for session in ("SessionA", "SessionB"):
@@ -61,7 +61,7 @@ class RobustnessTests(unittest.TestCase):
                 aeva.mkdir(parents=True)
                 (aeva / "123.bin").touch()
 
-            bins, _ = list_all_aeva_bins(root, dedupe=True)
+            bins, _ = list_all_aeva_bins(root)
             self.assertEqual(len(bins), 2)
             self.assertEqual(
                 {path.parts[-5] for path in bins},

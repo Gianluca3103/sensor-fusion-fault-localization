@@ -78,7 +78,6 @@ scene, a `320x320` target grid, and a `0.05 m` point-movement tolerance.
 ```bash
 python Fault_Localization_Model/create_grid_reliability_heatmaps.py \
   --data-root "/path/to/HeRCULES" \
-  --all-scenes \
   --temporal-split train \
   --train-ratio 0.70 \
   --val-ratio 0.15 \

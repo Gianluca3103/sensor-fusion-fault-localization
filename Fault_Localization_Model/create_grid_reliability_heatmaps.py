@@ -1,5 +1,4 @@
 from pathlib import Path
-import argparse
 from bisect import bisect_right
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
@@ -15,23 +14,21 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from Fault_Localization_Model.bev_utils import make_rgb_preview, project_lidar_bev, write_image  # noqa: E402
-from Fault_Localization_Model.config_utils import (  # noqa: E402
-    config_get,
-    load_json_config,
-    require_directory,
-    require_positive,
-    require_range,
-    setup_logging,
+from Fault_Localization_Model.aeva_dataset.hercules_discovery import (  # noqa: E402
+    hercules_source_metadata,
+    list_all_aeva_bins,
 )
+from Fault_Localization_Model.aeva_dataset.temporal_split import select_temporal_split_bins  # noqa: E402
+from Fault_Localization_Model.config.cli import parse_args  # noqa: E402
+from Fault_Localization_Model.config.defaults import DEFAULT_FOG_ROOT, DEFAULT_INJECTOR_ROOT  # noqa: E402
+from Fault_Localization_Model.config.validation import validate_generation_args  # noqa: E402
+from Fault_Localization_Model.config_utils import setup_logging  # noqa: E402
 from Fault_Localization_Model.concurrency_utils import iter_bounded_futures  # noqa: E402
 from Fault_Localization_Model.data_injection_utils import (  # noqa: E402
-    DEFAULT_FOG_ROOT,
-    DEFAULT_HERCULES_ROOT,
-    DEFAULT_INJECTOR_ROOT,
+    DEFAULT_FOG_SIMULATOR_NOISE,
+    DEFAULT_WEATHER_THREADS,
     dilate_mask,
-    find_aeva_dir,
     filter_pointcloud,
-    list_aeva_bins,
     read_hercules_aeva_bin,
 )
 from Fault_Localization_Model.fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
@@ -52,7 +49,6 @@ from PFS_Radar.radar_data import (  # noqa: E402
 )
 
 
-DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "grid_reliability_heatmaps"
 LOGGER = logging.getLogger("create_grid_reliability_heatmaps")
 FAULT_PLAN = [
     ("rain_sim", 5),
@@ -87,219 +83,6 @@ RESUME_REQUIRED_ARRAYS = (
     "added_point_ids",
 )
 WORKER_CONTEXT = None
-
-
-def config_defaults(config):
-    return {
-        "data_root": config_get(config, "paths.data_root", str(DEFAULT_HERCULES_ROOT)),
-        "injector_root": config_get(config, "paths.injector_root", str(DEFAULT_INJECTOR_ROOT)),
-        "fog_root": config_get(config, "paths.fog_root", str(DEFAULT_FOG_ROOT)),
-        "output_root": config_get(config, "paths.output_root", str(DEFAULT_OUTPUT_ROOT)),
-        "day": config_get(config, "hercules.day", "Day_1_Parking"),
-        "session": config_get(config, "hercules.session", "01_Day"),
-        "all_scenes": config_get(config, "hercules.all_scenes", False),
-        "include_scenes": config_get(config, "hercules.include_scenes", None),
-        "exclude_scenes": config_get(config, "hercules.exclude_scenes", None),
-        "keep_duplicate_frames": config_get(config, "hercules.keep_duplicate_frames", False),
-        "num_samples": config_get(config, "generation.num_samples", 24),
-        "seed": config_get(config, "generation.seed", 42),
-        "shuffle": config_get(config, "generation.shuffle", True),
-        "fault_plan": config_get(config, "faults.plan", None),
-        "faults": config_get(config, "faults.names", None),
-        "severities": config_get(config, "faults.severities", None),
-        "fog_noise": config_get(config, "faults.fog_noise", 10),
-        "weather_threads": config_get(config, "faults.weather_threads", 1),
-        "num_workers": config_get(config, "generation.num_workers", 1),
-        "grid_size": config_get(config, "bev.grid_size", 100),
-        "x_min": config_get(config, "bev.x_min", 0.0),
-        "x_max": config_get(config, "bev.x_max", 64.0),
-        "y_min": config_get(config, "bev.y_min", -32.0),
-        "y_max": config_get(config, "bev.y_max", 32.0),
-        "resolution": config_get(config, "bev.resolution", 0.20),
-        "min_range": config_get(config, "bev.min_range", 1.0),
-        "max_range": config_get(config, "bev.max_range", 120.0),
-        "movement_tolerance_m": config_get(config, "reliability.movement_tolerance_m", 0.05),
-    }
-
-
-def parse_args():
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", default=None, help="Optional JSON config file with dataset-generation defaults.")
-    pre_args, _ = pre_parser.parse_known_args()
-    defaults = config_defaults(load_json_config(pre_args.config))
-
-    parser = argparse.ArgumentParser(
-        parents=[pre_parser],
-        description="Create Hercules reliability/fault heatmaps by splitting the original BEV view into reliability squares.",
-    )
-    parser.add_argument("--data-root", default=defaults["data_root"])
-    parser.add_argument("--injector-root", default=defaults["injector_root"])
-    parser.add_argument("--fog-root", default=defaults["fog_root"])
-    parser.add_argument("--output-root", default=defaults["output_root"])
-    parser.add_argument("--day", default=defaults["day"])
-    parser.add_argument("--session", default=defaults["session"])
-    parser.add_argument(
-        "--all-scenes",
-        action="store_true",
-        default=defaults["all_scenes"],
-        help="Use every Hercules LiDAR/Aeva folder found under --data-root instead of one --day/--session.",
-    )
-    parser.add_argument(
-        "--include-scenes",
-        nargs="*",
-        default=defaults["include_scenes"],
-        help="Only use these top-level Hercules scene folders, e.g. Bridge01_Day Mountain01_Day.",
-    )
-    parser.add_argument(
-        "--exclude-scenes",
-        nargs="*",
-        default=defaults["exclude_scenes"],
-        help="Exclude these top-level Hercules scene folders.",
-    )
-    parser.add_argument(
-        "--keep-duplicate-frames",
-        action="store_true",
-        default=defaults["keep_duplicate_frames"],
-        help="In --all-scenes mode, keep repeated scene/timestamp frames from duplicated extracted folders.",
-    )
-    parser.add_argument("--num-samples", type=int, default=defaults["num_samples"])
-    parser.add_argument("--frames", type=int, nargs="*", default=None)
-    parser.add_argument(
-        "--temporal-split",
-        choices=["train", "val", "test"],
-        default=None,
-        help="Use the first train ratio, next validation ratio, or final test ratio from every Aeva folder.",
-    )
-    parser.add_argument("--train-ratio", type=float, default=0.70)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument(
-        "--require-causal-radar-max-delta-ms",
-        type=float,
-        default=None,
-        help=(
-            "Before sampling, keep only raw LiDAR frames whose scene has a causal "
-            "Continental radar frame at or before the LiDAR timestamp within this "
-            "many milliseconds. Use the same value as Radar V2 --max-delta-ms."
-        ),
-    )
-    parser.add_argument("--faults", nargs="*", default=defaults["faults"])
-    parser.add_argument("--severities", type=int, nargs="*", default=defaults["severities"])
-    parser.add_argument(
-        "--fault-plan",
-        nargs="*",
-        default=defaults["fault_plan"],
-        help="Exact mixed-severity plan, e.g. fog_sim:3 rain_sim:5 snow_sim:5 lidar_crosstalk_noise:1 fov_filter:1.",
-    )
-    parser.add_argument(
-        "--no-shuffle",
-        action="store_true",
-        default=not bool(defaults["shuffle"]),
-        help="Keep frame/fault/severity order deterministic.",
-    )
-    parser.add_argument(
-        "--no-previews",
-        action="store_true",
-        help="Skip the six diagnostic PNGs per sample and save only training data plus manifests.",
-    )
-    parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
-    parser.add_argument("--x-min", type=float, default=defaults["x_min"])
-    parser.add_argument("--x-max", type=float, default=defaults["x_max"])
-    parser.add_argument("--y-min", type=float, default=defaults["y_min"])
-    parser.add_argument("--y-max", type=float, default=defaults["y_max"])
-    parser.add_argument("--resolution", type=float, default=defaults["resolution"])
-    parser.add_argument("--min-range", type=float, default=defaults["min_range"])
-    parser.add_argument("--max-range", type=float, default=defaults["max_range"])
-    parser.add_argument(
-        "--movement-tolerance-m",
-        type=float,
-        default=defaults["movement_tolerance_m"],
-        help="Maximum clean-to-faulty displacement treated as unchanged. Defaults to 0.05 m.",
-    )
-    parser.add_argument("--fog-noise", type=int, default=defaults["fog_noise"])
-    parser.add_argument(
-        "--weather-threads",
-        type=int,
-        default=defaults["weather_threads"],
-        help=(
-            "LISA threads inside each generation worker. Keep at 1 when using "
-            "multiple --num-workers to avoid nested CPU oversubscription."
-        ),
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=defaults["num_workers"],
-        help="Number of parallel sample-generation worker processes. Use 1 for the original sequential behavior.",
-    )
-    parser.add_argument(
-        "--source-batch-size",
-        type=int,
-        default=32,
-        help=(
-            "Maximum samples per chronological worker batch. Random sample "
-            "selection, indexes, seeds, and filenames remain unchanged."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=defaults["seed"])
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return parser.parse_args()
-
-
-def validate_generation_args(args):
-    require_directory(args.data_root, "Hercules data root")
-    require_directory(args.injector_root, "3D corruptions injector root")
-    require_directory(args.fog_root, "LiDAR fog simulator root")
-    require_positive(args.num_samples, "num_samples")
-    require_positive(args.grid_size, "grid_size")
-    require_positive(args.resolution, "resolution")
-    require_positive(args.num_workers, "num_workers")
-    require_positive(args.source_batch_size, "source_batch_size")
-    require_positive(args.weather_threads, "weather_threads")
-    require_positive(args.movement_tolerance_m, "movement_tolerance_m")
-    if args.fog_noise < 0:
-        raise ValueError("--fog-noise must be non-negative.")
-    if args.seed < 0:
-        raise ValueError("--seed must be non-negative.")
-    if (
-        not np.isfinite([args.train_ratio, args.val_ratio]).all()
-        or args.train_ratio <= 0.0
-        or args.val_ratio <= 0.0
-    ):
-        raise ValueError("--train-ratio and --val-ratio must be positive.")
-    if args.train_ratio + args.val_ratio >= 1.0:
-        raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
-    if args.require_causal_radar_max_delta_ms is not None and (
-        not np.isfinite(args.require_causal_radar_max_delta_ms)
-        or args.require_causal_radar_max_delta_ms < 0.0
-    ):
-        raise ValueError("--require-causal-radar-max-delta-ms must be non-negative.")
-    require_range(args.x_min, args.x_max, "x range")
-    require_range(args.y_min, args.y_max, "y range")
-    require_range(args.min_range, args.max_range, "point range")
-    if args.frames and args.temporal_split:
-        raise ValueError(
-            "--frames cannot be combined with --temporal-split because frame "
-            "indexes are global while temporal splits are computed per folder."
-        )
-    include_scenes = normalize_scene_filter(args.include_scenes) or set()
-    exclude_scenes = normalize_scene_filter(args.exclude_scenes) or set()
-    overlap = include_scenes & exclude_scenes
-    if overlap:
-        raise ValueError(
-            "Scenes cannot be both included and excluded: "
-            + ", ".join(sorted(overlap))
-        )
-    if not args.all_scenes and (
-        include_scenes or exclude_scenes or args.keep_duplicate_frames
-    ):
-        raise ValueError(
-            "--include-scenes, --exclude-scenes, and --keep-duplicate-frames "
-            "require --all-scenes."
-        )
-    if args.fault_plan and (args.faults or args.severities):
-        raise ValueError(
-            "--fault-plan cannot be combined with --faults or --severities."
-        )
 
 
 def colorize_fault_heatmap(values):
@@ -402,79 +185,6 @@ def clean_bev_rgb(points, x_range, y_range, resolution):
     return make_rgb_preview(layers), layers
 
 
-def normalize_scene_filter(scene_names):
-    if not scene_names:
-        return None
-    return {str(scene).strip().lower() for scene in scene_names if str(scene).strip()}
-
-
-def list_all_aeva_bins(data_root, dedupe=True, include_scenes=None, exclude_scenes=None):
-    include_scenes = normalize_scene_filter(include_scenes)
-    exclude_scenes = normalize_scene_filter(exclude_scenes)
-    aeva_dirs = []
-    for candidate in sorted(data_root.rglob("Aeva")):
-        if candidate.is_dir() and list(candidate.glob("*.bin")):
-            relative = candidate.relative_to(data_root)
-            scene = relative.parts[0].lower() if relative.parts else ""
-            if include_scenes is not None and scene not in include_scenes:
-                continue
-            if exclude_scenes is not None and scene in exclude_scenes:
-                continue
-            aeva_dirs.append(candidate)
-    if not aeva_dirs:
-        raise FileNotFoundError(f"No Hercules Aeva folders with .bin files found under {data_root}")
-
-    bins = []
-    for aeva_dir in aeva_dirs:
-        bins.extend(list_aeva_bins(aeva_dir))
-    bins = sorted(bins, key=lambda path: str(path.relative_to(data_root)).lower())
-    if dedupe:
-        unique_bins = {}
-        for bin_path in bins:
-            source_meta = hercules_source_metadata(bin_path, data_root)
-            key = (
-                source_meta["scene"],
-                source_meta["session"],
-                bin_path.stem,
-            )
-            current = unique_bins.get(key)
-            if current is None or len(bin_path.parts) < len(current.parts):
-                unique_bins[key] = bin_path
-        bins = sorted(unique_bins.values(), key=lambda path: str(path.relative_to(data_root)).lower())
-    return bins, aeva_dirs
-
-
-def select_temporal_split_bins(bins, data_root, split_name, train_ratio=0.70, val_ratio=0.15):
-    """Select a chronological train/val/test slice inside each Aeva folder."""
-    grouped = {}
-    for bin_path in bins:
-        source_dir = hercules_source_metadata(bin_path, data_root)["source_aeva_dir"]
-        grouped.setdefault(source_dir, []).append(bin_path)
-
-    selected = []
-    split_counts = []
-    for source_dir, folder_bins in sorted(grouped.items()):
-        folder_bins = sorted(folder_bins, key=lambda path: path.stem)
-        count = len(folder_bins)
-        train_end = int(count * train_ratio)
-        val_end = int(count * (train_ratio + val_ratio))
-        if split_name == "train":
-            split_bins = folder_bins[:train_end]
-        elif split_name == "val":
-            split_bins = folder_bins[train_end:val_end]
-        elif split_name == "test":
-            split_bins = folder_bins[val_end:]
-        else:
-            raise ValueError(f"Unknown temporal split: {split_name}")
-        selected.extend(split_bins)
-        split_counts.append((source_dir, count, len(split_bins)))
-
-    selected = sorted(selected, key=lambda path: str(path.relative_to(data_root)).lower())
-    if not selected:
-        raise FileNotFoundError(f"No frames selected for temporal split {split_name!r}.")
-    return selected, split_counts
-
-
 def has_causal_radar_within_delta(bin_path, data_root, max_delta_ms):
     """Return whether a raw Aeva frame has the same causal radar anchor as Radar V2."""
 
@@ -507,31 +217,11 @@ def filter_bins_with_causal_radar(bins, data_root, max_delta_ms):
     return eligible, skipped
 
 
-def hercules_source_metadata(bin_path, data_root):
-    relative = bin_path.relative_to(data_root)
-    parts = relative.parts
-    scene = parts[0] if parts else ""
-    session = ""
-    if "LiDAR" in parts:
-        lidar_index = parts.index("LiDAR")
-        if lidar_index > 1:
-            session = parts[lidar_index - 1]
-    source_dir = str(bin_path.parent)
-    return {
-        "scene": scene,
-        "day": scene,
-        "session": session,
-        "source_relative_path": str(relative),
-        "source_aeva_dir": source_dir,
-    }
-
-
 def worker_init(context):
     global WORKER_CONTEXT
     WORKER_CONTEXT = dict(context)
     _load_clean_artifacts.cache_clear()
-    injector_root = Path(WORKER_CONTEXT["injector_root"])
-    WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(injector_root)
+    WORKER_CONTEXT["lidar_corruptions"] = load_fault_injector(DEFAULT_INJECTOR_ROOT)
 
 
 @lru_cache(maxsize=2)
@@ -710,14 +400,14 @@ def load_matching_existing_sample(
         "resolution": cfg["resolution"],
         "min_range": cfg["min_range"],
         "max_range": cfg["max_range"],
-        "fog_noise": cfg["fog_noise"],
+        "fog_noise": DEFAULT_FOG_SIMULATOR_NOISE,
         "ground_truth_method": GROUND_TRUTH_METHOD,
         "visualization_method": VISUALIZATION_METHOD,
         "movement_tolerance_m": cfg["movement_tolerance_m"],
         "generator_version": GENERATOR_VERSION,
         "generation_seed": cfg["generation_seed"],
         "injection_seed": injection_seed,
-        "weather_threads": cfg["weather_threads"],
+        "weather_threads": DEFAULT_WEATHER_THREADS,
     }
     for key, expected_value in expected.items():
         if metadata.get(key) != expected_value:
@@ -817,8 +507,6 @@ def create_one_sample(task):
     bin_path = Path(task["bin_path"])
     data_root = Path(cfg["data_root"])
     output_root = Path(cfg["output_root"])
-    injector_root = Path(cfg["injector_root"])
-    fog_root = Path(cfg["fog_root"])
     fault = task["fault"]
     severity = task["severity"]
     injection_seed = task["injection_seed"]
@@ -873,12 +561,10 @@ def create_one_sample(task):
         clean_points,
         clean_point_ids,
         severity,
-        injector_root,
-        fog_root,
-        cfg["fog_noise"],
-        cfg["lidar_corruptions"],
+        DEFAULT_INJECTOR_ROOT,
+        DEFAULT_FOG_ROOT,
+        lidar_corruptions=cfg["lidar_corruptions"],
         rng_seed=injection_seed,
-        weather_threads=cfg["weather_threads"],
     )
     _, range_mask = filter_pointcloud(
         injection.points,
@@ -1013,14 +699,14 @@ def create_one_sample(task):
         "resolution": cfg["resolution"],
         "min_range": cfg["min_range"],
         "max_range": cfg["max_range"],
-        "fog_noise": cfg["fog_noise"],
+        "fog_noise": fog_counts.get("fog_noise", ""),
         "ground_truth_method": GROUND_TRUTH_METHOD,
         "visualization_method": VISUALIZATION_METHOD,
         "movement_tolerance_m": cfg["movement_tolerance_m"],
         "generator_version": GENERATOR_VERSION,
         "generation_seed": cfg["generation_seed"],
         "injection_seed": injection_seed,
-        "weather_threads": cfg["weather_threads"],
+        "weather_threads": fog_counts.get("weather_threads", ""),
         "injection_metadata": fog_counts,
         "definition": (
             "reliability=correct/(correct+missing+moved+added), using exact "
@@ -1072,35 +758,23 @@ def create_one_sample(task):
 
 
 def main():
-    args = parse_args()
-    setup_logging(args.log_level)
-    validate_generation_args(args)
+    #Read and Validate Settings
+    args = parse_args() #Collects and Convert Settings
+    setup_logging(args.log_level) #Configures terminal messages
+    validate_generation_args(args) #Checks if settings are usable
 
+    #Calculate BEV Dimensions
     image_height = int(np.ceil((args.x_max - args.x_min) / args.resolution))
     image_width = int(np.ceil((args.y_max - args.y_min) / args.resolution))
 
+    #Define Important Folders
     data_root = Path(args.data_root)
     output_root = Path(args.output_root)
-    injector_root = Path(args.injector_root)
-    fog_root = Path(args.fog_root)
 
-    if args.all_scenes:
-        bins, aeva_dirs = list_all_aeva_bins(
-            data_root,
-            dedupe=not args.keep_duplicate_frames,
-            include_scenes=args.include_scenes,
-            exclude_scenes=args.exclude_scenes,
-        )
-        source_description = f"{len(aeva_dirs)} Aeva folders under {data_root}"
-    else:
-        aeva_dir = find_aeva_dir(data_root, args.day, args.session)
-        bins = list_aeva_bins(aeva_dir)
-        source_description = str(aeva_dir)
-    if args.frames:
-        invalid_frames = [frame for frame in args.frames if frame <= 0 or frame > len(bins)]
-        if invalid_frames:
-            raise ValueError(f"Requested frame indexes are out of range: {invalid_frames}")
-        bins = [bins[frame - 1] for frame in args.frames]
+    #Find All available Lidar .bin files
+    bins, aeva_dirs = list_all_aeva_bins(data_root)
+    source_description = f"{len(aeva_dirs)} Aeva folders under {data_root}"
+    #Split into Train/Val/Test given the time in which the frame is located
     if args.temporal_split:
         bins, split_counts = select_temporal_split_bins(
             bins,
@@ -1127,6 +801,7 @@ def main():
             )
     if not bins:
         raise FileNotFoundError("No Hercules Aeva frames selected.")
+    #Remove frames without matching radar
     if args.require_causal_radar_max_delta_ms is not None:
         before_count = len(bins)
         bins, skipped_no_radar = filter_bins_with_causal_radar(
@@ -1142,20 +817,16 @@ def main():
             before_count,
             skipped_no_radar,
         )
-
+    #Choose Faults and Samples
     plan = build_fault_plan(args.fault_plan, args.faults, args.severities, FAULT_PLAN)
     LOGGER.info("Selected %d frame candidates from %s", len(bins), source_description)
     LOGGER.info("Fault plan: %s", ", ".join(f"{fault}:S{severity}" for fault, severity in plan))
     samples = choose_samples(bins, args.num_samples, args.seed, plan, shuffle=not args.no_shuffle)
     output_root.mkdir(parents=True, exist_ok=True)
-
+    #Store Settings by sample processing workers
     worker_context = {
         "data_root": str(data_root),
         "output_root": str(output_root),
-        "injector_root": str(injector_root),
-        "fog_root": str(fog_root),
-        "fog_noise": args.fog_noise,
-        "weather_threads": args.weather_threads,
         "grid_size": args.grid_size,
         "x_min": args.x_min,
         "x_max": args.x_max,
@@ -1170,6 +841,7 @@ def main():
         "image_width": image_width,
         "generation_seed": args.seed,
     }
+    #Create task description per generated sample
     tasks = [
         {
             "index": index,
@@ -1184,6 +856,7 @@ def main():
         }
         for index, (bin_path, fault, severity) in enumerate(samples)
     ]
+    #Group Tasks into batches
     task_batches = chronological_source_batches(
         tasks,
         args.source_batch_size,
@@ -1195,7 +868,7 @@ def main():
     )
     rows = []
     skipped = 0
-
+    #Process Each sample
     if args.num_workers == 1:
         LOGGER.info("Creating samples sequentially")
         worker_init(worker_context)
@@ -1255,7 +928,7 @@ def main():
     rows = sorted(rows, key=lambda row: row["index"])
     if skipped:
         LOGGER.info("Skipped %d existing samples", skipped)
-
+    #Save a document describing generated samples
     write_csv_rows(
         output_root / "manifest.csv",
         rows,

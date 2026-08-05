@@ -1,14 +1,122 @@
-"""Stage I oracle-mask LiDAR/radar reconstruction modules."""
+"""Building blocks for the second-stage BEV reconstruction pipeline."""
 
-from .coarse_reconstructor import CoarseLiDARRadarReconstructor
-from .diffusion_scheduler import DiffusionSchedule
-from .residual_diffusion_unet import ResidualDiffusionUNet
-from .stage1_pipeline import Stage1ReconstructionPipeline
+from .bev_triplets import BEVTripletDataset, load_bev_triplet
+from .encoders import (
+    CleanBEVEncoder,
+    FaultyBEVEncoder,
+    GoodDataFusion,
+    LiDARTrustedBEVEncoder,
+    MultiScaleBEVEncoding,
+    RadarBEVEncoder,
+    ReconstructionBEVEncoders,
+    RequiredCorrection,
+    TripletBEVEncoders,
+    mask_unreliable_lidar,
+)
+from .fault_selector import (
+    FaultBlob,
+    FaultSelection,
+    FaultSelector,
+    FaultSelectorConfig,
+)
+from .coarse_model import (
+    AbsolutePositionEncoder,
+    BottleneckFusionBlock,
+    CoarseReplacementHead,
+    CoarseReconstructionConfig,
+    CoarseReconstructionModel,
+    GlobalFusionBlock,
+    GlobalLidarEncoder,
+    GlobalRadarEncoder,
+    LocalToGlobalCrossAttention,
+    LocalUNetDecoder,
+    LocalUNetEncoder,
+)
+from .coarse_loss import (
+    CoarseLossConfig,
+    MaskedBEVReconstructionLoss,
+    coarse_reconstruction_metrics,
+    masked_bev_mae,
+)
+from .coarse_dataset import CoarseReconstructionDataset
+from .diffusion_process import (
+    BEVChannelNormalization,
+    DiffusionProcessConfig,
+    GaussianNoiseSchedule,
+    MaskedEpsilonMSELoss,
+    residual_target,
+)
+from .residual_diffusion import (
+    DiffusionDownBlock,
+    DiffusionUpBlock,
+    MaskedResidualDiffusion,
+    ResidualDiffusionUNet,
+    ResidualDiffusionUNetConfig,
+    SinusoidalTimeEmbedding,
+    TimeConditionedResidualBlock,
+)
+from .diffusion_pipeline import (
+    FrozenCoarseDiffusionPipeline,
+    ResidualDiffusionSampler,
+    load_frozen_coarse_model,
+)
+from .diffusion_metrics import (
+    bev_occupancy,
+    occupancy_metrics,
+    per_channel_continuous_metrics,
+    reconstruction_stage_metrics,
+)
 
 __all__ = [
-    "CoarseLiDARRadarReconstructor",
-    "DiffusionSchedule",
+    "BEVTripletDataset",
+    "BEVChannelNormalization",
+    "AbsolutePositionEncoder",
+    "BottleneckFusionBlock",
+    "CleanBEVEncoder",
+    "CoarseReplacementHead",
+    "CoarseReconstructionDataset",
+    "CoarseLossConfig",
+    "CoarseReconstructionConfig",
+    "CoarseReconstructionModel",
+    "DiffusionDownBlock",
+    "DiffusionProcessConfig",
+    "DiffusionUpBlock",
+    "FaultyBEVEncoder",
+    "GoodDataFusion",
+    "GlobalFusionBlock",
+    "GlobalLidarEncoder",
+    "GlobalRadarEncoder",
+    "GaussianNoiseSchedule",
+    "LiDARTrustedBEVEncoder",
+    "LocalToGlobalCrossAttention",
+    "LocalUNetDecoder",
+    "LocalUNetEncoder",
+    "MaskedBEVReconstructionLoss",
+    "MaskedEpsilonMSELoss",
+    "MaskedResidualDiffusion",
+    "FaultBlob",
+    "FaultSelection",
+    "FaultSelector",
+    "FaultSelectorConfig",
+    "MultiScaleBEVEncoding",
+    "RadarBEVEncoder",
+    "ReconstructionBEVEncoders",
+    "ResidualDiffusionSampler",
     "ResidualDiffusionUNet",
-    "Stage1ReconstructionPipeline",
+    "ResidualDiffusionUNetConfig",
+    "RequiredCorrection",
+    "TripletBEVEncoders",
+    "SinusoidalTimeEmbedding",
+    "TimeConditionedResidualBlock",
+    "FrozenCoarseDiffusionPipeline",
+    "load_bev_triplet",
+    "mask_unreliable_lidar",
+    "coarse_reconstruction_metrics",
+    "masked_bev_mae",
+    "bev_occupancy",
+    "load_frozen_coarse_model",
+    "occupancy_metrics",
+    "per_channel_continuous_metrics",
+    "reconstruction_stage_metrics",
+    "residual_target",
 ]
-

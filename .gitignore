@@ -24,6 +24,8 @@ data/**
 # Generated reliability datasets and previews
 Fault_Localization_Model/grid_reliability*/
 Fault_Localization_Model/*dataset*/
+!Fault_Localization_Model/aeva_dataset/
+!Fault_Localization_Model/aeva_dataset/*.py
 Fault_Localization_Model/*smoke*/
 Fault_Localization_Model/test_*heatmaps*/
 Fault_Localization_Model/**/*.npz

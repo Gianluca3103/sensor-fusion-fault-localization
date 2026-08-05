@@ -8,13 +8,8 @@ import random
 import sys
 import types
 import numpy as np
+from Fault_Localization_Model.config.defaults import DEFAULT_FOG_ROOT
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1] #Defines the repo root as one level above this script
-#Builds folder path relative to repo root
-DEFAULT_HERCULES_ROOT = REPO_ROOT / "data" / "HerculesFiles" / "Data"
-DEFAULT_INJECTOR_ROOT = REPO_ROOT / "Weather_Injector" / "3D_Corruptions_AD"
-DEFAULT_FOG_ROOT = REPO_ROOT / "Weather_Injector" / "LiDAR_fog_sim"
 _FOG_SIMULATION_PATH = DEFAULT_FOG_ROOT / "fog_simulation.py"
 _FOG_SIMULATION_SPEC = importlib.util.spec_from_file_location(
     "weather_injector_fog_simulation",
@@ -30,6 +25,8 @@ P_R_fog_soft = _FOG_SIMULATION_MODULE.P_R_fog_soft
 
 AEVA_RECORD_BYTES = 29
 FOG_ALPHA_BY_SEVERITY = [0.005, 0.01, 0.02, 0.03, 0.06]
+DEFAULT_FOG_SIMULATOR_NOISE = 10
+DEFAULT_WEATHER_THREADS = 1
 ROW_ALIGNED_CORRUPTIONS = {
     "scene_glare_noise",
     "lidar_crosstalk_noise",
@@ -177,7 +174,7 @@ def _apply_lisa_weather(
     severity: int,
     mode: str,
     rng_seed=None,
-    weather_threads: int = 1,
+    weather_threads: int = DEFAULT_WEATHER_THREADS,
 ) -> np.ndarray:
     validate_fault_spec(f"{mode}_sim", severity)
     if int(weather_threads) < 1:
@@ -209,7 +206,7 @@ def apply_fault(
     points: np.ndarray,
     severity: int,
     rng_seed=None,
-    weather_threads: int = 1,
+    weather_threads: int = DEFAULT_WEATHER_THREADS,
 ) -> np.ndarray:
     fault, severity = validate_fault_spec(fault, severity)
     if fault == "rain_sim":
@@ -283,27 +280,6 @@ def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     return output
 
 
-def find_aeva_dir(data_root: Path, day: str, session: str) -> Path:
-    candidates = [
-        data_root / day / session / "LiDAR" / "LiDAR" / "Aeva",
-        data_root / day / "LiDAR" / "LiDAR" / "Aeva",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "Could not find Hercules Aeva LiDAR folder. Tried: "
-        + ", ".join(str(path) for path in candidates)
-    )
-
-
-def list_aeva_bins(aeva_dir: Path):
-    bins = sorted(aeva_dir.glob("*.bin"), key=lambda path: path.stem)
-    if not bins:
-        raise FileNotFoundError(f"No Hercules Aeva .bin files found in {aeva_dir}")
-    return bins
-
-
 def read_hercules_aeva_bin(path: Path) -> np.ndarray:
     raw = path.read_bytes()
     if len(raw) % AEVA_RECORD_BYTES:
@@ -332,7 +308,7 @@ def apply_fog_simulator(
     fog_root: Path,
     points: np.ndarray,
     severity: int,
-    noise: int,
+    noise: int = DEFAULT_FOG_SIMULATOR_NOISE,
     rng_seed=None,
 ):
     validate_fault_spec("fog_sim", severity)
@@ -359,6 +335,7 @@ def apply_fog_simulator(
     labels = np.ones((augmented_pc.shape[0], 1), dtype=np.float32)
     labels[soft_mask, 0] = 2.0
     return np.hstack([augmented_pc[:, :4], labels]), {
+        "fog_noise": int(noise),
         "fog_alpha": alpha,
         "fog_soft_response_points": int(np.sum(soft_mask)),
         "fog_info_json": json.dumps(info or {}, sort_keys=True),

@@ -47,10 +47,7 @@ generate_split() {
   local seed="$3"
   "$PYTHON" Fault_Localization_Model/create_grid_reliability_heatmaps.py \
     --data-root "$HERCULES_ROOT" \
-    --injector-root "$REPO_ROOT/Weather_Injector/3D_Corruptions_AD" \
-    --fog-root "$REPO_ROOT/Weather_Injector/LiDAR_fog_sim" \
     --output-root "$DATASET_ROOT/$split" \
-    --all-scenes \
     --temporal-split "$split" \
     --train-ratio 0.70 \
     --val-ratio 0.15 \

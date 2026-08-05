@@ -1,0 +1,91 @@
+{
+  "residual_diffusion": {
+    "enabled": true,
+    "coarse_checkpoint": null,
+    "freeze_coarse_model": true,
+    "detach_coarse_output": true,
+    "num_train_timesteps": 1000,
+    "noise_schedule": "cosine",
+    "prediction_type": "epsilon",
+    "restrict_noise_to_reconstruction_mask": true,
+    "restrict_forward_process_to_reconstruction_mask": true,
+    "restrict_loss_to_reconstruction_mask": true,
+    "restrict_reverse_process_to_reconstruction_mask": true,
+    "restrict_final_residual_to_reconstruction_mask": true,
+    "conditioning": {
+      "use_coarse_bev": true,
+      "use_reconstruction_mask": true,
+      "use_global_context_map": false,
+      "use_attention_context": false,
+      "use_radar": false,
+      "use_halo": false
+    },
+    "normalization": {
+      "channel_means": [0.0, 0.0, 0.0],
+      "channel_stds": [1.0, 1.0, 1.0],
+      "epsilon": 1e-6,
+      "source": "existing_uint8_div_255_channel_scaling"
+    },
+    "unet": {
+      "input_channels": 7,
+      "output_channels": 3,
+      "base_channels": 32,
+      "channel_multipliers": [1, 2, 4, 8],
+      "residual_blocks_per_level": 2,
+      "time_embedding_dim": 256,
+      "normalization": "group_norm",
+      "activation": "silu",
+      "dropout": 0.0
+    },
+    "loss": {
+      "type": "masked_epsilon_mse",
+      "denominator_epsilon": 1e-8,
+      "snr_weighting": false
+    },
+    "sampling": {
+      "method": "ddpm",
+      "num_inference_steps": 1000,
+      "save_intermediate_steps": false,
+      "intermediate_stride": 100
+    },
+    "evaluation": {
+      "primary_region": "reconstruction_mask",
+      "report_full_scene": true,
+      "report_iou": true,
+      "report_f1": true,
+      "report_precision": true,
+      "report_recall": true,
+      "report_channel_mae": true,
+      "report_channel_rmse": true,
+      "report_diagnostic_subregions": true,
+      "max_sampling_samples": 8,
+      "seed": 12345
+    }
+  },
+  "fault_selector": {
+    "threshold": 0.0,
+    "min_blob_cells": 5,
+    "max_blobs": 3,
+    "merge_radius_cells": 4,
+    "box_padding_cells": 2,
+    "combine_gap_cells": 40,
+    "min_relative_blob_size": 0.05,
+    "bbox_quantile": 0.01,
+    "min_repair_fault_fraction": 0.75,
+    "min_halo_healthy_fraction": 0.9,
+    "min_halo_healthy_cells": 64,
+    "min_halo_context_ratio": 0.25,
+    "min_halo_width_cells": 4,
+    "healthy_reliability_threshold": 1.0
+  },
+  "training": {
+    "epochs": 50,
+    "batch_size": 4,
+    "num_workers": 4,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.001,
+    "grad_clip": 1.0,
+    "mixed_precision": true,
+    "seed": 42
+  }
+}
