@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -73,6 +74,11 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     return {key: batch[key].to(device, non_blocking=True) for key in keys}
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _shape_log(inputs: dict, outputs: dict) -> dict:
@@ -253,6 +259,8 @@ def main():
     history = []
     best_validation = float("inf")
     for epoch in range(1, epochs + 1):
+        _synchronize_device(device)
+        train_started = time.perf_counter()
         train_stats, train_shapes = _run_epoch(
             model,
             train_loader,
@@ -263,6 +271,9 @@ def main():
             grad_clip=grad_clip,
             use_amp=use_amp,
         )
+        _synchronize_device(device)
+        train_seconds = time.perf_counter() - train_started
+        validation_started = time.perf_counter()
         with torch.no_grad():
             val_stats, val_shapes = _run_epoch(
                 model,
@@ -279,13 +290,21 @@ def main():
                     save_conditioning_samples,
                 ),
             )
+        _synchronize_device(device)
+        validation_seconds = time.perf_counter() - validation_started
+        epoch_seconds = train_seconds + validation_seconds
         if epoch == 1:
             atomic_write_json(
                 output_root / "debug_batch_shapes.json",
                 {"train": train_shapes, "validation": val_shapes},
             )
             print("Debug tensor shapes:", json.dumps(val_shapes, indent=2))
-        row = {"epoch": epoch}
+        row = {
+            "epoch": epoch,
+            "runtime/train_seconds": train_seconds,
+            "runtime/validation_seconds": validation_seconds,
+            "runtime/epoch_seconds": epoch_seconds,
+        }
         row.update({f"train/{key}": value for key, value in train_stats.items()})
         row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
@@ -295,7 +314,10 @@ def main():
             f"val/reconstruction_loss={val_stats['reconstruction_loss']:.6f} "
             f"val/improvement={val_stats['reconstruction_improvement']:.6f} "
             f"val/relative_improvement={val_stats['relative_improvement']:.3%} "
-            f"outside_change={val_stats['outside_mask_max_change']:.3e}"
+            f"outside_change={val_stats['outside_mask_max_change']:.3e} "
+            f"train_time={train_seconds:.1f}s "
+            f"val_time={validation_seconds:.1f}s "
+            f"epoch_time={epoch_seconds:.1f}s"
         )
         checkpoint = {
             "epoch": epoch,

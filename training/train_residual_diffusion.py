@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -168,6 +169,11 @@ def _move_batch(batch, device):
         "halo_mask": "halo_mask",
     }
     return {target: batch[source].to(device, non_blocking=True) for target, source in mapping.items()}
+
+
+def _synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _shape_log(inputs, output):
@@ -357,19 +363,42 @@ def main():
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}; coarse model frozen: true")
     for epoch in range(start_epoch, epochs + 1):
+        _synchronize_device(device)
+        train_started = time.perf_counter()
         train_stats, train_shapes = _run_epoch(pipeline, train_loader, device, optimizer=optimizer, scaler=scaler, grad_clip=float(training.get("grad_clip", 1.0)), use_amp=use_amp)
+        _synchronize_device(device)
+        train_seconds = time.perf_counter() - train_started
+        validation_started = time.perf_counter()
         with torch.no_grad():
             val_stats, val_shapes = _run_epoch(pipeline, val_loader, device, use_amp=use_amp)
+        _synchronize_device(device)
+        validation_seconds = time.perf_counter() - validation_started
+        epoch_seconds = train_seconds + validation_seconds
         if train_stats["optimizer_steps"] > 0:
             scheduler.step()
         if epoch == start_epoch:
             atomic_write_json(output_root / "debug_batch_shapes.json", {"train": train_shapes, "validation": val_shapes})
             print("Debug tensor shapes:", json.dumps(val_shapes, indent=2))
-        row = {"epoch": epoch, "learning_rate": optimizer.param_groups[0]["lr"]}
+        row = {
+            "epoch": epoch,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "runtime/train_seconds": train_seconds,
+            "runtime/validation_seconds": validation_seconds,
+            "runtime/epoch_seconds": epoch_seconds,
+        }
         row.update({f"train/{key}": value for key, value in train_stats.items()})
         row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
-        print(f"epoch {epoch:03d}: train/diffusion_loss={train_stats['diffusion_loss']:.6f} val/diffusion_loss={val_stats['diffusion_loss']:.6f} train/residual_target_mean_abs={train_stats['residual_target_mean_abs']:.6f} train/coarse_masked_mae={train_stats['coarse_masked_mae']:.6f}")
+        print(
+            f"epoch {epoch:03d}: "
+            f"train/diffusion_loss={train_stats['diffusion_loss']:.6f} "
+            f"val/diffusion_loss={val_stats['diffusion_loss']:.6f} "
+            f"train/residual_target_mean_abs={train_stats['residual_target_mean_abs']:.6f} "
+            f"train/coarse_masked_mae={train_stats['coarse_masked_mae']:.6f} "
+            f"train_time={train_seconds:.1f}s "
+            f"val_time={validation_seconds:.1f}s "
+            f"epoch_time={epoch_seconds:.1f}s"
+        )
         improved = val_stats["diffusion_loss"] < best
         if improved:
             best = val_stats["diffusion_loss"]
