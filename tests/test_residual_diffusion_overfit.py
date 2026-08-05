@@ -25,6 +25,8 @@ class ResidualDiffusionOverfitTests(unittest.TestCase):
             DiffusionProcessConfig(num_train_timesteps=4, noise_schedule="linear"),
         )
         coarse = torch.zeros(batch, 3, 8, 8)
+        radar = torch.zeros(batch, 4, 8, 8)
+        halo = torch.zeros(batch, 1, 8, 8)
         clean = masks * (0.2 + 0.6 * torch.rand_like(coarse))
         timestep = torch.full((batch,), 2, dtype=torch.long)
         epsilon = torch.randn_like(clean)
@@ -32,20 +34,20 @@ class ResidualDiffusionOverfitTests(unittest.TestCase):
 
         with torch.no_grad():
             initial = diffusion(
-                clean, coarse, masks, timestep=timestep, epsilon=epsilon
+                clean, coarse, radar, masks, halo, timestep=timestep, epsilon=epsilon
             )
             initial_loss = float(initial["diffusion_loss"])
         for _ in range(180):
             optimizer.zero_grad(set_to_none=True)
             output = diffusion(
-                clean, coarse, masks, timestep=timestep, epsilon=epsilon
+                clean, coarse, radar, masks, halo, timestep=timestep, epsilon=epsilon
             )
             output["diffusion_loss"].backward()
             optimizer.step()
 
         with torch.no_grad():
             fitted = diffusion(
-                clean, coarse, masks, timestep=timestep, epsilon=epsilon
+                clean, coarse, radar, masks, halo, timestep=timestep, epsilon=epsilon
             )
             schedule = diffusion.schedule
             residual_prediction = masks * (

@@ -85,10 +85,11 @@ residual_gt = reconstruction_mask * (clean_lidar_bev - coarse_lidar_bev)
 ```
 
 At every forward and reverse step, the residual and Gaussian noise are zeroed
-outside `reconstruction_mask`. The diffusion U-Net receives only seven spatial
-channels: three noisy residual channels, three coarse-BEV channels, and the
-one-channel reconstruction mask. It does not receive radar, halo masks, global
-context, attention outputs, or latent features.
+outside `reconstruction_mask`. The diffusion U-Net receives eleven spatial
+channels: three noisy residual channels, three coarse-BEV channels, four local
+radar channels masked to the union of the repair region and geometric halo,
+and the one-channel reconstruction mask. It does not receive global radar
+representations, global context, attention outputs, or latent features.
 
 The default configuration is `configs/residual_diffusion.json`. It uses 1000
 cosine DDPM steps, epsilon prediction, a timestep-conditioned convolutional
@@ -117,3 +118,9 @@ than zero.
 The first implementation intentionally supports DDPM only. The sampler API is
 separate from the network and schedule so DDIM can be added later without
 changing the training model.
+
+U-Net fixed architecture:
+        "use_full_spatial_map": True,
+        "use_global_average_pooling": False,
+        "crop_global_context": False,
+        "num_cross_attention_blocks": 1,

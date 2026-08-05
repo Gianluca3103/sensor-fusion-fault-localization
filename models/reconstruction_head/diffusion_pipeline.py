@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .coarse_model import CoarseReconstructionConfig, CoarseReconstructionModel
+from .coarse_config import CoarseReconstructionConfig
+from .coarse_model import CoarseReconstructionModel
 from .residual_diffusion import MaskedResidualDiffusion
 
 
@@ -25,6 +26,27 @@ def load_frozen_coarse_model(checkpoint_path, device="cpu"):
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval().requires_grad_(False)
     return model, checkpoint
+
+
+def validate_diffusion_checkpoint_compatibility(checkpoint, diffusion):
+    """Reject legacy 7-channel checkpoints before state loading."""
+    state = checkpoint.get("diffusion_state_dict")
+    if not isinstance(state, dict):
+        raise KeyError("Diffusion checkpoint requires diffusion_state_dict")
+    key = "unet.input_projection.weight"
+    weight = state.get(key)
+    if weight is None or weight.ndim != 4:
+        raise KeyError(f"Diffusion checkpoint is missing a valid {key}")
+    checkpoint_channels = int(weight.shape[1])
+    expected_channels = diffusion.unet.config.input_channels
+    if checkpoint_channels != expected_channels:
+        legacy = "legacy 7-channel " if checkpoint_channels == 7 else ""
+        raise ValueError(
+            "Incompatible residual-diffusion checkpoint: "
+            f"the {legacy}checkpoint expects {checkpoint_channels} input channels, "
+            f"but local radar conditioning requires {expected_channels}. Start a "
+            "fresh diffusion run with an 11-channel checkpoint."
+        )
 
 
 class FrozenCoarseDiffusionPipeline(nn.Module):
@@ -73,7 +95,9 @@ class FrozenCoarseDiffusionPipeline(nn.Module):
         output = self.diffusion(
             clean_lidar_bev,
             coarse,
+            radar_bev,
             reconstruction_mask,
+            halo_mask,
             **diffusion_options,
         )
         output.update(
@@ -95,7 +119,9 @@ class ResidualDiffusionSampler:
     def sample(
         self,
         coarse_lidar_bev,
+        radar_bev,
         reconstruction_mask,
+        halo_mask,
         *,
         faulty_lidar_bev=None,
         generator=None,
@@ -118,8 +144,13 @@ class ResidualDiffusionSampler:
                 device=coarse_lidar_bev.device,
                 dtype=torch.long,
             )
-            epsilon_pred, _input = self.diffusion.predict_epsilon(
-                residual_t, coarse_lidar_bev, reconstruction_mask, timestep
+            epsilon_pred, _input, local_radar, active_mask = self.diffusion.predict_epsilon(
+                residual_t,
+                coarse_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                halo_mask,
+                timestep,
             )
             residual_t = self.diffusion.schedule.ddpm_step(
                 residual_t,
@@ -141,10 +172,11 @@ class ResidualDiffusionSampler:
             "residual_pred": residual_pred,
             "final_lidar_bev": final_lidar_bev,
             "reconstruction_mask": reconstruction_mask,
+            "local_radar": local_radar,
+            "active_mask": active_mask,
         }
         if faulty_lidar_bev is not None:
             output["faulty_lidar_bev"] = faulty_lidar_bev
         if save_intermediate_steps:
             output["intermediate_steps"] = intermediates
         return output
-

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from typing import Sequence
 
 import torch
@@ -10,51 +9,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .encoders import BEVEncoder, _group_count
-
-
-@dataclass(frozen=True)
-class CoarseReconstructionConfig:
-    lidar_channels: int = 3
-    radar_channels: int = 4
-    unet_base_channels: int = 16
-    unet_depth: int = 5
-    dropout: float = 0.0
-    global_base_channels: int = 16
-    global_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8, 16)
-    attention_dim: int = 128
-    num_heads: int = 4
-    attention_dropout: float = 0.0
-
-    @property
-    def local_input_channels(self) -> int:
-        return self.lidar_channels + self.radar_channels + 2
-
-    def validate(self) -> None:
-        integer_values = {
-            "lidar_channels": self.lidar_channels,
-            "radar_channels": self.radar_channels,
-            "unet_base_channels": self.unet_base_channels,
-            "unet_depth": self.unet_depth,
-            "global_base_channels": self.global_base_channels,
-            "attention_dim": self.attention_dim,
-            "num_heads": self.num_heads,
-        }
-        for name, value in integer_values.items():
-            if value < 1:
-                raise ValueError(f"{name} must be positive")
-        if not self.global_channel_multipliers or any(
-            value < 1 for value in self.global_channel_multipliers
-        ):
-            raise ValueError("global_channel_multipliers must contain positive values")
-        if self.attention_dim % self.num_heads:
-            raise ValueError("attention_dim must be divisible by num_heads")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must be in [0,1)")
-        if not 0.0 <= self.attention_dropout < 1.0:
-            raise ValueError("attention_dropout must be in [0,1)")
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+from .coarse_config import CoarseReconstructionConfig
 
 
 def _validate_binary_mask(
@@ -458,4 +413,3 @@ class CoarseReconstructionModel(nn.Module):
             assert attention_weights is not None
             outputs["attention_weights"] = attention_weights
         return outputs
-

@@ -20,6 +20,7 @@ from models.reconstruction_head import (
     per_channel_continuous_metrics,
     reconstruction_stage_metrics,
     residual_target,
+    validate_diffusion_checkpoint_compatibility,
 )
 
 
@@ -43,6 +44,13 @@ def _inputs(batch=2, size=16):
     return clean, coarse, mask
 
 
+def _radar_and_halo(batch=2, size=16):
+    radar = torch.randn(batch, 4, size, size)
+    halo = torch.zeros(batch, 1, size, size)
+    halo[:, :, 2:14, 1:15] = 1
+    return radar, halo
+
+
 class DummyCoarse(nn.Module):
     def __init__(self):
         super().__init__()
@@ -58,15 +66,29 @@ class ResidualDiffusionTests(unittest.TestCase):
     def test_masked_target_forward_process_input_and_prediction_shapes(self):
         diffusion = _diffusion()
         clean, coarse, mask = _inputs()
+        radar, halo = _radar_and_halo()
         timestep = torch.tensor([0, 7])
         epsilon = torch.randn_like(clean)
-        output = diffusion(clean, coarse, mask, timestep=timestep, epsilon=epsilon)
+        output = diffusion(
+            clean,
+            coarse,
+            radar,
+            mask,
+            halo,
+            timestep=timestep,
+            epsilon=epsilon,
+        )
         self.assertEqual(output["residual_gt"].shape, clean.shape)
         self.assertTrue(torch.all(output["residual_gt"] * (1 - mask) == 0))
         self.assertTrue(torch.all(output["epsilon_masked"] * (1 - mask) == 0))
         self.assertTrue(torch.all(output["residual_t"] * (1 - mask) == 0))
-        self.assertEqual(output["diffusion_input"].shape, (2, 7, 16, 16))
+        self.assertEqual(output["diffusion_input"].shape, (2, 11, 16, 16))
         self.assertEqual(output["epsilon_pred"].shape, clean.shape)
+        active_mask = torch.maximum(mask, halo)
+        self.assertTrue(torch.equal(output["active_mask"], active_mask))
+        self.assertTrue(torch.equal(output["local_radar"], active_mask * radar))
+        self.assertTrue(torch.all(output["local_radar"] * (1 - active_mask) == 0))
+        self.assertTrue(torch.all(output["epsilon_pred"] * (1 - mask) == 0))
         self.assertTrue(torch.isfinite(output["diffusion_loss"]))
 
     def test_residual_target_uses_clean_minus_coarse_only_inside_mask(self):
@@ -88,16 +110,19 @@ class ResidualDiffusionTests(unittest.TestCase):
             loss.backward()
             self.assertIsNotNone(prediction.grad)
 
-    def test_diffusion_gradients_and_no_attention_or_external_conditioning(self):
+    def test_diffusion_gradients_and_no_global_attention_conditioning(self):
         diffusion = _diffusion().train()
         clean, coarse, mask = _inputs(1)
-        output = diffusion(clean, coarse, mask)
+        radar, halo = _radar_and_halo(1)
+        output = diffusion(clean, coarse, radar, mask, halo)
         output["diffusion_loss"].backward()
         self.assertTrue(any(p.grad is not None for p in diffusion.unet.parameters()))
         module_names = {module.__class__.__name__.lower() for module in diffusion.unet.modules()}
         self.assertFalse(any("attention" in name for name in module_names))
         signature_names = diffusion.predict_epsilon.__code__.co_varnames
-        for forbidden in ("radar", "halo", "global_context_map", "attention_context"):
+        self.assertIn("radar_bev", signature_names)
+        self.assertIn("halo_mask", signature_names)
+        for forbidden in ("global_context_map", "attention_context"):
             self.assertNotIn(forbidden, signature_names)
 
     def test_frozen_coarse_pipeline_receives_no_gradients(self):
@@ -116,10 +141,13 @@ class ResidualDiffusionTests(unittest.TestCase):
         diffusion = _diffusion().eval()
         sampler = ResidualDiffusionSampler(diffusion)
         _clean, coarse, mask = _inputs(1)
+        radar, halo = _radar_and_halo(1)
         faulty = coarse.clone()
         first = sampler.sample(
             coarse,
+            radar,
             mask,
+            halo,
             faulty_lidar_bev=faulty,
             generator=torch.Generator().manual_seed(123),
             save_intermediate_steps=True,
@@ -127,10 +155,14 @@ class ResidualDiffusionTests(unittest.TestCase):
         )
         second = sampler.sample(
             coarse,
+            radar,
             mask,
+            halo,
             generator=torch.Generator().manual_seed(123),
         )
         self.assertTrue(torch.equal(first["final_lidar_bev"], second["final_lidar_bev"]))
+        self.assertTrue(torch.equal(first["local_radar"], second["local_radar"]))
+        self.assertTrue(torch.equal(first["active_mask"], torch.maximum(mask, halo)))
         self.assertTrue(torch.all(first["residual_pred"] * (1 - mask) == 0))
         self.assertTrue(torch.equal(first["final_lidar_bev"] * (1 - mask), coarse * (1 - mask)))
         for _step, residual in first["intermediate_steps"]:
@@ -182,11 +214,66 @@ class ResidualDiffusionTests(unittest.TestCase):
     def test_mixed_precision_forward_backward(self):
         diffusion = _diffusion().train()
         clean, coarse, mask = _inputs(1)
+        radar, halo = _radar_and_halo(1)
         with torch.autocast("cpu", dtype=torch.bfloat16):
-            output = diffusion(clean, coarse, mask)
+            output = diffusion(clean, coarse, radar, mask, halo)
         self.assertTrue(torch.isfinite(output["diffusion_loss"]))
         output["diffusion_loss"].backward()
         self.assertIsNotNone(diffusion.unet.output_projection.weight.grad)
+
+    def test_training_and_sampling_use_identical_local_radar_conditioning(self):
+        diffusion = _diffusion().eval()
+        clean, coarse, mask = _inputs(1)
+        radar, halo = _radar_and_halo(1)
+        with torch.no_grad():
+            trained = diffusion(
+                clean,
+                coarse,
+                radar,
+                mask,
+                halo,
+                timestep=torch.tensor([3]),
+                epsilon=torch.zeros_like(clean),
+            )
+            sampled = ResidualDiffusionSampler(diffusion).sample(
+                coarse,
+                radar,
+                mask,
+                halo,
+                generator=torch.Generator().manual_seed(7),
+            )
+        self.assertTrue(torch.equal(trained["local_radar"], sampled["local_radar"]))
+        self.assertTrue(torch.equal(trained["active_mask"], sampled["active_mask"]))
+        self.assertTrue(
+            torch.equal(sampled["final_lidar_bev"] * (1 - mask), coarse * (1 - mask))
+        )
+
+    def test_local_radar_conditioning_rejects_invalid_shapes_and_dtype(self):
+        diffusion = _diffusion()
+        clean, coarse, mask = _inputs(1)
+        radar, halo = _radar_and_halo(1)
+        invalid = (
+            (radar[:, :3], mask, halo, ValueError, "radar_bev must have shape"),
+            (radar[:, :, :-1], mask, halo, ValueError, "radar_bev must have shape"),
+            (radar.double(), mask, halo, TypeError, "radar_bev dtype"),
+            (radar, mask[:, :, :-1], halo, ValueError, "reconstruction_mask must have shape"),
+            (radar, mask, halo[:, :, :-1], ValueError, "halo_mask must have shape"),
+        )
+        for bad_radar, bad_mask, bad_halo, error, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(error, message):
+                    diffusion(clean, coarse, bad_radar, bad_mask, bad_halo)
+
+    def test_legacy_seven_channel_checkpoint_is_rejected_clearly(self):
+        diffusion = _diffusion()
+        state = diffusion.state_dict()
+        current = state["unet.input_projection.weight"]
+        state["unet.input_projection.weight"] = torch.randn(
+            current.shape[0], 7, *current.shape[2:]
+        )
+        checkpoint = {"diffusion_state_dict": state}
+        with self.assertRaisesRegex(ValueError, "legacy 7-channel checkpoint"):
+            validate_diffusion_checkpoint_compatibility(checkpoint, diffusion)
 
     def test_coarse_checkpoint_loader(self):
         config = CoarseReconstructionConfig(

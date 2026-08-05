@@ -22,6 +22,7 @@ from .diffusion_process import (
 @dataclass(frozen=True)
 class ResidualDiffusionUNetConfig:
     lidar_channels: int = 3
+    radar_channels: int = 4
     base_channels: int = 32
     channel_multipliers: tuple[int, ...] = (1, 2, 4, 8)
     residual_blocks_per_level: int = 2
@@ -30,10 +31,10 @@ class ResidualDiffusionUNetConfig:
 
     @property
     def input_channels(self) -> int:
-        return 2 * self.lidar_channels + 1
+        return 2 * self.lidar_channels + self.radar_channels + 1
 
     def validate(self) -> None:
-        if self.lidar_channels < 1 or self.base_channels < 1:
+        if self.lidar_channels < 1 or self.radar_channels < 1 or self.base_channels < 1:
             raise ValueError("channel counts must be positive")
         if not self.channel_multipliers or any(x < 1 for x in self.channel_multipliers):
             raise ValueError("channel_multipliers must contain positive values")
@@ -128,7 +129,7 @@ class DiffusionUpBlock(nn.Module):
 
 
 class ResidualDiffusionUNet(nn.Module):
-    """Simple convolutional epsilon predictor with no attention or multimodal inputs."""
+    """Simple convolutional epsilon predictor with local masked radar context."""
 
     def __init__(self, config: ResidualDiffusionUNetConfig | None = None):
         super().__init__()
@@ -224,26 +225,116 @@ class MaskedResidualDiffusion(nn.Module):
             self.schedule.config.denominator_epsilon
         )
 
-    def predict_epsilon(self, residual_t, coarse_lidar_bev, reconstruction_mask, timestep):
+    def _local_radar_conditioning(
+        self,
+        residual_t,
+        coarse_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        halo_mask,
+    ):
+        if residual_t.shape != coarse_lidar_bev.shape:
+            raise ValueError("residual_t and coarse_lidar_bev must have identical shapes")
+        if coarse_lidar_bev.ndim != 4:
+            raise ValueError("coarse_lidar_bev must have shape [B,C,H,W]")
+        batch, _channels, height, width = coarse_lidar_bev.shape
+        expected_radar = (
+            batch,
+            self.unet.config.radar_channels,
+            height,
+            width,
+        )
+        if tuple(radar_bev.shape) != expected_radar:
+            raise ValueError(
+                f"radar_bev must have shape {expected_radar}, got {tuple(radar_bev.shape)}"
+            )
+        expected_mask = (batch, 1, height, width)
+        for name, mask in (
+            ("reconstruction_mask", reconstruction_mask),
+            ("halo_mask", halo_mask),
+        ):
+            if tuple(mask.shape) != expected_mask:
+                raise ValueError(
+                    f"{name} must have shape {expected_mask}, got {tuple(mask.shape)}"
+                )
+            if mask.dtype != coarse_lidar_bev.dtype:
+                raise TypeError(
+                    f"{name} dtype {mask.dtype} must match coarse LiDAR dtype "
+                    f"{coarse_lidar_bev.dtype}"
+                )
+            if mask.device != coarse_lidar_bev.device:
+                raise ValueError(f"{name} must be on the same device as coarse_lidar_bev")
+        if radar_bev.dtype != coarse_lidar_bev.dtype:
+            raise TypeError(
+                f"radar_bev dtype {radar_bev.dtype} must match coarse LiDAR dtype "
+                f"{coarse_lidar_bev.dtype}"
+            )
+        if residual_t.dtype != coarse_lidar_bev.dtype:
+            raise TypeError("residual_t dtype must match coarse_lidar_bev dtype")
+        if radar_bev.device != coarse_lidar_bev.device:
+            raise ValueError("radar_bev must be on the same device as coarse_lidar_bev")
+        active_mask = torch.maximum(reconstruction_mask, halo_mask)
+        local_radar = active_mask * radar_bev
+        return local_radar, active_mask
+
+    def predict_epsilon(
+        self,
+        residual_t,
+        coarse_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        halo_mask,
+        timestep,
+    ):
+        local_radar, active_mask = self._local_radar_conditioning(
+            residual_t,
+            coarse_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+        )
         coarse_normalized = self.normalization.normalize(coarse_lidar_bev)
         diffusion_input = torch.cat(
-            (residual_t, coarse_normalized, reconstruction_mask), dim=1
+            (
+                residual_t,
+                coarse_normalized,
+                local_radar,
+                reconstruction_mask,
+            ),
+            dim=1,
         )
         epsilon_pred = self.unet(diffusion_input, timestep)
-        return reconstruction_mask * epsilon_pred, diffusion_input
+        return (
+            reconstruction_mask * epsilon_pred,
+            diffusion_input,
+            local_radar,
+            active_mask,
+        )
 
     def forward(
         self,
         clean_lidar_bev,
         coarse_lidar_bev,
+        radar_bev,
         reconstruction_mask,
+        halo_mask,
         *,
         timestep=None,
         epsilon=None,
         generator=None,
     ):
+        difference = clean_lidar_bev - coarse_lidar_bev
+        # Validate every conditioning tensor before mask broadcasting is used
+        # to construct the residual target.
+        self._local_radar_conditioning(
+            difference,
+            coarse_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+        )
         residual_gt = reconstruction_mask * self.normalization.normalize_residual(
-            clean_lidar_bev - coarse_lidar_bev
+            difference
         )
         batch = clean_lidar_bev.shape[0]
         if timestep is None:
@@ -263,8 +354,13 @@ class MaskedResidualDiffusion(nn.Module):
         residual_t, epsilon_masked = self.schedule.add_masked_noise(
             residual_gt, epsilon, timestep, reconstruction_mask
         )
-        epsilon_pred, diffusion_input = self.predict_epsilon(
-            residual_t, coarse_lidar_bev, reconstruction_mask, timestep
+        epsilon_pred, diffusion_input, local_radar, active_mask = self.predict_epsilon(
+            residual_t,
+            coarse_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+            timestep,
         )
         loss = self.loss_function(epsilon_pred, epsilon, reconstruction_mask)
         return {
@@ -276,8 +372,9 @@ class MaskedResidualDiffusion(nn.Module):
             "epsilon_masked": epsilon_masked,
             "epsilon_pred": epsilon_pred,
             "diffusion_input": diffusion_input,
+            "local_radar": local_radar,
+            "active_mask": active_mask,
             "reconstruction_mask": reconstruction_mask,
             "timestep": timestep,
             "diffusion_loss": loss,
         }
-

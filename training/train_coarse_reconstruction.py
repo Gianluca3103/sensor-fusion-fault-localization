@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
-import json
 from pathlib import Path
 import sys
 
@@ -24,13 +22,12 @@ from Fault_Localization_Model.io_utils import (
 )
 from PFS.training_utils import resolve_device, seed_everything
 from models.reconstruction_head import (
-    CoarseLossConfig,
-    CoarseReconstructionConfig,
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
-    FaultSelectorConfig,
     MaskedBEVReconstructionLoss,
+    build_configs,
     coarse_reconstruction_metrics,
+    load_config,
 )
 
 
@@ -49,77 +46,6 @@ def _parse_args():
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--limit-samples", type=int)
     return parser.parse_args()
-
-
-def _load_config(path: str | Path) -> dict:
-    path = Path(path)
-    with path.open("r", encoding="utf-8") as handle:
-            suffix = path.suffix.lower()
-            if suffix == ".json":
-                payload = json.load(handle)
-            elif suffix in {".yaml", ".yml"}:
-                import yaml
-                payload = yaml.safe_load(handle)
-            else:
-                raise ValueError(f"Unsupported configuration format: {suffix}")
-    if not isinstance(payload, dict):
-        raise ValueError("Coarse configuration must decode to a mapping")
-    return payload
-
-
-def _build_configs(payload: dict):
-    coarse = payload.get("coarse_reconstruction", {})
-    unet = coarse.get("unet", {})
-    global_context = coarse.get("global_context", {})
-    if not coarse.get("enabled", True):
-        raise ValueError("coarse_reconstruction.enabled must be true for this trainer")
-    if unet.get("normalization", "group_norm") != "group_norm":
-        raise ValueError("The coarse U-Net currently supports group_norm only")
-    if unet.get("activation", "silu") != "silu":
-        raise ValueError("The coarse U-Net currently supports silu activation only")
-    required_global_contract = {
-        "use_full_spatial_map": True,
-        "use_global_average_pooling": False,
-        "crop_global_context": False,
-        "num_cross_attention_blocks": 1,
-    }
-    for key, expected in required_global_contract.items():
-        if global_context.get(key, expected) != expected:
-            raise ValueError(f"global_context.{key} must be {expected!r}")
-    model_config = CoarseReconstructionConfig(
-        unet_base_channels=unet.get("base_channels", 16),
-        unet_depth=unet.get("depth", 5),
-        dropout=unet.get("dropout", 0.0),
-        global_base_channels=global_context.get("base_channels", 16),
-        global_channel_multipliers=tuple(
-            global_context.get("channel_multipliers", (1, 2, 4, 8, 16))
-        ),
-        attention_dim=global_context.get("attention_dim", 128),
-        num_heads=global_context.get("num_heads", 4),
-        attention_dropout=global_context.get("attention_dropout", 0.0),
-    )
-    loss_payload = coarse.get("loss", {})
-    if loss_payload.get("lambda_occupancy", 0.0) != 0.0 or (
-        loss_payload.get("lambda_offset", 0.0) != 0.0
-    ):
-        raise ValueError("Occupancy/offset losses require a compatible LiDAR decoder")
-    loss_config = CoarseLossConfig(
-        reconstruction_loss_type=loss_payload.get(
-            "reconstruction_loss_type", "smooth_l1"
-        ),
-        lambda_reconstruction=loss_payload.get("lambda_reconstruction", 1.0),
-        epsilon=loss_payload.get("epsilon", 1.0e-8),
-    )
-    selector_payload = payload.get("fault_selector", {})
-    valid_selector_fields = {field.name for field in fields(FaultSelectorConfig)}
-    unknown = set(selector_payload) - valid_selector_fields
-    if unknown:
-        raise ValueError("Unknown fault_selector settings: " + ", ".join(sorted(unknown)))
-    selector_config = FaultSelectorConfig(**selector_payload)
-    model_config.validate()
-    loss_config.validate()
-    selector_config.validate()
-    return model_config, loss_config, selector_config
 
 
 def _split_paths(data_root: Path, split: str, limit: int | None) -> list[Path]:
@@ -260,8 +186,8 @@ def _run_epoch(
 
 def main():
     args = _parse_args()
-    payload = _load_config(args.config)
-    model_config, loss_config, selector_config = _build_configs(payload)
+    payload = load_config(args.config)
+    model_config, loss_config, selector_config = build_configs(payload)
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 8))

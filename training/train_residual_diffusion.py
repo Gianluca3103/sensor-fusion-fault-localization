@@ -31,6 +31,7 @@ from models.reconstruction_head import (
     ResidualDiffusionUNetConfig,
     load_frozen_coarse_model,
     reconstruction_stage_metrics,
+    validate_diffusion_checkpoint_compatibility,
 )
 
 
@@ -76,15 +77,17 @@ def _require_contract(section):
         if section.get(key, True) is not True:
             raise ValueError(f"residual_diffusion.{key} must be true")
     conditioning = section.get("conditioning", {})
-    for key in ("use_coarse_bev", "use_reconstruction_mask"):
+    for key in ("use_coarse_bev", "use_reconstruction_mask", "use_radar", "use_halo"):
         if conditioning.get(key, True) is not True:
             raise ValueError(f"conditioning.{key} must be true")
-    for key in ("use_global_context_map", "use_attention_context", "use_radar", "use_halo"):
+    for key in ("use_global_context_map", "use_attention_context"):
         if conditioning.get(key, False) is not False:
             raise ValueError(f"conditioning.{key} must be false in residual diffusion")
     unet = section.get("unet", {})
-    if unet.get("input_channels", 7) != 7 or unet.get("output_channels", 3) != 3:
-        raise ValueError("Direct-BEV diffusion requires exactly 7 input and 3 output channels")
+    if unet.get("input_channels", 11) != 11 or unet.get("output_channels", 3) != 3:
+        raise ValueError(
+            "Local-radar residual diffusion requires exactly 11 input and 3 output channels"
+        )
     if unet.get("normalization", "group_norm") != "group_norm":
         raise ValueError("Only GroupNorm is supported")
     if unet.get("activation", "silu") != "silu":
@@ -109,6 +112,7 @@ def _build_components(payload):
     loss = section.get("loss", {})
     model_config = ResidualDiffusionUNetConfig(
         lidar_channels=3,
+        radar_channels=int(unet.get("radar_channels", 4)),
         base_channels=int(unet.get("base_channels", 32)),
         channel_multipliers=tuple(unet.get("channel_multipliers", (1, 2, 4, 8))),
         residual_blocks_per_level=int(unet.get("residual_blocks_per_level", 2)),
@@ -170,6 +174,7 @@ def _shape_log(inputs, output):
     keys = (
         "coarse_lidar_bev", "erased_lidar_bev", "residual_gt", "residual_t",
         "epsilon", "epsilon_pred", "diffusion_input", "reconstruction_mask",
+        "local_radar", "active_mask",
     )
     result = {key: list(value.shape) for key, value in inputs.items()}
     result.update({key: list(output[key].shape) for key in keys})
@@ -257,7 +262,11 @@ def _final_sampling_evaluation(pipeline, loader, device, section, output_root):
             batch["healthy_context_mask"], batch["halo_mask"],
         )
         sampled = sampler.sample(
-            coarse, batch["reconstruction_mask"], faulty_lidar_bev=batch["faulty_lidar_bev"],
+            coarse,
+            batch["radar_bev"],
+            batch["reconstruction_mask"],
+            batch["halo_mask"],
+            faulty_lidar_bev=batch["faulty_lidar_bev"],
             generator=generator,
             save_intermediate_steps=bool(sampling.get("save_intermediate_steps", False)),
             intermediate_stride=int(sampling.get("intermediate_stride", 100)),
@@ -270,6 +279,8 @@ def _final_sampling_evaluation(pipeline, loader, device, section, output_root):
                     "residual_pred",
                     "final_lidar_bev",
                     "reconstruction_mask",
+                    "local_radar",
+                    "active_mask",
                 )
             }
         for index in range(coarse.shape[0]):
@@ -332,6 +343,7 @@ def main():
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         if checkpoint.get("coarse_checkpoint_identity") != _file_identity(args.coarse_checkpoint):
             raise ValueError("Resume coarse-checkpoint identity does not match")
+        validate_diffusion_checkpoint_compatibility(checkpoint, diffusion)
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

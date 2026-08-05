@@ -23,7 +23,6 @@ from .coarse_model import (
     AbsolutePositionEncoder,
     BottleneckFusionBlock,
     CoarseReplacementHead,
-    CoarseReconstructionConfig,
     CoarseReconstructionModel,
     GlobalFusionBlock,
     GlobalLidarEncoder,
@@ -32,6 +31,7 @@ from .coarse_model import (
     LocalUNetDecoder,
     LocalUNetEncoder,
 )
+from .coarse_config import CoarseReconstructionConfig, build_configs, load_config
 from .coarse_loss import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
@@ -59,6 +59,7 @@ from .diffusion_pipeline import (
     FrozenCoarseDiffusionPipeline,
     ResidualDiffusionSampler,
     load_frozen_coarse_model,
+    validate_diffusion_checkpoint_compatibility,
 )
 from .diffusion_metrics import (
     bev_occupancy,
@@ -112,9 +113,12 @@ __all__ = [
     "load_bev_triplet",
     "mask_unreliable_lidar",
     "coarse_reconstruction_metrics",
+    "build_configs",
+    "load_config",
     "masked_bev_mae",
     "bev_occupancy",
     "load_frozen_coarse_model",
+    "validate_diffusion_checkpoint_compatibility",
     "occupancy_metrics",
     "per_channel_continuous_metrics",
     "reconstruction_stage_metrics",

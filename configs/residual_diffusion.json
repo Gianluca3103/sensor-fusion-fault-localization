@@ -17,8 +17,8 @@
       "use_reconstruction_mask": true,
       "use_global_context_map": false,
       "use_attention_context": false,
-      "use_radar": false,
-      "use_halo": false
+      "use_radar": true,
+      "use_halo": true
     },
     "normalization": {
       "channel_means": [0.0, 0.0, 0.0],
@@ -27,8 +27,9 @@
       "source": "existing_uint8_div_255_channel_scaling"
     },
     "unet": {
-      "input_channels": 7,
+      "input_channels": 11,
       "output_channels": 3,
+      "radar_channels": 4,
       "base_channels": 32,
       "channel_multipliers": [1, 2, 4, 8],
       "residual_blocks_per_level": 2,
