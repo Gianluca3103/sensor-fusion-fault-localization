@@ -47,7 +47,8 @@ def _parse_args():
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
-    parser.add_argument("--limit-samples", type=int)
+    parser.add_argument("--limit-train-samples", type=int)
+    parser.add_argument("--limit-val-samples", type=int)
     parser.add_argument("--resume")
     return parser.parse_args()
 
@@ -152,7 +153,7 @@ def _split_paths(root, split, limit):
     paths = sorted(path.rglob("*.npz"))
     if limit is not None:
         if limit < 1:
-            raise ValueError("--limit-samples must be positive")
+            raise ValueError("Split sample limits must be positive")
         paths = paths[:limit]
     if not paths:
         raise FileNotFoundError(f"No NPZ samples found under {path}")
@@ -332,8 +333,8 @@ def main():
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     dataset_options = {"radar_root": Path(args.radar_root), "resize_hw": (320, 320), "selector_config": selector_config}
-    train_dataset = CoarseReconstructionDataset(_split_paths(args.data_root, "train", args.limit_samples), **dataset_options)
-    val_dataset = CoarseReconstructionDataset(_split_paths(args.data_root, "val", args.limit_samples), **dataset_options)
+    train_dataset = CoarseReconstructionDataset(_split_paths(args.data_root, "train", args.limit_train_samples), **dataset_options)
+    val_dataset = CoarseReconstructionDataset(_split_paths(args.data_root, "val", args.limit_val_samples), **dataset_options)
     loader_options = {"batch_size": batch_size, "num_workers": workers, "pin_memory": device.type == "cuda", "persistent_workers": workers > 0}
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)

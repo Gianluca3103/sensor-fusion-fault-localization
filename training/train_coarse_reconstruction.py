@@ -46,7 +46,8 @@ def _parse_args():
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
-    parser.add_argument("--limit-samples", type=int)
+    parser.add_argument("--limit-train-samples", type=int)
+    parser.add_argument("--limit-val-samples", type=int)
     return parser.parse_args()
 
 
@@ -57,7 +58,7 @@ def _split_paths(data_root: Path, split: str, limit: int | None) -> list[Path]:
     paths = sorted(split_root.rglob("*.npz"))
     if limit is not None:
         if limit < 1:
-            raise ValueError("--limit-samples must be positive")
+            raise ValueError("Split sample limits must be positive")
         paths = paths[:limit]
     if not paths:
         raise FileNotFoundError(f"No NPZ samples found under {split_root}")
@@ -211,8 +212,8 @@ def main():
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     data_root = Path(args.data_root)
-    train_paths = _split_paths(data_root, "train", args.limit_samples)
-    val_paths = _split_paths(data_root, "val", args.limit_samples)
+    train_paths = _split_paths(data_root, "train", args.limit_train_samples)
+    val_paths = _split_paths(data_root, "val", args.limit_val_samples)
     dataset_options = {
         "radar_root": Path(args.radar_root),
         "resize_hw": (320, 320),
