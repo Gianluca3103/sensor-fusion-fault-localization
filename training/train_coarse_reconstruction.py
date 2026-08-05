@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import random
 import sys
 import time
 
@@ -22,6 +23,8 @@ from Fault_Localization_Model.io_utils import (
     atomic_write_json,
     write_csv_rows,
 )
+from Fault_Localization_Model.sample_utils import load_sample_metadata
+from PFS_Radar.radar_data import radar_cache_path
 from PFS.training_utils import resolve_device, seed_everything
 from models.reconstruction_head import (
     CoarseReconstructionDataset,
@@ -51,17 +54,44 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _split_paths(data_root: Path, split: str, limit: int | None) -> list[Path]:
+def _split_paths(
+    data_root: Path,
+    radar_root: Path,
+    split: str,
+    limit: int | None,
+    seed: int,
+) -> list[Path]:
     split_root = data_root / split
     if not split_root.is_dir():
         raise FileNotFoundError(f"Required dataset split is missing: {split_root}")
+    if not radar_root.is_dir():
+        raise FileNotFoundError(f"Radar cache root is missing: {radar_root}")
     paths = sorted(split_root.rglob("*.npz"))
+    available_paths = []
+    total = len(paths)
+    print(f"Checking {split} radar availability for {total} samples...", flush=True)
+    for index, path in enumerate(paths, 1):
+        metadata = load_sample_metadata(path)
+        if radar_cache_path(radar_root, metadata).is_file():
+            available_paths.append(path)
+        if index % 10_000 == 0 or index == total:
+            print(
+                f"  {split}: checked {index}/{total}; "
+                f"available={len(available_paths)}; "
+                f"missing={index - len(available_paths)}",
+                flush=True,
+            )
+    paths = available_paths
     if limit is not None:
         if limit < 1:
             raise ValueError("Split sample limits must be positive")
-        paths = paths[:limit]
+        rng = random.Random(seed)
+        paths = rng.sample(paths, k=min(limit, len(paths)))
     if not paths:
-        raise FileNotFoundError(f"No NPZ samples found under {split_root}")
+        raise FileNotFoundError(
+            f"No samples with aligned radar were found under {split_root} "
+            f"using radar root {radar_root}"
+        )
     return paths
 
 
@@ -212,10 +242,23 @@ def main():
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     data_root = Path(args.data_root)
-    train_paths = _split_paths(data_root, "train", args.limit_train_samples)
-    val_paths = _split_paths(data_root, "val", args.limit_val_samples)
+    radar_root = Path(args.radar_root)
+    train_paths = _split_paths(
+        data_root,
+        radar_root,
+        "train",
+        args.limit_train_samples,
+        seed,
+    )
+    val_paths = _split_paths(
+        data_root,
+        radar_root,
+        "val",
+        args.limit_val_samples,
+        seed,
+    )
     dataset_options = {
-        "radar_root": Path(args.radar_root),
+        "radar_root": radar_root,
         "resize_hw": (320, 320),
         "selector_config": selector_config,
     }
