@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -10,10 +9,6 @@ import torch
 from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel, parameter_breakdown
 from PFS_Radar.radar_data import (
     CONTINENTAL_DTYPE,
-    RADAR_CACHE_VERSION,
-    historical_radar_frames,
-    load_ground_truth_poses,
-    pose_matrix,
     project_radar_bev,
     radar_cache_path,
     radar_cache_is_compatible,
@@ -24,15 +19,6 @@ from PFS_Radar.train_pfs_radar import euclidean_dilate, localization_surrogate_l
 
 
 class PFSRadarTests(unittest.TestCase):
-    def test_pose_matrix_uses_xyzw_quaternion_order(self):
-        half_sqrt = np.sqrt(0.5)
-        transform = pose_matrix(
-            np.asarray([1.0, 2.0, 3.0]),
-            np.asarray([0.0, 0.0, half_sqrt, half_sqrt]),
-        )
-        point = transform @ np.asarray([1.0, 0.0, 0.0, 1.0])
-        self.assertTrue(np.allclose(point[:3], [1.0, 3.0, 3.0]))
-
     def test_radar_projection_uses_expected_channels(self):
         points = np.asarray(
             [
@@ -83,34 +69,7 @@ class PFSRadarTests(unittest.TestCase):
                 {**metadata, "scene": "../outside"},
             )
 
-    def test_unsorted_ground_truth_timestamps_are_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "poses.txt"
-            path.write_text(
-                "2 0 0 0 0 0 0 1\n1 0 0 0 0 0 0 1\n",
-                encoding="utf-8",
-            )
-            load_ground_truth_poses.cache_clear()
-            with self.assertRaises(ValueError):
-                load_ground_truth_poses(str(path))
-
-    def test_historical_stack_never_selects_future_radar(self):
-        timestamps = (100_000_000, 140_000_000)
-        paths = ("100000000.bin", "140000000.bin")
-        with patch(
-            "PFS_Radar.radar_data.scene_radar_resources",
-            return_value=(timestamps, paths, np.eye(4)),
-        ):
-            selected, delta_ms = historical_radar_frames(
-                Path("scene"),
-                lidar_timestamp=130_000_000,
-                frame_count=1,
-                max_delta_ms=50.0,
-            )
-        self.assertEqual(selected, [Path("100000000.bin")])
-        self.assertEqual(delta_ms, -30.0)
-
-    def test_radar_cache_compatibility_checks_stack_and_shape(self):
+    def test_radar_cache_compatibility_checks_alignment_and_shape(self):
         sample_metadata = {
             "scene": "Scene01",
             "timestamp": "123",
@@ -122,13 +81,10 @@ class PFSRadarTests(unittest.TestCase):
             "scene": "Scene01",
             "lidar_timestamp": "123",
             "radar_delta_ms": 10.0,
-            "radar_frame_count": 20,
-            "requested_radar_frame_count": 20,
             "x_range": [0.0, 4.0],
             "y_range": [-2.0, 2.0],
             "resolution": 1.0,
             "max_abs_velocity": 30.0,
-            "cache_format_version": RADAR_CACHE_VERSION,
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.npz"
@@ -143,15 +99,6 @@ class PFSRadarTests(unittest.TestCase):
                     sample_metadata,
                     max_delta_ms=30.0,
                     max_abs_velocity=30.0,
-                    radar_frame_count=20,
-                    require_full_stack=True,
-                )
-            )
-            self.assertFalse(
-                radar_cache_is_compatible(
-                    path,
-                    sample_metadata,
-                    radar_frame_count=1,
                 )
             )
 

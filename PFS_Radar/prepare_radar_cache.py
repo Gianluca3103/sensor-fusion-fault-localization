@@ -79,17 +79,6 @@ def main():
     )
     parser.add_argument("--max-delta-ms", type=float, default=30.0)
     parser.add_argument("--max-abs-velocity", type=float, default=30.0)
-    parser.add_argument(
-        "--radar-frame-count",
-        type=int,
-        default=1,
-        help="Causal radar frames accumulated before BEV projection. Use 20 for temporal stacking.",
-    )
-    parser.add_argument(
-        "--require-full-stack",
-        action="store_true",
-        help="Fail instead of using empty leading history at the start of a sequence.",
-    )
     args = parser.parse_args()
     if args.num_workers < 1:
         parser.error("--num-workers must be at least 1")
@@ -99,8 +88,6 @@ def main():
         parser.error("--max-delta-ms must be non-negative")
     if not math.isfinite(args.max_abs_velocity) or args.max_abs_velocity <= 0.0:
         parser.error("--max-abs-velocity must be positive")
-    if args.radar_frame_count < 1:
-        parser.error("--radar-frame-count must be at least 1")
 
     dataset_root = Path(args.dataset_root)
     hercules_root = Path(args.hercules_root)
@@ -139,8 +126,6 @@ def main():
             metadata,
             max_delta_ms=args.max_delta_ms,
             max_abs_velocity=args.max_abs_velocity,
-            radar_frame_count=args.radar_frame_count,
-            require_full_stack=args.require_full_stack,
         ):
             continue
         pending.append(
@@ -156,8 +141,6 @@ def main():
                     output_root,
                     args.max_delta_ms,
                     args.max_abs_velocity,
-                    args.radar_frame_count,
-                    args.require_full_stack,
                 ),
             )
         )
@@ -230,8 +213,7 @@ def main():
         report = "\n".join(f"{path}\t{exc}" for path, exc in skipped_alignment)
         atomic_write_text(skipped_report_path, report)
         print(
-            f"Skipped {len(skipped_alignment)} samples without a complete, pose-aligned "
-            f"{args.radar_frame_count}-frame causal history."
+            f"Skipped {len(skipped_alignment)} samples without an aligned radar frame."
         )
     else:
         skipped_report_path.unlink(missing_ok=True)

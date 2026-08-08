@@ -1,15 +1,13 @@
-"""Adaptive, Doppler-aware K-Radar preprocessing for RadarV2."""
+"""Single-frame, Doppler-aware K-Radar preprocessing for RadarV2."""
 
 from .radar_data import (
-    AdaptiveStackConfig,
-    DopplerTrackingConfig,
+    DopplerConfig,
     RADAR_CACHE_VERSION,
     kradar_cache_path,
 )
 
 __all__ = [
-    "AdaptiveStackConfig",
-    "DopplerTrackingConfig",
+    "DopplerConfig",
     "RADAR_CACHE_VERSION",
     "kradar_cache_path",
 ]

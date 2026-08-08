@@ -19,19 +19,10 @@ The four radar channels are:
 3. normalized absolute radial velocity
 4. normalized radar cross section (RCS)
 
-The radar input is a causal stack containing the frame nearest the current
-LiDAR timestamp and the preceding 19 frames. Each historical cloud is
-ego-motion compensated into the current Aeva LiDAR frame using the
-sensor-specific `Continental_gt.txt` and `Aeva_gt.txt` trajectories plus the
-IMU/sensor mounting rotations. The aligned points are concatenated before one
-BEV projection. A cache is used so multiple fault variants of the same LiDAR
-frame share one radar tensor.
-
-Strict cache preparation rejects sequence-start samples that do not have 20
-real historical radar frames or a valid ground-truth pose. It never fills the
-window with future frames. Cache format version 3 also includes the exact
-Hercules scene/session in its path and metadata, preventing same-timestamp
-collisions across sessions. Rebuild caches produced by earlier versions.
+The radar input contains one frame aligned with the current LiDAR timestamp.
+A cache is used so multiple fault variants of the same LiDAR frame share one
+radar tensor. Cache paths include the exact scene/session, preventing
+same-timestamp collisions across sessions.
 
 ## PFS adaptation
 
@@ -52,7 +43,7 @@ PYTHON="/home/arrubuntu20/anaconda3/envs/sensor-fusion/bin/python"
 REPO_ROOT="/mnt/3D10B36523559581/Gianluca/sensor-fusion-fault-localization"
 HERCULES_ROOT="/mnt/3D10B36523559581/HeRCULES"
 DATASET_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/grid_reliability_20k_grid320_id_v3"
-RADAR_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/radar_cache_20k_stack20"
+RADAR_ROOT="/mnt/3D10B36523559581/Gianluca/sensor_fusion_outputs/radar_cache_20k"
 
 cd "$REPO_ROOT"
 "$PYTHON" PFS_Radar/prepare_radar_cache.py \
@@ -60,16 +51,12 @@ cd "$REPO_ROOT"
   --hercules-root "$HERCULES_ROOT" \
   --output-root "$RADAR_ROOT" \
   --num-workers 4 \
-  --max-delta-ms 30 \
-  --radar-frame-count 20 \
-  --require-full-stack
+  --max-delta-ms 30
 ```
 
-The cache builder records and verifies its stack length, BEV geometry,
-normalization, and alignment settings. Reusing a cache root is safe: corrupt
-or incompatible entries are rebuilt. Retrain from scratch when changing from
-one radar frame to 20 because the four-channel tensor becomes substantially
-denser.
+The cache builder records and verifies its BEV geometry, normalization, and
+alignment settings. Reusing a cache root is safe: corrupt or incompatible
+entries are rebuilt.
 
 ## 2. Train
 

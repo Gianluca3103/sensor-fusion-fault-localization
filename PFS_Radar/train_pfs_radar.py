@@ -125,8 +125,6 @@ def validate_training_args(parser, args):
         parser.error(
             "--metric-grid-size cannot exceed the smaller resized input dimension"
         )
-    if args.radar_frame_count is not None and args.radar_frame_count < 1:
-        parser.error("--radar-frame-count must be positive or omitted")
     if not 0.0 <= args.dropout < 1.0:
         parser.error("--dropout must lie in [0,1)")
     if args.learning_rate <= 0.0 or args.min_learning_rate <= 0.0:
@@ -172,10 +170,6 @@ def validate_training_args(parser, args):
         and args.radar_max_abs_velocity <= 0.0
     ):
         parser.error("--radar-max-abs-velocity must be positive")
-    if args.require_full_radar_stack and args.radar_frame_count is None:
-        parser.error(
-            "--require-full-radar-stack requires --radar-frame-count"
-        )
     if args.seed < 0:
         parser.error("--seed must be non-negative")
 
@@ -729,17 +723,6 @@ def main():
     parser.add_argument("--bev-x-span-m", type=float, default=64.0)
     parser.add_argument("--bev-y-span-m", type=float, default=64.0)
     parser.add_argument(
-        "--radar-frame-count",
-        type=int,
-        default=None,
-        help="Require cache entries built from this many causal radar frames.",
-    )
-    parser.add_argument(
-        "--require-full-radar-stack",
-        action="store_true",
-        help="Reject cache entries with fewer frames than --radar-frame-count.",
-    )
-    parser.add_argument(
         "--max-radar-delta-ms",
         type=float,
         default=None,
@@ -790,8 +773,6 @@ def main():
     cache_requirements = {
         "max_delta_ms": args.max_radar_delta_ms,
         "max_abs_velocity": args.radar_max_abs_velocity,
-        "radar_frame_count": args.radar_frame_count,
-        "require_full_stack": args.require_full_radar_stack,
     }
     train_paths, missing_train = filter_samples_with_radar_cache(
         train_paths,
@@ -924,8 +905,6 @@ def main():
                 "bev_y_span_m",
                 "include_faults",
                 "exclude_faults",
-                "radar_frame_count",
-                "require_full_radar_stack",
                 "max_radar_delta_ms",
                 "radar_max_abs_velocity",
             ),

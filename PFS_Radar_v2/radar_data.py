@@ -1,4 +1,4 @@
-"""K-Radar tensor-derived adaptive stacking and Doppler-tracked BEV cache."""
+"""Single-frame K-Radar pc10p to four-channel RadarV2 cache."""
 
 from __future__ import annotations
 
@@ -16,30 +16,17 @@ from Fault_Localization_Model.kradar_dataset import (
     load_radar_from_lidar_transform,
     parse_label_frame,
 )
-from PFS_Radar_v2.pose import pose_velocity, select_adaptive_indices
-from PFS_Radar_v2.radar_types import (
-    AdaptiveStackConfig,
-    ClusterObservation,
-    DopplerTrackingConfig,
-    ProcessedFrame,
-    RadarAlignmentUnavailableError,
-    SelectedFrame,
-    TrackState,
-)
-from PFS_Radar_v2.tracking import (
-    associate_tracks,
-    compensate_doppler,
-    dbscan_labels,
-    make_observations,
-)
+from PFS_Radar_v2.pose import pose_velocity
+from PFS_Radar_v2.radar_types import DopplerConfig, RadarAlignmentUnavailableError
+from PFS_Radar_v2.tracking import compensate_doppler
 
 
-RADAR_CACHE_VERSION = 7
-POLICY_NAME = "kradar_pc10p_power_height_doppler_v2"
+RADAR_CACHE_VERSION = 8
+POLICY_NAME = "kradar_pc10p_single_frame_power_height_doppler_v3"
 CHANNELS = [
     "static_occupancy",
     "normalized_power",
-    "tracked_dynamic_speed",
+    "dynamic_speed",
     "robust_upper_height",
 ]
 POWER_NORMALIZATION_QUANTILE = 0.99
@@ -91,9 +78,7 @@ class KRadarSequenceIndex:
 
 
 def kradar_cache_path(root: Path, sequence: str | int, radar_index: str | int) -> Path:
-    sequence_text = str(int(sequence))
-    radar_text = f"{int(radar_index):05d}"
-    return Path(root) / sequence_text / f"{radar_text}.npz"
+    return Path(root) / str(int(sequence)) / f"{int(radar_index):05d}.npz"
 
 
 def _odometry_path(odometry_root: Path, sequence: str) -> Path:
@@ -118,7 +103,6 @@ def _load_sequence_index_cached(
 ) -> KRadarSequenceIndex:
     dataset_root = Path(dataset_root_text)
     radar_point_root = Path(radar_point_root_text)
-    odometry_root = Path(odometry_root_text)
     sequence_root = kradar_sequence_root(dataset_root, sequence)
     label_paths = sorted((sequence_root / "info_label").glob("*.txt"))
     if not label_paths:
@@ -126,8 +110,9 @@ def _load_sequence_index_cached(
             f"No K-Radar labels under {sequence_root / 'info_label'}"
         )
 
-    pose_rows = np.loadtxt(_odometry_path(odometry_root, sequence), dtype=np.float64)
-    pose_rows = np.atleast_2d(pose_rows)
+    pose_rows = np.atleast_2d(
+        np.loadtxt(_odometry_path(Path(odometry_root_text), sequence), dtype=np.float64)
+    )
     if pose_rows.shape != (len(label_paths), 12):
         raise ValueError(
             f"K-Radar sequence {sequence} has {len(label_paths)} labels but odometry "
@@ -183,7 +168,7 @@ def load_sequence_index(
 
 @lru_cache(maxsize=32)
 def load_kradar_pc10p(path: Path) -> np.ndarray:
-    """Load the tensor-derived K-Radar pc10p format as float32."""
+    """Load one tensor-derived K-Radar pc10p frame as float32."""
 
     points = np.load(Path(path), allow_pickle=False)
     if points.ndim != 2 or points.shape[1] != len(K_RADAR_POINT_COLUMNS):
@@ -202,8 +187,6 @@ def load_lidar_from_radar_transform(
     calibration_path: Path,
     radar_to_lidar_z_m: float = 0.7,
 ) -> np.ndarray:
-    """Load K-Radar's translation-only radar/LiDAR calibration."""
-
     transform = np.linalg.inv(
         load_radar_from_lidar_transform(calibration_path, radar_to_lidar_z_m)
     )
@@ -236,8 +219,6 @@ def _grid_indices(
 
 
 def _normalize_cell_power(cell_power: np.ndarray) -> np.ndarray:
-    """Robustly log-normalize non-negative cell power into [0, 1]."""
-
     output = np.zeros_like(cell_power, dtype=np.float32)
     occupied = cell_power > 0.0
     if not np.any(occupied):
@@ -256,230 +237,74 @@ def _upper_height_grid(
     heights_m: np.ndarray,
     shape: tuple[int, int],
 ) -> np.ndarray:
-    """Return normalized per-cell upper-height quantiles with empty cells at zero."""
-
     output = np.zeros(shape[0] * shape[1], dtype=np.float32)
     if flat_cells.size == 0:
         return output.reshape(shape)
-
     z_min, z_max = HEIGHT_RANGE_M
     plausible = (heights_m >= z_min) & (heights_m <= z_max)
     flat_cells = flat_cells[plausible]
     heights_m = heights_m[plausible]
     if flat_cells.size == 0:
         return output.reshape(shape)
-
     order = np.lexsort((heights_m, flat_cells))
     sorted_cells = flat_cells[order]
     sorted_heights = heights_m[order]
     starts = np.flatnonzero(np.r_[True, sorted_cells[1:] != sorted_cells[:-1]])
     ends = np.r_[starts[1:], len(sorted_cells)]
-    counts = ends - starts
-    offsets = np.ceil(UPPER_HEIGHT_QUANTILE * counts).astype(np.int64) - 1
+    offsets = np.ceil(UPPER_HEIGHT_QUANTILE * (ends - starts)).astype(np.int64) - 1
     upper_heights = sorted_heights[starts + offsets]
-
-    normalized = (upper_heights - z_min) / (z_max - z_min)
-    output[sorted_cells[starts]] = normalized.astype(np.float32)
+    output[sorted_cells[starts]] = (
+        (upper_heights - z_min) / (z_max - z_min)
+    ).astype(np.float32)
     return output.reshape(shape)
 
 
-def project_adaptive_bev(
-    frames: list[ProcessedFrame],
-    observations: list[list[ClusterObservation]],
-    tracks: dict[int, TrackState],
-    lidar_timestamp: int,
+def project_radar_bev(
+    points: np.ndarray,
+    doppler_residual_mps: np.ndarray,
+    dynamic_mask: np.ndarray,
     x_range: tuple[float, float],
     y_range: tuple[float, float],
     resolution: float,
-    tracking_config: DopplerTrackingConfig,
+    config: DopplerConfig,
 ) -> np.ndarray:
-    """Project K-Radar frames as occupancy, power, speed, and upper height."""
+    """Project one aligned frame as occupancy, power, speed, and upper height."""
 
-    tracking_config.validate()
+    config.validate()
     height = int(np.ceil((x_range[1] - x_range[0]) / resolution))
     width = int(np.ceil((y_range[1] - y_range[0]) / resolution))
     output = np.zeros((4, height, width), dtype=np.float32)
+    if not len(points):
+        return output
+
+    rows, cols, valid = _grid_indices(points[:, :3], x_range, y_range, resolution)
+    rows, cols = rows[valid], cols[valid]
+    valid_dynamic = dynamic_mask[valid]
+
+    static_rows, static_cols = rows[~valid_dynamic], cols[~valid_dynamic]
+    if len(static_rows):
+        output[0, static_rows, static_cols] = 1.0
+
     cell_power = np.zeros((height, width), dtype=np.float32)
-    height_cells = []
-    height_values = []
-
-    for frame in frames:
-        static_points = frame.points[~frame.dynamic_mask, :3]
-        if len(static_points):
-            rows, cols, valid = _grid_indices(
-                static_points, x_range, y_range, resolution
-            )
-            rows, cols = rows[valid], cols[valid]
-            supported_cells = np.unique(rows.astype(np.int64) * width + cols)
-            supported_rows = supported_cells // width
-            supported_cols = supported_cells % width
-            output[0, supported_rows, supported_cols] = 1.0
-
-        rows, cols, valid = _grid_indices(
-            frame.points[:, :3], x_range, y_range, resolution
-        )
-        if np.any(valid):
-            rows, cols = rows[valid], cols[valid]
-            weighted_power = np.maximum(frame.points[valid, 4], 0.0) * frame.weight
-            np.maximum.at(cell_power, (rows, cols), weighted_power)
-            height_cells.append(rows.astype(np.int64) * width + cols)
-            height_values.append(frame.points[valid, 2])
-
+    np.maximum.at(cell_power, (rows, cols), np.maximum(points[valid, 4], 0.0))
     output[1] = _normalize_cell_power(cell_power)
-    if height_cells:
-        output[3] = _upper_height_grid(
-            np.concatenate(height_cells),
-            np.concatenate(height_values),
-            (height, width),
+
+    dynamic_rows, dynamic_cols = rows[valid_dynamic], cols[valid_dynamic]
+    if len(dynamic_rows):
+        speed = np.clip(
+            np.abs(doppler_residual_mps[valid][valid_dynamic])
+            / config.max_abs_velocity_mps,
+            0.0,
+            1.0,
         )
+        np.maximum.at(output[2], (dynamic_rows, dynamic_cols), speed)
 
-    for frame_index, frame_observations in enumerate(observations):
-        frame = frames[frame_index]
-        assigned = np.zeros(len(frame.points), dtype=bool)
-        for observation in frame_observations:
-            track = tracks[observation.track_id]
-            confirmed = track.hits >= tracking_config.min_track_hits
-            age_s = (lidar_timestamp - frame.timestamp) / 1_000_000_000.0
-            points = frame.points[observation.point_indices, :3].copy()
-            if confirmed:
-                points[:, :2] += track.velocity[None, :] * age_s
-                speed = float(np.linalg.norm(track.velocity))
-            else:
-                speed = float(
-                    np.max(np.abs(frame.doppler_residual_mps[observation.point_indices]))
-                )
-            rows, cols, valid = _grid_indices(points, x_range, y_range, resolution)
-            rows, cols = rows[valid], cols[valid]
-            np.maximum.at(
-                output[2],
-                (rows, cols),
-                np.float32(np.clip(speed / tracking_config.max_abs_velocity_mps, 0, 1)),
-            )
-            assigned[observation.point_indices] = True
-
-        unclustered = frame.dynamic_mask & ~assigned
-        if np.any(unclustered):
-            points = frame.points[unclustered, :3]
-            residual = np.abs(frame.doppler_residual_mps[unclustered])
-            rows, cols, valid = _grid_indices(points, x_range, y_range, resolution)
-            rows, cols = rows[valid], cols[valid]
-            np.maximum.at(
-                output[2],
-                (rows, cols),
-                np.clip(residual[valid] / tracking_config.max_abs_velocity_mps, 0, 1),
-            )
-    return output
-
-
-def _select_sequence_frames(
-    sequence_index: KRadarSequenceIndex,
-    current_position: int,
-    config: AdaptiveStackConfig,
-) -> list[SelectedFrame]:
-    current_timestamp = sequence_index.timestamps[current_position]
-    rows = select_adaptive_indices(
-        sequence_index.timestamps[: current_position + 1],
-        sequence_index.poses[: current_position + 1],
-        current_timestamp,
-        config,
-        reference_pose=sequence_index.poses[current_position],
+    output[3] = _upper_height_grid(
+        rows.astype(np.int64) * width + cols,
+        points[valid, 2],
+        (height, width),
     )
-    selected = [
-        SelectedFrame(
-            path=sequence_index.radar_paths[row["index"]],
-            timestamp=row["timestamp"],
-            pose=sequence_index.poses[row["index"]],
-            age_s=float(row["age_s"]),
-            translation_m=float(row["translation_m"]),
-            rotation_deg=float(row["rotation_deg"]),
-            weight=float(row["weight"]),
-            pose_delta_ms=0.0,
-            radar_index=sequence_index.radar_indices[row["index"]],
-            lidar_index=sequence_index.lidar_indices[row["index"]],
-        )
-        for row in rows
-    ]
-    if not selected or selected[-1].radar_index != sequence_index.radar_indices[current_position]:
-        raise RadarAlignmentUnavailableError(
-            f"Adaptive policy did not select current K-Radar frame "
-            f"{sequence_index.radar_indices[current_position]}"
-        )
-    return selected
-
-
-def _process_frames(
-    sequence_index: KRadarSequenceIndex,
-    current_position: int,
-    selected: list[SelectedFrame],
-    lidar_from_radar: np.ndarray,
-    tracking_config: DopplerTrackingConfig,
-) -> tuple[list[ProcessedFrame], list[np.ndarray], list[np.ndarray], float, float]:
-    current_lidar_from_world = np.linalg.inv(sequence_index.poses[current_position])
-    processed: list[ProcessedFrame] = []
-    raw_frames: list[np.ndarray] = []
-    radar_to_current_rotations: list[np.ndarray] = []
-    latest_speed = 0.0
-    latest_yaw_rate = 0.0
-
-    for selected_frame in selected:
-        source_position = sequence_index.position(selected_frame.radar_index)
-        source_points = load_kradar_pc10p(selected_frame.path)
-        # Tracking utilities expect [x,y,z,Doppler,...]. Keep power in column 4.
-        raw = np.column_stack(
-            (source_points[:, :3], source_points[:, 4], source_points[:, 3])
-        ).astype(np.float32, copy=False)
-        velocity_radar, yaw_rate = pose_velocity(
-            sequence_index.timestamps,
-            sequence_index.poses,
-            selected_frame.timestamp,
-            np.eye(3, dtype=np.float64),
-        )
-        residual, applied_sign, _ = compensate_doppler(
-            raw,
-            velocity_radar,
-            doppler_sign=tracking_config.doppler_sign,
-            sign_inference_min_speed_mps=tracking_config.sign_inference_min_speed_mps,
-            doppler_period_mps=tracking_config.doppler_period_mps,
-        )
-        power_threshold = float(
-            np.quantile(raw[:, 4], tracking_config.dynamic_power_quantile)
-        )
-        dynamic = (
-            (np.abs(residual) > tracking_config.dynamic_threshold_mps)
-            & (raw[:, 4] >= power_threshold)
-        )
-        labels = dbscan_labels(
-            raw[:, :2],
-            dynamic,
-            tracking_config.cluster_eps_m,
-            tracking_config.cluster_min_samples,
-        )
-
-        current_lidar_from_radar = (
-            current_lidar_from_world
-            @ sequence_index.poses[source_position]
-            @ lidar_from_radar
-        )
-        aligned = raw.copy()
-        aligned[:, :3] = transform_xyz(raw[:, :3], current_lidar_from_radar)
-        processed.append(
-            ProcessedFrame(
-                timestamp=selected_frame.timestamp,
-                points=aligned,
-                doppler_residual_mps=residual,
-                dynamic_mask=dynamic,
-                cluster_labels=labels,
-                weight=selected_frame.weight,
-                doppler_sign=applied_sign,
-                sensor_speed_mps=float(np.linalg.norm(velocity_radar)),
-                yaw_rate_dps=math.degrees(yaw_rate),
-            )
-        )
-        raw_frames.append(raw)
-        radar_to_current_rotations.append(current_lidar_from_radar[:3, :3])
-        latest_speed = float(np.linalg.norm(velocity_radar))
-        latest_yaw_rate = math.degrees(yaw_rate)
-    return processed, raw_frames, radar_to_current_rotations, latest_speed, latest_yaw_rate
+    return output
 
 
 def radar_cache_is_compatible(
@@ -492,8 +317,7 @@ def radar_cache_is_compatible(
     x_range: tuple[float, float],
     y_range: tuple[float, float],
     resolution: float,
-    stack_config: AdaptiveStackConfig | None = None,
-    tracking_config: DopplerTrackingConfig | None = None,
+    doppler_config: DopplerConfig | None = None,
 ) -> bool:
     cache_path = Path(cache_path)
     if not cache_path.is_file():
@@ -534,10 +358,8 @@ def radar_cache_is_compatible(
             return False
         if not np.isclose(float(metadata.get("resolution")), resolution):
             return False
-        if stack_config is not None and metadata.get("adaptive_stack") != asdict(stack_config):
-            return False
-        if tracking_config is not None and metadata.get("doppler_tracking") != asdict(
-            tracking_config
+        if doppler_config is not None and metadata.get("doppler") != asdict(
+            doppler_config
         ):
             return False
         return True
@@ -556,34 +378,30 @@ def build_radar_cache_entry(
     y_range: tuple[float, float] = (-32.0, 32.0),
     resolution: float = 0.2,
     radar_to_lidar_z_m: float = 0.7,
-    stack_config: AdaptiveStackConfig | None = None,
-    tracking_config: DopplerTrackingConfig | None = None,
+    doppler_config: DopplerConfig | None = None,
 ) -> Path:
-    stack_config = stack_config or AdaptiveStackConfig()
-    tracking_config = tracking_config or DopplerTrackingConfig()
-    stack_config.validate()
-    tracking_config.validate()
+    doppler_config = doppler_config or DopplerConfig()
+    doppler_config.validate()
     if resolution <= 0.0 or not math.isfinite(resolution):
         raise ValueError("resolution must be finite and positive")
 
     sequence_index = load_sequence_index(
         dataset_root, radar_point_root, odometry_root, sequence
     )
-    current_position = sequence_index.position(radar_index)
-    radar_text = sequence_index.radar_indices[current_position]
-    lidar_text = sequence_index.lidar_indices[current_position]
-    lidar_timestamp = sequence_index.timestamps[current_position]
+    position = sequence_index.position(radar_index)
+    radar_text = sequence_index.radar_indices[position]
+    lidar_text = sequence_index.lidar_indices[position]
+    timestamp = sequence_index.timestamps[position]
     output_path = kradar_cache_path(output_root, sequence_index.sequence, radar_text)
     compatibility = dict(
         sequence=sequence_index.sequence,
         radar_index=radar_text,
         lidar_index=lidar_text,
-        timestamp=lidar_timestamp,
+        timestamp=timestamp,
         x_range=x_range,
         y_range=y_range,
         resolution=resolution,
-        stack_config=stack_config,
-        tracking_config=tracking_config,
+        doppler_config=doppler_config,
     )
     if radar_cache_is_compatible(output_path, **compatibility):
         return output_path
@@ -596,86 +414,65 @@ def build_radar_cache_entry(
     lidar_from_radar = load_lidar_from_radar_transform(
         calibration_path, radar_to_lidar_z_m
     )
-    selected = _select_sequence_frames(sequence_index, current_position, stack_config)
-    frames, raw_frames, rotations, ego_speed_mps, yaw_rate_dps = _process_frames(
-        sequence_index,
-        current_position,
-        selected,
-        lidar_from_radar,
-        tracking_config,
+    source_points = load_kradar_pc10p(sequence_index.radar_paths[position])
+    points = np.column_stack(
+        (source_points[:, :3], source_points[:, 4], source_points[:, 3])
+    ).astype(np.float32, copy=False)
+    velocity_radar, yaw_rate = pose_velocity(
+        sequence_index.timestamps,
+        sequence_index.poses,
+        timestamp,
     )
-    observations = make_observations(frames, raw_frames, rotations)
-    tracks = associate_tracks(
-        observations,
-        tracking_config.association_distance_m,
-        tracking_config.velocity_smoothing,
+    residual, applied_sign, _ = compensate_doppler(
+        points,
+        velocity_radar,
+        doppler_sign=doppler_config.doppler_sign,
+        sign_inference_min_speed_mps=doppler_config.sign_inference_min_speed_mps,
+        doppler_period_mps=doppler_config.doppler_period_mps,
     )
-    radar_bev = project_adaptive_bev(
-        frames,
-        observations,
-        tracks,
-        lidar_timestamp,
+    if len(points):
+        power_threshold = float(
+            np.quantile(points[:, 4], doppler_config.dynamic_power_quantile)
+        )
+        dynamic = (
+            (np.abs(residual) > doppler_config.dynamic_threshold_mps)
+            & (points[:, 4] >= power_threshold)
+        )
+    else:
+        dynamic = np.zeros(0, dtype=bool)
+    points[:, :3] = transform_xyz(points[:, :3], lidar_from_radar)
+    radar_bev = project_radar_bev(
+        points,
+        residual,
+        dynamic,
         x_range,
         y_range,
         resolution,
-        tracking_config,
+        doppler_config,
     )
 
-    confirmed_tracks = [
-        {
-            "track_id": track.track_id,
-            "hits": track.hits,
-            "velocity_xy_mps": track.velocity.tolist(),
-            "speed_mps": float(np.linalg.norm(track.velocity)),
-            "latest_position_xy_m": track.position.tolist(),
-        }
-        for track in tracks.values()
-        if track.hits >= tracking_config.min_track_hits
-    ]
-    alignment_rows = [
-        {
-            "radar_index": selection.radar_index,
-            "lidar_index": selection.lidar_index,
-            "timestamp_ns": selection.timestamp,
-            "age_ms": selection.age_s * 1000.0,
-            "relative_translation_m": selection.translation_m,
-            "relative_rotation_deg": selection.rotation_deg,
-            "weight": selection.weight,
-            "doppler_sign": frame.doppler_sign,
-            "sensor_speed_mps": frame.sensor_speed_mps,
-            "yaw_rate_dps": frame.yaw_rate_dps,
-            "point_count": int(len(frame.points)),
-            "dynamic_point_count": int(np.count_nonzero(frame.dynamic_mask)),
-        }
-        for selection, frame in zip(selected, frames)
-    ]
     cache_metadata = {
         "cache_format_version": RADAR_CACHE_VERSION,
         "policy": POLICY_NAME,
         "dataset": "K-Radar",
         "radar_source": "from_rdr_cube_xyz/pc10p",
+        "radar_source_path": str(sequence_index.radar_paths[position]),
         "radar_source_columns": K_RADAR_POINT_COLUMNS,
         "sequence": sequence_index.sequence,
         "radar_index": radar_text,
         "lidar_index": lidar_text,
-        "timestamp_ns": lidar_timestamp,
-        "radar_sources": [str(item.path) for item in selected],
-        "radar_frame_count": len(selected),
-        "effective_frame_support": float(sum(item.weight for item in selected)),
-        "adaptive_stack": asdict(stack_config),
-        "doppler_tracking": asdict(tracking_config),
-        "ego_speed_mps": ego_speed_mps,
-        "yaw_rate_dps": yaw_rate_dps,
-        "alignment_rows": alignment_rows,
-        "confirmed_dynamic_track_count": len(confirmed_tracks),
-        "dynamic_tracks": confirmed_tracks,
+        "timestamp_ns": timestamp,
+        "doppler": asdict(doppler_config),
+        "doppler_sign": applied_sign,
+        "ego_speed_mps": float(np.linalg.norm(velocity_radar)),
+        "yaw_rate_dps": math.degrees(yaw_rate),
+        "point_count": int(len(points)),
+        "dynamic_point_count": int(np.count_nonzero(dynamic)),
         "calibration": {
             "lidar_from_radar": lidar_from_radar.tolist(),
             "radar_to_lidar_z_m": radar_to_lidar_z_m,
         },
-        "pose_source": "K-Radar resources/odometry/gt KITTI-format poses",
-        "temporal_alignment": "adaptive pose-gated compensation into current paired LiDAR frame",
-        "doppler_processing": "K-Radar ambiguity-wrapped ego residual, power gating, clustering, and causal tracking",
+        "pose_source": "K-Radar resources/odometry/gt (ego-Doppler only)",
         "channels": CHANNELS,
         "power_normalization_quantile": POWER_NORMALIZATION_QUANTILE,
         "upper_height_quantile": UPPER_HEIGHT_QUANTILE,

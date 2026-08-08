@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -20,16 +20,8 @@ CONTINENTAL_DTYPE = np.dtype(
     }
 )
 RADAR_CACHE_VERSION = 3
-SCENE_RESOURCE_NAMES = {
-    "continental_gt.txt",
-    "aeva_gt.txt",
-    "imu_lidar.txt",
-    "continental_lidar.txt",
-}
-
-
 class RadarAlignmentUnavailableError(ValueError):
-    """Raised when a causal radar stack cannot be aligned without extrapolation."""
+    """Raised when a radar frame cannot be aligned without extrapolation."""
 
 
 def _safe_metadata_component(value, label: str, *, required: bool = True) -> str:
@@ -163,70 +155,6 @@ def transform_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (homogeneous @ transform.T)[:, :3].astype(np.float32)
 
 
-def pose_matrix(position: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
-    position = np.asarray(position, dtype=np.float64)
-    quaternion = np.asarray(quaternion_xyzw, dtype=np.float64)
-    if position.shape != (3,) or quaternion.shape != (4,):
-        raise ValueError("Pose requires a 3-vector position and xyzw quaternion")
-    if not np.isfinite(position).all() or not np.isfinite(quaternion).all():
-        raise ValueError("Ground-truth pose contains non-finite values")
-    norm = np.linalg.norm(quaternion)
-    if norm < 1e-12:
-        raise ValueError("Ground-truth pose contains a zero quaternion")
-    x, y, z, w = quaternion / norm
-    rotation = np.asarray(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = np.asarray(position, dtype=np.float64)
-    return transform
-
-
-@lru_cache(maxsize=128)
-def load_ground_truth_poses(path_text: str) -> tuple[tuple[int, ...], np.ndarray]:
-    values = np.loadtxt(path_text, dtype=str)
-    if values.ndim == 1:
-        values = values[None]
-    if values.shape[1] != 8:
-        raise ValueError(f"Expected [timestamp,x,y,z,qx,qy,qz,qw] in {path_text}")
-    timestamps = tuple(int(value) for value in values[:, 0])
-    if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
-        raise ValueError(
-            f"Ground-truth timestamps in {path_text} must be strictly increasing and unique"
-        )
-    pose_values = values[:, 1:].astype(np.float64)
-    if not np.isfinite(pose_values).all():
-        raise ValueError(f"Ground-truth poses in {path_text} contain non-finite values")
-    transforms = np.stack(
-        [pose_matrix(row[:3], row[3:7]) for row in pose_values],
-        axis=0,
-    )
-    return timestamps, transforms
-
-
-def nearest_ground_truth_pose(path: Path, timestamp: int, max_delta_ms: float = 20.0) -> tuple[np.ndarray, float]:
-    if max_delta_ms < 0.0:
-        raise ValueError("max_delta_ms must be non-negative")
-    timestamps, transforms = load_ground_truth_poses(str(path.resolve()))
-    insertion = bisect_left(timestamps, timestamp)
-    candidates = [index for index in (insertion - 1, insertion) if 0 <= index < len(timestamps)]
-    if not candidates:
-        raise FileNotFoundError(f"No ground-truth poses in {path}")
-    best = min(candidates, key=lambda index: abs(timestamps[index] - timestamp))
-    delta_ms = (timestamps[best] - timestamp) / 1_000_000.0
-    if abs(delta_ms) > max_delta_ms:
-        raise RadarAlignmentUnavailableError(
-            f"Nearest pose in {path.name} is {abs(delta_ms):.1f} ms from timestamp {timestamp}"
-        )
-    return transforms[best], delta_ms
-
-
 def find_named_directory(root: Path, name: str) -> Path:
     candidates = [
         path
@@ -238,28 +166,12 @@ def find_named_directory(root: Path, name: str) -> Path:
     return min(candidates, key=lambda path: len(path.parts))
 
 
-@lru_cache(maxsize=256)
-def _scene_resource_index(root_text: str) -> dict[str, Path]:
-    root = Path(root_text)
-    candidates: dict[str, list[Path]] = {}
-    for path in root.rglob("*"):
-        lowered = path.name.lower()
-        if lowered in SCENE_RESOURCE_NAMES and path.is_file():
-            candidates.setdefault(lowered, []).append(path)
-    return {
-        name: min(paths, key=lambda path: len(path.parts))
-        for name, paths in candidates.items()
-    }
-
-
 def find_named_file(root: Path, name: str) -> Path:
-    lowered = name.lower()
-    if lowered in SCENE_RESOURCE_NAMES:
-        try:
-            return _scene_resource_index(str(Path(root).resolve()))[lowered]
-        except KeyError as exc:
-            raise FileNotFoundError(f"No {name} under {root}") from exc
-    candidates = [path for path in root.rglob("*") if path.is_file() and path.name.lower() == name.lower()]
+    candidates = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.name.lower() == name.lower()
+    ]
     if not candidates:
         raise FileNotFoundError(f"No {name} under {root}")
     return min(candidates, key=lambda path: len(path.parts))
@@ -296,98 +208,6 @@ def nearest_radar_frame(scene_root: Path, lidar_timestamp: int, max_delta_ms: fl
             f"limit is {max_delta_ms:.1f} ms"
         )
     return Path(path_texts[best]), delta_ms, radar_to_lidar
-
-
-def historical_radar_frames(
-    scene_root: Path,
-    lidar_timestamp: int,
-    frame_count: int,
-    max_delta_ms: float,
-    require_full_stack: bool = False,
-) -> tuple[list[Path], float]:
-    if frame_count < 1:
-        raise ValueError("frame_count must be at least 1")
-    if max_delta_ms < 0.0:
-        raise ValueError("max_delta_ms must be non-negative")
-    timestamps, path_texts, _ = scene_radar_resources(str(scene_root.resolve()))
-    current_index = bisect_right(timestamps, lidar_timestamp) - 1
-    if current_index < 0:
-        raise RadarAlignmentUnavailableError(
-            f"No causal radar frame exists at or before LiDAR timestamp "
-            f"{lidar_timestamp}"
-        )
-    delta_ms = (timestamps[current_index] - lidar_timestamp) / 1_000_000.0
-    if -delta_ms > max_delta_ms:
-        raise RadarAlignmentUnavailableError(
-            f"Latest causal radar frame is {-delta_ms:.1f} ms before LiDAR frame; "
-            f"limit is {max_delta_ms:.1f} ms"
-        )
-    start = current_index - frame_count + 1
-    if start < 0 and require_full_stack:
-        raise RadarAlignmentUnavailableError(
-            f"Only {current_index + 1} causal radar frames exist before LiDAR timestamp "
-            f"{lidar_timestamp}; {frame_count} are required"
-        )
-    start = max(0, start)
-    return [Path(path_texts[index]) for index in range(start, current_index + 1)], delta_ms
-
-
-def stack_radar_in_current_lidar_frame(
-    scene_root: Path,
-    lidar_timestamp: int,
-    radar_paths: list[Path],
-) -> tuple[np.ndarray, list[dict]]:
-    continental_gt = find_named_file(scene_root, "Continental_gt.txt")
-    aeva_gt = find_named_file(scene_root, "Aeva_gt.txt")
-    lidar_to_imu = load_named_transform(
-        find_named_file(scene_root, "IMU_LiDAR.txt"),
-        "Tr_lidar_to_imu",
-    )
-    lidar_to_radar = load_lidar_to_radar_transform(
-        find_named_file(scene_root, "Continental_LiDAR.txt")
-    )
-    radar_to_lidar = np.linalg.inv(lidar_to_radar)
-    imu_from_lidar_rotation = lidar_to_imu[:3, :3]
-    imu_from_radar_rotation = imu_from_lidar_rotation @ radar_to_lidar[:3, :3]
-
-    lidar_ground_truth, lidar_pose_delta_ms = nearest_ground_truth_pose(
-        aeva_gt, lidar_timestamp
-    )
-    world_from_current_lidar = np.eye(4, dtype=np.float64)
-    world_from_current_lidar[:3, :3] = (
-        lidar_ground_truth[:3, :3] @ imu_from_lidar_rotation
-    )
-    world_from_current_lidar[:3, 3] = lidar_ground_truth[:3, 3]
-    current_lidar_from_world = np.linalg.inv(world_from_current_lidar)
-    aligned_clouds = []
-    alignment_rows = []
-    for radar_path in radar_paths:
-        radar_timestamp = int(radar_path.stem)
-        radar_ground_truth, radar_pose_delta_ms = nearest_ground_truth_pose(
-            continental_gt, radar_timestamp
-        )
-        world_from_radar = np.eye(4, dtype=np.float64)
-        world_from_radar[:3, :3] = (
-            radar_ground_truth[:3, :3] @ imu_from_radar_rotation
-        )
-        world_from_radar[:3, 3] = radar_ground_truth[:3, 3]
-        current_lidar_from_radar = current_lidar_from_world @ world_from_radar
-        points = read_continental_bin(radar_path)
-        if len(points):
-            aligned = points.copy()
-            aligned[:, :3] = transform_xyz(points[:, :3], current_lidar_from_radar)
-            aligned_clouds.append(aligned)
-        alignment_rows.append(
-            {
-                "radar_timestamp": str(radar_timestamp),
-                "age_ms": (lidar_timestamp - radar_timestamp) / 1_000_000.0,
-                "radar_pose_delta_ms": radar_pose_delta_ms,
-                "lidar_pose_delta_ms": lidar_pose_delta_ms,
-            }
-        )
-    if not aligned_clouds:
-        return np.empty((0, 8), dtype=np.float32), alignment_rows
-    return np.concatenate(aligned_clouds, axis=0).astype(np.float32), alignment_rows
 
 
 def project_radar_bev(
@@ -457,8 +277,6 @@ def radar_cache_is_compatible(
     *,
     max_delta_ms: float | None = None,
     max_abs_velocity: float | None = None,
-    radar_frame_count: int | None = None,
-    require_full_stack: bool = False,
 ) -> bool:
     """Return whether a radar cache is readable and matches the requested build."""
     cache_path = Path(cache_path)
@@ -470,10 +288,6 @@ def radar_cache_is_compatible(
                 return False
             radar_bev = np.asarray(data["radar_bev"])
             cache_metadata = json.loads(str(data["metadata_json"]))
-
-        if radar_frame_count is not None:
-            if int(cache_metadata.get("cache_format_version", 0)) != RADAR_CACHE_VERSION:
-                return False
 
         x_range = tuple(
             float(value)
@@ -519,18 +333,6 @@ def radar_cache_is_compatible(
             delta_ms = abs(float(cache_metadata.get("radar_delta_ms")))
             if delta_ms > max_delta_ms + 1e-9:
                 return False
-        if radar_frame_count is not None:
-            requested = int(
-                cache_metadata.get(
-                    "requested_radar_frame_count",
-                    cache_metadata.get("radar_frame_count", 1),
-                )
-            )
-            actual = int(cache_metadata.get("radar_frame_count", requested))
-            if requested != radar_frame_count or actual > radar_frame_count:
-                return False
-            if require_full_stack and actual != radar_frame_count:
-                return False
         return True
     except Exception:
         return False
@@ -542,8 +344,6 @@ def build_radar_cache_entry(
     radar_root: Path,
     max_delta_ms: float = 30.0,
     max_abs_velocity: float = 30.0,
-    radar_frame_count: int = 1,
-    require_full_stack: bool = False,
 ) -> Path:
     metadata = load_sample_metadata(sample_path)
     scene = scene_name_from_metadata(metadata)
@@ -553,40 +353,15 @@ def build_radar_cache_entry(
         metadata,
         max_delta_ms=max_delta_ms,
         max_abs_velocity=max_abs_velocity,
-        radar_frame_count=radar_frame_count,
-        require_full_stack=require_full_stack,
     ):
         return output_path
 
     scene_root = scene_session_root(hercules_root, metadata)
     lidar_timestamp = int(metadata["timestamp"])
-    if radar_frame_count == 1:
-        radar_path, delta_ms, radar_to_lidar = nearest_radar_frame(
-            scene_root, lidar_timestamp, max_delta_ms
-        )
-        radar_points = read_continental_bin(radar_path)
-        radar_paths = [radar_path]
-        alignment_rows = [
-            {
-                "radar_timestamp": radar_path.stem,
-                "age_ms": (lidar_timestamp - int(radar_path.stem)) / 1_000_000.0,
-                "alignment": "static Continental_LiDAR extrinsic",
-            }
-        ]
-    else:
-        radar_paths, delta_ms = historical_radar_frames(
-            scene_root,
-            lidar_timestamp,
-            radar_frame_count,
-            max_delta_ms,
-            require_full_stack=require_full_stack,
-        )
-        radar_points, alignment_rows = stack_radar_in_current_lidar_frame(
-            scene_root,
-            lidar_timestamp,
-            radar_paths,
-        )
-        radar_to_lidar = np.eye(4, dtype=np.float64)
+    radar_path, delta_ms, radar_to_lidar = nearest_radar_frame(
+        scene_root, lidar_timestamp, max_delta_ms
+    )
+    radar_points = read_continental_bin(radar_path)
     x_range = tuple(float(value) for value in metadata.get("x_range", [0.0, 64.0]))
     y_range = tuple(float(value) for value in metadata.get("y_range", [-32.0, 32.0]))
     resolution = float(metadata.get("resolution", 0.2))
@@ -604,25 +379,16 @@ def build_radar_cache_entry(
         "scene": scene,
         "session": session_name_from_metadata(metadata),
         "lidar_timestamp": str(lidar_timestamp),
-        "radar_timestamp": radar_paths[-1].stem,
+        "radar_timestamp": radar_path.stem,
         "radar_delta_ms": delta_ms,
-        "radar_sources": [str(path) for path in radar_paths],
-        "radar_frame_count": len(radar_paths),
-        "requested_radar_frame_count": radar_frame_count,
-        "leading_empty_frame_count": radar_frame_count - len(radar_paths),
-        "temporal_alignment": (
-            "sensor-specific PR_GT poses into current Aeva frame"
-            if radar_frame_count > 1
-            else "static Continental_LiDAR extrinsic"
-        ),
-        "alignment_rows": alignment_rows,
+        "radar_source": str(radar_path),
+        "alignment": "static Continental_LiDAR extrinsic",
         "channels": ["occupancy", "log_density", "absolute_velocity", "rcs"],
         "x_range": x_range,
         "y_range": y_range,
         "resolution": resolution,
         "max_delta_ms": max_delta_ms,
         "max_abs_velocity": max_abs_velocity,
-        "require_full_stack": bool(require_full_stack),
     }
     atomic_savez_compressed(
         output_path,
@@ -638,10 +404,6 @@ def radar_cache_requirements_from_checkpoint(checkpoint: dict) -> dict:
     return {
         "max_delta_ms": saved_args.get("max_radar_delta_ms"),
         "max_abs_velocity": saved_args.get("radar_max_abs_velocity"),
-        "radar_frame_count": saved_args.get("radar_frame_count"),
-        "require_full_stack": bool(
-            saved_args.get("require_full_radar_stack", False)
-        ),
     }
 
 
@@ -651,8 +413,6 @@ def filter_samples_with_radar_cache(
     *,
     max_delta_ms: float | None = None,
     max_abs_velocity: float | None = None,
-    radar_frame_count: int | None = None,
-    require_full_stack: bool = False,
 ) -> tuple[list[Path], list[Path]]:
     available = []
     missing = []
@@ -666,8 +426,6 @@ def filter_samples_with_radar_cache(
                 metadata,
                 max_delta_ms=max_delta_ms,
                 max_abs_velocity=max_abs_velocity,
-                radar_frame_count=radar_frame_count,
-                require_full_stack=require_full_stack,
             )
             else missing
         )

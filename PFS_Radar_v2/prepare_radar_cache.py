@@ -33,8 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from Fault_Localization_Model.concurrency_utils import iter_bounded_futures
 from Fault_Localization_Model.io_utils import atomic_write_text
 from PFS_Radar_v2.radar_data import (
-    AdaptiveStackConfig,
-    DopplerTrackingConfig,
+    DopplerConfig,
     build_radar_cache_entry,
     kradar_cache_path,
     load_sequence_index,
@@ -80,7 +79,7 @@ def _sequence_batches(keyed_tasks, batch_size):
 def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Build pose-aligned, Doppler-tracked RadarV2 BEVs from K-Radar "
+            "Build single-frame, Doppler-compensated RadarV2 BEVs from K-Radar "
             "tensor-derived pc10p files."
         )
     )
@@ -108,13 +107,6 @@ def _parse_args():
     parser.add_argument("--y-range", type=float, nargs=2, default=(-32.0, 32.0))
     parser.add_argument("--resolution", type=float, default=0.2)
     parser.add_argument("--radar-to-lidar-z-m", type=float, default=0.7)
-    parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--max-history-s", type=float, default=1.0)
-    parser.add_argument("--max-translation-m", type=float, default=4.0)
-    parser.add_argument("--max-rotation-deg", type=float, default=5.0)
-    parser.add_argument("--weight-time-s", type=float, default=0.5)
-    parser.add_argument("--weight-translation-m", type=float, default=2.0)
-    parser.add_argument("--weight-rotation-deg", type=float, default=3.0)
     parser.add_argument("--dynamic-threshold-mps", type=float, default=1.0)
     parser.add_argument("--dynamic-power-quantile", type=float, default=0.9)
     parser.add_argument(
@@ -125,17 +117,12 @@ def _parse_args():
     )
     parser.add_argument("--doppler-sign", choices=("auto", "1", "-1"), default="auto")
     parser.add_argument("--sign-inference-min-speed-mps", type=float, default=0.5)
-    parser.add_argument("--cluster-eps-m", type=float, default=1.2)
-    parser.add_argument("--cluster-min-samples", type=int, default=2)
-    parser.add_argument("--association-distance-m", type=float, default=3.0)
-    parser.add_argument("--min-track-hits", type=int, default=2)
-    parser.add_argument("--velocity-smoothing", type=float, default=0.5)
     parser.add_argument("--max-abs-velocity-mps", type=float, default=30.0)
     args = parser.parse_args()
     if args.num_workers < 1 or args.batch_size < 1:
         parser.error("--num-workers and --batch-size must be at least 1")
-    if args.max_pending_frames < 0 or args.max_frames < 0:
-        parser.error("pending/frame limits must be non-negative")
+    if args.max_pending_frames < 0:
+        parser.error("--max-pending-frames must be non-negative")
     if args.resolution <= 0.0 or not math.isfinite(args.resolution):
         parser.error("--resolution must be finite and positive")
     if args.x_range[0] >= args.x_range[1] or args.y_range[0] >= args.y_range[1]:
@@ -145,31 +132,16 @@ def _parse_args():
 
 def main():
     parser, args = _parse_args()
-    stack_config = AdaptiveStackConfig(
-        max_frames=None if args.max_frames == 0 else args.max_frames,
-        max_age_s=args.max_history_s,
-        max_translation_m=args.max_translation_m,
-        max_rotation_deg=args.max_rotation_deg,
-        weight_time_s=args.weight_time_s,
-        weight_translation_m=args.weight_translation_m,
-        weight_rotation_deg=args.weight_rotation_deg,
-    )
-    tracking_config = DopplerTrackingConfig(
+    doppler_config = DopplerConfig(
         dynamic_threshold_mps=args.dynamic_threshold_mps,
         doppler_sign=args.doppler_sign,
         sign_inference_min_speed_mps=args.sign_inference_min_speed_mps,
-        cluster_eps_m=args.cluster_eps_m,
-        cluster_min_samples=args.cluster_min_samples,
-        association_distance_m=args.association_distance_m,
-        min_track_hits=args.min_track_hits,
-        velocity_smoothing=args.velocity_smoothing,
         max_abs_velocity_mps=args.max_abs_velocity_mps,
         doppler_period_mps=args.doppler_period_mps,
         dynamic_power_quantile=args.dynamic_power_quantile,
     )
     try:
-        stack_config.validate()
-        tracking_config.validate()
+        doppler_config.validate()
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -214,8 +186,7 @@ def main():
                 x_range=x_range,
                 y_range=y_range,
                 resolution=args.resolution,
-                stack_config=stack_config,
-                tracking_config=tracking_config,
+                doppler_config=doppler_config,
             )
             if compatible:
                 cached_count += 1
@@ -231,8 +202,7 @@ def main():
                 y_range,
                 args.resolution,
                 args.radar_to_lidar_z_m,
-                stack_config,
-                tracking_config,
+                doppler_config,
             )
             keyed_tasks.append(((int(index.sequence), index.timestamps[position]), task))
 
@@ -294,7 +264,7 @@ def main():
                 for sequence, radar_index, message in skipped
             ),
         )
-        print(f"Skipped {len(skipped)} frames without valid pose history.")
+        print(f"Skipped {len(skipped)} frames without valid alignment data.")
     else:
         skipped_path.unlink(missing_ok=True)
     print(f"K-Radar RadarV2 cache complete: {output_root}")

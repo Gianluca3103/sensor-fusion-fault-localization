@@ -1,7 +1,7 @@
 # Sensor Fusion Fault Localization
 
 Thesis pipeline for detecting unreliable regions in degraded LiDAR BEV maps,
-optionally conditioned on clean, temporally stacked 4D radar.
+optionally conditioned on clean, paired-frame 4D radar.
 
 The repository contains three maintained stages:
 
@@ -36,7 +36,7 @@ PFS/
   calibrate_thresholds_eval_test.py    LiDAR-only calibration/evaluation
 
 PFS_Radar/
-  radar_data.py                        Radar loading, alignment, stacking, cache
+  radar_data.py                        Radar cache lookup and loading
   datasets.py                          Shared radar-conditioned datasets
   pfs_radar_model.py                   Final radar-conditioned model
   prepare_radar_cache.py               Pose-aligned radar cache generation
@@ -105,8 +105,7 @@ python -m Fault_Localization_Model.create_grid_reliability_heatmaps \
 ```
 
 Run the same command for `val` and `test` with 15,000 samples each and separate
-output folders. `scripts/run_100k_stack20_machine.sh` automates the full
-100,000-sample radar-conditioned pipeline on the configured Linux machine.
+output folders.
 
 Generation is deterministic and resumable. Samples are written atomically.
 Every run rewrites a complete `manifest.csv`, including samples reused during
@@ -141,8 +140,7 @@ fine occupancy grid is used to create the target.
 
 ## Train the Final Radar Model
 
-Prepare the K-Radar pc10p cache first. Use one frame while validating the
-current alignment path:
+Prepare the single-frame K-Radar pc10p cache first:
 
 ```bash
 python -m PFS_Radar_v2.prepare_radar_cache \
@@ -150,7 +148,6 @@ python -m PFS_Radar_v2.prepare_radar_cache \
   --radar-point-root "/path/to/K-Radar_Data/radar/pc10p" \
   --odometry-root "/path/to/K-Radar_Data/support/official_k_radar/resources/odometry" \
   --output-root "/path/to/radar_cache" \
-  --max-frames 1 \
   --num-workers 12
 ```
 
@@ -242,5 +239,5 @@ python -m unittest discover -s tests -v
 
 The test suite covers point provenance, reliability targets, one-to-one
 localization, atomic writes, resumable manifests, split leakage, radar
-projection, causal stacking, session paths, pose transforms, reference-branch
+projection, paired-frame lookup, session paths, pose transforms, reference-branch
 normalization, model shapes, and checkpoint contracts.

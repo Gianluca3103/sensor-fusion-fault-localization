@@ -39,6 +39,26 @@ def _inputs(batch=2, size=32):
 
 
 class CoarseReconstructionTests(unittest.TestCase):
+    def test_local_attention_projection_is_used_only_when_channels_differ(self):
+        matching = CoarseReconstructionModel(_config())
+        self.assertIsInstance(
+            matching.cross_attention.local_projection, torch.nn.Identity
+        )
+
+        different = CoarseReconstructionModel(
+            CoarseReconstructionConfig(
+                unet_base_channels=2,
+                unet_depth=5,
+                global_base_channels=2,
+                global_channel_multipliers=(1, 2, 4, 8, 16),
+                attention_dim=8,
+                num_heads=2,
+            )
+        )
+        self.assertIsInstance(
+            different.cross_attention.local_projection, torch.nn.Conv2d
+        )
+
     def test_direct_bev_erasure_replacement_attention_and_preservation(self):
         model = CoarseReconstructionModel(_config()).eval()
         faulty, radar, reconstruction, healthy, halo, _clean = _inputs()
@@ -203,4 +223,3 @@ class CoarseReconstructionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

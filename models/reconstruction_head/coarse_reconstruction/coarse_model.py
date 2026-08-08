@@ -153,7 +153,11 @@ def _normalized_grid(
 class LocalToGlobalCrossAttention(nn.Module):
     def __init__(self, local_channels: int, config: CoarseReconstructionConfig):
         super().__init__()
-        self.local_projection = nn.Conv2d(local_channels, config.attention_dim, 1)
+        self.local_projection = (
+            nn.Identity()
+            if local_channels == config.attention_dim
+            else nn.Conv2d(local_channels, config.attention_dim, 1)
+        )
         self.position_encoder = AbsolutePositionEncoder(config.attention_dim)
         self.query_norm = nn.LayerNorm(config.attention_dim)
         self.context_norm = nn.LayerNorm(config.attention_dim)
