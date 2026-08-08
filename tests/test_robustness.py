@@ -8,6 +8,11 @@ import unittest
 import numpy as np
 import torch
 
+from Fault_Localization_Model.bev_utils import (
+    HEIGHT_RANGE_M,
+    LIDAR_CHANNELS,
+    UPPER_HEIGHT_QUANTILE,
+)
 from Fault_Localization_Model.create_grid_reliability_heatmaps import (
     GENERATOR_VERSION,
     GROUND_TRUTH_METHOD,
@@ -15,7 +20,12 @@ from Fault_Localization_Model.create_grid_reliability_heatmaps import (
     build_manifest_row,
     load_matching_existing_sample,
 )
-from Fault_Localization_Model.aeva_dataset import list_all_aeva_bins
+from Fault_Localization_Model.kradar_dataset import (
+    K_RADAR_AZIMUTH_RANGE_RAD,
+    K_RADAR_ELEVATION_RANGE_RAD,
+    K_RADAR_RANGE_M,
+    list_all_kradar_lidar_frames,
+)
 from Fault_Localization_Model.concurrency_utils import iter_bounded_futures
 from Fault_Localization_Model.io_utils import (
     atomic_savez_compressed,
@@ -53,19 +63,35 @@ def write_sample(path, source_relative_path):
 
 
 class RobustnessTests(unittest.TestCase):
-    def test_all_scene_discovery_keeps_frames_across_sessions(self):
+    def test_kradar_discovery_keeps_paired_frames_across_sequences(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for session in ("SessionA", "SessionB"):
-                aeva = root / "Scene01" / session / "LiDAR" / "LiDAR" / "Aeva"
-                aeva.mkdir(parents=True)
-                (aeva / "123.bin").touch()
+            for sequence in ("1", "2"):
+                sequence_root = root / "lidar" / sequence
+                lidar = sequence_root / "os2-64"
+                labels = sequence_root / "info_label"
+                calibration = sequence_root / "info_calib"
+                radar = root / "radar" / "pc10p" / sequence
+                for path in (lidar, labels, calibration, radar):
+                    path.mkdir(parents=True, exist_ok=True)
+                (lidar / "os2-64_00001.pcd").touch()
+                (labels / "00033_00001.txt").write_text(
+                    "* idx(tesseract_os2-64_cam-front_os1-128_cam-lrr)="
+                    "00033_00001_00002_00001_00004, "
+                    "timestamp=1643292946.710046076\n",
+                    encoding="utf-8",
+                )
+                (calibration / "calib_radar_lidar.txt").write_text(
+                    "frame difference,x,y\n32,-2.54,0.3\n",
+                    encoding="utf-8",
+                )
+                (radar / "rpc_00033.npy").touch()
 
-            bins, _ = list_all_aeva_bins(root)
-            self.assertEqual(len(bins), 2)
+            frames, _ = list_all_kradar_lidar_frames(root)
+            self.assertEqual(len(frames), 2)
             self.assertEqual(
-                {path.parts[-5] for path in bins},
-                {"SessionA", "SessionB"},
+                {path.parents[1].name for path in frames},
+                {"1", "2"},
             )
 
     def test_bounded_future_iterator_processes_every_task(self):
@@ -273,12 +299,15 @@ class RobustnessTests(unittest.TestCase):
             sample = root / "0000_123_fov_filter_s1.npz"
             grid = np.ones((2, 2), dtype=np.float32)
             metadata = {
-                "dataset": "Hercules",
-                "scene": "Scene01",
-                "day": "Scene01",
+                "dataset": "K-Radar",
+                "scene": "1",
+                "day": "1",
                 "session": "",
-                "source_relative_path": "Scene01/LiDAR/Aeva/123.bin",
-                "source_aeva_dir": "Scene01/LiDAR/Aeva",
+                "sequence": "1",
+                "lidar_index": "00001",
+                "radar_index": "00033",
+                "source_relative_path": "1/os2-64/os2-64_00001.pcd",
+                "source_lidar_dir": "1/os2-64",
                 "timestamp": "123",
                 "fault": "fov_filter",
                 "severity": 1,
@@ -298,6 +327,12 @@ class RobustnessTests(unittest.TestCase):
                 "generation_seed": 42,
                 "injection_seed": 99,
                 "weather_threads": 1,
+                "radar_azimuth_range_rad": list(K_RADAR_AZIMUTH_RANGE_RAD),
+                "radar_elevation_range_rad": list(K_RADAR_ELEVATION_RANGE_RAD),
+                "radar_range_m": list(K_RADAR_RANGE_M),
+                "lidar_channels": list(LIDAR_CHANNELS),
+                "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
+                "lidar_height_range_m": list(HEIGHT_RANGE_M),
                 "injection_metadata": {},
             }
             arrays = {
@@ -346,9 +381,12 @@ class RobustnessTests(unittest.TestCase):
                 sample,
                 config,
                 {
-                    "scene": "Scene01",
+                    "scene": "1",
                     "session": "",
-                    "source_relative_path": "Scene01/LiDAR/Aeva/123.bin",
+                    "sequence": "1",
+                    "lidar_index": "00001",
+                    "radar_index": "00033",
+                    "source_relative_path": "1/os2-64/os2-64_00001.pcd",
                 },
                 "123",
                 "fov_filter",

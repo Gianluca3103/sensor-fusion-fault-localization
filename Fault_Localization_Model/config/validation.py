@@ -1,10 +1,6 @@
 from pathlib import Path
 import math
 
-import numpy as np
-
-
-
 def require_directory(path, label):
     path = Path(path)
     if not path.exists():
@@ -47,7 +43,7 @@ def require_non_negative(value, label):
 
 
 def validate_generation_args(args):
-    require_directory(args.data_root, "Hercules data root")
+    require_directory(args.data_root, "K-Radar data root")
     require_positive(args.num_samples, "num_samples")
     require_positive(args.grid_size, "grid_size")
     require_positive(args.resolution, "resolution")
@@ -57,11 +53,6 @@ def validate_generation_args(args):
     require_non_negative(args.seed, "--seed")
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
-    if args.require_causal_radar_max_delta_ms is not None and (
-        not np.isfinite(args.require_causal_radar_max_delta_ms)
-        or args.require_causal_radar_max_delta_ms < 0.0
-    ):
-        raise ValueError("--require-causal-radar-max-delta-ms must be non-negative.")
     require_range(args.x_min, args.x_max, "x range")
     require_range(args.y_min, args.y_max, "y range")
     require_range(args.min_range, args.max_range, "point range")

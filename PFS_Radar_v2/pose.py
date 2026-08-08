@@ -6,8 +6,10 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from PFS_Radar.radar_data import RadarAlignmentUnavailableError
-from PFS_Radar_v2.radar_types import AdaptiveStackConfig
+from PFS_Radar_v2.radar_types import (
+    AdaptiveStackConfig,
+    RadarAlignmentUnavailableError,
+)
 
 
 def rotation_angle_rad(rotation: np.ndarray) -> float:

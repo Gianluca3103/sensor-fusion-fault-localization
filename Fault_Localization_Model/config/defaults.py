@@ -3,7 +3,7 @@ import json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_HERCULES_ROOT = REPO_ROOT / "data" / "HerculesFiles" / "Data"
+DEFAULT_KRADAR_ROOT = REPO_ROOT.parent / "K-Radar_Data"
 DEFAULT_INJECTOR_ROOT = REPO_ROOT / "Weather_Injector" / "3D_Corruptions_AD"
 DEFAULT_FOG_ROOT = REPO_ROOT / "Weather_Injector" / "LiDAR_fog_sim"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Fault_Localization_Model" / "grid_reliability_heatmaps"
@@ -36,7 +36,7 @@ def config_get(config, dotted_key, default=None):
 #Default configuration values
 def config_defaults(config):
     return {
-        "data_root": config_get(config, "paths.data_root", str(DEFAULT_HERCULES_ROOT)),
+        "data_root": config_get(config, "paths.data_root", str(DEFAULT_KRADAR_ROOT)),
         "output_root": config_get(config, "paths.output_root", str(DEFAULT_OUTPUT_ROOT)),
         "num_samples": config_get(config, "generation.num_samples", 24),
         "seed": config_get(config, "generation.seed", 42),
@@ -52,6 +52,6 @@ def config_defaults(config):
         "y_max": config_get(config, "bev.y_max", 32.0),
         "resolution": config_get(config, "bev.resolution", 0.20),
         "min_range": config_get(config, "bev.min_range", 1.0),
-        "max_range": config_get(config, "bev.max_range", 120.0),
+        "max_range": config_get(config, "bev.max_range", 118.037109375),
         "movement_tolerance_m": config_get(config, "reliability.movement_tolerance_m", 0.05),
     }

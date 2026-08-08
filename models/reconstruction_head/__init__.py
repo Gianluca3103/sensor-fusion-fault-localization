@@ -1,25 +1,20 @@
 """Building blocks for the second-stage BEV reconstruction pipeline."""
 
-from .bev_triplets import BEVTripletDataset, load_bev_triplet
-from .encoders import (
-    CleanBEVEncoder,
-    FaultyBEVEncoder,
-    GoodDataFusion,
-    LiDARTrustedBEVEncoder,
-    MultiScaleBEVEncoding,
-    RadarBEVEncoder,
-    ReconstructionBEVEncoders,
-    RequiredCorrection,
-    TripletBEVEncoders,
-    mask_unreliable_lidar,
-)
 from .fault_selector import (
     FaultBlob,
     FaultSelection,
     FaultSelector,
     FaultSelectorConfig,
 )
-from .coarse_model import (
+from .fault_selector_cache import (
+    InvalidSelectorCacheError,
+    build_selector_cache_entry,
+    load_selector_inputs,
+    load_selector_cache,
+    selector_cache_path,
+    selector_cache_root,
+)
+from .coarse_reconstruction.coarse_model import (
     AbsolutePositionEncoder,
     BottleneckFusionBlock,
     CoarseReplacementHead,
@@ -31,22 +26,27 @@ from .coarse_model import (
     LocalUNetDecoder,
     LocalUNetEncoder,
 )
-from .coarse_config import CoarseReconstructionConfig, build_configs, load_config
-from .coarse_loss import (
+from .coarse_reconstruction.coarse_config import (
+    CoarseReconstructionConfig,
+    build_configs,
+    build_selector_config,
+    load_config,
+)
+from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
     coarse_reconstruction_metrics,
     masked_bev_mae,
 )
-from .coarse_dataset import CoarseReconstructionDataset
-from .diffusion_process import (
+from .coarse_dataset import CoarseReconstructionDataset, load_bev_triplet
+from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
     GaussianNoiseSchedule,
     MaskedEpsilonMSELoss,
     residual_target,
 )
-from .residual_diffusion import (
+from .diffusion_process.residual_diffusion import (
     DiffusionDownBlock,
     DiffusionUpBlock,
     MaskedResidualDiffusion,
@@ -55,13 +55,13 @@ from .residual_diffusion import (
     SinusoidalTimeEmbedding,
     TimeConditionedResidualBlock,
 )
-from .diffusion_pipeline import (
+from .diffusion_process.diffusion_pipeline import (
     FrozenCoarseDiffusionPipeline,
     ResidualDiffusionSampler,
     load_frozen_coarse_model,
     validate_diffusion_checkpoint_compatibility,
 )
-from .diffusion_metrics import (
+from .diffusion_process.diffusion_metrics import (
     bev_occupancy,
     occupancy_metrics,
     per_channel_continuous_metrics,
@@ -69,11 +69,9 @@ from .diffusion_metrics import (
 )
 
 __all__ = [
-    "BEVTripletDataset",
     "BEVChannelNormalization",
     "AbsolutePositionEncoder",
     "BottleneckFusionBlock",
-    "CleanBEVEncoder",
     "CoarseReplacementHead",
     "CoarseReconstructionDataset",
     "CoarseLossConfig",
@@ -82,13 +80,10 @@ __all__ = [
     "DiffusionDownBlock",
     "DiffusionProcessConfig",
     "DiffusionUpBlock",
-    "FaultyBEVEncoder",
-    "GoodDataFusion",
     "GlobalFusionBlock",
     "GlobalLidarEncoder",
     "GlobalRadarEncoder",
     "GaussianNoiseSchedule",
-    "LiDARTrustedBEVEncoder",
     "LocalToGlobalCrossAttention",
     "LocalUNetDecoder",
     "LocalUNetEncoder",
@@ -99,28 +94,29 @@ __all__ = [
     "FaultSelection",
     "FaultSelector",
     "FaultSelectorConfig",
-    "MultiScaleBEVEncoding",
-    "RadarBEVEncoder",
-    "ReconstructionBEVEncoders",
+    "InvalidSelectorCacheError",
     "ResidualDiffusionSampler",
     "ResidualDiffusionUNet",
     "ResidualDiffusionUNetConfig",
-    "RequiredCorrection",
-    "TripletBEVEncoders",
     "SinusoidalTimeEmbedding",
     "TimeConditionedResidualBlock",
     "FrozenCoarseDiffusionPipeline",
     "load_bev_triplet",
-    "mask_unreliable_lidar",
     "coarse_reconstruction_metrics",
     "build_configs",
+    "build_selector_config",
+    "build_selector_cache_entry",
     "load_config",
     "masked_bev_mae",
     "bev_occupancy",
     "load_frozen_coarse_model",
+    "load_selector_cache",
+    "load_selector_inputs",
     "validate_diffusion_checkpoint_compatibility",
     "occupancy_metrics",
     "per_channel_continuous_metrics",
     "reconstruction_stage_metrics",
     "residual_target",
+    "selector_cache_path",
+    "selector_cache_root",
 ]

@@ -12,31 +12,24 @@ from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 import numpy as np
 
-from Fault_Localization_Model.sample_utils import validate_heatmap_array, validate_rgb_array
-from .fault_selector import FaultSelector, FaultSelectorConfig
+from Fault_Localization_Model.sample_utils import validate_rgb_array
+from .coarse_reconstruction.coarse_config import build_selector_config, load_config
+from .fault_selector import FaultSelector
+from .fault_selector_cache import load_selector_inputs
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--threshold", type=float, default=0.0)
-    parser.add_argument("--min-blob-cells", type=int, default=5)
-    parser.add_argument("--max-blobs", type=int, default=3)
-    parser.add_argument("--merge-radius-cells", type=int, default=4)
-    parser.add_argument("--box-padding-cells", type=int, default=2)
-    parser.add_argument("--combine-gap-cells", type=int, default=40)
-    parser.add_argument("--min-relative-blob-size", type=float, default=0.05)
-    parser.add_argument("--bbox-quantile", type=float, default=0.01)
-    parser.add_argument("--min-repair-fault-fraction", type=float, default=0.75)
-    parser.add_argument("--min-halo-healthy-fraction", type=float, default=0.90)
-    parser.add_argument("--min-halo-healthy-cells", type=int, default=64)
-    parser.add_argument("--min-halo-context-ratio", type=float, default=0.25)
-    parser.add_argument("--min-halo-width-cells", type=int, default=4)
-    parser.add_argument("--healthy-reliability-threshold", type=float, default=1.0)
-    parser.add_argument("--max-halo-dilation-cells", type=int)
-    parser.add_argument("--distance-bin-m", type=float, default=10.0)
-    parser.add_argument("--connectivity", type=int, choices=(4, 8), default=8)
+    parser.add_argument(
+        "--config",
+        default=str(
+            Path(__file__).resolve().parents[2]
+            / "configs"
+            / "coarse_reconstruction.json"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -49,32 +42,9 @@ def load_fault_selection_sample(sample_path):
         faulty = validate_rgb_array(
             data["faulty_rgb"], name="faulty_rgb", path=sample_path
         )
-        heatmap = validate_heatmap_array(data["fault_heatmap"], path=sample_path)
-        if "reliability_map" not in data:
-            raise KeyError(f"reliability_map is missing from {sample_path}")
-        reliability = np.asarray(data["reliability_map"], dtype=np.float32)
-        if reliability.shape != heatmap.shape:
-            raise ValueError(
-                f"reliability_map in {sample_path} has shape {reliability.shape}, "
-                f"expected {heatmap.shape}"
-            )
-        if not np.isfinite(reliability).all() or np.any(
-            (reliability < 0.0) | (reliability > 1.0)
-        ):
-            raise ValueError("reliability_map must contain finite values in [0,1]")
-        evidence = {}
-        for name in (
-            "added_faulty_counts",
-            "missing_faulty_counts",
-            "moved_faulty_counts",
-        ):
-            if name not in data:
-                raise KeyError(f"{name} is missing from {sample_path}")
-            evidence[name] = np.asarray(data[name])
-        if "faulty_counts" not in data:
-            raise KeyError(f"faulty_counts is missing from {sample_path}")
-        evidence["reliability_map"] = reliability
-        evidence["faulty_counts"] = np.asarray(data["faulty_counts"])
+    evidence = load_selector_inputs(sample_path)
+    heatmap = evidence.pop("fault_heatmap")
+    reliability = evidence["reliability_map"]
     return clean, faulty, reliability, heatmap, evidence
 
 
@@ -194,27 +164,8 @@ def render_fault_selection(sample_path, output_path, selector):
 
 def main():
     args = _parse_args()
-    selector = FaultSelector(
-        FaultSelectorConfig(
-            threshold=args.threshold,
-            min_blob_cells=args.min_blob_cells,
-            max_blobs=args.max_blobs,
-            merge_radius_cells=args.merge_radius_cells,
-            box_padding_cells=args.box_padding_cells,
-            combine_gap_cells=args.combine_gap_cells,
-            min_relative_blob_size=args.min_relative_blob_size,
-            bbox_quantile=args.bbox_quantile,
-            min_repair_fault_fraction=args.min_repair_fault_fraction,
-            min_halo_healthy_fraction=args.min_halo_healthy_fraction,
-            min_halo_healthy_cells=args.min_halo_healthy_cells,
-            min_halo_context_ratio=args.min_halo_context_ratio,
-            min_halo_width_cells=args.min_halo_width_cells,
-            healthy_reliability_threshold=args.healthy_reliability_threshold,
-            max_halo_dilation_cells=args.max_halo_dilation_cells,
-            distance_bin_m=args.distance_bin_m,
-            connectivity=args.connectivity,
-        )
-    )
+    selector_config = build_selector_config(load_config(args.config))
+    selector = FaultSelector(selector_config)
     output_path = Path(args.output)
     selection = render_fault_selection(args.sample, output_path, selector)
 
@@ -234,7 +185,7 @@ def main():
         )
     print(
         f"Rejected {len(selection.rejected_small_blobs)} blobs smaller than "
-        f"{args.min_blob_cells} cells."
+        f"{selector_config.min_blob_cells} cells."
     )
     print(
         f"Excluded {selection.excluded_added_only_cell_count} added-only fault cells."

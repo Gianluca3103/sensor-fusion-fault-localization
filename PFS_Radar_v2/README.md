@@ -1,94 +1,74 @@
-# PFS-Radar v2: Adaptive Stacking and Doppler Tracking
+# RadarV2 for K-Radar
 
-`PFS_Radar_v2` is a new radar preprocessing path. It leaves the original
-`PFS_Radar` implementation unchanged.
+`PFS_Radar_v2` now builds the existing four-channel RadarV2 representation
+from K-Radar rather than HeRCULES Continental radar.
 
-## What changes
+## Input
 
-The cache builder uses the newest causal Continental frame as its pose
-reference and walks backward until any accuracy gate is crossed:
+Use the tensor-derived `from_rdr_cube_xyz/pc10p` files. Each
+`rpc_<index>.npy` row contains:
 
-- maximum history
-- maximum relative translation
-- maximum relative rotation
-- optional maximum number of frames (disabled by default)
+`x, y, z, power, Doppler, range, azimuth, elevation, range index, azimuth index, elevation index`
 
-Every accepted frame is ego-motion compensated into the current Aeva LiDAR
-frame. Its contribution is softly weighted by age, translation, and rotation.
-Density is divided by total effective frame support so slow and fast sequences
-have comparable scale.
+Do not substitute `sparse_radar_tensor_wide_range`: its rows contain only
+`x, y, z, power`, so it cannot produce RadarV2's Doppler-based dynamic
+channels.
 
-Raw radial Doppler is compensated with pose-derived radar velocity. The
-`auto` sign mode chooses the Continental sign convention that best explains the
-static majority in each frame. Large residuals are clustered with DBSCAN,
-associated causally across the selected window, and assigned a planar velocity
-from both centroid motion and the available radial constraints. Confirmed
-tracks are advanced to the current LiDAR timestamp before BEV projection,
-reducing trails from moving vehicles.
+Frame timestamps and radar/LiDAR pairings come from `info_label`. Motion
+compensation uses the KITTI-format poses in `resources/odometry/gt`, whose
+rows correspond to the sorted label frames. `calib_radar_lidar.txt` is
+inverted so all accumulated radar points are expressed in the current paired
+LiDAR frame.
+
+LiDAR frames, labels, and calibration files are organized under
+`<K-Radar-root>/lidar/<sequence>/`; tensor-derived radar points remain under
+`<K-Radar-root>/radar/pc10p/<sequence>/`.
+
+K-Radar Doppler is ambiguous outside an interval of approximately 3.865 m/s.
+The cache builder wraps the ego-motion residual into that interval before
+static/dynamic classification. Dynamic clustering is additionally restricted
+to the configured high-power quantile because pc10p contains roughly 100,000
+tensor cells per frame rather than a small conventional radar point cloud.
 
 ## Four output channels
 
-The tensor shape remains `[4, H, W]`:
+The downstream contract remains `[4, H, W]`:
 
 1. static occupancy
-2. support-normalized static density
+2. robust log-normalized power
 3. tracked dynamic speed
-4. dynamic-track occupancy/confidence
+4. robust upper height
 
-These semantics differ from PFS-Radar v1. Use a separate cache root and retrain
-the PFS-Radar model from scratch.
+Power is the maximum temporally weighted power in each BEV cell, log-scaled
+against the 99th percentile of occupied cells. Upper height is the per-cell
+90th percentile of physically plausible aligned radar heights in `[-3, 5]`
+metres, normalized into `[0, 1]`. Returns outside that vertical range are
+excluded from the height statistic, and empty cells remain zero.
+
+At the default ranges and resolution the cache shape is `[4, 320, 320]`.
+Cache files are written as `<output-root>/<sequence>/<radar-index>.npz`.
 
 ## Build the cache
 
-```bash
-PYTHON="/path/to/python"
-DATASET_ROOT="/path/to/reliability_dataset"
-HERCULES_ROOT="/path/to/HeRCULES"
-RADAR_V2_ROOT="/path/to/radar_cache_adaptive_doppler_v2"
+PowerShell:
 
-"$PYTHON" PFS_Radar_v2/prepare_radar_cache.py \
-  --dataset-root "$DATASET_ROOT" \
-  --hercules-root "$HERCULES_ROOT" \
-  --output-root "$RADAR_V2_ROOT" \
-  --num-workers 4 \
-  --max-delta-ms 30 \
-  --max-frames 0 \
-  --max-history-s 1.0 \
-  --max-translation-m 4.0 \
-  --max-rotation-deg 5.0 \
-  --doppler-sign auto \
-  --dynamic-threshold-mps 1.0 \
-  --cluster-eps-m 1.2 \
-  --cluster-min-samples 2 \
-  --association-distance-m 3.0 \
-  --min-track-hits 2
+```powershell
+$PYTHON = "C:\path\to\python.exe"
+$KRADAR = "C:\Users\gianl\Desktop\Thesis\K-Radar_Data"
+$REPO = "C:\Users\gianl\Desktop\Thesis\Sensor-Fusion_Final_Model_Repo"
+
+Set-Location $REPO
+& $PYTHON -m PFS_Radar_v2.prepare_radar_cache `
+  --kradar-root $KRADAR `
+  --radar-point-root "$KRADAR\radar\pc10p" `
+  --odometry-root "$KRADAR\support\official_k_radar\resources\odometry" `
+  --output-root "$KRADAR\radar_v2_cache" `
+  --num-workers 4
 ```
 
-`--max-frames 0` removes the frame-count cap. The accepted causal history is
-still bounded by `--max-history-s`, `--max-translation-m`, and
-`--max-rotation-deg`, and older accepted frames receive smaller soft weights.
-Use a positive value only when a strict compute or memory ceiling is required.
+For a one-frame smoke test, add `--max-pending-frames 1 --num-workers 1`.
+The builder is resumable: compatible cache entries are skipped on later runs.
 
-For training, use the existing `PFS_Radar/train_pfs_radar.py` with
-`--radar-root "$RADAR_V2_ROOT"`. Do not pass the v1 fixed-stack validation
-arguments `--radar-frame-count` or `--require-full-radar-stack`; the v2 cache
-records and validates its complete adaptive policy itself.
-
-## Sign check
-
-Start with `--doppler-sign auto`. Inspect `alignment_rows[].doppler_sign` in a
-few cache metadata records. If the inferred convention is stable for the
-dataset, repeat the controlled experiment with explicit `--doppler-sign 1` or
-`--doppler-sign -1`. At very low ego speed auto mode deliberately falls back to
-`1` because the static scene does not provide enough evidence to infer a sign.
-
-## Recommended ablation
-
-Compare:
-
-1. one radar frame
-2. fixed 20-frame PFS-Radar v1
-3. adaptive PFS-Radar v2
-
-Report localization IoU, precision, recall, turns, ego-speed bins, dynamic
-artifacts, runtime, selected-frame count, and confirmed-track count.
+The adaptive temporal policy is still bounded by history, translation, and
+rotation. `--max-frames 0` means no additional frame-count cap. The default
+BEV geometry is `x=[0,64)`, `y=[-32,32)`, resolution `0.2 m`.

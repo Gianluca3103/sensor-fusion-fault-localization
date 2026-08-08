@@ -30,11 +30,6 @@ def masked_bev_mae(
     reconstruction_mask: torch.Tensor,
     epsilon: float = 1.0e-8,
 ) -> torch.Tensor:
-    if prediction.shape != target.shape:
-        raise ValueError("prediction and target must have identical shapes")
-    expected_mask = (prediction.shape[0], 1, *prediction.shape[-2:])
-    if tuple(reconstruction_mask.shape) != expected_mask:
-        raise ValueError(f"reconstruction_mask must have shape {expected_mask}")
     numerator = (
         reconstruction_mask * (prediction - target).abs()
     ).sum()
@@ -57,8 +52,6 @@ class MaskedBEVReconstructionLoss(nn.Module):
     ) -> dict[str, torch.Tensor]:
         replacement = outputs["replacement_raw"]
         mask = outputs["reconstruction_mask"]
-        if replacement.shape != clean_lidar_bev.shape:
-            raise ValueError("replacement_raw and clean_lidar_bev must have identical shapes")
         if self.config.reconstruction_loss_type == "smooth_l1":
             elementwise = F.smooth_l1_loss(
                 replacement, clean_lidar_bev, reduction="none"
@@ -99,4 +92,3 @@ def coarse_reconstruction_metrics(
         "relative_improvement": relative,
         "outside_mask_max_change": outside_change,
     }
-

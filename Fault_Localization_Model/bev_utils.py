@@ -4,6 +4,15 @@ from typing import Dict, Tuple
 import numpy as np
 
 
+LIDAR_CHANNELS = (
+    "occupancy",
+    "log_density",
+    "robust_upper_height",
+)
+UPPER_HEIGHT_QUANTILE = 0.90
+HEIGHT_RANGE_M = (-3.0, 5.0)
+
+
 def _validate_geometry(x_range, y_range, resolution):
     if len(x_range) != 2 or len(y_range) != 2:
         raise ValueError("x_range and y_range must each contain exactly two values")
@@ -91,6 +100,38 @@ def normalize_occupied(grid: np.ndarray, occupied: np.ndarray) -> np.ndarray:
     return output
 
 
+def robust_upper_height_grid(
+    flat_cells: np.ndarray,
+    heights_m: np.ndarray,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Return the radar-matched per-cell upper-height representation."""
+
+    output = np.zeros(shape[0] * shape[1], dtype=np.float32)
+    if flat_cells.size == 0:
+        return output.reshape(shape)
+
+    z_min, z_max = HEIGHT_RANGE_M
+    plausible = (heights_m >= z_min) & (heights_m <= z_max)
+    flat_cells = flat_cells[plausible]
+    heights_m = heights_m[plausible]
+    if flat_cells.size == 0:
+        return output.reshape(shape)
+
+    order = np.lexsort((heights_m, flat_cells))
+    sorted_cells = flat_cells[order]
+    sorted_heights = heights_m[order]
+    starts = np.flatnonzero(np.r_[True, sorted_cells[1:] != sorted_cells[:-1]])
+    ends = np.r_[starts[1:], len(sorted_cells)]
+    counts = ends - starts
+    offsets = np.ceil(UPPER_HEIGHT_QUANTILE * counts).astype(np.int64) - 1
+    upper_heights = sorted_heights[starts + offsets]
+
+    normalized = (upper_heights - z_min) / (z_max - z_min)
+    output[sorted_cells[starts]] = normalized.astype(np.float32)
+    return output.reshape(shape)
+
+
 def project_lidar_bev(
     points: np.ndarray,
     x_range: Tuple[float, float],
@@ -98,10 +139,10 @@ def project_lidar_bev(
     resolution: float,
 ) -> Dict[str, np.ndarray]:
     points = np.asarray(points)
-    if points.ndim != 2 or points.shape[1] < 4:
-        raise ValueError(f"points must have shape [N,>=4], got {points.shape}")
-    if not np.isfinite(points[:, :4]).all():
-        raise ValueError("points contains non-finite XYZ/intensity values")
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"points must have shape [N,>=3], got {points.shape}")
+    if not np.isfinite(points[:, :3]).all():
+        raise ValueError("points contains non-finite XYZ values")
     x_min, x_max, y_min, y_max, resolution = _validate_geometry(
         x_range, y_range, resolution
     )
@@ -111,10 +152,9 @@ def project_lidar_bev(
         width = int(np.ceil((y_max - y_min) / resolution))
         zeros = np.zeros((height, width), dtype=np.float32)
         return {
+            "occupancy": zeros.copy(),
             "density": zeros.copy(),
-            "height": zeros.copy(),
-            "intensity": zeros.copy(),
-            "height_spread": zeros.copy(),
+            "robust_upper_height": zeros.copy(),
             "raw_density": zeros.copy(),
         }
 
@@ -124,43 +164,35 @@ def project_lidar_bev(
         y_range=(y_min, y_max),
         resolution=resolution,
     )
-    intensity = points[valid, 3]
-
     density = np.zeros((height, width), dtype=np.float32)
-    max_height = np.full((height, width), -np.inf, dtype=np.float32)
-    min_height = np.full((height, width), np.inf, dtype=np.float32)
-    intensity_sum = np.zeros((height, width), dtype=np.float32)
 
     if len(xyz) > 0:
         np.add.at(density, (rows, cols), 1.0)
-        np.maximum.at(max_height, (rows, cols), xyz[:, 2])
-        np.minimum.at(min_height, (rows, cols), xyz[:, 2])
-        np.add.at(intensity_sum, (rows, cols), intensity)
 
-    occupied = density > 0
-    mean_intensity = np.zeros_like(intensity_sum)
-    np.divide(intensity_sum, density, out=mean_intensity, where=occupied)
-
-    height_normalized = normalize_occupied(max_height, occupied)
+    occupancy = (density > 0).astype(np.float32)
     density_normalized = normalize_by_max(np.log1p(density))
-    intensity_normalized = normalize_occupied(mean_intensity, occupied)
-
-    height_spread = np.zeros((height, width), dtype=np.float32)
-    height_spread[occupied] = max_height[occupied] - min_height[occupied]
-    height_spread = normalize_by_max(height_spread)
+    flat_cells = rows.astype(np.int64) * width + cols
+    robust_upper_height = robust_upper_height_grid(
+        flat_cells,
+        xyz[:, 2],
+        (height, width),
+    )
 
     return {
+        "occupancy": occupancy,
         "density": density_normalized,
-        "height": height_normalized,
-        "intensity": intensity_normalized,
-        "height_spread": height_spread,
+        "robust_upper_height": robust_upper_height,
         "raw_density": density,
     }
 
 
 def make_rgb_preview(bev_layers: Dict[str, np.ndarray]) -> np.ndarray:
     rgb = np.stack(
-        [bev_layers["height"], bev_layers["intensity"], bev_layers["density"]],
+        [
+            bev_layers["occupancy"],
+            bev_layers["density"],
+            bev_layers["robust_upper_height"],
+        ],
         axis=-1,
     )
     return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)

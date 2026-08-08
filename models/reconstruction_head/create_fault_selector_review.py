@@ -13,7 +13,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .fault_selector import FaultSelector, FaultSelectorConfig
+from .coarse_reconstruction.coarse_config import build_selector_config, load_config
+from .fault_selector import FaultSelector
 from .visualize_fault_selection import (
     load_fault_selection_sample,
     render_fault_selection,
@@ -36,23 +37,14 @@ def _parse_args():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--samples-per-group", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threshold", type=float, default=0.0)
-    parser.add_argument("--min-blob-cells", type=int, default=5)
-    parser.add_argument("--max-blobs", type=int, default=3)
-    parser.add_argument("--merge-radius-cells", type=int, default=4)
-    parser.add_argument("--box-padding-cells", type=int, default=2)
-    parser.add_argument("--combine-gap-cells", type=int, default=40)
-    parser.add_argument("--min-relative-blob-size", type=float, default=0.05)
-    parser.add_argument("--bbox-quantile", type=float, default=0.01)
-    parser.add_argument("--min-repair-fault-fraction", type=float, default=0.75)
-    parser.add_argument("--min-halo-healthy-fraction", type=float, default=0.90)
-    parser.add_argument("--min-halo-healthy-cells", type=int, default=64)
-    parser.add_argument("--min-halo-context-ratio", type=float, default=0.25)
-    parser.add_argument("--min-halo-width-cells", type=int, default=4)
-    parser.add_argument("--healthy-reliability-threshold", type=float, default=1.0)
-    parser.add_argument("--max-halo-dilation-cells", type=int)
-    parser.add_argument("--distance-bin-m", type=float, default=10.0)
-    parser.add_argument("--connectivity", type=int, choices=(4, 8), default=8)
+    parser.add_argument(
+        "--config",
+        default=str(
+            Path(__file__).resolve().parents[2]
+            / "configs"
+            / "coarse_reconstruction.json"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -153,25 +145,7 @@ def main():
         "fog": Path(args.fog_root),
         "old_laser": Path(args.old_laser_root),
     }
-    selector_config = FaultSelectorConfig(
-        threshold=args.threshold,
-        min_blob_cells=args.min_blob_cells,
-        max_blobs=args.max_blobs,
-        merge_radius_cells=args.merge_radius_cells,
-        box_padding_cells=args.box_padding_cells,
-        combine_gap_cells=args.combine_gap_cells,
-        min_relative_blob_size=args.min_relative_blob_size,
-        bbox_quantile=args.bbox_quantile,
-        min_repair_fault_fraction=args.min_repair_fault_fraction,
-        min_halo_healthy_fraction=args.min_halo_healthy_fraction,
-        min_halo_healthy_cells=args.min_halo_healthy_cells,
-        min_halo_context_ratio=args.min_halo_context_ratio,
-        min_halo_width_cells=args.min_halo_width_cells,
-        healthy_reliability_threshold=args.healthy_reliability_threshold,
-        max_halo_dilation_cells=args.max_halo_dilation_cells,
-        distance_bin_m=args.distance_bin_m,
-        connectivity=args.connectivity,
-    )
+    selector_config = build_selector_config(load_config(args.config))
     config_path = output_root / "selector_config.json"
     existing_config = None
     if config_path.exists():

@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
 import hashlib
 import json
 from pathlib import Path
-import random
 import sys
 import time
 
@@ -16,23 +14,27 @@ from torch.utils.data import DataLoader
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Fault_Localization_Model.io_utils import atomic_torch_save, atomic_write_json, write_csv_rows
-from Fault_Localization_Model.sample_utils import load_sample_metadata
-from PFS_Radar.radar_data import radar_cache_path
-from PFS.training_utils import capture_rng_state, resolve_device, restore_rng_state, seed_everything
+from PFS.training_utils import (
+    _split_paths,
+    capture_rng_state,
+    resolve_device,
+    restore_rng_state,
+    seed_everything,
+)
 from models.reconstruction_head import (
     BEVChannelNormalization,
     CoarseReconstructionDataset,
     DiffusionProcessConfig,
-    FaultSelectorConfig,
     FrozenCoarseDiffusionPipeline,
     MaskedResidualDiffusion,
     ResidualDiffusionSampler,
     ResidualDiffusionUNetConfig,
+    build_selector_config,
     load_frozen_coarse_model,
     reconstruction_stage_metrics,
     validate_diffusion_checkpoint_compatibility,
@@ -137,52 +139,10 @@ def _build_components(payload):
         epsilon=float(normalization.get("epsilon", 1e-6)),
         source=normalization.get("source", "configured_training_statistics"),
     )
-    selector_payload = payload.get("fault_selector", {})
-    valid = {field.name for field in fields(FaultSelectorConfig)}
-    unknown = set(selector_payload) - valid
-    if unknown:
-        raise ValueError("Unknown fault_selector settings: " + ", ".join(sorted(unknown)))
-    selector = FaultSelectorConfig(**selector_payload)
+    selector = build_selector_config(payload)
     model_config.validate()
     process_config.validate()
-    selector.validate()
     return model_config, process_config, normalizer, selector
-
-
-def _split_paths(root, radar_root, split, limit, seed):
-    path = Path(root) / split
-    radar_root = Path(radar_root)
-    if not path.is_dir():
-        raise FileNotFoundError(f"Required dataset split is missing: {path}")
-    if not radar_root.is_dir():
-        raise FileNotFoundError(f"Radar cache root is missing: {radar_root}")
-    paths = sorted(path.rglob("*.npz"))
-    available_paths = []
-    total = len(paths)
-    print(f"Checking {split} radar availability for {total} samples...", flush=True)
-    for index, sample_path in enumerate(paths, 1):
-        metadata = load_sample_metadata(sample_path)
-        if radar_cache_path(radar_root, metadata).is_file():
-            available_paths.append(sample_path)
-        if index % 10_000 == 0 or index == total:
-            print(
-                f"  {split}: checked {index}/{total}; "
-                f"available={len(available_paths)}; "
-                f"missing={index - len(available_paths)}",
-                flush=True,
-            )
-    paths = available_paths
-    if limit is not None:
-        if limit < 1:
-            raise ValueError("Split sample limits must be positive")
-        rng = random.Random(seed)
-        paths = rng.sample(paths, k=min(limit, len(paths)))
-    if not paths:
-        raise FileNotFoundError(
-            f"No samples with aligned radar were found under {path} "
-            f"using radar root {radar_root}"
-        )
-    return paths
 
 
 def _move_batch(batch, device):
@@ -194,7 +154,14 @@ def _move_batch(batch, device):
         "healthy_context_mask": "healthy_context_mask",
         "halo_mask": "halo_mask",
     }
-    return {target: batch[source].to(device, non_blocking=True) for target, source in mapping.items()}
+    moved = {
+        target: batch[source].to(device, non_blocking=True)
+        for target, source in mapping.items()
+    }
+    mask_dtype = moved["faulty_lidar_bev"].dtype
+    for key in ("reconstruction_mask", "healthy_context_mask", "halo_mask"):
+        moved[key] = moved[key].to(dtype=mask_dtype)
+    return moved
 
 
 def _synchronize_device(device):
@@ -359,13 +326,18 @@ def main():
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     radar_root = Path(args.radar_root)
-    dataset_options = {"radar_root": radar_root, "resize_hw": (320, 320), "selector_config": selector_config}
+    data_root = Path(args.data_root)
+    dataset_options = {
+        "radar_root": radar_root,
+        "data_root": data_root,
+        "selector_config": selector_config,
+    }
     train_dataset = CoarseReconstructionDataset(
-        _split_paths(args.data_root, radar_root, "train", args.limit_train_samples, seed),
+        _split_paths(args.data_root, "train", args.limit_train_samples, seed),
         **dataset_options,
     )
     val_dataset = CoarseReconstructionDataset(
-        _split_paths(args.data_root, radar_root, "val", args.limit_val_samples, seed),
+        _split_paths(args.data_root, "val", args.limit_val_samples, seed),
         **dataset_options,
     )
     loader_options = {"batch_size": batch_size, "num_workers": workers, "pin_memory": device.type == "cuda", "persistent_workers": workers > 0}

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from .coarse_loss import CoarseLossConfig
-from .fault_selector import FaultSelectorConfig
+from ..fault_selector import FaultSelectorConfig
 
 
 @dataclass(frozen=True)
@@ -15,13 +15,13 @@ class CoarseReconstructionConfig:
     lidar_channels: int = 3
     radar_channels: int = 4
     unet_base_channels: int = 16
-    unet_depth: int = 5
-    dropout: float = 0.0
+    unet_depth: int = 4
+    dropout: float = 0.025
     global_base_channels: int = 16
     global_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8, 16)
     attention_dim: int = 128
     num_heads: int = 4
-    attention_dropout: float = 0.0
+    attention_dropout: float = 0.025
 
     @property
     def local_input_channels(self) -> int:
@@ -57,19 +57,24 @@ class CoarseReconstructionConfig:
 
 def load_config(path: str | Path) -> dict:
     path = Path(path)
+    if path.suffix.lower() != ".json":
+        raise ValueError("Coarse configuration must be a JSON file")
     with path.open("r", encoding="utf-8") as handle:
-        suffix = path.suffix.lower()
-        if suffix == ".json":
-            payload = json.load(handle)
-        elif suffix in {".yaml", ".yml"}:
-            import yaml
-
-            payload = yaml.safe_load(handle)
-        else:
-            raise ValueError(f"Unsupported configuration format: {suffix}")
+        payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("Coarse configuration must decode to a mapping")
     return payload
+
+
+def build_selector_config(payload: dict) -> FaultSelectorConfig:
+    selector_payload = payload.get("fault_selector", {})
+    valid_fields = {field.name for field in fields(FaultSelectorConfig)}
+    unknown = set(selector_payload) - valid_fields
+    if unknown:
+        raise ValueError("Unknown fault_selector settings: " + ", ".join(sorted(unknown)))
+    config = FaultSelectorConfig(**selector_payload)
+    config.validate()
+    return config
 
 
 def build_configs(payload: dict):
@@ -113,13 +118,7 @@ def build_configs(payload: dict):
         lambda_reconstruction=loss_payload.get("lambda_reconstruction", 1.0),
         epsilon=loss_payload.get("epsilon", 1.0e-8),
     )
-    selector_payload = payload.get("fault_selector", {})
-    valid_selector_fields = {field.name for field in fields(FaultSelectorConfig)}
-    unknown = set(selector_payload) - valid_selector_fields
-    if unknown:
-        raise ValueError("Unknown fault_selector settings: " + ", ".join(sorted(unknown)))
-    selector_config = FaultSelectorConfig(**selector_payload)
+    selector_config = build_selector_config(payload)
     model_config.validate()
     loss_config.validate()
-    selector_config.validate()
     return model_config, loss_config, selector_config

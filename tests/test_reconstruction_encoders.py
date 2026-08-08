@@ -7,103 +7,24 @@ import numpy as np
 import torch
 
 from models.reconstruction_head import (
-    BEVTripletDataset,
     FaultSelector,
     FaultSelectorConfig,
-    ReconstructionBEVEncoders,
-    RequiredCorrection,
-    TripletBEVEncoders,
-    mask_unreliable_lidar,
+    load_bev_triplet,
 )
+from models.reconstruction_head.encoders import BEVEncoder
 
 
 class ReconstructionEncoderTests(unittest.TestCase):
-    def test_triplet_encoders_produce_matching_independent_pyramids(self):
-        encoders = TripletBEVEncoders(
+    def test_bev_encoder_produces_expected_bottleneck(self):
+        encoder = BEVEncoder(
+            in_channels=3,
             base_channels=4,
             channel_multipliers=(1, 2, 4),
         ).eval()
         with torch.no_grad():
-            output = encoders(
-                torch.zeros(2, 3, 65, 63),
-                torch.zeros(2, 4, 65, 63),
-                torch.zeros(2, 3, 65, 63),
-                torch.ones(2, 1, 65, 63),
-                torch.ones(2, 1, 65, 63),
-            )
+            bottleneck = encoder(torch.zeros(2, 3, 65, 63))
 
-        expected_shapes = ((2, 4, 65, 63), (2, 8, 33, 32), (2, 16, 17, 16))
-        for modality in ("clean", "radar", "faulty", "lidar_trusted"):
-            self.assertEqual(
-                tuple(tuple(feature.shape) for feature in output[modality].features),
-                expected_shapes,
-            )
-        self.assertEqual(
-            tuple(output["good_data"].shape),
-            (2, 32, 17, 16),
-        )
-        trusted_latent = output["lidar_trusted"].bottleneck
-        radar_latent = output["radar"].bottleneck
-        self.assertTrue(torch.equal(output["good_data"][:, :16], trusted_latent))
-        self.assertTrue(torch.equal(output["good_data"][:, 16:], radar_latent))
-        self.assertEqual(tuple(output["required_correction"].shape), (2, 16, 17, 16))
-        self.assertEqual(tuple(output["latent_repair_mask"].shape), (2, 1, 17, 16))
-        self.assertIsNot(encoders.clean, encoders.faulty)
-        self.assertIsNot(
-            next(encoders.clean.parameters()),
-            next(encoders.faulty.parameters()),
-        )
-        self.assertIsNot(encoders.faulty, encoders.lidar_trusted)
-        self.assertIsNot(
-            next(encoders.faulty.parameters()),
-            next(encoders.lidar_trusted.parameters()),
-        )
-        self.assertIs(TripletBEVEncoders, ReconstructionBEVEncoders)
-
-    def test_triplet_encoder_rejects_misaligned_inputs(self):
-        encoders = TripletBEVEncoders(base_channels=2, channel_multipliers=(1, 2))
-        with self.assertRaisesRegex(ValueError, "must share a spatial shape"):
-            encoders(
-                torch.zeros(1, 3, 32, 32),
-                torch.zeros(1, 4, 16, 32),
-                torch.zeros(1, 3, 32, 32),
-                torch.ones(1, 1, 32, 32),
-                torch.ones(1, 1, 32, 32),
-            )
-
-    def test_required_correction_is_clean_minus_faulty_inside_repair_box(self):
-        clean_latent = torch.ones(1, 2, 4, 4)
-        faulty_latent = torch.full((1, 2, 4, 4), 0.25)
-        clean = type("Encoding", (), {"bottleneck": clean_latent})()
-        faulty = type("Encoding", (), {"bottleneck": faulty_latent})()
-        repair_mask = torch.zeros(1, 1, 8, 8)
-        repair_mask[:, :, :4, :4] = 1.0
-
-        correction, latent_mask = RequiredCorrection()(
-            clean,
-            faulty,
-            repair_mask,
-        )
-
-        self.assertTrue(torch.all(latent_mask[:, :, :2, :2] == 1.0))
-        self.assertTrue(torch.all(latent_mask[:, :, 2:, :] == 0.0))
-        self.assertTrue(torch.all(latent_mask[:, :, :, 2:] == 0.0))
-        self.assertTrue(torch.all(correction[:, :, :2, :2] == 0.75))
-        self.assertTrue(torch.all(correction[:, :, 2:, :] == 0.0))
-        self.assertTrue(torch.all(correction[:, :, :, 2:] == 0.0))
-
-    def test_trusted_lidar_removes_every_unreliable_cell(self):
-        faulty = torch.arange(36, dtype=torch.float32).reshape(1, 3, 3, 4)
-        reliability = torch.ones(1, 1, 3, 4)
-        reliability[:, :, 0, 1] = 0.0
-        reliability[:, :, 2, 3] = 0.75
-
-        trusted = mask_unreliable_lidar(faulty, reliability)
-
-        self.assertTrue(torch.all(trusted[:, :, 0, 1] == 0.0))
-        self.assertTrue(torch.all(trusted[:, :, 2, 3] == 0.0))
-        retained = reliability.expand_as(faulty) == 1.0
-        self.assertTrue(torch.equal(trusted[retained], faulty[retained]))
+        self.assertEqual(tuple(bottleneck.shape), (2, 16, 17, 16))
 
     def test_dataset_loads_and_normalizes_existing_artifact_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -134,22 +55,20 @@ class ReconstructionEncoderTests(unittest.TestCase):
                 radar_bev=np.full((4, 8, 6), 0.5, dtype=np.float32),
             )
 
-            item = BEVTripletDataset(
-                [sample_path], radar_root, resize_hw=(10, 12)
-            )[0]
+            item = load_bev_triplet(sample_path, radar_root)
 
-        self.assertEqual(item["clean_bev"].shape, (3, 10, 12))
-        self.assertEqual(item["radar_bev"].shape, (4, 10, 12))
-        self.assertEqual(item["faulty_bev"].shape, (3, 10, 12))
-        self.assertEqual(item["lidar_trusted_bev"].shape, (3, 10, 12))
-        self.assertEqual(item["fault_heatmap"].shape, (1, 10, 12))
-        self.assertEqual(item["reliability_map"].shape, (1, 10, 12))
-        self.assertEqual(item["faulty_counts"].shape, (1, 10, 12))
-        self.assertEqual(item["missing_faulty_counts"].shape, (1, 10, 12))
+        self.assertEqual(item["clean_bev"].shape, (3, 8, 6))
+        self.assertEqual(item["radar_bev"].shape, (4, 8, 6))
+        self.assertEqual(item["faulty_bev"].shape, (3, 8, 6))
+        self.assertNotIn("fault_heatmap", item)
+        self.assertNotIn("reliability_map", item)
+        self.assertNotIn("faulty_counts", item)
+        self.assertNotIn("missing_faulty_counts", item)
+        self.assertNotIn("metadata_json", item)
+        self.assertNotIn("radar_path", item)
         self.assertTrue(torch.all(item["clean_bev"] == 1.0))
         self.assertTrue(torch.all(item["radar_bev"] == 0.5))
         self.assertTrue(torch.all(item["faulty_bev"] == 0.0))
-        self.assertTrue(torch.all(item["lidar_trusted_bev"] == 0.0))
 
     def test_fault_selector_rejects_isolated_cells_and_combines_major_regions(self):
         heatmap = np.zeros((40, 20), dtype=np.float32)
@@ -187,6 +106,33 @@ class ReconstructionEncoderTests(unittest.TestCase):
         self.assertTrue(selection.reconstruction_mask[35, 2])
         self.assertTrue(selection.reconstruction_mask[22, 9])
         self.assertTrue(selection.reconstruction_mask[3, 15])
+
+    def test_fault_selector_clips_repair_and_halo_to_valid_support(self):
+        support = np.tri(12, 12, dtype=bool)
+        heatmap = support.astype(np.float32)
+
+        selection = FaultSelector(
+            FaultSelectorConfig(
+                min_blob_cells=1,
+                max_blobs=1,
+                merge_radius_cells=0,
+                box_padding_cells=0,
+                bbox_quantile=0.0,
+                min_repair_fault_fraction=0.0,
+                min_halo_healthy_fraction=0.0,
+                min_halo_healthy_cells=0,
+                min_halo_context_ratio=0.0,
+                min_halo_width_cells=1,
+                ignore_added_only=False,
+            )
+        ).select(
+            heatmap,
+            valid_support_mask=support,
+        )
+
+        self.assertTrue(np.array_equal(selection.reconstruction_mask, support))
+        self.assertFalse(np.any(selection.halo_mask & ~support))
+        self.assertFalse(np.any(selection.healthy_context_mask & ~support))
 
     def test_fault_selector_prefers_larger_blob_within_distance_bin(self):
         heatmap = np.zeros((20, 20), dtype=np.float32)

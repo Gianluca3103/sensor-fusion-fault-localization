@@ -1,5 +1,17 @@
 # Deterministic coarse LiDAR reconstruction
 
+## Code layout
+
+```text
+reconstruction_head/
+├── coarse_reconstruction/   coarse model, loss, config, and trainer
+├── diffusion_process/       diffusion model, process, pipeline, metrics, and trainer
+├── coarse_dataset.py        aligned BEV and cached-mask loading shared by both stages
+├── encoders.py              shared encoder building blocks
+├── fault_selector.py        shared repair/halo selection
+└── fault_selector_cache.py  shared deterministic mask cache
+```
+
 The coarse stage directly predicts replacement LiDAR BEV content. It has no
 separate reconstruction-latent encoder and does not predict a correction to
 hidden LiDAR values. It contains no diffusion process.
@@ -55,11 +67,28 @@ all cells inside it come from the replacement prediction.
 
 ## Training
 
-The independent trainer is `training.train_coarse_reconstruction`; its default
-configuration is `configs/coarse_reconstruction.json`.
+The independent trainer is
+`models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction`;
+its default configuration is `configs/coarse_reconstruction.json`.
+
+Fault Selector masks are precomputed once rather than recalculated in every
+epoch. Generate the cache before coarse or diffusion training:
 
 ```powershell
-python -m training.train_coarse_reconstruction `
+python -m models.reconstruction_head.cache_fault_selector_masks `
+  --data-root "C:\path\to\grid_reliability_dataset" `
+  --config "configs\coarse_reconstruction.json" `
+  --num-workers 8
+```
+
+By default, a dataset named `grid_reliability_dataset` uses the sibling cache
+directory `grid_reliability_dataset_fault_selector_cache`. Masks are compressed
+`uint8` arrays and include the complete Fault Selector configuration. Training
+fails clearly when the cache is missing or its configuration is stale;
+rerunning the command rebuilds only stale entries.
+
+```powershell
+python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction `
   --data-root "C:\path\to\grid_reliability_dataset" `
   --radar-root "C:\path\to\radar_v2_cache" `
   --output-root "C:\path\to\coarse_reconstruction_run" `
@@ -71,9 +100,18 @@ clean LiDAR over every cell in `reconstruction_mask`. Empty masks return a
 differentiable zero loss. Validation logs erased and coarse masked MAE,
 reconstruction improvement, relative improvement, and outside-mask change.
 
+During the first training and validation pass, the trainer records the
+per-sample fraction of the complete BEV covered by `reconstruction_mask OR
+halo_mask`. It writes train, validation, and combined median, 90th percentile,
+and maximum coverage to `active_fraction_profile.json`, then prints a
+dense-versus-cropped/sparse architecture recommendation. This static mask
+profile is collected only once and does not change model behavior.
+
 The trainer writes checkpoints, history, first-batch tensor shapes, and sample
 outputs containing `coarse_lidar_bev`, `replacement_raw`, and
-`reconstruction_mask`.
+`reconstruction_mask`. When attention diagnostics are enabled, attention
+weights are requested only for the first validation batch that is saved; later
+validation batches do not materialize unused attention matrices.
 
 ## Masked residual diffusion
 
@@ -99,7 +137,7 @@ is identity; configurable training-set means and standard deviations are saved
 in checkpoints when supplied.
 
 ```powershell
-python -m training.train_residual_diffusion `
+python -m models.reconstruction_head.diffusion_process.train_residual_diffusion `
   --data-root "C:\path\to\grid_reliability_dataset" `
   --radar-root "C:\path\to\radar_v2_cache" `
   --coarse-checkpoint "C:\path\to\coarse_run\best_model.pt" `
@@ -118,9 +156,3 @@ than zero.
 The first implementation intentionally supports DDPM only. The sampler API is
 separate from the network and schedule so DDIM can be added later without
 changing the training model.
-
-U-Net fixed architecture:
-        "use_full_spatial_map": True,
-        "use_global_average_pooling": False,
-        "crop_global_context": False,
-        "num_cross_attention_blocks": 1,

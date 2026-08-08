@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from PFS_Radar_v2.radar_types import ClusterObservation, ProcessedFrame, TrackState
 
@@ -10,8 +11,9 @@ def compensate_doppler(
     sensor_velocity: np.ndarray,
     doppler_sign: str = "auto",
     sign_inference_min_speed_mps: float = 0.5,
+    doppler_period_mps: float | None = None,
 ) -> tuple[np.ndarray, int, np.ndarray]:
-    """Subtract the radial Doppler expected from ego motion."""
+    """Subtract expected ego Doppler, including K-Radar velocity wrapping."""
 
     points = np.asarray(points, dtype=np.float64)
     sensor_velocity = np.asarray(sensor_velocity, dtype=np.float64)
@@ -21,6 +23,8 @@ def compensate_doppler(
         raise ValueError("sensor_velocity must be a finite 3-vector")
     if doppler_sign not in {"auto", "1", "-1"}:
         raise ValueError("doppler_sign must be one of: auto, 1, -1")
+    if doppler_period_mps is not None and doppler_period_mps <= 0.0:
+        raise ValueError("doppler_period_mps must be positive when provided")
     ranges = np.linalg.norm(points[:, :3], axis=1)
     valid = ranges > 1e-6
     line_of_sight = np.zeros((len(points), 3), dtype=np.float64)
@@ -28,20 +32,23 @@ def compensate_doppler(
     expected_static = -(line_of_sight @ sensor_velocity)
     measured = points[:, 3]
 
+    def residual_for_sign(sign: int) -> np.ndarray:
+        residual = sign * measured - expected_static
+        if doppler_period_mps is not None:
+            half_period = 0.5 * doppler_period_mps
+            residual = (residual + half_period) % doppler_period_mps - half_period
+        return residual
+
     if doppler_sign == "auto":
         if np.linalg.norm(sensor_velocity) < sign_inference_min_speed_mps or not np.any(valid):
             sign = 1
         else:
-            positive_score = float(
-                np.median(np.abs(measured[valid] - expected_static[valid]))
-            )
-            negative_score = float(
-                np.median(np.abs(-measured[valid] - expected_static[valid]))
-            )
+            positive_score = float(np.median(np.abs(residual_for_sign(1)[valid])))
+            negative_score = float(np.median(np.abs(residual_for_sign(-1)[valid])))
             sign = 1 if positive_score <= negative_score else -1
     else:
         sign = int(doppler_sign)
-    residual = sign * measured - expected_static
+    residual = residual_for_sign(sign)
     residual[~valid] = 0.0
     return residual.astype(np.float32), sign, expected_static.astype(np.float32)
 
@@ -52,7 +59,7 @@ def dbscan_labels(
     eps_m: float,
     min_samples: int,
 ) -> np.ndarray:
-    """Small dependency-free 2-D DBSCAN for sparse radar detections."""
+    """2-D DBSCAN using a spatial index suitable for dense K-Radar cells."""
 
     xy = np.asarray(xy, dtype=np.float64)
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
@@ -67,53 +74,40 @@ def dbscan_labels(
     candidates = np.flatnonzero(candidate_mask & np.isfinite(xy).all(axis=1))
     if not len(candidates):
         return labels
-    cells: dict[tuple[int, int], list[int]] = {}
-    point_cells: dict[int, tuple[int, int]] = {}
-    for index in candidates:
-        cell = tuple(np.floor(xy[index] / eps_m).astype(np.int64))
-        point_cells[int(index)] = cell
-        cells.setdefault(cell, []).append(int(index))
-
-    eps_squared = eps_m * eps_m
-
-    def neighbors(index: int) -> list[int]:
-        cell = point_cells[index]
-        nearby: list[int] = []
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for other in cells.get((cell[0] + dx, cell[1] + dy), ()):
-                    if float(np.sum((xy[index] - xy[other]) ** 2)) <= eps_squared:
-                        nearby.append(other)
-        return nearby
-
-    visited: set[int] = set()
+    coordinates = xy[candidates]
+    tree = cKDTree(coordinates)
+    neighbor_counts = tree.query_ball_point(
+        coordinates, eps_m, return_length=True
+    )
+    core = neighbor_counts >= min_samples
+    visited = np.zeros(len(candidates), dtype=bool)
+    local_labels = np.full(len(candidates), -1, dtype=np.int32)
     cluster_id = 0
-    for seed in candidates:
-        seed = int(seed)
-        if seed in visited:
+    for seed in range(len(candidates)):
+        if visited[seed]:
             continue
-        visited.add(seed)
-        seed_neighbors = neighbors(seed)
-        if len(seed_neighbors) < min_samples:
+        visited[seed] = True
+        if not core[seed]:
             continue
-        labels[seed] = cluster_id
-        queue = list(seed_neighbors)
+        local_labels[seed] = cluster_id
+        queue = list(tree.query_ball_point(coordinates[seed], eps_m))
         queued = set(queue)
         cursor = 0
         while cursor < len(queue):
             point = queue[cursor]
             cursor += 1
-            if point not in visited:
-                visited.add(point)
-                point_neighbors = neighbors(point)
-                if len(point_neighbors) >= min_samples:
+            if not visited[point]:
+                visited[point] = True
+                if core[point]:
+                    point_neighbors = tree.query_ball_point(coordinates[point], eps_m)
                     for neighbor in point_neighbors:
                         if neighbor not in queued:
                             queued.add(neighbor)
                             queue.append(neighbor)
-            if labels[point] < 0:
-                labels[point] = cluster_id
+            if local_labels[point] < 0:
+                local_labels[point] = cluster_id
         cluster_id += 1
+    labels[candidates] = local_labels
     return labels
 
 

@@ -1,5 +1,4 @@
 from pathlib import Path
-from bisect import bisect_right
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import json
@@ -13,12 +12,25 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from Fault_Localization_Model.bev_utils import make_rgb_preview, project_lidar_bev, write_image  # noqa: E402
-from Fault_Localization_Model.aeva_dataset.hercules_discovery import (  # noqa: E402
-    hercules_source_metadata,
-    list_all_aeva_bins,
+from Fault_Localization_Model.bev_utils import (  # noqa: E402
+    HEIGHT_RANGE_M,
+    LIDAR_CHANNELS,
+    UPPER_HEIGHT_QUANTILE,
+    make_rgb_preview,
+    project_lidar_bev,
+    write_image,
 )
-from Fault_Localization_Model.aeva_dataset.temporal_split import select_temporal_split_bins  # noqa: E402
+from Fault_Localization_Model.kradar_dataset import (  # noqa: E402
+    K_RADAR_AZIMUTH_RANGE_RAD,
+    K_RADAR_ELEVATION_RANGE_RAD,
+    K_RADAR_RANGE_M,
+    kradar_source_metadata,
+    list_all_kradar_lidar_frames,
+    load_radar_from_lidar_transform,
+    radar_overlap_mask,
+    read_kradar_lidar_pcd,
+    select_temporal_split_frames,
+)
 from Fault_Localization_Model.config.cli import parse_args  # noqa: E402
 from Fault_Localization_Model.config.defaults import DEFAULT_FOG_ROOT, DEFAULT_INJECTOR_ROOT  # noqa: E402
 from Fault_Localization_Model.config.validation import validate_generation_args  # noqa: E402
@@ -29,7 +41,6 @@ from Fault_Localization_Model.data_injection_utils import (  # noqa: E402
     DEFAULT_WEATHER_THREADS,
     dilate_mask,
     filter_pointcloud,
-    read_hercules_aeva_bin,
 )
 from Fault_Localization_Model.fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
 from Fault_Localization_Model.io_utils import atomic_savez_compressed, write_csv_rows  # noqa: E402
@@ -42,13 +53,6 @@ from Fault_Localization_Model.reliability_maps import (  # noqa: E402
     point_counts_grid,
 )
 from Fault_Localization_Model.visualization_utils import add_reliability_colorbar, side_by_side  # noqa: E402
-from PFS_Radar.radar_data import (  # noqa: E402
-    RadarAlignmentUnavailableError,
-    scene_radar_resources,
-    scene_session_root,
-)
-
-
 LOGGER = logging.getLogger("create_grid_reliability_heatmaps")
 FAULT_PLAN = [
     ("rain_sim", 5),
@@ -62,7 +66,7 @@ FAULT_PLAN = [
 ]
 GROUND_TRUTH_METHOD = "point_id_provenance_v2_literature_fov"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
-GENERATOR_VERSION = 6
+GENERATOR_VERSION = 8
 RESUME_REQUIRED_ARRAYS = (
     "fault_heatmap",
     "reliability_map",
@@ -185,38 +189,6 @@ def clean_bev_rgb(points, x_range, y_range, resolution):
     return make_rgb_preview(layers), layers
 
 
-def has_causal_radar_within_delta(bin_path, data_root, max_delta_ms):
-    """Return whether a raw Aeva frame has the same causal radar anchor as Radar V2."""
-
-    timestamp = int(Path(bin_path).stem)
-    source_meta = hercules_source_metadata(Path(bin_path), Path(data_root))
-    try:
-        scene_root = scene_session_root(Path(data_root), source_meta)
-        radar_timestamps, _, _ = scene_radar_resources(str(scene_root.resolve()))
-        current_index = bisect_right(radar_timestamps, timestamp) - 1
-        if current_index < 0:
-            return False
-        age_ms = (timestamp - radar_timestamps[current_index]) / 1_000_000.0
-        return age_ms <= float(max_delta_ms)
-    except (FileNotFoundError, ValueError, RadarAlignmentUnavailableError):
-        return False
-
-
-def filter_bins_with_causal_radar(bins, data_root, max_delta_ms):
-    eligible = [
-        bin_path
-        for bin_path in bins
-        if has_causal_radar_within_delta(bin_path, data_root, max_delta_ms)
-    ]
-    skipped = len(bins) - len(eligible)
-    if not eligible:
-        raise FileNotFoundError(
-            "No LiDAR frames remain after requiring causal radar within "
-            f"{max_delta_ms:g} ms."
-        )
-    return eligible, skipped
-
-
 def worker_init(context):
     global WORKER_CONTEXT
     WORKER_CONTEXT = dict(context)
@@ -225,22 +197,30 @@ def worker_init(context):
 
 
 @lru_cache(maxsize=2)
-def _load_clean_artifacts(bin_path_text):
+def _load_clean_artifacts(lidar_path_text):
     """Load and project one immutable clean source frame per worker."""
 
     if WORKER_CONTEXT is None:
         raise RuntimeError("Worker context was not initialized.")
     cfg = WORKER_CONTEXT
-    bin_path = Path(bin_path_text)
-    clean_raw = read_hercules_aeva_bin(bin_path)
-    clean_points = filter_pointcloud(
+    lidar_path = Path(lidar_path_text)
+    source_meta = kradar_source_metadata(lidar_path, cfg["data_root"])
+    radar_from_lidar = load_radar_from_lidar_transform(
+        source_meta["calibration_path"]
+    )
+    clean_raw = read_kradar_lidar_pcd(lidar_path)
+    _, range_mask = filter_pointcloud(
         clean_raw,
         cfg["min_range"],
         cfg["max_range"],
-    )[:, :4]
+        return_mask=True,
+    )
+    overlap_mask = radar_overlap_mask(clean_raw, radar_from_lidar)
+    clean_points = clean_raw[range_mask & overlap_mask, :4]
     if len(clean_points) == 0:
         raise ValueError(
-            f"No valid LiDAR points remain after range filtering {bin_path}"
+            "No LiDAR points remain after range and K-Radar FOV filtering "
+            f"{lidar_path}"
         )
     clean_point_ids = np.arange(len(clean_points), dtype=np.int64)
     clean_rgb, clean_layers = clean_bev_rgb(
@@ -254,6 +234,7 @@ def _load_clean_artifacts(bin_path_text):
         clean_point_ids,
         clean_rgb,
         clean_layers["raw_density"],
+        radar_from_lidar,
     )
 
 
@@ -264,12 +245,12 @@ def chronological_source_batches(tasks, batch_size):
         raise ValueError("batch_size must be at least 1")
     groups = {}
     for task in tasks:
-        groups.setdefault(task["bin_path"], []).append(task)
+        groups.setdefault(task["lidar_path"], []).append(task)
 
     batches = []
     current = []
-    for bin_path in sorted(groups, key=lambda value: value.lower()):
-        group = sorted(groups[bin_path], key=lambda task: task["index"])
+    for lidar_path in sorted(groups, key=lambda value: value.lower()):
+        group = sorted(groups[lidar_path], key=lambda task: task["index"])
         if current and len(current) + len(group) > batch_size:
             batches.append(current)
             current = []
@@ -385,10 +366,13 @@ def load_matching_existing_sample(
         return None
 
     expected = {
-        "dataset": "Hercules",
+        "dataset": "K-Radar",
         "scene": source_meta["scene"],
         "session": source_meta["session"],
         "source_relative_path": source_meta["source_relative_path"],
+        "sequence": source_meta["sequence"],
+        "lidar_index": source_meta["lidar_index"],
+        "radar_index": source_meta["radar_index"],
         "timestamp": timestamp,
         "fault": fault,
         "severity": severity,
@@ -408,6 +392,12 @@ def load_matching_existing_sample(
         "generation_seed": cfg["generation_seed"],
         "injection_seed": injection_seed,
         "weather_threads": DEFAULT_WEATHER_THREADS,
+        "radar_azimuth_range_rad": list(K_RADAR_AZIMUTH_RANGE_RAD),
+        "radar_elevation_range_rad": list(K_RADAR_ELEVATION_RANGE_RAD),
+        "radar_range_m": list(K_RADAR_RANGE_M),
+        "lidar_channels": list(LIDAR_CHANNELS),
+        "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
+        "lidar_height_range_m": list(HEIGHT_RANGE_M),
     }
     for key, expected_value in expected.items():
         if metadata.get(key) != expected_value:
@@ -457,7 +447,10 @@ def build_manifest_row(
         "day": metadata.get("day", ""),
         "session": metadata.get("session", ""),
         "source_relative_path": metadata.get("source_relative_path", ""),
-        "source_aeva_dir": metadata.get("source_aeva_dir", ""),
+        "source_lidar_dir": metadata.get("source_lidar_dir", ""),
+        "sequence": metadata.get("sequence", ""),
+        "lidar_index": metadata.get("lidar_index", ""),
+        "radar_index": metadata.get("radar_index", ""),
         "timestamp": metadata.get("timestamp", ""),
         "fault": metadata.get("fault", ""),
         "severity": metadata.get("severity", ""),
@@ -504,15 +497,15 @@ def create_one_sample(task):
 
     cfg = WORKER_CONTEXT
     index = task["index"]
-    bin_path = Path(task["bin_path"])
+    lidar_path = Path(task["lidar_path"])
     data_root = Path(cfg["data_root"])
     output_root = Path(cfg["output_root"])
     fault = task["fault"]
     severity = task["severity"]
     injection_seed = task["injection_seed"]
 
-    timestamp = bin_path.stem
-    source_meta = hercules_source_metadata(bin_path, data_root)
+    source_meta = kradar_source_metadata(lidar_path, data_root)
+    timestamp = source_meta["timestamp"]
     stem = f"{index:04d}_{timestamp}_{fault}_s{severity}"
 
     fault_png = output_root / f"{stem}_fault_heatmap.png"
@@ -551,7 +544,8 @@ def create_one_sample(task):
         cached_clean_point_ids,
         clean_rgb,
         clean_density,
-    ) = _load_clean_artifacts(str(bin_path))
+        radar_from_lidar,
+    ) = _load_clean_artifacts(str(lidar_path))
     # Fault injectors receive per-sample copies so cached clean artifacts cannot
     # leak mutations between different fault realizations of the same frame.
     clean_points = cached_clean_points.copy()
@@ -572,7 +566,12 @@ def create_one_sample(task):
         cfg["max_range"],
         return_mask=True,
     )
-    active_mask = range_mask & (injection.injector_labels != 0)
+    overlap_mask = radar_overlap_mask(injection.points, radar_from_lidar)
+    active_mask = (
+        range_mask
+        & overlap_mask
+        & (injection.injector_labels != 0)
+    )
     faulty_points = injection.points[active_mask]
     faulty_point_ids = injection.point_ids[active_mask]
     faulty_source_ids = injection.source_ids[active_mask]
@@ -680,13 +679,19 @@ def create_one_sample(task):
         write_image(marked_png, marked_rgb)
         write_image(comparison_png, comparison_rgb)
     sample_metadata = {
-        "dataset": "Hercules",
+        "dataset": "K-Radar",
         "day": source_meta["day"],
         "scene": source_meta["scene"],
         "session": source_meta["session"],
+        "sequence": source_meta["sequence"],
+        "lidar_index": source_meta["lidar_index"],
+        "radar_index": source_meta["radar_index"],
         "source_relative_path": source_meta["source_relative_path"],
-        "source_aeva_dir": source_meta["source_aeva_dir"],
+        "source_lidar_dir": source_meta["source_lidar_dir"],
+        "label_relative_path": source_meta["label_relative_path"],
+        "radar_relative_path": source_meta["radar_relative_path"],
         "timestamp": timestamp,
+        "timestamp_ns": source_meta["timestamp_ns"],
         "fault": fault,
         "severity": severity,
         "grid_size": cfg["grid_size"],
@@ -699,6 +704,15 @@ def create_one_sample(task):
         "resolution": cfg["resolution"],
         "min_range": cfg["min_range"],
         "max_range": cfg["max_range"],
+        "lidar_sensor": "os2-64",
+        "radar_azimuth_range_rad": list(K_RADAR_AZIMUTH_RANGE_RAD),
+        "radar_elevation_range_rad": list(K_RADAR_ELEVATION_RANGE_RAD),
+        "radar_range_m": list(K_RADAR_RANGE_M),
+        "lidar_channels": list(LIDAR_CHANNELS),
+        "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
+        "lidar_height_range_m": list(HEIGHT_RANGE_M),
+        "radar_from_lidar": radar_from_lidar.tolist(),
+        "spatial_support": "intersection of LiDAR returns and K-Radar polar FOV",
         "fog_noise": fog_counts.get("fog_noise", ""),
         "ground_truth_method": GROUND_TRUTH_METHOD,
         "visualization_method": VISUALIZATION_METHOD,
@@ -771,13 +785,15 @@ def main():
     data_root = Path(args.data_root)
     output_root = Path(args.output_root)
 
-    #Find All available Lidar .bin files
-    bins, aeva_dirs = list_all_aeva_bins(data_root)
-    source_description = f"{len(aeva_dirs)} Aeva folders under {data_root}"
+    # Find every locally available os2-64 frame with an exact pc10p pairing.
+    lidar_frames, sequence_dirs = list_all_kradar_lidar_frames(data_root)
+    source_description = (
+        f"{len(sequence_dirs)} K-Radar sequences under {data_root}"
+    )
     #Split into Train/Val/Test given the time in which the frame is located
     if args.temporal_split:
-        bins, split_counts = select_temporal_split_bins(
-            bins,
+        lidar_frames, split_counts = select_temporal_split_frames(
+            lidar_frames,
             data_root,
             args.temporal_split,
             train_ratio=args.train_ratio,
@@ -786,42 +802,36 @@ def main():
         LOGGER.info(
             "Temporal split %s selected %d frames using train=%.3f val=%.3f test=%.3f",
             args.temporal_split,
-            len(bins),
+            len(lidar_frames),
             args.train_ratio,
             args.val_ratio,
             1.0 - args.train_ratio - args.val_ratio,
         )
-        for source_dir, total_count, split_count in split_counts:
+        for sequence, total_count, split_count in split_counts:
             LOGGER.debug(
                 "Temporal split %s: %s -> %d/%d frames",
                 args.temporal_split,
-                source_dir,
+                sequence,
                 split_count,
                 total_count,
             )
-    if not bins:
-        raise FileNotFoundError("No Hercules Aeva frames selected.")
-    #Remove frames without matching radar
-    if args.require_causal_radar_max_delta_ms is not None:
-        before_count = len(bins)
-        bins, skipped_no_radar = filter_bins_with_causal_radar(
-            bins,
-            data_root,
-            args.require_causal_radar_max_delta_ms,
-        )
-        LOGGER.info(
-            "Causal radar prefilter <= %.1f ms kept %d/%d raw LiDAR frames "
-            "and removed %d before sample generation",
-            args.require_causal_radar_max_delta_ms,
-            len(bins),
-            before_count,
-            skipped_no_radar,
-        )
+    if not lidar_frames:
+        raise FileNotFoundError("No paired K-Radar LiDAR frames selected.")
     #Choose Faults and Samples
     plan = build_fault_plan(args.fault_plan, args.faults, args.severities, FAULT_PLAN)
-    LOGGER.info("Selected %d frame candidates from %s", len(bins), source_description)
+    LOGGER.info(
+        "Selected %d paired frame candidates from %s",
+        len(lidar_frames),
+        source_description,
+    )
     LOGGER.info("Fault plan: %s", ", ".join(f"{fault}:S{severity}" for fault, severity in plan))
-    samples = choose_samples(bins, args.num_samples, args.seed, plan, shuffle=not args.no_shuffle)
+    samples = choose_samples(
+        lidar_frames,
+        args.num_samples,
+        args.seed,
+        plan,
+        shuffle=not args.no_shuffle,
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     #Store Settings by sample processing workers
     worker_context = {
@@ -845,7 +855,7 @@ def main():
     tasks = [
         {
             "index": index,
-            "bin_path": str(bin_path),
+            "lidar_path": str(lidar_path),
             "fault": fault,
             "severity": severity,
             "injection_seed": int(
@@ -854,7 +864,7 @@ def main():
                 )[0]
             ),
         }
-        for index, (bin_path, fault, severity) in enumerate(samples)
+        for index, (lidar_path, fault, severity) in enumerate(samples)
     ]
     #Group Tasks into batches
     task_batches = chronological_source_batches(

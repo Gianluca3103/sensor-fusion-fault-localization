@@ -8,21 +8,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .encoders import BEVEncoder, _group_count
+from ..encoders import BEVEncoder, _group_count
 from .coarse_config import CoarseReconstructionConfig
-
-
-def _validate_binary_mask(
-    mask: torch.Tensor,
-    name: str,
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    expected = (reference.shape[0], 1, *reference.shape[-2:])
-    if tuple(mask.shape) != expected:
-        raise ValueError(f"{name} must have shape {expected}, got {tuple(mask.shape)}")
-    if not torch.isfinite(mask).all() or not torch.all((mask == 0) | (mask == 1)):
-        raise ValueError(f"{name} must be a finite binary mask containing only 0 and 1")
-    return mask.to(device=reference.device, dtype=reference.dtype)
 
 
 class ResidualCoarseBlock(nn.Module):
@@ -96,7 +83,7 @@ class GlobalLidarEncoder(nn.Module):
         return self.encoder.out_channels[-1]
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.encoder(tensor).bottleneck
+        return self.encoder(tensor)
 
 
 class GlobalRadarEncoder(nn.Module):
@@ -113,7 +100,7 @@ class GlobalRadarEncoder(nn.Module):
         return self.encoder.out_channels[-1]
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.encoder(tensor).bottleneck
+        return self.encoder(tensor)
 
 
 class GlobalFusionBlock(nn.Module):
@@ -321,27 +308,6 @@ class CoarseReconstructionModel(nn.Module):
         *,
         return_attention_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
-        if faulty_lidar_bev.ndim != 4 or radar_bev.ndim != 4:
-            raise ValueError("LiDAR and radar inputs must have shape [B,C,H,W]")
-        if faulty_lidar_bev.shape[1] != self.config.lidar_channels:
-            raise ValueError("faulty_lidar_bev has the wrong channel count")
-        if radar_bev.shape[1] != self.config.radar_channels:
-            raise ValueError("radar_bev has the wrong channel count")
-        if faulty_lidar_bev.shape[0] != radar_bev.shape[0] or (
-            faulty_lidar_bev.shape[-2:] != radar_bev.shape[-2:]
-        ):
-            raise ValueError("LiDAR and radar must share batch and spatial dimensions")
-        reconstruction_mask = _validate_binary_mask(
-            reconstruction_mask, "reconstruction_mask", faulty_lidar_bev
-        )
-        healthy_context_mask = _validate_binary_mask(
-            healthy_context_mask, "healthy_context_mask", faulty_lidar_bev
-        )
-        halo_mask = _validate_binary_mask(halo_mask, "halo_mask", faulty_lidar_bev)
-        if torch.any(reconstruction_mask * healthy_context_mask):
-            raise ValueError("healthy_context_mask must not overlap reconstruction_mask")
-        if torch.any(healthy_context_mask * (1.0 - halo_mask)):
-            raise ValueError("healthy_context_mask must be contained inside halo_mask")
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
         active_mask = torch.maximum(reconstruction_mask, halo_mask)
 
@@ -357,14 +323,10 @@ class CoarseReconstructionModel(nn.Module):
             ),
             dim=1,
         )
-        if local_input.shape[1] != self.config.local_input_channels:
-            raise AssertionError("Direct local input channel contract was violated")
         skip_features, local_bottleneck = self.local_unet_encoder(local_input)
 
         h_lidar_global = self.global_lidar_encoder(erased_lidar_bev)
         h_radar_global = self.global_radar_encoder(radar_bev)
-        if h_lidar_global.shape[-2:] != h_radar_global.shape[-2:]:
-            raise ValueError("Global LiDAR and radar feature maps must align")
         global_context_map = self.global_fusion(
             torch.cat((h_lidar_global, h_radar_global), dim=1)
         )
@@ -387,8 +349,6 @@ class CoarseReconstructionModel(nn.Module):
                 align_corners=False,
             )
         replacement_raw = self.replacement_head(decoder_feature)
-        if replacement_raw.shape != faulty_lidar_bev.shape:
-            raise AssertionError("Replacement output must match the LiDAR BEV shape")
         coarse_lidar_bev = (
             (1.0 - reconstruction_mask) * faulty_lidar_bev
             + reconstruction_mask * replacement_raw

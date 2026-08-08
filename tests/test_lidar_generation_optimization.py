@@ -94,10 +94,10 @@ class LidarGenerationOptimizationTests(unittest.TestCase):
 
     def test_chronological_batches_preserve_tasks_and_group_duplicates(self):
         tasks = [
-            {"index": 0, "bin_path": "scene/z/30.bin", "injection_seed": 10},
-            {"index": 1, "bin_path": "scene/a/20.bin", "injection_seed": 11},
-            {"index": 2, "bin_path": "scene/a/10.bin", "injection_seed": 12},
-            {"index": 3, "bin_path": "scene/a/20.bin", "injection_seed": 13},
+            {"index": 0, "lidar_path": "scene/z/30.pcd", "injection_seed": 10},
+            {"index": 1, "lidar_path": "scene/a/20.pcd", "injection_seed": 11},
+            {"index": 2, "lidar_path": "scene/a/10.pcd", "injection_seed": 12},
+            {"index": 3, "lidar_path": "scene/a/20.pcd", "injection_seed": 13},
         ]
 
         batches = chronological_source_batches(tasks, batch_size=2)
@@ -110,14 +110,14 @@ class LidarGenerationOptimizationTests(unittest.TestCase):
         duplicate_batch = [
             batch
             for batch in batches
-            if any(task["bin_path"] == "scene/a/20.bin" for task in batch)
+            if any(task["lidar_path"] == "scene/a/20.pcd" for task in batch)
         ]
         self.assertEqual(len(duplicate_batch), 1)
         self.assertEqual(
             [
                 task["index"]
                 for task in duplicate_batch[0]
-                if task["bin_path"] == "scene/a/20.bin"
+                if task["lidar_path"] == "scene/a/20.pcd"
             ],
             [1, 3],
         )

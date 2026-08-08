@@ -1,7 +1,8 @@
+"""K-Radar tensor-derived adaptive stacking and Doppler-tracked BEV cache."""
+
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 import json
 import math
@@ -10,25 +11,20 @@ from pathlib import Path
 import numpy as np
 
 from Fault_Localization_Model.io_utils import atomic_savez_compressed
-from Fault_Localization_Model.sample_utils import load_sample_metadata
-from PFS_Radar.radar_data import (
-    RadarAlignmentUnavailableError,
-    find_named_file as _find_named_file,
-    load_ground_truth_poses,
-    load_lidar_to_radar_transform as _load_lidar_to_radar_transform,
-    load_named_transform as _load_named_transform,
-    radar_cache_path,
-    read_continental_bin as _read_continental_bin,
-    scene_name_from_metadata,
-    scene_radar_resources,
-    scene_session_root,
-    session_name_from_metadata,
-    transform_xyz,
+from Fault_Localization_Model.kradar_dataset import (
+    kradar_sequence_root,
+    load_radar_from_lidar_transform,
+    parse_label_frame,
 )
-from PFS_Radar_v2.pose import (
-    interpolated_pose_from_sequence,
-    pose_velocity,
-    select_adaptive_indices,
+from PFS_Radar_v2.pose import pose_velocity, select_adaptive_indices
+from PFS_Radar_v2.radar_types import (
+    AdaptiveStackConfig,
+    ClusterObservation,
+    DopplerTrackingConfig,
+    ProcessedFrame,
+    RadarAlignmentUnavailableError,
+    SelectedFrame,
+    TrackState,
 )
 from PFS_Radar_v2.tracking import (
     associate_tracks,
@@ -36,78 +32,183 @@ from PFS_Radar_v2.tracking import (
     dbscan_labels,
     make_observations,
 )
-from PFS_Radar_v2.radar_types import (
-    AdaptiveStackConfig,
-    ClusterObservation,
-    DopplerTrackingConfig,
-    ProcessedFrame,
-    SelectedFrame,
-    TrackState,
-)
 
 
-RADAR_CACHE_VERSION = 5
-POLICY_NAME = "adaptive_pose_doppler_tracking_interpolated_v3"
+RADAR_CACHE_VERSION = 7
+POLICY_NAME = "kradar_pc10p_power_height_doppler_v2"
 CHANNELS = [
     "static_occupancy",
-    "support_normalized_static_density",
+    "normalized_power",
     "tracked_dynamic_speed",
-    "dynamic_track_occupancy",
+    "robust_upper_height",
 ]
-SCENE_RESOURCE_NAMES = {
-    "continental_gt.txt",
-    "aeva_gt.txt",
-    "imu_lidar.txt",
-    "continental_lidar.txt",
-}
+POWER_NORMALIZATION_QUANTILE = 0.99
+UPPER_HEIGHT_QUANTILE = 0.90
+HEIGHT_RANGE_M = (-3.0, 5.0)
+K_RADAR_POINT_COLUMNS = [
+    "x_m",
+    "y_m",
+    "z_m",
+    "power",
+    "doppler_mps",
+    "range_m",
+    "azimuth_rad",
+    "elevation_rad",
+    "range_index",
+    "azimuth_index",
+    "elevation_index",
+]
 
 
-@lru_cache(maxsize=256)
-def _scene_resource_index(root: Path) -> dict[str, Path]:
-    """Discover all Radar v2 scene resources in one recursive traversal."""
-
-    candidates: dict[str, list[Path]] = {}
-    for path in root.rglob("*"):
-        lowered = path.name.lower()
-        if lowered in SCENE_RESOURCE_NAMES and path.is_file():
-            candidates.setdefault(lowered, []).append(path)
-    return {
-        name: min(paths, key=lambda path: len(path.parts))
-        for name, paths in candidates.items()
-    }
+def transform_xyz(xyz: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    xyz = np.asarray(xyz, dtype=np.float64)
+    transform = np.asarray(transform, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must have shape [N,3], got {xyz.shape}")
+    if transform.shape != (4, 4):
+        raise ValueError(f"transform must have shape [4,4], got {transform.shape}")
+    homogeneous = np.column_stack((xyz, np.ones(len(xyz), dtype=np.float64)))
+    return (transform @ homogeneous.T).T[:, :3].astype(np.float32)
 
 
-def find_named_file(root: Path, name: str) -> Path:
-    """Reuse a single scene-resource index within each worker."""
+@dataclass(frozen=True)
+class KRadarSequenceIndex:
+    sequence: str
+    timestamps: tuple[int, ...]
+    poses: np.ndarray
+    radar_indices: tuple[str, ...]
+    lidar_indices: tuple[str, ...]
+    radar_paths: tuple[Path, ...]
 
-    lowered = name.lower()
-    if lowered not in SCENE_RESOURCE_NAMES:
-        return _find_named_file(root, name)
-    try:
-        return _scene_resource_index(root)[lowered]
-    except KeyError as exc:
-        raise FileNotFoundError(f"No {name} under {root}") from exc
-
-
-@lru_cache(maxsize=256)
-def load_named_transform(path: Path, key: str) -> np.ndarray:
-    """Cache immutable calibration matrices within each worker."""
-
-    return _load_named_transform(path, key)
-
-
-@lru_cache(maxsize=128)
-def load_lidar_to_radar_transform(path: Path) -> np.ndarray:
-    """Cache the immutable Continental-to-LiDAR calibration."""
-
-    return _load_lidar_to_radar_transform(path)
+    def position(self, radar_index: str | int) -> int:
+        normalized = f"{int(radar_index):05d}"
+        try:
+            return self.radar_indices.index(normalized)
+        except ValueError as exc:
+            raise RadarAlignmentUnavailableError(
+                f"K-Radar sequence {self.sequence} has no pc10p frame {normalized}"
+            ) from exc
 
 
-@lru_cache(maxsize=256)
-def read_continental_bin(path: Path) -> np.ndarray:
-    """Reuse raw radar frames across overlapping chronological windows."""
+def kradar_cache_path(root: Path, sequence: str | int, radar_index: str | int) -> Path:
+    sequence_text = str(int(sequence))
+    radar_text = f"{int(radar_index):05d}"
+    return Path(root) / sequence_text / f"{radar_text}.npz"
 
-    return _read_continental_bin(path)
+
+def _odometry_path(odometry_root: Path, sequence: str) -> Path:
+    candidates = (
+        Path(odometry_root) / f"gt_{int(sequence):02d}.txt",
+        Path(odometry_root) / "gt" / f"gt_{int(sequence):02d}.txt",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"No K-Radar odometry for sequence {sequence} under {odometry_root}"
+    )
+
+
+@lru_cache(maxsize=64)
+def _load_sequence_index_cached(
+    dataset_root_text: str,
+    radar_point_root_text: str,
+    odometry_root_text: str,
+    sequence: str,
+) -> KRadarSequenceIndex:
+    dataset_root = Path(dataset_root_text)
+    radar_point_root = Path(radar_point_root_text)
+    odometry_root = Path(odometry_root_text)
+    sequence_root = kradar_sequence_root(dataset_root, sequence)
+    label_paths = sorted((sequence_root / "info_label").glob("*.txt"))
+    if not label_paths:
+        raise FileNotFoundError(
+            f"No K-Radar labels under {sequence_root / 'info_label'}"
+        )
+
+    pose_rows = np.loadtxt(_odometry_path(odometry_root, sequence), dtype=np.float64)
+    pose_rows = np.atleast_2d(pose_rows)
+    if pose_rows.shape != (len(label_paths), 12):
+        raise ValueError(
+            f"K-Radar sequence {sequence} has {len(label_paths)} labels but odometry "
+            f"shape {pose_rows.shape}; expected [{len(label_paths)},12]"
+        )
+    all_poses = np.repeat(np.eye(4, dtype=np.float64)[None], len(pose_rows), axis=0)
+    all_poses[:, :3, :4] = pose_rows.reshape(-1, 3, 4)
+
+    timestamps: list[int] = []
+    poses: list[np.ndarray] = []
+    radar_indices: list[str] = []
+    lidar_indices: list[str] = []
+    radar_paths: list[Path] = []
+    for row, label_path in enumerate(label_paths):
+        radar_index, lidar_index, timestamp = parse_label_frame(label_path)
+        radar_path = radar_point_root / sequence / f"rpc_{radar_index}.npy"
+        if not radar_path.is_file():
+            continue
+        timestamps.append(timestamp)
+        poses.append(all_poses[row])
+        radar_indices.append(radar_index)
+        lidar_indices.append(lidar_index)
+        radar_paths.append(radar_path)
+    if not radar_paths:
+        raise FileNotFoundError(
+            f"No pc10p frames for K-Radar sequence {sequence} under {radar_point_root}"
+        )
+    if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
+        raise ValueError(f"K-Radar sequence {sequence} timestamps are not increasing")
+    return KRadarSequenceIndex(
+        sequence=sequence,
+        timestamps=tuple(timestamps),
+        poses=np.stack(poses),
+        radar_indices=tuple(radar_indices),
+        lidar_indices=tuple(lidar_indices),
+        radar_paths=tuple(radar_paths),
+    )
+
+
+def load_sequence_index(
+    dataset_root: Path,
+    radar_point_root: Path,
+    odometry_root: Path,
+    sequence: str | int,
+) -> KRadarSequenceIndex:
+    return _load_sequence_index_cached(
+        str(Path(dataset_root).resolve()),
+        str(Path(radar_point_root).resolve()),
+        str(Path(odometry_root).resolve()),
+        str(int(sequence)),
+    )
+
+
+@lru_cache(maxsize=32)
+def load_kradar_pc10p(path: Path) -> np.ndarray:
+    """Load the tensor-derived K-Radar pc10p format as float32."""
+
+    points = np.load(Path(path), allow_pickle=False)
+    if points.ndim != 2 or points.shape[1] != len(K_RADAR_POINT_COLUMNS):
+        raise ValueError(
+            f"K-Radar pc10p file {path} must have shape [N,11], got {points.shape}"
+        )
+    points = np.asarray(points, dtype=np.float32)
+    if not np.isfinite(points).all():
+        raise ValueError(f"K-Radar pc10p file contains non-finite values: {path}")
+    points.setflags(write=False)
+    return points
+
+
+@lru_cache(maxsize=64)
+def load_lidar_from_radar_transform(
+    calibration_path: Path,
+    radar_to_lidar_z_m: float = 0.7,
+) -> np.ndarray:
+    """Load K-Radar's translation-only radar/LiDAR calibration."""
+
+    transform = np.linalg.inv(
+        load_radar_from_lidar_transform(calibration_path, radar_to_lidar_z_m)
+    )
+    transform.setflags(write=False)
+    return transform
 
 
 def _grid_indices(
@@ -126,12 +227,60 @@ def _grid_indices(
         & (xyz[:, 1] < y_range[1])
     )
     cols = np.floor((xyz[:, 1] - y_range[0]) / resolution).astype(np.int32)
-    rows_from_bottom = np.floor(
-        (xyz[:, 0] - x_range[0]) / resolution
-    ).astype(np.int32)
+    rows_from_bottom = np.floor((xyz[:, 0] - x_range[0]) / resolution).astype(
+        np.int32
+    )
     rows = height - 1 - rows_from_bottom
     valid &= (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
     return rows, cols, valid
+
+
+def _normalize_cell_power(cell_power: np.ndarray) -> np.ndarray:
+    """Robustly log-normalize non-negative cell power into [0, 1]."""
+
+    output = np.zeros_like(cell_power, dtype=np.float32)
+    occupied = cell_power > 0.0
+    if not np.any(occupied):
+        return output
+    scale = float(np.quantile(cell_power[occupied], POWER_NORMALIZATION_QUANTILE))
+    if scale <= 0.0:
+        return output
+    output[occupied] = np.log1p(np.minimum(cell_power[occupied], scale)) / np.log1p(
+        scale
+    )
+    return output
+
+
+def _upper_height_grid(
+    flat_cells: np.ndarray,
+    heights_m: np.ndarray,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Return normalized per-cell upper-height quantiles with empty cells at zero."""
+
+    output = np.zeros(shape[0] * shape[1], dtype=np.float32)
+    if flat_cells.size == 0:
+        return output.reshape(shape)
+
+    z_min, z_max = HEIGHT_RANGE_M
+    plausible = (heights_m >= z_min) & (heights_m <= z_max)
+    flat_cells = flat_cells[plausible]
+    heights_m = heights_m[plausible]
+    if flat_cells.size == 0:
+        return output.reshape(shape)
+
+    order = np.lexsort((heights_m, flat_cells))
+    sorted_cells = flat_cells[order]
+    sorted_heights = heights_m[order]
+    starts = np.flatnonzero(np.r_[True, sorted_cells[1:] != sorted_cells[:-1]])
+    ends = np.r_[starts[1:], len(sorted_cells)]
+    counts = ends - starts
+    offsets = np.ceil(UPPER_HEIGHT_QUANTILE * counts).astype(np.int64) - 1
+    upper_heights = sorted_heights[starts + offsets]
+
+    normalized = (upper_heights - z_min) / (z_max - z_min)
+    output[sorted_cells[starts]] = normalized.astype(np.float32)
+    return output.reshape(shape)
 
 
 def project_adaptive_bev(
@@ -144,12 +293,15 @@ def project_adaptive_bev(
     resolution: float,
     tracking_config: DopplerTrackingConfig,
 ) -> np.ndarray:
+    """Project K-Radar frames as occupancy, power, speed, and upper height."""
+
     tracking_config.validate()
     height = int(np.ceil((x_range[1] - x_range[0]) / resolution))
     width = int(np.ceil((y_range[1] - y_range[0]) / resolution))
     output = np.zeros((4, height, width), dtype=np.float32)
-    density = np.zeros((height, width), dtype=np.float32)
-    effective_support = sum(frame.weight for frame in frames)
+    cell_power = np.zeros((height, width), dtype=np.float32)
+    height_cells = []
+    height_values = []
 
     for frame in frames:
         static_points = frame.points[~frame.dynamic_mask, :3]
@@ -158,13 +310,27 @@ def project_adaptive_bev(
                 static_points, x_range, y_range, resolution
             )
             rows, cols = rows[valid], cols[valid]
-            output[0, rows, cols] = 1.0
-            np.add.at(density, (rows, cols), frame.weight)
+            supported_cells = np.unique(rows.astype(np.int64) * width + cols)
+            supported_rows = supported_cells // width
+            supported_cols = supported_cells % width
+            output[0, supported_rows, supported_cols] = 1.0
 
-    if effective_support > 0.0:
-        normalized_density = density / effective_support
-        output[1] = np.clip(
-            np.log1p(normalized_density) / np.log(2.0), 0.0, 1.0
+        rows, cols, valid = _grid_indices(
+            frame.points[:, :3], x_range, y_range, resolution
+        )
+        if np.any(valid):
+            rows, cols = rows[valid], cols[valid]
+            weighted_power = np.maximum(frame.points[valid, 4], 0.0) * frame.weight
+            np.maximum.at(cell_power, (rows, cols), weighted_power)
+            height_cells.append(rows.astype(np.int64) * width + cols)
+            height_values.append(frame.points[valid, 2])
+
+    output[1] = _normalize_cell_power(cell_power)
+    if height_cells:
+        output[3] = _upper_height_grid(
+            np.concatenate(height_cells),
+            np.concatenate(height_values),
+            (height, width),
         )
 
     for frame_index, frame_observations in enumerate(observations):
@@ -178,25 +344,16 @@ def project_adaptive_bev(
             if confirmed:
                 points[:, :2] += track.velocity[None, :] * age_s
                 speed = float(np.linalg.norm(track.velocity))
-                confidence = min(1.0, track.hits / tracking_config.min_track_hits)
             else:
                 speed = float(
                     np.max(np.abs(frame.doppler_residual_mps[observation.point_indices]))
                 )
-                confidence = 0.5
             rows, cols, valid = _grid_indices(points, x_range, y_range, resolution)
             rows, cols = rows[valid], cols[valid]
             np.maximum.at(
                 output[2],
                 (rows, cols),
-                np.float32(
-                    np.clip(
-                        speed / tracking_config.max_abs_velocity_mps, 0.0, 1.0
-                    )
-                ),
-            )
-            np.maximum.at(
-                output[3], (rows, cols), np.float32(confidence)
+                np.float32(np.clip(speed / tracking_config.max_abs_velocity_mps, 0, 1)),
             )
             assigned[observation.point_indices] = True
 
@@ -209,163 +366,88 @@ def project_adaptive_bev(
             np.maximum.at(
                 output[2],
                 (rows, cols),
-                np.clip(
-                    residual[valid] / tracking_config.max_abs_velocity_mps,
-                    0.0,
-                    1.0,
-                ),
+                np.clip(residual[valid] / tracking_config.max_abs_velocity_mps, 0, 1),
             )
-            np.maximum.at(output[3], (rows, cols), np.float32(0.25))
     return output
 
 
-def _select_scene_frames(
-    scene_root: Path,
-    lidar_timestamp: int,
-    max_delta_ms: float,
+def _select_sequence_frames(
+    sequence_index: KRadarSequenceIndex,
+    current_position: int,
     config: AdaptiveStackConfig,
-) -> tuple[list[SelectedFrame], float]:
-    timestamps, path_texts, _ = scene_radar_resources(str(scene_root.resolve()))
-    current_index = bisect_right(timestamps, lidar_timestamp) - 1
-    if current_index < 0:
-        raise RadarAlignmentUnavailableError(
-            f"No causal radar frame exists at or before LiDAR timestamp {lidar_timestamp}"
-        )
-    delta_ms = (timestamps[current_index] - lidar_timestamp) / 1_000_000.0
-    if -delta_ms > max_delta_ms:
-        raise RadarAlignmentUnavailableError(
-            f"Latest causal radar frame is {-delta_ms:.1f} ms before LiDAR frame; "
-            f"limit is {max_delta_ms:.1f} ms"
-        )
-
-    continental_gt = find_named_file(scene_root, "Continental_gt.txt")
-    pose_timestamps, continental_poses = load_ground_truth_poses(
-        str(continental_gt.resolve())
-    )
-    lidar_reference_pose, lidar_reference_delta_ms = interpolated_pose_from_sequence(
-        pose_timestamps,
-        continental_poses,
-        lidar_timestamp,
-    )
-    selected_pose_rows: list[np.ndarray] = []
-    pose_deltas: list[float] = []
-    oldest_timestamp = lidar_timestamp - int(config.max_age_s * 1_000_000_000)
-    candidate_start = bisect_left(
-        timestamps,
-        oldest_timestamp,
-        0,
-        current_index + 1,
-    )
-    if config.max_frames is not None:
-        candidate_start = max(
-            candidate_start,
-            current_index - config.max_frames + 1,
-        )
-    for index in range(candidate_start, current_index + 1):
-        pose, pose_delta_ms = interpolated_pose_from_sequence(
-            pose_timestamps,
-            continental_poses,
-            timestamps[index],
-        )
-        selected_pose_rows.append(pose)
-        pose_deltas.append(pose_delta_ms)
-    candidate_timestamps = timestamps[candidate_start : current_index + 1]
-    selection_rows = select_adaptive_indices(
-        candidate_timestamps,
-        np.stack(selected_pose_rows),
-        lidar_timestamp,
+) -> list[SelectedFrame]:
+    current_timestamp = sequence_index.timestamps[current_position]
+    rows = select_adaptive_indices(
+        sequence_index.timestamps[: current_position + 1],
+        sequence_index.poses[: current_position + 1],
+        current_timestamp,
         config,
-        reference_pose=lidar_reference_pose,
+        reference_pose=sequence_index.poses[current_position],
     )
-    selected: list[SelectedFrame] = []
-    for row in selection_rows:
-        local_index = int(row["index"])
-        global_index = candidate_start + local_index
-        selected.append(
-            SelectedFrame(
-                path=Path(path_texts[global_index]),
-                timestamp=timestamps[global_index],
-                pose=selected_pose_rows[local_index],
-                age_s=float(row["age_s"]),
-                translation_m=float(row["translation_m"]),
-                rotation_deg=float(row["rotation_deg"]),
-                weight=float(row["weight"]),
-                pose_delta_ms=max(
-                    float(pose_deltas[local_index]),
-                    float(abs(lidar_reference_delta_ms)),
-                ),
-            )
+    selected = [
+        SelectedFrame(
+            path=sequence_index.radar_paths[row["index"]],
+            timestamp=row["timestamp"],
+            pose=sequence_index.poses[row["index"]],
+            age_s=float(row["age_s"]),
+            translation_m=float(row["translation_m"]),
+            rotation_deg=float(row["rotation_deg"]),
+            weight=float(row["weight"]),
+            pose_delta_ms=0.0,
+            radar_index=sequence_index.radar_indices[row["index"]],
+            lidar_index=sequence_index.lidar_indices[row["index"]],
         )
-    if not selected:
+        for row in rows
+    ]
+    if not selected or selected[-1].radar_index != sequence_index.radar_indices[current_position]:
         raise RadarAlignmentUnavailableError(
-            f"Adaptive policy selected no radar frame for {lidar_timestamp}"
+            f"Adaptive policy did not select current K-Radar frame "
+            f"{sequence_index.radar_indices[current_position]}"
         )
-    return selected, delta_ms
+    return selected
 
 
 def _process_frames(
-    scene_root: Path,
-    lidar_timestamp: int,
+    sequence_index: KRadarSequenceIndex,
+    current_position: int,
     selected: list[SelectedFrame],
+    lidar_from_radar: np.ndarray,
     tracking_config: DopplerTrackingConfig,
-) -> tuple[
-    list[ProcessedFrame],
-    list[np.ndarray],
-    list[np.ndarray],
-    float,
-    float,
-]:
-    continental_gt_path = find_named_file(scene_root, "Continental_gt.txt")
-    pose_timestamps, continental_poses = load_ground_truth_poses(
-        str(continental_gt_path.resolve())
-    )
-    aeva_gt = find_named_file(scene_root, "Aeva_gt.txt")
-    lidar_to_imu = load_named_transform(
-        find_named_file(scene_root, "IMU_LiDAR.txt"),
-        "Tr_lidar_to_imu",
-    )
-    lidar_to_radar = load_lidar_to_radar_transform(
-        find_named_file(scene_root, "Continental_LiDAR.txt")
-    )
-    radar_to_lidar = np.linalg.inv(lidar_to_radar)
-    imu_from_lidar_rotation = lidar_to_imu[:3, :3]
-    imu_from_radar_rotation = imu_from_lidar_rotation @ radar_to_lidar[:3, :3]
-
-    aeva_pose_timestamps, aeva_poses = load_ground_truth_poses(
-        str(aeva_gt.resolve())
-    )
-    lidar_pose, lidar_pose_delta_ms = interpolated_pose_from_sequence(
-        aeva_pose_timestamps,
-        aeva_poses,
-        lidar_timestamp,
-    )
-    world_from_current_lidar = np.eye(4, dtype=np.float64)
-    world_from_current_lidar[:3, :3] = (
-        lidar_pose[:3, :3] @ imu_from_lidar_rotation
-    )
-    world_from_current_lidar[:3, 3] = lidar_pose[:3, 3]
-    current_lidar_from_world = np.linalg.inv(world_from_current_lidar)
-
+) -> tuple[list[ProcessedFrame], list[np.ndarray], list[np.ndarray], float, float]:
+    current_lidar_from_world = np.linalg.inv(sequence_index.poses[current_position])
     processed: list[ProcessedFrame] = []
     raw_frames: list[np.ndarray] = []
     radar_to_current_rotations: list[np.ndarray] = []
     latest_speed = 0.0
     latest_yaw_rate = 0.0
+
     for selected_frame in selected:
-        raw = read_continental_bin(selected_frame.path)
+        source_position = sequence_index.position(selected_frame.radar_index)
+        source_points = load_kradar_pc10p(selected_frame.path)
+        # Tracking utilities expect [x,y,z,Doppler,...]. Keep power in column 4.
+        raw = np.column_stack(
+            (source_points[:, :3], source_points[:, 4], source_points[:, 3])
+        ).astype(np.float32, copy=False)
         velocity_radar, yaw_rate = pose_velocity(
-            pose_timestamps,
-            continental_poses,
+            sequence_index.timestamps,
+            sequence_index.poses,
             selected_frame.timestamp,
-            imu_from_radar_rotation,
+            np.eye(3, dtype=np.float64),
         )
         residual, applied_sign, _ = compensate_doppler(
             raw,
             velocity_radar,
             doppler_sign=tracking_config.doppler_sign,
             sign_inference_min_speed_mps=tracking_config.sign_inference_min_speed_mps,
+            doppler_period_mps=tracking_config.doppler_period_mps,
         )
-        dynamic = np.abs(residual) > tracking_config.dynamic_threshold_mps
+        power_threshold = float(
+            np.quantile(raw[:, 4], tracking_config.dynamic_power_quantile)
+        )
+        dynamic = (
+            (np.abs(residual) > tracking_config.dynamic_threshold_mps)
+            & (raw[:, 4] >= power_threshold)
+        )
         labels = dbscan_labels(
             raw[:, :2],
             dynamic,
@@ -373,17 +455,13 @@ def _process_frames(
             tracking_config.cluster_min_samples,
         )
 
-        world_from_radar = np.eye(4, dtype=np.float64)
-        world_from_radar[:3, :3] = (
-            selected_frame.pose[:3, :3] @ imu_from_radar_rotation
+        current_lidar_from_radar = (
+            current_lidar_from_world
+            @ sequence_index.poses[source_position]
+            @ lidar_from_radar
         )
-        world_from_radar[:3, 3] = selected_frame.pose[:3, 3]
-        current_lidar_from_radar = current_lidar_from_world @ world_from_radar
         aligned = raw.copy()
-        if len(aligned):
-            aligned[:, :3] = transform_xyz(
-                raw[:, :3], current_lidar_from_radar
-            )
+        aligned[:, :3] = transform_xyz(raw[:, :3], current_lidar_from_radar)
         processed.append(
             ProcessedFrame(
                 timestamp=selected_frame.timestamp,
@@ -401,25 +479,24 @@ def _process_frames(
         radar_to_current_rotations.append(current_lidar_from_radar[:3, :3])
         latest_speed = float(np.linalg.norm(velocity_radar))
         latest_yaw_rate = math.degrees(yaw_rate)
-    return (
-        processed,
-        raw_frames,
-        radar_to_current_rotations,
-        latest_speed,
-        latest_yaw_rate,
-    )
+    return processed, raw_frames, radar_to_current_rotations, latest_speed, latest_yaw_rate
 
 
 def radar_cache_is_compatible(
     cache_path: Path,
-    sample_metadata: dict,
     *,
-    max_delta_ms: float | None = None,
+    sequence: str | int,
+    radar_index: str | int,
+    lidar_index: str | int,
+    timestamp: int,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    resolution: float,
     stack_config: AdaptiveStackConfig | None = None,
     tracking_config: DopplerTrackingConfig | None = None,
 ) -> bool:
     cache_path = Path(cache_path)
-    if not cache_path.exists():
+    if not cache_path.is_file():
         return False
     try:
         with np.load(cache_path, allow_pickle=False) as data:
@@ -427,15 +504,6 @@ def radar_cache_is_compatible(
                 return False
             radar_bev = np.asarray(data["radar_bev"])
             metadata = json.loads(str(data["metadata_json"]))
-        x_range = tuple(
-            float(value)
-            for value in sample_metadata.get("x_range", [0.0, 64.0])
-        )
-        y_range = tuple(
-            float(value)
-            for value in sample_metadata.get("y_range", [-32.0, 32.0])
-        )
-        resolution = float(sample_metadata.get("resolution", 0.2))
         expected_shape = (
             4,
             int(np.ceil((x_range[1] - x_range[0]) / resolution)),
@@ -444,23 +512,21 @@ def radar_cache_is_compatible(
         if (
             radar_bev.shape != expected_shape
             or not np.isfinite(radar_bev).all()
-            or (radar_bev.size and float(radar_bev.min()) < 0.0)
-            or (radar_bev.size and float(radar_bev.max()) > 1.0)
+            or float(radar_bev.min(initial=0.0)) < 0.0
+            or float(radar_bev.max(initial=0.0)) > 1.0
         ):
             return False
         if int(metadata.get("cache_format_version", 0)) != RADAR_CACHE_VERSION:
             return False
-        if metadata.get("policy") != POLICY_NAME:
+        if metadata.get("policy") != POLICY_NAME or metadata.get("channels") != CHANNELS:
             return False
-        if metadata.get("channels") != CHANNELS:
+        if str(metadata.get("sequence")) != str(int(sequence)):
             return False
-        if str(metadata.get("scene")) != scene_name_from_metadata(sample_metadata):
+        if str(metadata.get("radar_index")) != f"{int(radar_index):05d}":
             return False
-        if str(metadata.get("session", "")) != session_name_from_metadata(
-            sample_metadata
-        ):
+        if str(metadata.get("lidar_index")) != f"{int(lidar_index):05d}":
             return False
-        if str(metadata.get("lidar_timestamp")) != str(sample_metadata["timestamp"]):
+        if int(metadata.get("timestamp_ns")) != int(timestamp):
             return False
         if not np.allclose(metadata.get("x_range"), x_range):
             return False
@@ -468,18 +534,11 @@ def radar_cache_is_compatible(
             return False
         if not np.isclose(float(metadata.get("resolution")), resolution):
             return False
-        if max_delta_ms is not None:
-            if abs(float(metadata.get("radar_delta_ms"))) > max_delta_ms + 1e-9:
-                return False
-            if not np.isclose(float(metadata.get("max_delta_ms")), max_delta_ms):
-                return False
-        if stack_config is not None and metadata.get("adaptive_stack") != asdict(
-            stack_config
-        ):
+        if stack_config is not None and metadata.get("adaptive_stack") != asdict(stack_config):
             return False
-        if tracking_config is not None and metadata.get(
-            "doppler_tracking"
-        ) != asdict(tracking_config):
+        if tracking_config is not None and metadata.get("doppler_tracking") != asdict(
+            tracking_config
+        ):
             return False
         return True
     except Exception:
@@ -487,10 +546,16 @@ def radar_cache_is_compatible(
 
 
 def build_radar_cache_entry(
-    sample_path: Path,
-    hercules_root: Path,
-    radar_root: Path,
-    max_delta_ms: float = 30.0,
+    dataset_root: Path,
+    radar_point_root: Path,
+    odometry_root: Path,
+    output_root: Path,
+    sequence: str | int,
+    radar_index: str | int,
+    x_range: tuple[float, float] = (0.0, 64.0),
+    y_range: tuple[float, float] = (-32.0, 32.0),
+    resolution: float = 0.2,
+    radar_to_lidar_z_m: float = 0.7,
     stack_config: AdaptiveStackConfig | None = None,
     tracking_config: DopplerTrackingConfig | None = None,
 ) -> Path:
@@ -498,57 +563,53 @@ def build_radar_cache_entry(
     tracking_config = tracking_config or DopplerTrackingConfig()
     stack_config.validate()
     tracking_config.validate()
-    if not math.isfinite(max_delta_ms) or max_delta_ms < 0.0:
-        raise ValueError("max_delta_ms must be finite and non-negative")
+    if resolution <= 0.0 or not math.isfinite(resolution):
+        raise ValueError("resolution must be finite and positive")
 
-    sample_path = Path(sample_path)
-    metadata = load_sample_metadata(sample_path)
-    output_path = radar_cache_path(radar_root, metadata)
-    if radar_cache_is_compatible(
-        output_path,
-        metadata,
-        max_delta_ms=max_delta_ms,
+    sequence_index = load_sequence_index(
+        dataset_root, radar_point_root, odometry_root, sequence
+    )
+    current_position = sequence_index.position(radar_index)
+    radar_text = sequence_index.radar_indices[current_position]
+    lidar_text = sequence_index.lidar_indices[current_position]
+    lidar_timestamp = sequence_index.timestamps[current_position]
+    output_path = kradar_cache_path(output_root, sequence_index.sequence, radar_text)
+    compatibility = dict(
+        sequence=sequence_index.sequence,
+        radar_index=radar_text,
+        lidar_index=lidar_text,
+        timestamp=lidar_timestamp,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
         stack_config=stack_config,
         tracking_config=tracking_config,
-    ):
+    )
+    if radar_cache_is_compatible(output_path, **compatibility):
         return output_path
 
-    scene_root = scene_session_root(hercules_root, metadata)
-    lidar_timestamp = int(metadata["timestamp"])
-    selected, radar_delta_ms = _select_scene_frames(
-        scene_root,
-        lidar_timestamp,
-        max_delta_ms,
-        stack_config,
+    calibration_path = (
+        kradar_sequence_root(dataset_root, sequence_index.sequence)
+        / "info_calib"
+        / "calib_radar_lidar.txt"
     )
-    (
-        frames,
-        raw_frames,
-        radar_to_current_rotations,
-        ego_speed_mps,
-        yaw_rate_dps,
-    ) = _process_frames(
-        scene_root,
-        lidar_timestamp,
+    lidar_from_radar = load_lidar_from_radar_transform(
+        calibration_path, radar_to_lidar_z_m
+    )
+    selected = _select_sequence_frames(sequence_index, current_position, stack_config)
+    frames, raw_frames, rotations, ego_speed_mps, yaw_rate_dps = _process_frames(
+        sequence_index,
+        current_position,
         selected,
+        lidar_from_radar,
         tracking_config,
     )
-    observations = make_observations(
-        frames, raw_frames, radar_to_current_rotations
-    )
+    observations = make_observations(frames, raw_frames, rotations)
     tracks = associate_tracks(
         observations,
         tracking_config.association_distance_m,
         tracking_config.velocity_smoothing,
     )
-
-    x_range = tuple(
-        float(value) for value in metadata.get("x_range", [0.0, 64.0])
-    )
-    y_range = tuple(
-        float(value) for value in metadata.get("y_range", [-32.0, 32.0])
-    )
-    resolution = float(metadata.get("resolution", 0.2))
     radar_bev = project_adaptive_bev(
         frames,
         observations,
@@ -573,12 +634,13 @@ def build_radar_cache_entry(
     ]
     alignment_rows = [
         {
-            "radar_timestamp": str(selection.timestamp),
+            "radar_index": selection.radar_index,
+            "lidar_index": selection.lidar_index,
+            "timestamp_ns": selection.timestamp,
             "age_ms": selection.age_s * 1000.0,
             "relative_translation_m": selection.translation_m,
             "relative_rotation_deg": selection.rotation_deg,
             "weight": selection.weight,
-            "radar_pose_delta_ms": selection.pose_delta_ms,
             "doppler_sign": frame.doppler_sign,
             "sensor_speed_mps": frame.sensor_speed_mps,
             "yaw_rate_dps": frame.yaw_rate_dps,
@@ -590,11 +652,13 @@ def build_radar_cache_entry(
     cache_metadata = {
         "cache_format_version": RADAR_CACHE_VERSION,
         "policy": POLICY_NAME,
-        "scene": scene_name_from_metadata(metadata),
-        "session": session_name_from_metadata(metadata),
-        "lidar_timestamp": str(lidar_timestamp),
-        "radar_timestamp": selected[-1].path.stem,
-        "radar_delta_ms": radar_delta_ms,
+        "dataset": "K-Radar",
+        "radar_source": "from_rdr_cube_xyz/pc10p",
+        "radar_source_columns": K_RADAR_POINT_COLUMNS,
+        "sequence": sequence_index.sequence,
+        "radar_index": radar_text,
+        "lidar_index": lidar_text,
+        "timestamp_ns": lidar_timestamp,
         "radar_sources": [str(item.path) for item in selected],
         "radar_frame_count": len(selected),
         "effective_frame_support": float(sum(item.weight for item in selected)),
@@ -605,21 +669,20 @@ def build_radar_cache_entry(
         "alignment_rows": alignment_rows,
         "confirmed_dynamic_track_count": len(confirmed_tracks),
         "dynamic_tracks": confirmed_tracks,
-        "pose_interpolation": (
-            "linear translation plus SLERP rotation at radar and LiDAR timestamps"
-        ),
-        "temporal_alignment": (
-            "adaptive pose-gated ego compensation into the interpolated current Aeva frame"
-        ),
-        "doppler_processing": (
-            "ego-compensated radial residuals, spatial clustering, causal "
-            "association, and tracked-point motion compensation"
-        ),
+        "calibration": {
+            "lidar_from_radar": lidar_from_radar.tolist(),
+            "radar_to_lidar_z_m": radar_to_lidar_z_m,
+        },
+        "pose_source": "K-Radar resources/odometry/gt KITTI-format poses",
+        "temporal_alignment": "adaptive pose-gated compensation into current paired LiDAR frame",
+        "doppler_processing": "K-Radar ambiguity-wrapped ego residual, power gating, clustering, and causal tracking",
         "channels": CHANNELS,
+        "power_normalization_quantile": POWER_NORMALIZATION_QUANTILE,
+        "upper_height_quantile": UPPER_HEIGHT_QUANTILE,
+        "height_range_m": HEIGHT_RANGE_M,
         "x_range": x_range,
         "y_range": y_range,
         "resolution": resolution,
-        "max_delta_ms": max_delta_ms,
     }
     atomic_savez_compressed(
         output_path,

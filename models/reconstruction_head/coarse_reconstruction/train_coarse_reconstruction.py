@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import random
 import sys
 import time
 
@@ -14,7 +13,7 @@ from torch.utils.data import DataLoader
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -23,9 +22,7 @@ from Fault_Localization_Model.io_utils import (
     atomic_write_json,
     write_csv_rows,
 )
-from Fault_Localization_Model.sample_utils import load_sample_metadata
-from PFS_Radar.radar_data import radar_cache_path
-from PFS.training_utils import resolve_device, seed_everything
+from PFS.training_utils import _split_paths, resolve_device, seed_everything
 from models.reconstruction_head import (
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
@@ -54,47 +51,6 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _split_paths(
-    data_root: Path,
-    radar_root: Path,
-    split: str,
-    limit: int | None,
-    seed: int,
-) -> list[Path]:
-    split_root = data_root / split
-    if not split_root.is_dir():
-        raise FileNotFoundError(f"Required dataset split is missing: {split_root}")
-    if not radar_root.is_dir():
-        raise FileNotFoundError(f"Radar cache root is missing: {radar_root}")
-    paths = sorted(split_root.rglob("*.npz"))
-    available_paths = []
-    total = len(paths)
-    print(f"Checking {split} radar availability for {total} samples...", flush=True)
-    for index, path in enumerate(paths, 1):
-        metadata = load_sample_metadata(path)
-        if radar_cache_path(radar_root, metadata).is_file():
-            available_paths.append(path)
-        if index % 10_000 == 0 or index == total:
-            print(
-                f"  {split}: checked {index}/{total}; "
-                f"available={len(available_paths)}; "
-                f"missing={index - len(available_paths)}",
-                flush=True,
-            )
-    paths = available_paths
-    if limit is not None:
-        if limit < 1:
-            raise ValueError("Split sample limits must be positive")
-        rng = random.Random(seed)
-        paths = rng.sample(paths, k=min(limit, len(paths)))
-    if not paths:
-        raise FileNotFoundError(
-            f"No samples with aligned radar were found under {split_root} "
-            f"using radar root {radar_root}"
-        )
-    return paths
-
-
 def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     keys = (
         "faulty_bev",
@@ -104,7 +60,11 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "halo_mask",
         "clean_bev",
     )
-    return {key: batch[key].to(device, non_blocking=True) for key in keys}
+    moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    mask_dtype = moved["faulty_bev"].dtype
+    for key in ("reconstruction_mask", "healthy_context_mask", "halo_mask"):
+        moved[key] = moved[key].to(dtype=mask_dtype)
+    return moved
 
 
 def _synchronize_device(device: torch.device) -> None:
@@ -131,6 +91,32 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
     result = {key: list(value.shape) for key, value in inputs.items()}
     result.update({key: list(outputs[key].shape) for key in names})
     return result
+
+
+def _summarize_active_fractions(values: list[float]) -> dict[str, float]:
+    if not values:
+        raise ValueError("Cannot summarize an empty active-fraction collection")
+    fractions = torch.tensor(values, dtype=torch.float64)
+    return {
+        "median": float(torch.quantile(fractions, 0.5)),
+        "p90": float(torch.quantile(fractions, 0.9)),
+        "maximum": float(fractions.max()),
+    }
+
+
+def _active_fraction_recommendation(summary: dict[str, float]) -> str:
+    if summary["median"] >= 0.25:
+        return "Keep the dense U-Net: typical active coverage is at least 25%."
+    if summary["p90"] <= 0.15:
+        return (
+            "Test cropped dense processing first: at least 90% of samples use "
+            "no more than 15% of the BEV. Consider a sparse U-Net only if "
+            "cropping remains too expensive."
+        )
+    return (
+        "Keep the dense U-Net for now and profile cropped dense processing: "
+        "active coverage is neither consistently sparse nor typically above 25%."
+    )
 
 
 def _save_conditioning(
@@ -171,6 +157,7 @@ def _run_epoch(
     use_amp=False,
     return_attention=False,
     conditioning_callback=None,
+    active_fraction_samples=None,
 ):
     training = optimizer is not None
     model.train(training)
@@ -178,6 +165,12 @@ def _run_epoch(
     samples = 0
     logged_shapes = None
     for batch_index, batch in enumerate(loader):
+        if active_fraction_samples is not None:
+            active_mask = torch.maximum(
+                batch["reconstruction_mask"], batch["halo_mask"]
+            )
+            fractions = active_mask.flatten(1).float().mean(dim=1)
+            active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -193,7 +186,7 @@ def _run_epoch(
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
-                    return_attention_weights=return_attention,
+                    return_attention_weights=return_attention and batch_index == 0,
                 )
                 losses = loss_fn(outputs, inputs["clean_bev"])
             if training:
@@ -245,21 +238,19 @@ def main():
     radar_root = Path(args.radar_root)
     train_paths = _split_paths(
         data_root,
-        radar_root,
         "train",
         args.limit_train_samples,
         seed,
     )
     val_paths = _split_paths(
         data_root,
-        radar_root,
         "val",
         args.limit_val_samples,
         seed,
     )
     dataset_options = {
         "radar_root": radar_root,
-        "resize_hw": (320, 320),
+        "data_root": data_root,
         "selector_config": selector_config,
     }
     train_dataset = CoarseReconstructionDataset(train_paths, **dataset_options)
@@ -302,7 +293,10 @@ def main():
     print(f"Device: {device}; AMP: {use_amp}")
     history = []
     best_validation = float("inf")
+    active_fraction_profile = None
     for epoch in range(1, epochs + 1):
+        train_active_fractions = [] if epoch == 1 else None
+        val_active_fractions = [] if epoch == 1 else None
         _synchronize_device(device)
         train_started = time.perf_counter()
         train_stats, train_shapes = _run_epoch(
@@ -314,6 +308,7 @@ def main():
             scaler=scaler,
             grad_clip=grad_clip,
             use_amp=use_amp,
+            active_fraction_samples=train_active_fractions,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -333,16 +328,50 @@ def main():
                     outputs,
                     save_conditioning_samples,
                 ),
+                active_fraction_samples=val_active_fractions,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started
         epoch_seconds = train_seconds + validation_seconds
         if epoch == 1:
+            train_active_summary = _summarize_active_fractions(
+                train_active_fractions
+            )
+            val_active_summary = _summarize_active_fractions(val_active_fractions)
+            combined_active_summary = _summarize_active_fractions(
+                train_active_fractions + val_active_fractions
+            )
+            active_fraction_profile = {
+                "definition": (
+                    "Per-sample mean of reconstruction_mask OR halo_mask over "
+                    "the complete BEV grid"
+                ),
+                "train": train_active_summary,
+                "validation": val_active_summary,
+                "combined": combined_active_summary,
+                "recommendation": _active_fraction_recommendation(
+                    combined_active_summary
+                ),
+            }
+            atomic_write_json(
+                output_root / "active_fraction_profile.json",
+                active_fraction_profile,
+            )
             atomic_write_json(
                 output_root / "debug_batch_shapes.json",
                 {"train": train_shapes, "validation": val_shapes},
             )
             print("Debug tensor shapes:", json.dumps(val_shapes, indent=2))
+            print(
+                "Active-mask coverage: "
+                f"median={combined_active_summary['median']:.2%}, "
+                f"p90={combined_active_summary['p90']:.2%}, "
+                f"max={combined_active_summary['maximum']:.2%}"
+            )
+            print(
+                "Architecture recommendation: "
+                f"{active_fraction_profile['recommendation']}"
+            )
         row = {
             "epoch": epoch,
             "runtime/train_seconds": train_seconds,
@@ -351,6 +380,18 @@ def main():
         }
         row.update({f"train/{key}": value for key, value in train_stats.items()})
         row.update({f"val/{key}": value for key, value in val_stats.items()})
+        if epoch == 1:
+            for split, summary in (
+                ("train", train_active_summary),
+                ("val", val_active_summary),
+                ("combined", combined_active_summary),
+            ):
+                row.update(
+                    {
+                        f"active_fraction/{split}_{key}": value
+                        for key, value in summary.items()
+                    }
+                )
         history.append(row)
         print(
             f"epoch {epoch:03d}: train/reconstruction_loss="
@@ -370,6 +411,7 @@ def main():
             "scaler_state_dict": scaler.state_dict(),
             "model_config": model_config.to_dict(),
             "loss_config": loss_config.__dict__,
+            "active_fraction_profile": active_fraction_profile,
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")

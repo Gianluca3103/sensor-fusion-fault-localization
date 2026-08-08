@@ -1,34 +1,76 @@
-"""Dataset adapter that adds oracle repair and trusted halo masks."""
+"""Loading and dataset adapter for coarse reconstruction samples."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .bev_triplets import load_bev_triplet
-from .fault_selector import FaultSelector, FaultSelectorConfig
+from Fault_Localization_Model.sample_utils import InvalidSampleError
+from PFS_Radar.radar_data import radar_cache_path
+
+from .fault_selector import FaultSelectorConfig
+from .fault_selector_cache import (
+    load_selector_cache,
+    selector_cache_path,
+)
+
+
+def load_bev_triplet(
+    sample_path: str | Path,
+    radar_root: str | Path,
+) -> dict[str, object]:
+    """Load one aligned, normalized BEV triplet from existing artifacts."""
+
+    sample_path = Path(sample_path)
+    radar_root = Path(radar_root)
+    try:
+        with np.load(sample_path, allow_pickle=False) as sample:
+            clean = np.asarray(sample["clean_rgb"])
+            faulty = np.asarray(sample["faulty_rgb"])
+            metadata = json.loads(str(sample["metadata_json"]))
+        radar_path = radar_cache_path(radar_root, metadata)
+        with np.load(radar_path, allow_pickle=False) as radar_cache:
+            radar = np.asarray(radar_cache["radar_bev"], dtype=np.float32)
+    except InvalidSampleError:
+        raise
+    except Exception as exc:
+        raise InvalidSampleError(
+            f"Cannot load aligned BEV triplet for {sample_path}: {exc}"
+        ) from exc
+
+    return {
+        "clean_bev": torch.from_numpy(
+            clean.astype(np.float32).transpose(2, 0, 1) / 255.0
+        ),
+        "radar_bev": torch.from_numpy(radar),
+        "faulty_bev": torch.from_numpy(
+            faulty.astype(np.float32).transpose(2, 0, 1) / 255.0
+        ),
+        "sample_path": str(sample_path),
+    }
 
 
 class CoarseReconstructionDataset(Dataset):
-    """Load aligned BEVs and derive Stage-I oracle masks with the Fault Selector."""
+    """Load aligned BEVs and precomputed Stage-I oracle masks."""
 
     def __init__(
         self,
         sample_paths,
         radar_root: str | Path,
         *,
-        resize_hw: tuple[int, int] | None = (320, 320),
+        data_root: str | Path,
         selector_config: FaultSelectorConfig | None = None,
     ):
         self.sample_paths = tuple(Path(path) for path in sample_paths)
         if not self.sample_paths:
             raise FileNotFoundError("No coarse reconstruction samples were provided")
         self.radar_root = Path(radar_root)
-        self.resize_hw = tuple(resize_hw) if resize_hw is not None else None
-        self.selector = FaultSelector(selector_config)
+        self.data_root = Path(data_root)
+        self.selector_config = selector_config or FaultSelectorConfig()
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -37,34 +79,26 @@ class CoarseReconstructionDataset(Dataset):
         item = load_bev_triplet(
             self.sample_paths[index],
             self.radar_root,
-            resize_hw=self.resize_hw,
         )
-        selection = self.selector.select(
-            item["fault_heatmap"][0].numpy(),
-            reliability_map=item["reliability_map"][0].numpy(),
-            faulty_counts=item["faulty_counts"][0].numpy(),
-            added_faulty_counts=item["added_faulty_counts"][0].numpy(),
-            missing_faulty_counts=item["missing_faulty_counts"][0].numpy(),
-            moved_faulty_counts=item["moved_faulty_counts"][0].numpy(),
+        cache_path = selector_cache_path(
+            self.sample_paths[index],
+            self.data_root,
         )
-        reconstruction_mask = torch.from_numpy(
-            selection.reconstruction_mask.astype(np.float32, copy=False)
-        )[None]
-        # Only occupied and reliable halo cells are trusted local LiDAR context.
-        healthy_context_mask = torch.from_numpy(
-            selection.healthy_context_mask.astype(np.float32, copy=False)
-        )[None]
-        halo_mask = torch.from_numpy(
-            selection.halo_mask.astype(np.float32, copy=False)
-        )[None]
+        cached = load_selector_cache(
+            cache_path,
+            self.selector_config,
+        )
         item.update(
             {
-                "reconstruction_mask": reconstruction_mask,
-                "healthy_context_mask": healthy_context_mask,
-                "halo_mask": halo_mask,
-                "selected_blob_count": len(selection.selected_blobs),
-                "reconstruction_cell_count": selection.selected_cell_count,
-                "healthy_context_cell_count": selection.healthy_context_cell_count,
+                "reconstruction_mask": torch.from_numpy(
+                    cached["reconstruction_mask"]
+                )[None],
+                "healthy_context_mask": torch.from_numpy(
+                    cached["healthy_context_mask"]
+                )[None],
+                "halo_mask": torch.from_numpy(
+                    cached["halo_mask"]
+                )[None],
             }
         )
         return item

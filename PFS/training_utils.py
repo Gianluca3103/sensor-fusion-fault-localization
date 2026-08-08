@@ -196,6 +196,24 @@ def split_paths(paths, val_ratio, seed):
     return train_paths, val_paths
 
 
+def _split_paths(data_root, split, limit, seed):
+    """Select samples from an existing dataset split."""
+    split_root = Path(data_root) / split
+    if not split_root.is_dir():
+        raise FileNotFoundError(
+            f"Required dataset split is missing: {split_root}"
+        )
+
+    paths = sorted(split_root.rglob("*.npz"))
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("Split sample limits must be positive")
+        paths = random.Random(seed).sample(paths, k=min(limit, len(paths)))
+    if not paths:
+        raise FileNotFoundError(f"No samples were found under {split_root}")
+    return paths
+
+
 def _dice_loss(logits, target, eps=1e-6):
     prediction = torch.sigmoid(logits)
     intersection = torch.sum(prediction * target, dim=(1, 2, 3))

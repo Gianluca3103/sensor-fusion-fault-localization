@@ -23,7 +23,6 @@ ParameterSet = _FOG_SIMULATION_MODULE.ParameterSet
 P_R_fog_hard = _FOG_SIMULATION_MODULE.P_R_fog_hard
 P_R_fog_soft = _FOG_SIMULATION_MODULE.P_R_fog_soft
 
-AEVA_RECORD_BYTES = 29
 FOG_ALPHA_BY_SEVERITY = [0.005, 0.01, 0.02, 0.03, 0.06]
 DEFAULT_FOG_SIMULATOR_NOISE = 10
 DEFAULT_WEATHER_THREADS = 1
@@ -278,30 +277,6 @@ def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
                 x0 = radius + dx
                 output |= padded[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]]
     return output
-
-
-def read_hercules_aeva_bin(path: Path) -> np.ndarray:
-    raw = path.read_bytes()
-    if len(raw) % AEVA_RECORD_BYTES:
-        raise ValueError(
-            f"Malformed Aeva file {path}: {len(raw)} bytes is not divisible by "
-            f"the {AEVA_RECORD_BYTES}-byte record size"
-        )
-    n_points = len(raw) // AEVA_RECORD_BYTES
-    if n_points == 0:
-        return np.empty((0, 4), dtype=np.float32)
-
-    usable = raw[: n_points * AEVA_RECORD_BYTES]
-    records = np.frombuffer(usable, dtype=np.uint8).reshape(n_points, AEVA_RECORD_BYTES)
-    xyzi = records[:, :16].copy().view("<f4").reshape(n_points, 4)
-    finite = np.isfinite(xyzi).all(axis=1)
-    xyzi = xyzi[finite]
-    plausible = (
-        (np.abs(xyzi[:, 0]) < 250.0)
-        & (np.abs(xyzi[:, 1]) < 250.0)
-        & (np.abs(xyzi[:, 2]) < 80.0)
-    )
-    return xyzi[plausible].astype(np.float32, copy=False)
 
 
 def apply_fog_simulator(

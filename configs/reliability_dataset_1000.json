@@ -1,11 +1,7 @@
 {
   "paths": {
-    "data_root": "data/HerculesFiles/Data",
+    "data_root": "../K-Radar_Data",
     "output_root": "outputs/reliability_dataset_1000"
-  },
-  "hercules": {
-    "day": "Day_1_Parking",
-    "session": "01_Day"
   },
   "generation": {
     "num_samples": 1000,
@@ -20,7 +16,7 @@
     "resolution": 0.20,
     "grid_size": 100,
     "min_range": 1.0,
-    "max_range": 120.0
+    "max_range": 118.037109375
   },
   "reliability": {
     "movement_tolerance_m": 0.05

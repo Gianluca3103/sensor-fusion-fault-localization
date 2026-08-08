@@ -9,7 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .encoders import _group_count
+from ..encoders import _group_count
 from .diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,

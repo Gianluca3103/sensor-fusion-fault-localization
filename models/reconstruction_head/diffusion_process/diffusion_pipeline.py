@@ -7,8 +7,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .coarse_config import CoarseReconstructionConfig
-from .coarse_model import CoarseReconstructionModel
+from ..coarse_reconstruction.coarse_config import CoarseReconstructionConfig
+from ..coarse_reconstruction.coarse_model import CoarseReconstructionModel
 from .residual_diffusion import MaskedResidualDiffusion
 
 

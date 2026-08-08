@@ -1,3 +1,5 @@
+"""Build the K-Radar adaptation of the four-channel RadarV2 cache."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,11 +10,10 @@ import sys
 
 try:
     from tqdm import tqdm
-except ImportError:  # Keep cache preparation usable in minimal environments.
-    class tqdm:  # noqa: N801 - mirror tqdm's public class name
+except ImportError:
+    class tqdm:  # noqa: N801
         def __init__(self, iterable=None, total=None, **_kwargs):
             self.iterable = iterable
-            self.total = total
 
         def __iter__(self):
             return iter(self.iterable)
@@ -31,14 +32,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from Fault_Localization_Model.concurrency_utils import iter_bounded_futures
 from Fault_Localization_Model.io_utils import atomic_write_text
-from Fault_Localization_Model.sample_utils import load_sample_metadata
-from PFS_Radar.radar_data import RadarAlignmentUnavailableError, radar_cache_path
 from PFS_Radar_v2.radar_data import (
     AdaptiveStackConfig,
     DopplerTrackingConfig,
     build_radar_cache_entry,
+    kradar_cache_path,
+    load_sequence_index,
     radar_cache_is_compatible,
 )
+from PFS_Radar_v2.radar_types import RadarAlignmentUnavailableError
 
 
 def _build(task):
@@ -46,36 +48,29 @@ def _build(task):
 
 
 def _build_batch(tasks):
-    """Build a chronological scene batch while retaining worker-local caches."""
-
     outcomes = []
     for task in tasks:
         try:
             _build(task)
-            outcomes.append(("created", task[0], ""))
+            outcomes.append(("created", task[5], task[4], ""))
         except RadarAlignmentUnavailableError as exc:
-            outcomes.append(("skipped", task[0], str(exc)))
+            outcomes.append(("skipped", task[5], task[4], str(exc)))
         except Exception as exc:
             outcomes.append(
-                ("failed", task[0], f"{type(exc).__name__}: {exc}")
+                ("failed", task[5], task[4], f"{type(exc).__name__}: {exc}")
             )
     return outcomes
 
 
-def _scene_batches(keyed_tasks, batch_size):
-    """Keep each batch chronological and confined to one scene/session."""
-
+def _sequence_batches(keyed_tasks, batch_size):
     batches = []
     current = []
-    current_scene = None
-    for scene_key, task in sorted(keyed_tasks, key=lambda item: item[0]):
-        task_scene = scene_key[:2]
-        if current and (
-            task_scene != current_scene or len(current) >= batch_size
-        ):
+    current_sequence = None
+    for (sequence, timestamp), task in sorted(keyed_tasks, key=lambda item: item[0]):
+        if current and (sequence != current_sequence or len(current) >= batch_size):
             batches.append(current)
             current = []
-        current_scene = task_scene
+        current_sequence = sequence
         current.append(task)
     if current:
         batches.append(current)
@@ -85,43 +80,35 @@ def _scene_batches(keyed_tasks, batch_size):
 def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Build adaptive, ego-compensated and Doppler-tracked Continental "
-            "radar BEVs for PFS-Radar v2."
+            "Build pose-aligned, Doppler-tracked RadarV2 BEVs from K-Radar "
+            "tensor-derived pc10p files."
         )
     )
-    parser.add_argument("--dataset-root", required=True)
-    parser.add_argument("--hercules-root", required=True)
+    parser.add_argument("--kradar-root", required=True)
+    parser.add_argument(
+        "--radar-point-root",
+        required=True,
+        help="Directory containing <sequence>/rpc_<radar-index>.npy pc10p files.",
+    )
+    parser.add_argument(
+        "--odometry-root",
+        required=True,
+        help="K-Radar resources/odometry or resources/odometry/gt directory.",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-        help=(
-            "Chronological samples processed per worker job. Larger batches "
-            "increase reuse of scene metadata and overlapping radar frames."
-        ),
-    )
-    parser.add_argument(
-        "--max-pending-samples",
+        "--max-pending-frames",
         type=int,
         default=0,
-        help=(
-            "Process at most this many currently uncached frames. Use 0 "
-            "(the default) for all pending frames; useful for timing a resumable "
-            "benchmark before a full run."
-        ),
+        help="Process at most this many uncached frames; 0 processes all.",
     )
-    parser.add_argument("--max-delta-ms", type=float, default=30.0)
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=0,
-        help=(
-            "Maximum accepted causal frames. Use 0 (the default) for no "
-            "frame-count cap; history, translation, and rotation gates still apply."
-        ),
-    )
+    parser.add_argument("--x-range", type=float, nargs=2, default=(0.0, 64.0))
+    parser.add_argument("--y-range", type=float, nargs=2, default=(-32.0, 32.0))
+    parser.add_argument("--resolution", type=float, default=0.2)
+    parser.add_argument("--radar-to-lidar-z-m", type=float, default=0.7)
+    parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--max-history-s", type=float, default=1.0)
     parser.add_argument("--max-translation-m", type=float, default=4.0)
     parser.add_argument("--max-rotation-deg", type=float, default=5.0)
@@ -129,15 +116,14 @@ def _parse_args():
     parser.add_argument("--weight-translation-m", type=float, default=2.0)
     parser.add_argument("--weight-rotation-deg", type=float, default=3.0)
     parser.add_argument("--dynamic-threshold-mps", type=float, default=1.0)
+    parser.add_argument("--dynamic-power-quantile", type=float, default=0.9)
     parser.add_argument(
-        "--doppler-sign",
-        choices=("auto", "1", "-1"),
-        default="auto",
-        help=(
-            "Raw Doppler convention. Auto chooses the sign whose ego-compensated "
-            "residual best fits the static majority in each frame."
-        ),
+        "--doppler-period-mps",
+        type=float,
+        default=3.865182436611008,
+        help="K-Radar unambiguous Doppler interval used to wrap ego residuals.",
     )
+    parser.add_argument("--doppler-sign", choices=("auto", "1", "-1"), default="auto")
     parser.add_argument("--sign-inference-min-speed-mps", type=float, default=0.5)
     parser.add_argument("--cluster-eps-m", type=float, default=1.2)
     parser.add_argument("--cluster-min-samples", type=int, default=2)
@@ -146,16 +132,14 @@ def _parse_args():
     parser.add_argument("--velocity-smoothing", type=float, default=0.5)
     parser.add_argument("--max-abs-velocity-mps", type=float, default=30.0)
     args = parser.parse_args()
-    if args.num_workers < 1:
-        parser.error("--num-workers must be at least 1")
-    if args.batch_size < 1:
-        parser.error("--batch-size must be at least 1")
-    if args.max_pending_samples < 0:
-        parser.error("--max-pending-samples must be non-negative")
-    if not math.isfinite(args.max_delta_ms) or args.max_delta_ms < 0.0:
-        parser.error("--max-delta-ms must be finite and non-negative")
-    if args.max_frames < 0:
-        parser.error("--max-frames must be 0 (unlimited) or a positive integer")
+    if args.num_workers < 1 or args.batch_size < 1:
+        parser.error("--num-workers and --batch-size must be at least 1")
+    if args.max_pending_frames < 0 or args.max_frames < 0:
+        parser.error("pending/frame limits must be non-negative")
+    if args.resolution <= 0.0 or not math.isfinite(args.resolution):
+        parser.error("--resolution must be finite and positive")
+    if args.x_range[0] >= args.x_range[1] or args.y_range[0] >= args.y_range[1]:
+        parser.error("BEV ranges must be increasing")
     return parser, args
 
 
@@ -180,6 +164,8 @@ def main():
         min_track_hits=args.min_track_hits,
         velocity_smoothing=args.velocity_smoothing,
         max_abs_velocity_mps=args.max_abs_velocity_mps,
+        doppler_period_mps=args.doppler_period_mps,
+        dynamic_power_quantile=args.dynamic_power_quantile,
     )
     try:
         stack_config.validate()
@@ -187,80 +173,79 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    dataset_root = Path(args.dataset_root)
-    hercules_root = Path(args.hercules_root)
+    kradar_root = Path(args.kradar_root)
+    radar_point_root = Path(args.radar_point_root)
+    odometry_root = Path(args.odometry_root)
     output_root = Path(args.output_root)
-    if not dataset_root.is_dir():
-        raise FileNotFoundError(f"Dataset root does not exist: {dataset_root}")
-    if not hercules_root.is_dir():
-        raise FileNotFoundError(f"HeRCULES root does not exist: {hercules_root}")
+    for label, path in (
+        ("K-Radar", kradar_root),
+        ("pc10p", radar_point_root),
+        ("odometry", odometry_root),
+    ):
+        if not path.is_dir():
+            raise FileNotFoundError(f"{label} root does not exist: {path}")
     output_root.mkdir(parents=True, exist_ok=True)
-    sample_paths = sorted(dataset_root.rglob("*.npz"))
-    if not sample_paths:
-        raise FileNotFoundError(
-            f"No reliability .npz samples found under {dataset_root}"
-        )
 
-    unique: dict[Path, tuple[Path, dict]] = {}
-    cache_geometry: dict[Path, tuple] = {}
-    for sample_path in sample_paths:
-        metadata = load_sample_metadata(sample_path)
-        destination = radar_cache_path(output_root, metadata)
-        geometry = (
-            tuple(metadata.get("x_range", [0.0, 64.0])),
-            tuple(metadata.get("y_range", [-32.0, 32.0])),
-            float(metadata.get("resolution", 0.2)),
-        )
-        if destination in cache_geometry and cache_geometry[destination] != geometry:
-            raise ValueError(
-                f"Samples mapping to {destination} request conflicting BEV "
-                f"geometries: {cache_geometry[destination]} and {geometry}"
-            )
-        cache_geometry[destination] = geometry
-        unique.setdefault(destination, (sample_path, metadata))
-
-    pending = []
-    for destination, (sample_path, metadata) in unique.items():
-        if radar_cache_is_compatible(
-            destination,
-            metadata,
-            max_delta_ms=args.max_delta_ms,
-            stack_config=stack_config,
-            tracking_config=tracking_config,
-        ):
-            continue
-        task = (
-            sample_path,
-            hercules_root,
-            output_root,
-            args.max_delta_ms,
-            stack_config,
-            tracking_config,
-        )
-        pending.append(
-            (
-                (
-                    str(metadata.get("scene") or metadata.get("day") or ""),
-                    str(metadata.get("session") or ""),
-                    int(metadata["timestamp"]),
-                ),
-                task,
-            )
-        )
-    pending = sorted(pending, key=lambda item: item[0])
-    total_pending = len(pending)
-    if args.max_pending_samples:
-        pending = pending[: args.max_pending_samples]
-    batches = _scene_batches(pending, args.batch_size)
-    pending_count = sum(len(batch) for batch in batches)
-    print(
-        f"Reliability samples: {len(sample_paths)} | "
-        f"unique LiDAR frames: {len(unique)} | "
-        f"already cached: {len(unique) - total_pending} | "
-        f"pending: {total_pending} | scheduled now: {pending_count} | "
-        f"chronological batches: {len(batches)}"
+    sequence_dirs = sorted(
+        (path for path in radar_point_root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
     )
-    skipped_path = output_root / "skipped_alignment_samples.txt"
+    if not sequence_dirs:
+        raise FileNotFoundError(f"No numeric K-Radar sequence directories under {radar_point_root}")
+
+    x_range = tuple(args.x_range)
+    y_range = tuple(args.y_range)
+    keyed_tasks = []
+    available_count = 0
+    cached_count = 0
+    for sequence_dir in sequence_dirs:
+        index = load_sequence_index(
+            kradar_root, radar_point_root, odometry_root, sequence_dir.name
+        )
+        available_count += len(index.radar_indices)
+        for position, radar_index in enumerate(index.radar_indices):
+            destination = kradar_cache_path(output_root, index.sequence, radar_index)
+            compatible = radar_cache_is_compatible(
+                destination,
+                sequence=index.sequence,
+                radar_index=radar_index,
+                lidar_index=index.lidar_indices[position],
+                timestamp=index.timestamps[position],
+                x_range=x_range,
+                y_range=y_range,
+                resolution=args.resolution,
+                stack_config=stack_config,
+                tracking_config=tracking_config,
+            )
+            if compatible:
+                cached_count += 1
+                continue
+            task = (
+                kradar_root,
+                radar_point_root,
+                odometry_root,
+                output_root,
+                index.sequence,
+                radar_index,
+                x_range,
+                y_range,
+                args.resolution,
+                args.radar_to_lidar_z_m,
+                stack_config,
+                tracking_config,
+            )
+            keyed_tasks.append(((int(index.sequence), index.timestamps[position]), task))
+
+    total_pending = len(keyed_tasks)
+    if args.max_pending_frames:
+        keyed_tasks = keyed_tasks[: args.max_pending_frames]
+    batches = _sequence_batches(keyed_tasks, args.batch_size)
+    scheduled = sum(len(batch) for batch in batches)
+    print(
+        f"K-Radar pc10p frames: {available_count} | already cached: {cached_count} | "
+        f"pending: {total_pending} | scheduled now: {scheduled} | batches: {len(batches)}"
+    )
+    skipped_path = output_root / "skipped_alignment_frames.txt"
     failure_path = output_root / "cache_failures.txt"
     if not batches:
         skipped_path.unlink(missing_ok=True)
@@ -269,62 +254,50 @@ def main():
 
     skipped = []
 
-    def raise_cache_failure(sample_path, message):
-        report = f"{sample_path}\t{message}"
-        atomic_write_text(failure_path, report)
-        raise RuntimeError(
-            f"Radar v2 cache failed for {sample_path}. Details: {failure_path}"
-        )
+    def handle_outcomes(outcomes):
+        for status, radar_index, sequence, message in outcomes:
+            if status == "skipped":
+                skipped.append((sequence, radar_index, message))
+            elif status == "failed":
+                report = f"sequence={sequence}\tradar={radar_index}\t{message}"
+                atomic_write_text(failure_path, report)
+                raise RuntimeError(
+                    f"K-Radar RadarV2 cache failed. Details: {failure_path}"
+                )
 
-    if args.num_workers == 1:
-        progress = tqdm(total=pending_count, desc="Radar v2 cache")
-        try:
+    progress = tqdm(total=scheduled, desc="K-Radar RadarV2 cache")
+    try:
+        if args.num_workers == 1:
             for batch in batches:
-                for status, sample_path, message in _build_batch(batch):
-                    if status == "skipped":
-                        skipped.append((sample_path, message))
-                    elif status == "failed":
-                        raise_cache_failure(sample_path, message)
-                    progress.update(1)
-        finally:
-            progress.close()
-    else:
-        with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-            futures = iter_bounded_futures(
-                executor,
-                _build_batch,
-                batches,
-                max_pending=max(args.num_workers * 3, 1),
-            )
-            progress = tqdm(total=pending_count, desc="Radar v2 cache")
-            try:
+                handle_outcomes(_build_batch(batch))
+                progress.update(len(batch))
+        else:
+            with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+                futures = iter_bounded_futures(
+                    executor,
+                    _build_batch,
+                    batches,
+                    max_pending=max(args.num_workers * 3, 1),
+                )
                 for future, batch in futures:
-                    try:
-                        outcomes = future.result()
-                    except Exception as exc:
-                        raise_cache_failure(
-                            batch[0][0],
-                            f"{type(exc).__name__}: {exc}",
-                        )
-                    for status, sample_path, message in outcomes:
-                        if status == "skipped":
-                            skipped.append((sample_path, message))
-                        elif status == "failed":
-                            raise_cache_failure(sample_path, message)
+                    handle_outcomes(future.result())
                     progress.update(len(batch))
-            finally:
-                progress.close()
+    finally:
+        progress.close()
 
     failure_path.unlink(missing_ok=True)
     if skipped:
         atomic_write_text(
             skipped_path,
-            "\n".join(f"{path}\t{exc}" for path, exc in skipped),
+            "\n".join(
+                f"sequence={sequence}\tradar={radar_index}\t{message}"
+                for sequence, radar_index, message in skipped
+            ),
         )
-        print(f"Skipped {len(skipped)} samples without valid causal pose history.")
+        print(f"Skipped {len(skipped)} frames without valid pose history.")
     else:
         skipped_path.unlink(missing_ok=True)
-    print(f"Radar v2 cache complete: {output_root}")
+    print(f"K-Radar RadarV2 cache complete: {output_root}")
 
 
 if __name__ == "__main__":

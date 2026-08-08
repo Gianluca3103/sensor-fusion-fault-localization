@@ -9,7 +9,7 @@ The repository contains three maintained stages:
 2. Train LiDAR-only PFS ablations or the final radar-conditioned PFS model.
 3. Calibrate localization thresholds on validation data and evaluate test data.
 
-Raw Hercules data, generated samples, radar caches, checkpoints, and run outputs
+Raw K-Radar data, generated samples, radar caches, checkpoints, and run outputs
 are intentionally excluded from Git.
 
 [![Tests](https://github.com/Gianluca3103/sensor-fusion-fault-localization/actions/workflows/tests.yml/badge.svg)](https://github.com/Gianluca3103/sensor-fusion-fault-localization/actions/workflows/tests.yml)
@@ -72,12 +72,22 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available()); pr
 
 ## Generate Reliability Targets
 
-The production dataset uses a temporal `70/15/15` split inside every Hercules
-scene, a `320x320` target grid, and a `0.05 m` point-movement tolerance.
+The production dataset uses the radar-paired K-Radar `os2-64` LiDAR frames,
+with a temporal `70/15/15` split inside every sequence, a `320x320` target
+grid, and a `0.05 m` point-movement tolerance. Discovery requires the paired
+`lidar/<sequence>/info_label` entry and
+`radar/pc10p/<sequence>/rpc_<index>.npy`, preventing
+samples without radar conditioning from entering the dataset.
+
+Although `os2-64` is a 360-degree LiDAR, generation keeps only points inside
+K-Radar's polar support: azimuth approximately `[-53, 53]` degrees and range
+up to `118.04 m`, plus its `[-18,18]` degree elevation support, evaluated in
+the calibrated radar coordinate frame. The BEV remains `x=[0,64)`,
+`y=[-32,32)`, at `0.2 m` resolution.
 
 ```bash
-python Fault_Localization_Model/create_grid_reliability_heatmaps.py \
-  --data-root "/path/to/HeRCULES" \
+python -m Fault_Localization_Model.create_grid_reliability_heatmaps \
+  --data-root "/path/to/K-Radar_Data" \
   --temporal-split train \
   --train-ratio 0.70 \
   --val-ratio 0.15 \
@@ -90,7 +100,6 @@ python Fault_Localization_Model/create_grid_reliability_heatmaps.py \
   --grid-size 320 \
   --movement-tolerance-m 0.05 \
   --num-workers 16 \
-  --weather-threads 1 \
   --no-previews \
   --seed 42
 ```
@@ -105,13 +114,13 @@ resume, so the manifest remains a faithful inventory after interruption.
 Use `scripts/remove_corrupt_npz.py` only to repair data created by older
 non-atomic versions.
 
-Generator version 3 derives an independent deterministic injection seed for
-every sample. This removes the old behavior where every sample at one severity
-shared a stochastic pattern; FOV loss also rotates across samples. Existing
-older samples intentionally fail the resume metadata check and are regenerated
-rather than mixed with version-3 data. Version 3 also assigns tolerated
-sub-5-cm point motion to the point's observed cell, preventing cell-edge
-reliability errors.
+Generator version 8 uses paired K-Radar `os2-64`/pc10p frames and applies the
+calibrated radar-overlap crop to clean and corrupted points. Its three LiDAR
+channels are binary occupancy, log point density, and per-cell 90th-percentile
+upper height normalized over the same `[-3, 5]` metre interval as radar. It
+retains the independent deterministic injection seed and assigns tolerated
+sub-5-cm point motion to the observed cell. Older representations intentionally
+fail the resume metadata check and are not mixed with version 8 data.
 When multiple generation processes are used, keep `--weather-threads 1` to
 avoid nested LISA thread pools oversubscribing the CPU.
 
@@ -132,25 +141,22 @@ fine occupancy grid is used to create the target.
 
 ## Train the Final Radar Model
 
-Prepare the causal 20-frame, pose-aligned radar cache first:
+Prepare the K-Radar pc10p cache first. Use one frame while validating the
+current alignment path:
 
 ```bash
-python PFS_Radar/prepare_radar_cache.py \
-  --dataset-root "/path/to/dataset" \
-  --hercules-root "/path/to/HeRCULES" \
+python -m PFS_Radar_v2.prepare_radar_cache \
+  --kradar-root "/path/to/K-Radar_Data" \
+  --radar-point-root "/path/to/K-Radar_Data/radar/pc10p" \
+  --odometry-root "/path/to/K-Radar_Data/support/official_k_radar/resources/odometry" \
   --output-root "/path/to/radar_cache" \
-  --radar-frame-count 20 \
-  --require-full-stack \
-  --max-delta-ms 30 \
+  --max-frames 1 \
   --num-workers 12
 ```
 
-Cache files are validated against the source timestamp, BEV geometry, velocity
-normalization, alignment tolerance, and requested stack length. Missing,
-corrupt, one-frame, or otherwise incompatible entries are rebuilt atomically.
-Cache format version 3 is causal and session-aware: it never selects a future
-radar frame and stores entries under their exact scene/session path. Rebuild
-older caches before training with this code.
+Cache files use the exact `sequence/radar_index` pairing stored in each
+generated LiDAR sample. Cache-format and channel metadata prevent obsolete
+radar representations from being reused by the cache builder.
 
 Then train:
 

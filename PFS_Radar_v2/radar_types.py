@@ -7,6 +7,10 @@ import math
 import numpy as np
 
 
+class RadarAlignmentUnavailableError(RuntimeError):
+    """Raised when a K-Radar frame cannot be pose-aligned."""
+
+
 @dataclass(frozen=True)
 class AdaptiveStackConfig:
     """Pose gates and soft weights for causal radar-frame accumulation."""
@@ -37,7 +41,7 @@ class AdaptiveStackConfig:
 
 @dataclass(frozen=True)
 class DopplerTrackingConfig:
-    """Ego-Doppler compensation, clustering, and short-window tracking."""
+    """K-Radar ego-Doppler compensation and short-window tracking."""
 
     dynamic_threshold_mps: float = 1.0
     doppler_sign: str = "auto"
@@ -48,6 +52,8 @@ class DopplerTrackingConfig:
     min_track_hits: int = 2
     velocity_smoothing: float = 0.5
     max_abs_velocity_mps: float = 30.0
+    doppler_period_mps: float = 3.865182436611008
+    dynamic_power_quantile: float = 0.9
 
     def validate(self) -> None:
         if self.doppler_sign not in {"auto", "1", "-1"}:
@@ -58,6 +64,7 @@ class DopplerTrackingConfig:
             "cluster_eps_m": self.cluster_eps_m,
             "association_distance_m": self.association_distance_m,
             "max_abs_velocity_mps": self.max_abs_velocity_mps,
+            "doppler_period_mps": self.doppler_period_mps,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -68,6 +75,8 @@ class DopplerTrackingConfig:
             raise ValueError("min_track_hits must be at least 1")
         if not 0.0 <= self.velocity_smoothing < 1.0:
             raise ValueError("velocity_smoothing must lie in [0, 1)")
+        if not 0.0 <= self.dynamic_power_quantile < 1.0:
+            raise ValueError("dynamic_power_quantile must lie in [0, 1)")
 
 
 @dataclass
@@ -80,6 +89,8 @@ class SelectedFrame:
     rotation_deg: float
     weight: float
     pose_delta_ms: float
+    radar_index: str = ""
+    lidar_index: str = ""
 
 
 @dataclass

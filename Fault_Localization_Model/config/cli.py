@@ -11,7 +11,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         parents=[pre_parser],
-        description="Create Hercules reliability/fault heatmaps by splitting the original BEV view into reliability squares.",
+        description="Create K-Radar LiDAR reliability/fault heatmaps inside the radar-overlap field of view.",
     )
     parser.add_argument("--data-root", default=defaults["data_root"])
     parser.add_argument("--output-root", default=defaults["output_root"])
@@ -21,20 +21,10 @@ def parse_args():
         "--temporal-split",
         choices=["train", "val", "test"],
         default=None,
-        help="Use the first train ratio, next validation ratio, or final test ratio from every Aeva folder.",
+        help="Use the first train ratio, next validation ratio, or final test ratio from every K-Radar sequence.",
     )
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument(
-        "--require-causal-radar-max-delta-ms",
-        type=float,
-        default=None,
-        help=(
-            "Before sampling, keep only raw LiDAR frames whose scene has a causal "
-            "Continental radar frame at or before the LiDAR timestamp within this "
-            "many milliseconds. Use the same value as Radar V2 --max-delta-ms."
-        ),
-    )
     parser.add_argument("--faults", nargs="*", default=defaults["faults"])
     parser.add_argument("--severities", type=int, nargs="*", default=defaults["severities"])
     parser.add_argument(
