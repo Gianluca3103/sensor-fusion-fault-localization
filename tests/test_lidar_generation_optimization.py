@@ -1,11 +1,16 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from Fault_Localization_Model.create_grid_reliability_heatmaps import (
+    UnusableSourceFrameError,
     canonical_maps_for_storage,
     chronological_source_batches,
+    create_sample_batch,
     point_counts_grid,
+    replacement_frame_pool,
 )
 
 
@@ -121,6 +126,39 @@ class LidarGenerationOptimizationTests(unittest.TestCase):
             ],
             [1, 3],
         )
+
+    def test_unusable_source_is_returned_for_replacement_without_losing_task(self):
+        task = {
+            "index": 17,
+            "lidar_path": "scene/58/00591.pcd",
+            "fault": "fog_sim",
+            "severity": 5,
+            "injection_seed": 123,
+        }
+        with patch(
+            "Fault_Localization_Model.create_grid_reliability_heatmaps."
+            "create_one_sample",
+            side_effect=UnusableSourceFrameError("zero overlap"),
+        ):
+            results = create_sample_batch([task])
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["unusable_source"])
+        self.assertEqual(results[0]["task"], task)
+        self.assertEqual(results[0]["error"], "zero overlap")
+
+    def test_replacement_pool_excludes_selected_frames_and_is_deterministic(self):
+        frames = [Path(f"scene/{index}.pcd") for index in range(6)]
+        samples = [
+            (frames[1], "fog_sim", 3),
+            (frames[4], "fov_filter", 1),
+        ]
+
+        first = replacement_frame_pool(frames, samples, 42, shuffle=True)
+        second = replacement_frame_pool(frames, samples, 42, shuffle=True)
+
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {frames[0], frames[2], frames[3], frames[5]})
 
 
 if __name__ == "__main__":

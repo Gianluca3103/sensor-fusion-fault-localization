@@ -32,6 +32,11 @@ def load_bev_triplet(
             clean = np.asarray(sample["clean_rgb"])
             faulty = np.asarray(sample["faulty_rgb"])
             metadata = json.loads(str(sample["metadata_json"]))
+            observability = (
+                np.asarray(sample["observability_confidence"], dtype=np.float32)
+                if "observability_confidence" in sample.files
+                else None
+            )
         radar_path = radar_cache_path(radar_root, metadata)
         with np.load(radar_path, allow_pickle=False) as radar_cache:
             radar = np.asarray(radar_cache["radar_bev"], dtype=np.float32)
@@ -42,7 +47,7 @@ def load_bev_triplet(
             f"Cannot load aligned BEV triplet for {sample_path}: {exc}"
         ) from exc
 
-    return {
+    item = {
         "clean_bev": torch.from_numpy(
             clean.astype(np.float32).transpose(2, 0, 1) / 255.0
         ),
@@ -52,6 +57,14 @@ def load_bev_triplet(
         ),
         "sample_path": str(sample_path),
     }
+    if observability is not None:
+        if observability.shape != clean.shape[:2]:
+            raise InvalidSampleError(
+                "observability_confidence must align with the LiDAR BEV; "
+                f"got {observability.shape} and {clean.shape[:2]}"
+            )
+        item["observability_confidence"] = torch.from_numpy(observability)[None]
+    return item
 
 
 class CoarseReconstructionDataset(Dataset):

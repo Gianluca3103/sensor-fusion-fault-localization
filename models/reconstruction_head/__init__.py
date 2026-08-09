@@ -6,6 +6,12 @@ from .fault_selector import (
     FaultSelector,
     FaultSelectorConfig,
 )
+from .fault_selector_simplified import (
+    FaultSelectorSimplified,
+    SimplifiedFaultComponent,
+    SimplifiedFaultSelection,
+    SimplifiedFaultSelectorConfig,
+)
 from .fault_selector_cache import (
     InvalidSelectorCacheError,
     build_selector_cache_entry,
@@ -35,8 +41,9 @@ from .coarse_reconstruction.coarse_config import (
 from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
+    ObservabilityWeightingConfig,
     coarse_reconstruction_metrics,
-    masked_bev_mae,
+    occupancy_bce_weights,
 )
 from .coarse_dataset import CoarseReconstructionDataset, load_bev_triplet
 from .diffusion_process.diffusion_process import (
@@ -88,12 +95,17 @@ __all__ = [
     "LocalUNetDecoder",
     "LocalUNetEncoder",
     "MaskedBEVReconstructionLoss",
+    "ObservabilityWeightingConfig",
     "MaskedEpsilonMSELoss",
     "MaskedResidualDiffusion",
     "FaultBlob",
     "FaultSelection",
     "FaultSelector",
     "FaultSelectorConfig",
+    "FaultSelectorSimplified",
+    "SimplifiedFaultComponent",
+    "SimplifiedFaultSelection",
+    "SimplifiedFaultSelectorConfig",
     "InvalidSelectorCacheError",
     "ResidualDiffusionSampler",
     "ResidualDiffusionUNet",
@@ -107,7 +119,7 @@ __all__ = [
     "build_selector_config",
     "build_selector_cache_entry",
     "load_config",
-    "masked_bev_mae",
+    "occupancy_bce_weights",
     "bev_occupancy",
     "load_frozen_coarse_model",
     "load_selector_cache",

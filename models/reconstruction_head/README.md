@@ -33,6 +33,10 @@ use it:
 erased_lidar_bev = (1 - reconstruction_mask) * faulty_lidar_bev
 ```
 
+The global LiDAR encoder receives this erased BEV concatenated with the
+reconstruction mask. The extra binary channel marks erased cells as unknown,
+so they cannot be confused with observed-empty LiDAR cells.
+
 The Coarse U-Net receives nine direct 320×320 channels:
 
 ```text
@@ -42,9 +46,9 @@ reconstruction_mask                           1 channel
 healthy_context_mask                          1 channel
 ```
 
-The default five-level residual U-Net compresses 320×320 to a 20×20 local
+The default four-level residual U-Net compresses 320×320 to a 40×40 local
 bottleneck. Separate lightweight global LiDAR and radar encoders preserve the
-complete BEV as 20×20 spatial maps. Learned global fusion produces
+complete BEV as spatial maps. Learned global fusion produces
 `global_context_map`, and every local bottleneck query attends to every global
 map position using absolute BEV positional embeddings.
 
@@ -52,6 +56,20 @@ The decoder returns to 320×320 and predicts:
 
 ```text
 replacement_raw: [B, 3, 320, 320]
+  channel 0: occupancy logits
+  channel 1: normalized log point density
+  channel 2: normalized robust P90 height
+```
+
+For the assembled BEV, the occupancy logits are converted to probabilities;
+the two continuous predictions remain unchanged:
+
+```text
+replacement_bev = concat(
+    sigmoid(occupancy_logits),
+    predicted_density,
+    predicted_height,
+)
 ```
 
 The structural output merge is:
@@ -59,7 +77,7 @@ The structural output merge is:
 ```text
 coarse_lidar_bev =
     (1 - reconstruction_mask) * faulty_lidar_bev
-    + reconstruction_mask * replacement_raw
+    + reconstruction_mask * replacement_bev
 ```
 
 Thus, output cells outside the reconstruction mask are exactly unchanged and
@@ -95,10 +113,52 @@ python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstr
   --device cuda
 ```
 
-The mask-normalized Smooth L1 objective supervises `replacement_raw` against
-clean LiDAR over every cell in `reconstruction_mask`. Empty masks return a
-differentiable zero loss. Validation logs erased and coarse masked MAE,
-reconstruction improvement, relative improvement, and outside-mask change.
+The baseline objective is channel-aware. Occupancy uses mask-normalized binary
+cross entropy with logits plus per-sample soft Dice throughout
+`reconstruction_mask`. Density and height use Smooth L1 only where the cell is
+both inside `reconstruction_mask` and occupied in the clean target:
+
+```text
+M_repair = reconstruction_mask
+M_continuous = reconstruction_mask * clean_occupancy
+
+L = lambda_occupancy * (L_BCE + L_Dice)
+    + lambda_density * L_SmoothL1_density
+    + lambda_height * L_SmoothL1_height
+```
+
+The default configuration keeps observability weighting disabled, reproducing
+the original baseline exactly. The controlled observability ablation can be
+enabled without changing the model or its inputs:
+
+```json
+"observability_weighting": {
+  "enabled": true,
+  "min_empty_weight": 0.1
+}
+```
+
+For clean-occupied cells the BCE weight is always one. For clean-empty cells:
+
+```text
+w_empty = min_empty_weight
+          + (1 - min_empty_weight) * observability_confidence
+
+L_BCE_obs = sum(BCEWithLogits * reconstruction_mask * w)
+            / sum(reconstruction_mask * w)
+```
+
+Only BCE uses this weight. Dice, density Smooth L1, height Smooth L1, the
+reconstruction metrics, and every inference path remain unchanged. Enabled
+training requires aligned `observability_confidence`; it never silently falls
+back to baseline BCE.
+
+Empty masks and masks without clean-occupied cells return differentiable zero
+for the corresponding terms. Validation compares coarse and faulty inputs
+inside the repair region using occupancy precision, recall, F1, IoU and
+hallucination rate; density MAE/RMSE; and robust-height MAE/RMSE in normalized
+units and meters. It also verifies that the result is unchanged outside the
+repair mask.
 
 During the first training and validation pass, the trainer records the
 per-sample fraction of the complete BEV covered by `reconstruction_mask OR
@@ -150,8 +210,7 @@ gradient clipping, exact resume, best/latest checkpoints, first-batch shape
 logging, and final validation-set ancestral DDPM sampling. Final metrics compare
 erased, coarse, and diffusion-refined BEVs inside the repair mask. Secondary
 full-scene metrics and actual-fault/sacrificed-healthy diagnostic regions are
-also written. Occupancy is consistently defined as LiDAR channel 2 greater
-than zero.
+also written. Occupancy is consistently stored in LiDAR channel 0.
 
 The first implementation intentionally supports DDPM only. The sampler API is
 separate from the network and schedule so DDIM can be added later without

@@ -41,6 +41,10 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 outputs = {
                     "erased_lidar_bev": erased,
                     "replacement_raw": faulty_bev,
+                    "replacement_bev": faulty_bev,
+                    "occupancy_logits": faulty_bev[:, 0:1],
+                    "predicted_density": faulty_bev[:, 1:2],
+                    "predicted_height": faulty_bev[:, 2:3],
                     "coarse_lidar_bev": faulty_bev,
                     "reconstruction_mask": reconstruction_mask,
                     "healthy_context_mask": healthy_context_mask,
@@ -48,6 +52,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 }
                 for name in (
                     "local_input",
+                    "global_lidar_input",
                     "local_bottleneck",
                     "query_tokens",
                     "context_tokens",

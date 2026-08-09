@@ -113,15 +113,29 @@ resume, so the manifest remains a faithful inventory after interruption.
 Use `scripts/remove_corrupt_npz.py` only to repair data created by older
 non-atomic versions.
 
-Generator version 8 uses paired K-Radar `os2-64`/pc10p frames and applies the
+Generator version 10 uses paired K-Radar `os2-64`/pc10p frames and applies the
 calibrated radar-overlap crop to clean and corrupted points. Its three LiDAR
 channels are binary occupancy, log point density, and per-cell 90th-percentile
 upper height normalized over the same `[-3, 5]` metre interval as radar. It
-retains the independent deterministic injection seed and assigns tolerated
-sub-5-cm point motion to the observed cell. Older representations intentionally
-fail the resume metadata check and are not mixed with version 8 data.
+also traces raw clean-LiDAR rays before fault injection to store a separate
+`320x320` observability-confidence target. Temporary 16-bin vertical coverage
+and saturating ray support are supervision metadata only; they are not model
+inputs and do not change clean or faulty BEV generation. The generator retains
+the independent deterministic injection seed and assigns tolerated sub-5-cm
+point motion to the observed cell. Older representations intentionally fail
+the resume metadata check and are not mixed with version 10 data.
 When multiple generation processes are used, keep `--weather-threads 1` to
 avoid nested LISA thread pools oversubscribing the CPU.
+
+Render the clean occupancy, ray count, vertical coverage, ray support, and
+confidence for one source frame with:
+
+```bash
+python scripts/visualize_lidar_observability.py \
+  --lidar-pcd "/path/to/lidar/1/os2-64/os2-64_00001.pcd" \
+  --calibration "/path/to/lidar/1/info_calib/calib_radar_lidar.txt" \
+  --output "/path/to/observability_debug.png"
+```
 
 ## Ground-Truth Definition
 

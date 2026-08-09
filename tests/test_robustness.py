@@ -324,6 +324,7 @@ class RobustnessTests(unittest.TestCase):
                 "visualization_method": VISUALIZATION_METHOD,
                 "movement_tolerance_m": 0.05,
                 "generator_version": GENERATOR_VERSION,
+                "remove_added_points": False,
                 "generation_seed": 42,
                 "injection_seed": 99,
                 "weather_threads": 1,
@@ -333,6 +334,9 @@ class RobustnessTests(unittest.TestCase):
                 "lidar_channels": list(LIDAR_CHANNELS),
                 "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
                 "lidar_height_range_m": list(HEIGHT_RANGE_M),
+                "lidar_sensor_origin_m": [0.0, 0.0, 0.0],
+                "observability_num_z_bins": 16,
+                "observability_ray_support_tau": 4.0,
                 "injection_metadata": {},
             }
             arrays = {
@@ -353,6 +357,12 @@ class RobustnessTests(unittest.TestCase):
                 "missing_point_ids": np.asarray([1], dtype=np.int64),
                 "moved_point_ids": np.empty(0, dtype=np.int64),
                 "added_point_ids": np.empty(0, dtype=np.int64),
+                "observability_confidence": np.zeros((2, 2), dtype=np.float16),
+                "observability_ray_count": np.zeros((2, 2), dtype=np.uint32),
+                "observability_vertical_coverage": np.zeros(
+                    (2, 2), dtype=np.float16
+                ),
+                "observability_ray_support": np.zeros((2, 2), dtype=np.float16),
             }
             np.savez_compressed(
                 sample,
@@ -373,6 +383,9 @@ class RobustnessTests(unittest.TestCase):
                 "fog_noise": 10,
                 "movement_tolerance_m": 0.05,
                 "generation_seed": 42,
+                "remove_added_points": False,
+                "observability_num_z_bins": 16,
+                "observability_ray_support_tau": 4.0,
                 "weather_threads": 1,
                 "output_root": str(root),
                 "save_previews": False,

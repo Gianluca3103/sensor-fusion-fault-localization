@@ -49,6 +49,13 @@ def validate_generation_args(args):
     require_positive(args.resolution, "resolution")
     require_positive(args.num_workers, "num_workers")
     require_positive(args.source_batch_size, "source_batch_size")
+    require_positive(args.observability_num_z_bins, "observability_num_z_bins")
+    require_positive(
+        args.observability_ray_support_tau,
+        "observability_ray_support_tau",
+    )
+    if int(args.observability_num_z_bins) != args.observability_num_z_bins:
+        raise ValueError("observability_num_z_bins must be an integer")
     require_positive(args.movement_tolerance_m, "movement_tolerance_m")
     require_non_negative(args.seed, "--seed")
     if args.train_ratio + args.val_ratio >= 1.0:

@@ -44,6 +44,15 @@ def parse_args():
         action="store_true",
         help="Skip the six diagnostic PNGs per sample and save only training data plus manifests.",
     )
+    parser.add_argument(
+        "--remove-added-points",
+        action=argparse.BooleanOptionalAction,
+        default=bool(defaults["remove_added_points"]),
+        help=(
+            "Remove injected points with no clean-source identity before "
+            "rasterizing the faulty LiDAR BEV. Missing-point faults remain."
+        ),
+    )
     parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
     parser.add_argument("--x-min", type=float, default=defaults["x_min"])
     parser.add_argument("--x-max", type=float, default=defaults["x_max"])
@@ -52,6 +61,18 @@ def parse_args():
     parser.add_argument("--resolution", type=float, default=defaults["resolution"])
     parser.add_argument("--min-range", type=float, default=defaults["min_range"])
     parser.add_argument("--max-range", type=float, default=defaults["max_range"])
+    parser.add_argument(
+        "--observability-num-z-bins",
+        type=int,
+        default=defaults["observability_num_z_bins"],
+        help="Temporary vertical bins used only by clean-LiDAR observability.",
+    )
+    parser.add_argument(
+        "--observability-ray-support-tau",
+        type=float,
+        default=defaults["observability_ray_support_tau"],
+        help="Tau in ray_support = 1 - exp(-ray_count / tau).",
+    )
     parser.add_argument(
         "--movement-tolerance-m",
         type=float,

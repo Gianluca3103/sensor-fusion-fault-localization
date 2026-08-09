@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, fields
 import json
 from pathlib import Path
 
-from .coarse_loss import CoarseLossConfig
+from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
 from ..fault_selector import FaultSelectorConfig
 
 
@@ -111,12 +111,42 @@ def build_configs(payload: dict):
         ),
     )
     loss_payload = coarse.get("loss", {})
+    allowed_loss_fields = {
+        "lambda_occupancy",
+        "lambda_density",
+        "lambda_height",
+        "epsilon",
+        "observability_weighting",
+    }
+    unknown_loss_fields = set(loss_payload) - allowed_loss_fields
+    if unknown_loss_fields:
+        raise ValueError(
+            "Unknown or obsolete coarse loss settings: "
+            + ", ".join(sorted(unknown_loss_fields))
+        )
+    observability_payload = loss_payload.get("observability_weighting", {})
+    if not isinstance(observability_payload, dict):
+        raise ValueError("coarse loss observability_weighting must be an object")
+    unknown_observability_fields = set(observability_payload) - {
+        "enabled",
+        "min_empty_weight",
+    }
+    if unknown_observability_fields:
+        raise ValueError(
+            "Unknown observability_weighting settings: "
+            + ", ".join(sorted(unknown_observability_fields))
+        )
     loss_config = CoarseLossConfig(
-        reconstruction_loss_type=loss_payload.get(
-            "reconstruction_loss_type", "smooth_l1"
-        ),
-        lambda_reconstruction=loss_payload.get("lambda_reconstruction", 1.0),
+        lambda_occupancy=loss_payload.get("lambda_occupancy", 1.0),
+        lambda_density=loss_payload.get("lambda_density", 1.0),
+        lambda_height=loss_payload.get("lambda_height", 1.0),
         epsilon=loss_payload.get("epsilon", 1.0e-8),
+        observability_weighting=ObservabilityWeightingConfig(
+            enabled=observability_payload.get("enabled", False),
+            min_empty_weight=observability_payload.get(
+                "min_empty_weight", 0.1
+            ),
+        ),
     )
     selector_config = build_selector_config(payload)
     model_config.validate()

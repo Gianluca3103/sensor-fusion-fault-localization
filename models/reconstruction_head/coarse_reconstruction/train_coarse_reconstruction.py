@@ -61,6 +61,10 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    if "observability_confidence" in batch:
+        moved["observability_confidence"] = batch[
+            "observability_confidence"
+        ].to(device, non_blocking=True)
     mask_dtype = moved["faulty_bev"].dtype
     for key in ("reconstruction_mask", "healthy_context_mask", "halo_mask"):
         moved[key] = moved[key].to(dtype=mask_dtype)
@@ -76,11 +80,16 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
     names = (
         "erased_lidar_bev",
         "replacement_raw",
+        "replacement_bev",
+        "occupancy_logits",
+        "predicted_density",
+        "predicted_height",
         "coarse_lidar_bev",
         "reconstruction_mask",
         "healthy_context_mask",
         "halo_mask",
         "local_input",
+        "global_lidar_input",
         "local_bottleneck",
         "query_tokens",
         "context_tokens",
@@ -132,6 +141,8 @@ def _save_conditioning(
     keys = (
         "coarse_lidar_bev",
         "replacement_raw",
+        "replacement_bev",
+        "occupancy_logits",
         "reconstruction_mask",
     )
     count = min(max_samples, outputs["coarse_lidar_bev"].shape[0])
@@ -188,7 +199,11 @@ def _run_epoch(
                     inputs["halo_mask"],
                     return_attention_weights=return_attention and batch_index == 0,
                 )
-                losses = loss_fn(outputs, inputs["clean_bev"])
+                losses = loss_fn(
+                    outputs,
+                    inputs["clean_bev"],
+                    inputs.get("observability_confidence"),
+                )
             if training:
                 scaler.scale(losses["loss"]).backward()
                 if grad_clip > 0:
@@ -202,6 +217,7 @@ def _run_epoch(
                 inputs["faulty_bev"],
                 inputs["clean_bev"],
                 loss_fn.config.epsilon,
+                inputs.get("observability_confidence"),
             )
         batch_size = inputs["faulty_bev"].shape[0]
         samples += batch_size
@@ -393,12 +409,28 @@ def main():
                     }
                 )
         history.append(row)
+        observability_log = ""
+        if loss_config.observability_weighting.enabled:
+            observability_log = (
+                "val/empty_observability="
+                f"{val_stats['mean_empty_observability_repair']:.3f} "
+                "val/empty_weight="
+                f"{val_stats['mean_empty_occupancy_weight']:.3f} "
+                "val/high_obs_hallucination="
+                f"{val_stats['hallucination_rate_high_observability']:.3%} "
+            )
         print(
-            f"epoch {epoch:03d}: train/reconstruction_loss="
-            f"{train_stats['reconstruction_loss']:.6f} "
-            f"val/reconstruction_loss={val_stats['reconstruction_loss']:.6f} "
-            f"val/improvement={val_stats['reconstruction_improvement']:.6f} "
-            f"val/relative_improvement={val_stats['relative_improvement']:.3%} "
+            f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
+            f"val/loss={val_stats['loss']:.6f} "
+            f"val/occupancy={val_stats['loss_occupancy']:.6f} "
+            f"val/density={val_stats['loss_density']:.6f} "
+            f"val/height={val_stats['loss_height']:.6f} "
+            f"val/F1={val_stats['coarse_occupancy_f1']:.3%} "
+            f"val/IoU={val_stats['coarse_occupancy_iou']:.3%} "
+            f"val/hallucination="
+            f"{val_stats['coarse_occupancy_hallucination_rate']:.3%} "
+            f"val/height_mae={val_stats['coarse_height_mae_m']:.3f}m "
+            f"{observability_log}"
             f"outside_change={val_stats['outside_mask_max_change']:.3e} "
             f"train_time={train_seconds:.1f}s "
             f"val_time={validation_seconds:.1f}s "
@@ -415,8 +447,8 @@ def main():
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")
-        if val_stats["reconstruction_loss"] < best_validation:
-            best_validation = val_stats["reconstruction_loss"]
+        if val_stats["loss"] < best_validation:
+            best_validation = val_stats["loss"]
             atomic_torch_save(checkpoint, output_root / "best_model.pt")
         write_csv_rows(
             output_root / "history.csv",

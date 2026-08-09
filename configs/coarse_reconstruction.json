@@ -3,7 +3,7 @@
     "enabled": true,
     "unet": {
       "base_channels": 16,
-      "depth": 5,
+      "depth": 4,
       "normalization": "group_norm",
       "activation": "silu",
       "dropout": 0.0
@@ -17,9 +17,14 @@
       "return_attention_during_validation": true
     },
     "loss": {
-      "reconstruction_loss_type": "smooth_l1",
-      "lambda_reconstruction": 1.0,
-      "epsilon": 1e-8
+      "lambda_occupancy": 1.0,
+      "lambda_density": 1.0,
+      "lambda_height": 1.0,
+      "epsilon": 1e-8,
+      "observability_weighting": {
+        "enabled": false,
+        "min_empty_weight": 0.1
+      }
     }
   },
   "fault_selector": {

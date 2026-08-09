@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn.functional as F
 
 from models.reconstruction_head import (
     CoarseLossConfig,
@@ -26,7 +25,8 @@ def _config():
 def _inputs(batch=2, size=32):
     faulty = torch.randn(batch, 3, size, size)
     radar = torch.randn(batch, 4, size, size)
-    clean = torch.randn(batch, 3, size, size)
+    clean = torch.rand(batch, 3, size, size)
+    clean[:, 0] = (clean[:, 0] >= 0.5).float()
     reconstruction = torch.zeros(batch, 1, size, size)
     reconstruction[:, :, size // 4 : 3 * size // 4, size // 4 : 3 * size // 4] = 1
     halo = torch.zeros_like(reconstruction)
@@ -73,7 +73,13 @@ class CoarseReconstructionTests(unittest.TestCase):
             )
 
         self.assertEqual(output["local_input"].shape, (2, 9, 32, 32))
+        self.assertEqual(output["global_lidar_input"].shape, (2, 4, 32, 32))
+        self.assertTrue(
+            torch.equal(output["global_lidar_input"][:, 3:4], reconstruction)
+        )
         self.assertEqual(output["replacement_raw"].shape, (2, 3, 32, 32))
+        self.assertEqual(output["replacement_bev"].shape, (2, 3, 32, 32))
+        self.assertEqual(output["occupancy_logits"].shape, (2, 1, 32, 32))
         self.assertEqual(output["coarse_lidar_bev"].shape, (2, 3, 32, 32))
         self.assertTrue(torch.all(output["erased_lidar_bev"] * reconstruction == 0))
         self.assertTrue(
@@ -92,7 +98,7 @@ class CoarseReconstructionTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 output["coarse_lidar_bev"] * reconstruction,
-                output["replacement_raw"] * reconstruction,
+                output["replacement_bev"] * reconstruction,
             )
         )
         self.assertEqual(output["local_bottleneck"].shape, (2, 16, 8, 8))
@@ -124,7 +130,7 @@ class CoarseReconstructionTests(unittest.TestCase):
         self.assertEqual(output["context_tokens"].shape[1], 400)
         self.assertEqual(output["replacement_raw"].shape, (1, 3, 320, 320))
 
-    def test_global_lidar_encoder_receives_erased_bev(self):
+    def test_global_lidar_encoder_receives_erased_bev_and_unknown_mask(self):
         model = CoarseReconstructionModel(_config()).eval()
         faulty, radar, reconstruction, healthy, halo, _clean = _inputs(1)
         observed = []
@@ -139,23 +145,21 @@ class CoarseReconstructionTests(unittest.TestCase):
         finally:
             handle.remove()
         self.assertEqual(len(observed), 1)
-        self.assertTrue(torch.all(observed[0] * reconstruction == 0))
+        self.assertEqual(observed[0].shape[1], 4)
+        self.assertTrue(torch.all(observed[0][:, :3] * reconstruction == 0))
+        self.assertTrue(torch.equal(observed[0][:, 3:4], reconstruction))
 
     def test_loss_covers_complete_reconstruction_region_and_empty_mask(self):
-        config = CoarseLossConfig(reconstruction_loss_type="smooth_l1")
-        loss_fn = MaskedBEVReconstructionLoss(config)
+        loss_fn = MaskedBEVReconstructionLoss(CoarseLossConfig())
         replacement = torch.zeros(1, 3, 4, 4, requires_grad=True)
         clean = torch.zeros_like(replacement)
-        clean[:, :, 1, 1] = 1.0  # Faulty cell target.
-        clean[:, :, 1, 2] = 0.5  # Deliberately sacrificed healthy cell target.
+        clean[:, 0, 1, 1] = 1.0
+        clean[:, 1:, 1, 1] = 0.5
         mask = torch.zeros(1, 1, 4, 4)
         mask[:, :, 1, 1:3] = 1
         outputs = {"replacement_raw": replacement, "reconstruction_mask": mask}
-        value = loss_fn(outputs, clean)["reconstruction_loss"]
-        expected = (
-            F.smooth_l1_loss(replacement, clean, reduction="none") * mask
-        ).sum() / (3 * mask.sum())
-        self.assertTrue(torch.equal(value, expected))
+        value = loss_fn(outputs, clean)["loss"]
+        self.assertTrue(torch.isfinite(value))
         value.backward()
         self.assertNotEqual(replacement.grad[:, :, 1, 2].abs().sum().item(), 0.0)
 
@@ -175,17 +179,24 @@ class CoarseReconstructionTests(unittest.TestCase):
 
     def test_metrics_compare_erased_and_reconstructed_bev(self):
         mask = torch.ones(1, 1, 2, 2)
-        faulty = torch.full((1, 3, 2, 2), 0.5)
+        faulty = torch.zeros(1, 3, 2, 2)
         clean = torch.ones_like(faulty)
+        logits = torch.full((1, 1, 2, 2), 20.0)
         outputs = {
             "reconstruction_mask": mask,
             "erased_lidar_bev": torch.zeros_like(faulty),
-            "coarse_lidar_bev": torch.full_like(faulty, 0.75),
+            "occupancy_logits": logits,
+            "coarse_lidar_bev": torch.cat(
+                (torch.sigmoid(logits), torch.full((1, 2, 2, 2), 0.75)),
+                dim=1,
+            ),
         }
         metrics = coarse_reconstruction_metrics(outputs, faulty, clean)
-        self.assertAlmostEqual(metrics["erased_masked_mae"].item(), 1.0)
-        self.assertAlmostEqual(metrics["coarse_masked_mae"].item(), 0.25)
-        self.assertAlmostEqual(metrics["relative_improvement"].item(), 0.75)
+        self.assertEqual(metrics["coarse_occupancy_f1"].item(), 1.0)
+        self.assertEqual(metrics["coarse_occupancy_iou"].item(), 1.0)
+        self.assertEqual(metrics["faulty_occupancy_recall"].item(), 0.0)
+        self.assertAlmostEqual(metrics["coarse_density_mae"].item(), 0.25)
+        self.assertAlmostEqual(metrics["coarse_height_mae_m"].item(), 2.0)
 
     def test_gradients_reach_every_required_component_without_latent_encoder(self):
         model = CoarseReconstructionModel(_config()).train()

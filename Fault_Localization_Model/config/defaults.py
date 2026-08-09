@@ -45,6 +45,15 @@ def config_defaults(config):
         "faults": config_get(config, "faults.names", None),
         "severities": config_get(config, "faults.severities", None),
         "num_workers": config_get(config, "generation.num_workers", 1),
+        "remove_added_points": config_get(
+            config, "generation.remove_added_points", False
+        ),
+        "observability_num_z_bins": config_get(
+            config, "observability.num_z_bins", 16
+        ),
+        "observability_ray_support_tau": config_get(
+            config, "observability.ray_support_tau", 4.0
+        ),
         "grid_size": config_get(config, "bev.grid_size", 100),
         "x_min": config_get(config, "bev.x_min", 0.0),
         "x_max": config_get(config, "bev.x_max", 64.0),

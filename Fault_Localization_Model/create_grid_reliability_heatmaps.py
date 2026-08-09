@@ -3,6 +3,7 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import json
 import logging
+import random
 import sys
 
 import numpy as np
@@ -44,6 +45,11 @@ from Fault_Localization_Model.data_injection_utils import (  # noqa: E402
 )
 from Fault_Localization_Model.fault_injector import build_fault_plan, choose_samples, inject_fault, load_fault_injector  # noqa: E402
 from Fault_Localization_Model.io_utils import atomic_savez_compressed, write_csv_rows  # noqa: E402
+from Fault_Localization_Model.lidar_observability import (  # noqa: E402
+    LIDAR_SENSOR_ORIGIN,
+    create_observability_map,
+    warm_observability_backend,
+)
 from Fault_Localization_Model.reliability_maps import (  # noqa: E402
     POINT_STATUS_ADDED,
     POINT_STATUS_MISSING,
@@ -66,7 +72,7 @@ FAULT_PLAN = [
 ]
 GROUND_TRUTH_METHOD = "point_id_provenance_v2_literature_fov"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
-GENERATOR_VERSION = 8
+GENERATOR_VERSION = 10
 RESUME_REQUIRED_ARRAYS = (
     "fault_heatmap",
     "reliability_map",
@@ -85,8 +91,16 @@ RESUME_REQUIRED_ARRAYS = (
     "missing_point_ids",
     "moved_point_ids",
     "added_point_ids",
+    "observability_confidence",
+    "observability_ray_count",
+    "observability_vertical_coverage",
+    "observability_ray_support",
 )
 WORKER_CONTEXT = None
+
+
+class UnusableSourceFrameError(ValueError):
+    """A paired source frame has no LiDAR evidence in radar support."""
 
 
 def colorize_fault_heatmap(values):
@@ -218,7 +232,7 @@ def _load_clean_artifacts(lidar_path_text):
     overlap_mask = radar_overlap_mask(clean_raw, radar_from_lidar)
     clean_points = clean_raw[range_mask & overlap_mask, :4]
     if len(clean_points) == 0:
-        raise ValueError(
+        raise UnusableSourceFrameError(
             "No LiDAR points remain after range and K-Radar FOV filtering "
             f"{lidar_path}"
         )
@@ -229,12 +243,23 @@ def _load_clean_artifacts(lidar_path_text):
         y_range=(cfg["y_min"], cfg["y_max"]),
         resolution=cfg["resolution"],
     )
+    observability = create_observability_map(
+        clean_points,
+        LIDAR_SENSOR_ORIGIN,
+        x_range=(cfg["x_min"], cfg["x_max"]),
+        y_range=(cfg["y_min"], cfg["y_max"]),
+        resolution=cfg["resolution"],
+        z_range=HEIGHT_RANGE_M,
+        num_z_bins=cfg["observability_num_z_bins"],
+        ray_support_tau=cfg["observability_ray_support_tau"],
+    )
     return (
         clean_points,
         clean_point_ids,
         clean_rgb,
         clean_layers["raw_density"],
         radar_from_lidar,
+        observability,
     )
 
 
@@ -263,7 +288,49 @@ def chronological_source_batches(tasks, batch_size):
 def create_sample_batch(tasks):
     """Create a chronological batch inside one persistent worker process."""
 
-    return [create_one_sample(task) for task in tasks]
+    results = []
+    for task in tasks:
+        try:
+            results.append(create_one_sample(task))
+        except UnusableSourceFrameError as exc:
+            results.append(
+                {
+                    "unusable_source": True,
+                    "task": dict(task),
+                    "error": str(exc),
+                }
+            )
+    return results
+
+
+def replacement_frame_pool(lidar_frames, samples, seed, *, shuffle):
+    """Return unused split frames in a deterministic replacement order."""
+
+    selected = {Path(lidar_path) for lidar_path, _fault, _severity in samples}
+    replacements = [
+        Path(lidar_path)
+        for lidar_path in lidar_frames
+        if Path(lidar_path) not in selected
+    ]
+    if shuffle:
+        random.Random(int(seed) ^ 0x5EED5EED).shuffle(replacements)
+    return replacements
+
+
+def faulty_point_keep_mask(
+    range_mask,
+    overlap_mask,
+    injector_labels,
+    source_ids,
+    *,
+    remove_added_points,
+):
+    """Select observable injected rows, optionally excluding synthetic returns."""
+
+    keep = range_mask & overlap_mask & (injector_labels != 0)
+    if remove_added_points:
+        keep &= source_ids >= 0
+    return keep
 
 
 def load_matching_existing_sample(
@@ -309,6 +376,32 @@ def load_matching_existing_sample(
                     )
                 if not np.isfinite(arrays[map_name]).all():
                     raise ValueError(f"{map_name} contains non-finite values")
+            observability_shape = (
+                cfg["image_height"],
+                cfg["image_width"],
+            )
+            for map_name in (
+                "observability_confidence",
+                "observability_ray_count",
+                "observability_vertical_coverage",
+                "observability_ray_support",
+            ):
+                if arrays[map_name].shape != observability_shape:
+                    raise ValueError(
+                        f"{map_name} has shape {arrays[map_name].shape}"
+                    )
+            for map_name in (
+                "observability_confidence",
+                "observability_vertical_coverage",
+                "observability_ray_support",
+            ):
+                values = arrays[map_name]
+                if (
+                    not np.isfinite(values).all()
+                    or float(values.min()) < 0.0
+                    or float(values.max()) > 1.0
+                ):
+                    raise ValueError(f"{map_name} must contain finite values in [0,1]")
             if (
                 not np.isfinite(arrays["fault_heatmap"]).all()
                 or float(arrays["fault_heatmap"].min()) < 0.0
@@ -389,6 +482,7 @@ def load_matching_existing_sample(
         "visualization_method": VISUALIZATION_METHOD,
         "movement_tolerance_m": cfg["movement_tolerance_m"],
         "generator_version": GENERATOR_VERSION,
+        "remove_added_points": bool(cfg.get("remove_added_points", False)),
         "generation_seed": cfg["generation_seed"],
         "injection_seed": injection_seed,
         "weather_threads": DEFAULT_WEATHER_THREADS,
@@ -398,6 +492,11 @@ def load_matching_existing_sample(
         "lidar_channels": list(LIDAR_CHANNELS),
         "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
         "lidar_height_range_m": list(HEIGHT_RANGE_M),
+        "lidar_sensor_origin_m": list(LIDAR_SENSOR_ORIGIN),
+        "observability_num_z_bins": cfg["observability_num_z_bins"],
+        "observability_ray_support_tau": cfg[
+            "observability_ray_support_tau"
+        ],
     }
     for key, expected_value in expected.items():
         if metadata.get(key) != expected_value:
@@ -455,6 +554,7 @@ def build_manifest_row(
         "fault": metadata.get("fault", ""),
         "severity": metadata.get("severity", ""),
         "generator_version": metadata.get("generator_version", ""),
+        "remove_added_points": metadata.get("remove_added_points", ""),
         "generation_seed": metadata.get("generation_seed", ""),
         "injection_seed": metadata.get("injection_seed", ""),
         "weather_threads": metadata.get("weather_threads", ""),
@@ -545,6 +645,7 @@ def create_one_sample(task):
         clean_rgb,
         clean_density,
         radar_from_lidar,
+        observability,
     ) = _load_clean_artifacts(str(lidar_path))
     # Fault injectors receive per-sample copies so cached clean artifacts cannot
     # leak mutations between different fault realizations of the same frame.
@@ -567,10 +668,12 @@ def create_one_sample(task):
         return_mask=True,
     )
     overlap_mask = radar_overlap_mask(injection.points, radar_from_lidar)
-    active_mask = (
-        range_mask
-        & overlap_mask
-        & (injection.injector_labels != 0)
+    active_mask = faulty_point_keep_mask(
+        range_mask,
+        overlap_mask,
+        injection.injector_labels,
+        injection.source_ids,
+        remove_added_points=cfg["remove_added_points"],
     )
     faulty_points = injection.points[active_mask]
     faulty_point_ids = injection.point_ids[active_mask]
@@ -711,6 +814,11 @@ def create_one_sample(task):
         "lidar_channels": list(LIDAR_CHANNELS),
         "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
         "lidar_height_range_m": list(HEIGHT_RANGE_M),
+        "lidar_sensor_origin_m": list(LIDAR_SENSOR_ORIGIN),
+        "observability_num_z_bins": cfg["observability_num_z_bins"],
+        "observability_ray_support_tau": cfg[
+            "observability_ray_support_tau"
+        ],
         "radar_from_lidar": radar_from_lidar.tolist(),
         "spatial_support": "intersection of LiDAR returns and K-Radar polar FOV",
         "fog_noise": fog_counts.get("fog_noise", ""),
@@ -718,6 +826,7 @@ def create_one_sample(task):
         "visualization_method": VISUALIZATION_METHOD,
         "movement_tolerance_m": cfg["movement_tolerance_m"],
         "generator_version": GENERATOR_VERSION,
+        "remove_added_points": cfg["remove_added_points"],
         "generation_seed": cfg["generation_seed"],
         "injection_seed": injection_seed,
         "weather_threads": fog_counts.get("weather_threads", ""),
@@ -750,6 +859,14 @@ def create_one_sample(task):
         faulty_point_ids=faulty_point_ids,
         faulty_source_ids=faulty_source_ids,
         faulty_injector_labels=faulty_injector_labels,
+        observability_confidence=observability[
+            "observability_confidence"
+        ].astype(np.float16),
+        observability_ray_count=observability["ray_count"].astype(np.uint32),
+        observability_vertical_coverage=observability[
+            "vertical_coverage"
+        ].astype(np.float16),
+        observability_ray_support=observability["ray_support"].astype(np.float16),
         metadata_json=json.dumps(sample_metadata, indent=2),
     )
     return {
@@ -850,6 +967,9 @@ def main():
         "image_height": image_height,
         "image_width": image_width,
         "generation_seed": args.seed,
+        "remove_added_points": args.remove_added_points,
+        "observability_num_z_bins": args.observability_num_z_bins,
+        "observability_ray_support_tau": args.observability_ray_support_tau,
     }
     #Create task description per generated sample
     tasks = [
@@ -866,6 +986,14 @@ def main():
         }
         for index, (lidar_path, fault, severity) in enumerate(samples)
     ]
+    replacement_paths = iter(
+        replacement_frame_pool(
+            lidar_frames,
+            samples,
+            args.seed,
+            shuffle=not args.no_shuffle,
+        )
+    )
     #Group Tasks into batches
     task_batches = chronological_source_batches(
         tasks,
@@ -878,30 +1006,77 @@ def main():
     )
     rows = []
     skipped = 0
+    completed = 0
+
+    def consume_results(results):
+        nonlocal completed, skipped
+        replacements = []
+        for result in results:
+            if result.get("unusable_source"):
+                failed_task = result["task"]
+                try:
+                    replacement_path = next(replacement_paths)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "No unused source frames remain to replace unusable "
+                        f"frame {failed_task['lidar_path']}"
+                    ) from exc
+                replacement = dict(failed_task)
+                replacement["lidar_path"] = str(replacement_path)
+                replacements.append(replacement)
+                LOGGER.warning(
+                    "Replacing unusable source for sample %04d: %s -> %s",
+                    failed_task["index"],
+                    failed_task["lidar_path"],
+                    replacement_path,
+                )
+                continue
+
+            completed += 1
+            rows.append(result)
+            if result.get("skipped"):
+                skipped += 1
+                LOGGER.info(
+                    "Skipping existing %04d/%04d: %s",
+                    completed,
+                    len(tasks),
+                    Path(result["npz"]).name,
+                )
+            else:
+                LOGGER.info(
+                    "Created %04d/%04d: %s",
+                    completed,
+                    len(tasks),
+                    Path(result["npz"]).name,
+                )
+        return replacements
+
+    if warm_observability_backend():
+        LOGGER.info("Using compiled LiDAR observability traversal")
+    else:
+        LOGGER.warning(
+            "Numba is unavailable; using the slower Python LiDAR "
+            "observability traversal"
+        )
     #Process Each sample
     if args.num_workers == 1:
         LOGGER.info("Creating samples sequentially")
         worker_init(worker_context)
-        completed = 0
-        for batch in task_batches:
-            for result in create_sample_batch(batch):
-                completed += 1
-                rows.append(result)
-                if result.get("skipped"):
-                    skipped += 1
-                    LOGGER.info(
-                        "Skipping existing %04d/%04d: %s",
-                        completed,
-                        len(tasks),
-                        Path(result["npz"]).name,
-                    )
-                else:
-                    LOGGER.info(
-                        "Created %04d/%04d: %s",
-                        completed,
-                        len(tasks),
-                        Path(result["npz"]).name,
-                    )
+        pending_batches = task_batches
+        while pending_batches:
+            replacement_tasks = []
+            for batch in pending_batches:
+                replacement_tasks.extend(
+                    consume_results(create_sample_batch(batch))
+                )
+            pending_batches = (
+                chronological_source_batches(
+                    replacement_tasks,
+                    args.source_batch_size,
+                )
+                if replacement_tasks
+                else []
+            )
     else:
         LOGGER.info("Creating samples with %d worker processes", args.num_workers)
         with ProcessPoolExecutor(
@@ -909,31 +1084,31 @@ def main():
             initializer=worker_init,
             initargs=(worker_context,),
         ) as executor:
-            completed = 0
-            for future, _ in iter_bounded_futures(
-                executor,
-                create_sample_batch,
-                task_batches,
-                max_pending=max(args.num_workers * 3, 1),
-            ):
-                for result in future.result():
-                    completed += 1
-                    rows.append(result)
-                    if result.get("skipped"):
-                        skipped += 1
-                        LOGGER.info(
-                            "Skipping existing %04d/%04d: %s",
-                            completed,
-                            len(tasks),
-                            Path(result["npz"]).name,
-                        )
-                    else:
-                        LOGGER.info(
-                            "Created %04d/%04d: %s",
-                            completed,
-                            len(tasks),
-                            Path(result["npz"]).name,
-                        )
+            pending_batches = task_batches
+            while pending_batches:
+                replacement_tasks = []
+                for future, _ in iter_bounded_futures(
+                    executor,
+                    create_sample_batch,
+                    pending_batches,
+                    max_pending=max(args.num_workers * 3, 1),
+                ):
+                    replacement_tasks.extend(
+                        consume_results(future.result())
+                    )
+                pending_batches = (
+                    chronological_source_batches(
+                        replacement_tasks,
+                        args.source_batch_size,
+                    )
+                    if replacement_tasks
+                    else []
+                )
+
+    if completed != len(tasks):
+        raise RuntimeError(
+            f"Generated {completed} samples, expected {len(tasks)}"
+        )
 
     rows = sorted(rows, key=lambda row: row["index"])
     if skipped:

@@ -73,7 +73,7 @@ class GlobalLidarEncoder(nn.Module):
     def __init__(self, config: CoarseReconstructionConfig):
         super().__init__()
         self.encoder = BEVEncoder(
-            config.lidar_channels,
+            config.lidar_channels + 1,
             base_channels=config.global_base_channels,
             channel_multipliers=config.global_channel_multipliers,
         )
@@ -224,8 +224,7 @@ class BottleneckFusionBlock(nn.Module):
         )
 
     def forward(
-        self, local_bottleneck: torch.Tensor, attention_context: torch.Tensor
-    ) -> torch.Tensor:
+        self, local_bottleneck: torch.Tensor, attention_context: torch.Tensor) -> torch.Tensor:
         if local_bottleneck.shape[-2:] != attention_context.shape[-2:]:
             raise ValueError("Attention context must match the local bottleneck grid")
         update = self.block(torch.cat((local_bottleneck, attention_context), dim=1))
@@ -329,7 +328,10 @@ class CoarseReconstructionModel(nn.Module):
         )
         skip_features, local_bottleneck = self.local_unet_encoder(local_input)
 
-        h_lidar_global = self.global_lidar_encoder(erased_lidar_bev)
+        global_lidar_input = torch.cat(
+            (erased_lidar_bev, reconstruction_mask), dim=1
+        )
+        h_lidar_global = self.global_lidar_encoder(global_lidar_input)
         h_radar_global = self.global_radar_encoder(radar_bev)
         global_context_map = self.global_fusion(
             torch.cat((h_lidar_global, h_radar_global), dim=1)
@@ -353,19 +355,35 @@ class CoarseReconstructionModel(nn.Module):
                 align_corners=False,
             )
         replacement_raw = self.replacement_head(decoder_feature)
+        occupancy_logits = replacement_raw[:, 0:1]
+        predicted_density = replacement_raw[:, 1:2]
+        predicted_height = replacement_raw[:, 2:3]
+        replacement_bev = torch.cat(
+            (
+                torch.sigmoid(occupancy_logits),
+                predicted_density,
+                predicted_height,
+            ),
+            dim=1,
+        )
         coarse_lidar_bev = (
             (1.0 - reconstruction_mask) * faulty_lidar_bev
-            + reconstruction_mask * replacement_raw
+            + reconstruction_mask * replacement_bev
         )
         outputs = {
             "erased_lidar_bev": erased_lidar_bev,
             "replacement_raw": replacement_raw,
+            "replacement_bev": replacement_bev,
+            "occupancy_logits": occupancy_logits,
+            "predicted_density": predicted_density,
+            "predicted_height": predicted_height,
             "coarse_lidar_bev": coarse_lidar_bev,
             "reconstruction_mask": reconstruction_mask,
             "healthy_context_mask": healthy_context_mask,
             "halo_mask": halo_mask,
             "active_mask": active_mask,
             "local_input": local_input,
+            "global_lidar_input": global_lidar_input,
             "local_bottleneck": local_bottleneck,
             "attention_context": attention_context,
             "fused_bottleneck": fused_bottleneck,

@@ -48,6 +48,9 @@ class ReconstructionEncoderTests(unittest.TestCase):
                 added_faulty_counts=np.zeros((8, 6), dtype=np.int32),
                 missing_faulty_counts=np.ones((8, 6), dtype=np.int32),
                 moved_faulty_counts=np.zeros((8, 6), dtype=np.int32),
+                observability_confidence=np.full(
+                    (8, 6), 0.625, dtype=np.float16
+                ),
                 metadata_json=np.asarray(json.dumps(metadata)),
             )
             np.savez_compressed(
@@ -60,6 +63,7 @@ class ReconstructionEncoderTests(unittest.TestCase):
         self.assertEqual(item["clean_bev"].shape, (3, 8, 6))
         self.assertEqual(item["radar_bev"].shape, (4, 8, 6))
         self.assertEqual(item["faulty_bev"].shape, (3, 8, 6))
+        self.assertEqual(item["observability_confidence"].shape, (1, 8, 6))
         self.assertNotIn("fault_heatmap", item)
         self.assertNotIn("reliability_map", item)
         self.assertNotIn("faulty_counts", item)
@@ -69,6 +73,7 @@ class ReconstructionEncoderTests(unittest.TestCase):
         self.assertTrue(torch.all(item["clean_bev"] == 1.0))
         self.assertTrue(torch.all(item["radar_bev"] == 0.5))
         self.assertTrue(torch.all(item["faulty_bev"] == 0.0))
+        self.assertTrue(torch.all(item["observability_confidence"] == 0.625))
 
     def test_fault_selector_rejects_isolated_cells_and_combines_major_regions(self):
         heatmap = np.zeros((40, 20), dtype=np.float32)
