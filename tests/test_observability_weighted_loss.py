@@ -1,3 +1,5 @@
+from dataclasses import asdict
+import json
 import unittest
 
 import torch
@@ -39,6 +41,22 @@ def _loss(enabled, min_empty_weight=0.1):
 
 
 class ObservabilityWeightedLossTests(unittest.TestCase):
+    def test_nested_loss_configuration_is_json_serializable(self):
+        config = CoarseLossConfig(
+            observability_weighting=ObservabilityWeightingConfig(
+                enabled=False,
+                min_empty_weight=0.0,
+            )
+        )
+
+        serialized = json.loads(json.dumps(asdict(config)))
+
+        self.assertFalse(serialized["observability_weighting"]["enabled"])
+        self.assertEqual(
+            serialized["observability_weighting"]["min_empty_weight"],
+            0.0,
+        )
+
     def test_occupied_cells_always_have_unit_weight(self):
         target = torch.ones(1, 1, 1, 3)
         confidence = torch.tensor([[[[0.0, 0.5, 1.0]]]])

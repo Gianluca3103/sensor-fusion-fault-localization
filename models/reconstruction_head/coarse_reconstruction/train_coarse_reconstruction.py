@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -299,7 +300,7 @@ def main():
         output_root / "resolved_config.json",
         {
             "model": model_config.to_dict(),
-            "loss": loss_config.__dict__,
+            "loss": asdict(loss_config),
             "selector": selector_config.__dict__,
             "training": training,
             "args": vars(args),
@@ -442,7 +443,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "model_config": model_config.to_dict(),
-            "loss_config": loss_config.__dict__,
+            "loss_config": asdict(loss_config),
             "active_fraction_profile": active_fraction_profile,
             "history": history,
         }
