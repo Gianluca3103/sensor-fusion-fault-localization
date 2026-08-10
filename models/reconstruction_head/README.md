@@ -113,11 +113,11 @@ python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstr
   --device cuda
 ```
 
-Pass `--disable-radar` for a controlled radar-input ablation. The trainer
-replaces every radar BEV with zeros before both training and validation, so
-neither the local radar conditioning nor the global radar encoder receives
-radar measurements. The architecture and parameter count remain unchanged,
-and the ablation is recorded in the resolved arguments and checkpoints.
+Use `--radar-mode full`, `global-only`, or `none` for controlled radar-input
+ablations. `global-only` supplies real radar only to the global radar encoder
+and zeros the local U-Net radar channels. `none` zeros radar for both branches;
+`--disable-radar` remains an alias for that mode. The architecture and parameter
+count remain unchanged, and the selected mode is recorded in checkpoints.
 
 The baseline objective is channel-aware. Occupancy uses mask-normalized binary
 cross entropy with logits plus per-sample soft Dice throughout

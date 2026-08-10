@@ -68,6 +68,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 super().__init__()
                 self.attention_requests = []
                 self.radar_sums = []
+                self.local_radar_sums = []
 
             def forward(
                 self,
@@ -77,10 +78,14 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 healthy_context_mask,
                 halo_mask,
                 *,
+                local_radar_bev=None,
                 return_attention_weights=False,
             ):
                 self.attention_requests.append(return_attention_weights)
                 self.radar_sums.append(float(radar_bev.sum()))
+                if local_radar_bev is None:
+                    local_radar_bev = radar_bev
+                self.local_radar_sums.append(float(local_radar_bev.sum()))
                 erased = faulty_bev * (1.0 - reconstruction_mask)
                 outputs = {
                     "erased_lidar_bev": erased,
@@ -135,6 +140,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
 
         self.assertEqual(model.attention_requests, [True, False])
         self.assertEqual(model.radar_sums, [64.0, 64.0])
+        self.assertEqual(model.local_radar_sums, [64.0, 64.0])
         self.assertEqual(saved_batches, [True])
         self.assertEqual(active_fractions, [1.0, 1.0])
 
@@ -144,10 +150,22 @@ class TrainingDataSelectionTests(unittest.TestCase):
             [batch],
             MaskedBEVReconstructionLoss(),
             torch.device("cpu"),
-            disable_radar=True,
+            radar_mode="none",
         )
         self.assertEqual(ablated_model.radar_sums, [0.0])
+        self.assertEqual(ablated_model.local_radar_sums, [0.0])
         self.assertEqual(float(batch["radar_bev"].sum()), 64.0)
+
+        global_only_model = RecordingModel()
+        run_coarse_epoch(
+            global_only_model,
+            [batch],
+            MaskedBEVReconstructionLoss(),
+            torch.device("cpu"),
+            radar_mode="global-only",
+        )
+        self.assertEqual(global_only_model.radar_sums, [64.0])
+        self.assertEqual(global_only_model.local_radar_sums, [0.0])
 
     def test_active_fraction_summary_and_recommendation(self):
         summary = _summarize_active_fractions([0.0, 0.25, 0.5, 0.75, 1.0])

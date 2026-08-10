@@ -309,6 +309,7 @@ class CoarseReconstructionModel(nn.Module):
         healthy_context_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         *,
+        local_radar_bev: torch.Tensor | None = None,
         return_attention_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
@@ -316,7 +317,9 @@ class CoarseReconstructionModel(nn.Module):
 
         erased_lidar_bev = (1.0 - reconstruction_mask) * faulty_lidar_bev
         local_lidar_context = healthy_context_mask * faulty_lidar_bev
-        local_radar_active = active_mask * radar_bev
+        if local_radar_bev is None:
+            local_radar_bev = radar_bev
+        local_radar_active = active_mask * local_radar_bev
         local_input = torch.cat(
             (
                 local_lidar_context,

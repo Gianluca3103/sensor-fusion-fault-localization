@@ -59,6 +59,16 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--radar-mode",
+        choices=("full", "global-only", "none"),
+        default="full",
+        help=(
+            "Radar conditioning mode: full uses local and global radar, "
+            "global-only removes radar from the local U-Net, and none removes "
+            "radar measurements from both branches."
+        ),
+    )
+    parser.add_argument(
         "--tensorboard",
         action="store_true",
         help="Write live training metrics for TensorBoard.",
@@ -221,7 +231,7 @@ def _run_epoch(
     return_attention=False,
     conditioning_callback=None,
     active_fraction_samples=None,
-    disable_radar=False,
+    radar_mode="full",
 ):
     training = optimizer is not None
     model.train(training)
@@ -236,8 +246,11 @@ def _run_epoch(
             fractions = active_mask.flatten(1).float().mean(dim=1)
             active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
-        if disable_radar:
+        local_radar_bev = None
+        if radar_mode == "none":
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
+        elif radar_mode == "global-only":
+            local_radar_bev = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
@@ -252,6 +265,7 @@ def _run_epoch(
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
+                    local_radar_bev=local_radar_bev,
                     return_attention_weights=return_attention and batch_index == 0,
                 )
                 losses = loss_fn(
@@ -289,6 +303,9 @@ def _run_epoch(
 
 def main():
     args = _parse_args()
+    if args.disable_radar and args.radar_mode != "full":
+        raise ValueError("Use either --disable-radar or --radar-mode, not both")
+    radar_mode = "none" if args.disable_radar else args.radar_mode
     payload = load_config(args.config)
     model_config, loss_config, selector_config = build_configs(payload)
     training = dict(payload.get("training", {}))
@@ -370,7 +387,7 @@ def main():
     )
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
-    print(f"Radar input enabled: {not args.disable_radar}")
+    print(f"Radar mode: {radar_mode}")
     history = []
     best_validation = float("inf")
     active_fraction_profile = None
@@ -389,7 +406,7 @@ def main():
             grad_clip=grad_clip,
             use_amp=use_amp,
             active_fraction_samples=train_active_fractions,
-            disable_radar=args.disable_radar,
+            radar_mode=radar_mode,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -410,7 +427,7 @@ def main():
                     save_conditioning_samples,
                 ),
                 active_fraction_samples=val_active_fractions,
-                disable_radar=args.disable_radar,
+                radar_mode=radar_mode,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started
@@ -528,7 +545,8 @@ def main():
             "model_config": model_config.to_dict(),
             "loss_config": asdict(loss_config),
             "active_fraction_profile": active_fraction_profile,
-            "radar_disabled": args.disable_radar,
+            "radar_mode": radar_mode,
+            "radar_disabled": radar_mode == "none",
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")
