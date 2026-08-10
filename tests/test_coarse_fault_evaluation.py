@@ -1,11 +1,41 @@
 import unittest
+import tempfile
+from pathlib import Path
+
+import torch
 
 from models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
+    _save_comparison,
     summarize_records,
 )
 
 
 class CoarseFaultEvaluationTests(unittest.TestCase):
+    def test_comparison_visualization_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "comparison.png"
+            clean = torch.zeros(3, 8, 8)
+            clean[0, 2:5, 2:5] = 1.0
+            coarse = clean.clone()
+            coarse[:, 3, 3] = 0.5
+            mask = torch.zeros(1, 8, 8)
+            mask[:, 1:6, 1:6] = 1.0
+            _save_comparison(
+                destination,
+                clean,
+                coarse,
+                mask,
+                {
+                    "fault_group": "fog_sim_s3",
+                    "sequence_id": "1",
+                    "frame_id": "1",
+                    "faulty_occupancy_exact_iou": 0.25,
+                    "coarse_occupancy_exact_iou": 0.5,
+                },
+            )
+            self.assertTrue(destination.is_file())
+            self.assertGreater(destination.stat().st_size, 0)
+
     def test_summary_reports_macro_and_micro_occupancy(self):
         records = [
             {

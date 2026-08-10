@@ -6,6 +6,11 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -41,6 +46,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-samples", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--visualize-samples-per-fault",
+        type=int,
+        default=5,
+        help="Clean/reconstructed comparisons saved for each fault group; 0 disables.",
+    )
     return parser.parse_args()
 
 
@@ -168,10 +179,68 @@ def _print_table(groups: dict[str, dict]) -> None:
         )
 
 
+def _bev_rgb(bev: torch.Tensor) -> np.ndarray:
+    return (
+        bev.detach()
+        .to(dtype=torch.float32)
+        .clamp(0.0, 1.0)
+        .permute(1, 2, 0)
+        .cpu()
+        .numpy()
+    )
+
+
+def _save_comparison(
+    destination: Path,
+    clean_bev: torch.Tensor,
+    coarse_bev: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    record: dict,
+) -> None:
+    clean = _bev_rgb(clean_bev)
+    coarse = _bev_rgb(coarse_bev)
+    mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
+    difference = np.mean(np.abs(coarse - clean), axis=-1) * mask
+    figure, axes = plt.subplots(1, 3, figsize=(16, 5), facecolor="black")
+    panels = (
+        (clean, "Clean LiDAR BEV", None),
+        (coarse, "Coarse reconstructed LiDAR BEV", None),
+        (difference, "Absolute error inside repair mask", "magma"),
+    )
+    for axis, (image, title, cmap) in zip(axes, panels):
+        axis.imshow(
+            image,
+            cmap=cmap,
+            vmin=0.0 if cmap else None,
+            vmax=1.0 if cmap else None,
+            interpolation="nearest",
+        )
+        axis.contour(mask.astype(np.uint8), levels=(0.5,), colors="cyan", linewidths=0.7)
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    figure.suptitle(
+        f"{record['fault_group']} | sequence {record['sequence_id']} | "
+        f"frame {record['frame_id']} | "
+        f"faulty IoU {record['faulty_occupancy_exact_iou']:.2%} -> "
+        f"coarse IoU {record['coarse_occupancy_exact_iou']:.2%}",
+        color="white",
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        destination,
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)
+
+
 def main() -> None:
     args = _parse_args()
     if args.batch_size < 1 or args.num_workers < 0:
         raise ValueError("batch size must be positive and workers non-negative")
+    if args.visualize_samples_per_fault < 0:
+        raise ValueError("visualization count cannot be negative")
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -214,6 +283,7 @@ def main() -> None:
     epsilon = float(checkpoint.get("loss_config", {}).get("epsilon", 1.0e-8))
     use_amp = device.type == "cuda" and not args.no_amp
     records = []
+    visualized = defaultdict(int)
     completed = 0
 
     with torch.inference_mode():
@@ -298,6 +368,22 @@ def main() -> None:
                     - record["faulty_occupancy_exact_iou"]
                 )
                 records.append(record)
+                if (
+                    visualized[record["fault_group"]]
+                    < args.visualize_samples_per_fault
+                ):
+                    visual_index = visualized[record["fault_group"]]
+                    _save_comparison(
+                        args.output_root
+                        / "visualizations"
+                        / record["fault_group"]
+                        / f"{visual_index:03d}_{Path(sample_path).stem}.png",
+                        inputs["clean_bev"][index],
+                        outputs["coarse_lidar_bev"][index],
+                        inputs["reconstruction_mask"][index],
+                        record,
+                    )
+                    visualized[record["fault_group"]] += 1
             completed += batch_size
             if completed % 500 < batch_size or completed == len(dataset):
                 print(f"Evaluated {completed}/{len(dataset)} samples", flush=True)
