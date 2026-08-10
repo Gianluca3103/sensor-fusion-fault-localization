@@ -6,10 +6,12 @@ import numpy as np
 
 from Fault_Localization_Model.kradar_dataset import (
     kradar_source_metadata,
+    load_kradar_annotations,
     load_radar_from_lidar_transform,
     radar_bev_support_mask,
     radar_overlap_mask,
     read_kradar_lidar_pcd,
+    resolve_kradar_label_path,
     select_temporal_split_frames,
 )
 
@@ -37,6 +39,57 @@ def write_ascii_pcd(path, points):
 
 
 class KRadarDatasetTests(unittest.TestCase):
+    def test_annotation_loader_converts_yaw_and_half_dimensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "labels.txt"
+            path.write_text(
+                "* header, timestamp=1\n"
+                "*, 0, -1, Sedan, 10, -2, 0.5, 90, 2.0, 1.0, 0.75\n",
+                encoding="utf-8",
+            )
+            annotation = load_kradar_annotations(path)[0]
+
+        self.assertEqual(annotation.class_name, "Sedan")
+        self.assertAlmostEqual(annotation.yaw, np.pi / 2.0)
+        self.assertEqual(
+            (annotation.length, annotation.width, annotation.height),
+            (4.0, 2.0, 1.5),
+        )
+
+    def test_annotation_loader_supports_v2_0_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "labels.txt"
+            path.write_text(
+                "* header, timestamp=1\n"
+                "*, -1, Bus or Truck, 20, 3, 1, -45, 3, 1.5, 1.25\n",
+                encoding="utf-8",
+            )
+            annotation = load_kradar_annotations(path, version="v2_0")[0]
+
+        self.assertEqual(annotation.class_name, "Bus or Truck")
+        self.assertAlmostEqual(annotation.yaw, -np.pi / 4.0)
+        self.assertEqual(annotation.length, 6.0)
+
+    def test_revised_annotation_path_is_preferred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "K-Radar"
+            revised = Path(directory) / "revised"
+            original = root / "lidar" / "1" / "info_label" / "frame.txt"
+            preferred = revised / "1" / "frame.txt"
+            original.parent.mkdir(parents=True)
+            preferred.parent.mkdir(parents=True)
+            original.touch()
+            preferred.touch()
+            resolved = resolve_kradar_label_path(
+                root,
+                {
+                    "sequence": "1",
+                    "label_relative_path": "lidar/1/info_label/frame.txt",
+                },
+                revised_label_root=revised,
+            )
+        self.assertEqual(resolved, preferred)
+
     def test_pcd_reader_preserves_xyzi(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "frame.pcd"

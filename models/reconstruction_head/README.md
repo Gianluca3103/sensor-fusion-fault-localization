@@ -194,6 +194,25 @@ outputs containing `coarse_lidar_bev`, `replacement_raw`, and
 weights are requested only for the first validation batch that is saved; later
 validation batches do not materialize unused attention matrices.
 
+Aggregate training history does not preserve fault identities. Evaluate a
+frozen checkpoint separately to obtain per-sample, per-fault, and
+per-fault/severity reconstruction metrics:
+
+```bash
+python -m models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault \
+  --checkpoint /path/to/coarse_run/best_model.pt \
+  --data-root /path/to/generated_samples \
+  --radar-root /path/to/radar_cache \
+  --output-root /path/to/coarse_run/per_fault_evaluation \
+  --config configs/coarse_reconstruction.json \
+  --split val --device cuda --batch-size 32 --num-workers 4
+```
+
+The evaluator reads radar/global-map ablation settings from the checkpoint and
+writes `per_sample_metrics.csv`, `by_fault_metrics.csv`, and `summary.json`.
+It reports macro per-sample metrics as well as micro exact-cell IoU/F1 formed
+from summed TP/FP/FN counts.
+
 ## Masked residual diffusion
 
 The second trainer freezes a completed coarse checkpoint and learns only its
@@ -236,3 +255,33 @@ also written. Occupancy is consistently stored in LiDAR channel 0.
 The first implementation intentionally supports DDPM only. The sampler API is
 separate from the network and schedule so DDIM can be added later without
 changing the training model.
+
+## Object-level reconstruction-region evaluation
+
+K-Radar GT boxes can be evaluated against cached reconstruction masks without
+running the reconstruction network:
+
+```powershell
+python -m models.reconstruction_head.evaluate_object_overlap `
+  --data-root "C:\path\to\generated_samples" `
+  --kradar-root "C:\path\to\K-Radar_Data" `
+  --output-root "C:\path\to\object_overlap_results" `
+  --split val `
+  --config "configs\coarse_reconstruction.json" `
+  --visualize-samples 10
+```
+
+Use `--revised-label-root` when the revised K-Radar v2.0 labels are stored
+outside the sequence directories. Revised labels are preferred when present;
+the frame label recorded in sample metadata is the fallback. The loader follows
+the official convention: yaw degrees are converted to radians and stored half
+dimensions are doubled into full length, width, and height. Labels are not
+calibration-shifted because these BEVs are rasterized in the native LiDAR frame.
+
+The command writes `objects.csv`, `objects.json`, `summary.json`, and GT/mask
+visualizations. Footprint coverage uses exact oriented-polygon area against the
+union of reconstruction-mask cells. Detector-derived loss, recovery, and
+preservation metrics remain explicitly unavailable: coarse output is a
+three-channel BEV raster, not a point cloud, and this repository does not have
+a frozen detector that consumes that representation. No BEV-to-point-cloud
+conversion is fabricated.
