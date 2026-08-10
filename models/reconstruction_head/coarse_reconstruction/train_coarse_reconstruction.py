@@ -479,6 +479,13 @@ def main():
             )
         print(
             f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
+            f"train/occupancy={train_stats['loss_occupancy']:.6f} "
+            f"train/density={train_stats['loss_density']:.6f} "
+            f"train/height={train_stats['loss_height']:.6f} "
+            "train/exact_F1="
+            f"{train_stats['coarse_occupancy_exact_f1']:.3%} "
+            "train/exact_IoU="
+            f"{train_stats['coarse_occupancy_exact_iou']:.3%} "
             f"val/loss={val_stats['loss']:.6f} "
             f"val/occupancy={val_stats['loss_occupancy']:.6f} "
             f"val/density={val_stats['loss_density']:.6f} "
@@ -496,7 +503,8 @@ def main():
             f"outside_change={val_stats['outside_mask_max_change']:.3e} "
             f"train_time={train_seconds:.1f}s "
             f"val_time={validation_seconds:.1f}s "
-            f"epoch_time={epoch_seconds:.1f}s"
+            f"epoch_time={epoch_seconds:.1f}s",
+            flush=True,
         )
         checkpoint = {
             "epoch": epoch,
