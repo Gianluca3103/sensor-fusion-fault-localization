@@ -119,6 +119,13 @@ and zeros the local U-Net radar channels. `none` zeros radar for both branches;
 `--disable-radar` remains an alias for that mode. The architecture and parameter
 count remain unchanged, and the selected mode is recorded in checkpoints.
 
+Pass `--disable-global-map` for the local-U-Net-only ablation. It bypasses both
+global encoders, global fusion, positional cross-attention, and bottleneck
+fusion; the local bottleneck is sent directly into the decoder. Local LiDAR,
+local radar, masks, skip connections, decoder, and replacement head remain
+active. The instantiated architecture is unchanged, but global parameters are
+not executed or trained during this ablation.
+
 The baseline objective is channel-aware. Occupancy uses mask-normalized binary
 cross entropy with logits plus per-sample soft Dice throughout
 `reconstruction_mask`. Density and height use Smooth L1 only where the cell is

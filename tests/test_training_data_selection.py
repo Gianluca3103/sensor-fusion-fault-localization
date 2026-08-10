@@ -69,6 +69,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 self.attention_requests = []
                 self.radar_sums = []
                 self.local_radar_sums = []
+                self.global_map_requests = []
 
             def forward(
                 self,
@@ -79,9 +80,11 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 halo_mask,
                 *,
                 local_radar_bev=None,
+                use_global_map=True,
                 return_attention_weights=False,
             ):
                 self.attention_requests.append(return_attention_weights)
+                self.global_map_requests.append(use_global_map)
                 self.radar_sums.append(float(radar_bev.sum()))
                 if local_radar_bev is None:
                     local_radar_bev = radar_bev
@@ -139,6 +142,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(model.attention_requests, [True, False])
+        self.assertEqual(model.global_map_requests, [True, True])
         self.assertEqual(model.radar_sums, [64.0, 64.0])
         self.assertEqual(model.local_radar_sums, [64.0, 64.0])
         self.assertEqual(saved_batches, [True])
@@ -166,6 +170,16 @@ class TrainingDataSelectionTests(unittest.TestCase):
         )
         self.assertEqual(global_only_model.radar_sums, [64.0])
         self.assertEqual(global_only_model.local_radar_sums, [0.0])
+
+        local_only_model = RecordingModel()
+        run_coarse_epoch(
+            local_only_model,
+            [batch],
+            MaskedBEVReconstructionLoss(),
+            torch.device("cpu"),
+            use_global_map=False,
+        )
+        self.assertEqual(local_only_model.global_map_requests, [False])
 
     def test_active_fraction_summary_and_recommendation(self):
         summary = _summarize_active_fractions([0.0, 0.25, 0.5, 0.75, 1.0])

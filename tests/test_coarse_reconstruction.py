@@ -149,6 +149,48 @@ class CoarseReconstructionTests(unittest.TestCase):
         self.assertTrue(torch.all(observed[0][:, :3] * reconstruction == 0))
         self.assertTrue(torch.equal(observed[0][:, 3:4], reconstruction))
 
+    def test_global_map_can_be_bypassed_for_local_only_ablation(self):
+        model = CoarseReconstructionModel(_config()).eval()
+        faulty, radar, reconstruction, healthy, halo, _clean = _inputs(1)
+        global_calls = []
+
+        handles = [
+            module.register_forward_hook(
+                lambda _module, _arguments, _output, name=name: global_calls.append(
+                    name
+                )
+            )
+            for name, module in (
+                ("global_lidar", model.global_lidar_encoder),
+                ("global_radar", model.global_radar_encoder),
+                ("global_fusion", model.global_fusion),
+                ("cross_attention", model.cross_attention),
+                ("bottleneck_fusion", model.bottleneck_fusion),
+            )
+        ]
+        try:
+            with torch.no_grad():
+                outputs = model(
+                    faulty,
+                    radar,
+                    reconstruction,
+                    healthy,
+                    halo,
+                    use_global_map=False,
+                    return_attention_weights=True,
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(global_calls, [])
+        self.assertTrue(
+            torch.equal(outputs["fused_bottleneck"], outputs["local_bottleneck"])
+        )
+        self.assertNotIn("global_context_map", outputs)
+        self.assertNotIn("attention_weights", outputs)
+        self.assertEqual(outputs["coarse_lidar_bev"].shape, faulty.shape)
+
     def test_loss_covers_complete_reconstruction_region_and_empty_mask(self):
         loss_fn = MaskedBEVReconstructionLoss(CoarseLossConfig())
         replacement = torch.zeros(1, 3, 4, 4, requires_grad=True)

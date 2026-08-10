@@ -69,6 +69,14 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--disable-global-map",
+        action="store_true",
+        help=(
+            "Use only the local U-Net by skipping both global encoders, "
+            "global fusion, cross-attention, and bottleneck fusion."
+        ),
+    )
+    parser.add_argument(
         "--tensorboard",
         action="store_true",
         help="Write live training metrics for TensorBoard.",
@@ -160,7 +168,9 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "global_context_map",
     )
     result = {key: list(value.shape) for key, value in inputs.items()}
-    result.update({key: list(outputs[key].shape) for key in names})
+    result.update(
+        {key: list(outputs[key].shape) for key in names if key in outputs}
+    )
     return result
 
 
@@ -232,6 +242,7 @@ def _run_epoch(
     conditioning_callback=None,
     active_fraction_samples=None,
     radar_mode="full",
+    use_global_map=True,
 ):
     training = optimizer is not None
     model.train(training)
@@ -266,6 +277,7 @@ def _run_epoch(
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
                     local_radar_bev=local_radar_bev,
+                    use_global_map=use_global_map,
                     return_attention_weights=return_attention and batch_index == 0,
                 )
                 losses = loss_fn(
@@ -388,6 +400,7 @@ def main():
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
     print(f"Radar mode: {radar_mode}")
+    print(f"Global map enabled: {not args.disable_global_map}")
     history = []
     best_validation = float("inf")
     active_fraction_profile = None
@@ -407,6 +420,7 @@ def main():
             use_amp=use_amp,
             active_fraction_samples=train_active_fractions,
             radar_mode=radar_mode,
+            use_global_map=not args.disable_global_map,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -428,6 +442,7 @@ def main():
                 ),
                 active_fraction_samples=val_active_fractions,
                 radar_mode=radar_mode,
+                use_global_map=not args.disable_global_map,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started
@@ -547,6 +562,7 @@ def main():
             "active_fraction_profile": active_fraction_profile,
             "radar_mode": radar_mode,
             "radar_disabled": radar_mode == "none",
+            "global_map_enabled": not args.disable_global_map,
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")

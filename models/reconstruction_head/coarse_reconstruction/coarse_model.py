@@ -310,6 +310,7 @@ class CoarseReconstructionModel(nn.Module):
         halo_mask: torch.Tensor,
         *,
         local_radar_bev: torch.Tensor | None = None,
+        use_global_map: bool = True,
         return_attention_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
@@ -331,24 +332,36 @@ class CoarseReconstructionModel(nn.Module):
         )
         skip_features, local_bottleneck = self.local_unet_encoder(local_input)
 
-        global_lidar_input = torch.cat(
-            (erased_lidar_bev, reconstruction_mask), dim=1
-        )
-        h_lidar_global = self.global_lidar_encoder(global_lidar_input)
-        h_radar_global = self.global_radar_encoder(radar_bev)
-        global_context_map = self.global_fusion(
-            torch.cat((h_lidar_global, h_radar_global), dim=1)
-        )
-        attention_context, attention_weights, query_tokens, context_tokens = (
-            self.cross_attention(
-                local_bottleneck,
-                global_context_map,
-                return_attention_weights=return_attention_weights,
+        global_outputs = {}
+        attention_weights = None
+        if use_global_map:
+            global_lidar_input = torch.cat(
+                (erased_lidar_bev, reconstruction_mask), dim=1
             )
-        )
-        fused_bottleneck = self.bottleneck_fusion(
-            local_bottleneck, attention_context
-        )
+            h_lidar_global = self.global_lidar_encoder(global_lidar_input)
+            h_radar_global = self.global_radar_encoder(radar_bev)
+            global_context_map = self.global_fusion(
+                torch.cat((h_lidar_global, h_radar_global), dim=1)
+            )
+            attention_context, attention_weights, query_tokens, context_tokens = (
+                self.cross_attention(
+                    local_bottleneck,
+                    global_context_map,
+                    return_attention_weights=return_attention_weights,
+                )
+            )
+            fused_bottleneck = self.bottleneck_fusion(
+                local_bottleneck, attention_context
+            )
+            global_outputs = {
+                "global_lidar_input": global_lidar_input,
+                "attention_context": attention_context,
+                "global_context_map": global_context_map,
+                "query_tokens": query_tokens,
+                "context_tokens": context_tokens,
+            }
+        else:
+            fused_bottleneck = local_bottleneck
         decoder_feature = self.local_unet_decoder(fused_bottleneck, skip_features)
         if decoder_feature.shape[-2:] != faulty_lidar_bev.shape[-2:]:
             decoder_feature = F.interpolate(
@@ -386,15 +399,11 @@ class CoarseReconstructionModel(nn.Module):
             "halo_mask": halo_mask,
             "active_mask": active_mask,
             "local_input": local_input,
-            "global_lidar_input": global_lidar_input,
             "local_bottleneck": local_bottleneck,
-            "attention_context": attention_context,
             "fused_bottleneck": fused_bottleneck,
-            "global_context_map": global_context_map,
-            "query_tokens": query_tokens,
-            "context_tokens": context_tokens,
         }
-        if return_attention_weights:
+        outputs.update(global_outputs)
+        if return_attention_weights and use_global_map:
             assert attention_weights is not None
             outputs["attention_weights"] = attention_weights
         return outputs
