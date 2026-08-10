@@ -51,6 +51,14 @@ def _parse_args():
     parser.add_argument("--limit-train-samples", type=int)
     parser.add_argument("--limit-val-samples", type=int)
     parser.add_argument(
+        "--disable-radar",
+        action="store_true",
+        help=(
+            "Run a radar-input ablation by replacing radar BEVs with zeros "
+            "during both training and validation."
+        ),
+    )
+    parser.add_argument(
         "--tensorboard",
         action="store_true",
         help="Write live training metrics for TensorBoard.",
@@ -213,6 +221,7 @@ def _run_epoch(
     return_attention=False,
     conditioning_callback=None,
     active_fraction_samples=None,
+    disable_radar=False,
 ):
     training = optimizer is not None
     model.train(training)
@@ -227,6 +236,8 @@ def _run_epoch(
             fractions = active_mask.flatten(1).float().mean(dim=1)
             active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
+        if disable_radar:
+            inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
@@ -359,6 +370,7 @@ def main():
     )
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
+    print(f"Radar input enabled: {not args.disable_radar}")
     history = []
     best_validation = float("inf")
     active_fraction_profile = None
@@ -377,6 +389,7 @@ def main():
             grad_clip=grad_clip,
             use_amp=use_amp,
             active_fraction_samples=train_active_fractions,
+            disable_radar=args.disable_radar,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -397,6 +410,7 @@ def main():
                     save_conditioning_samples,
                 ),
                 active_fraction_samples=val_active_fractions,
+                disable_radar=args.disable_radar,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started
@@ -514,6 +528,7 @@ def main():
             "model_config": model_config.to_dict(),
             "loss_config": asdict(loss_config),
             "active_fraction_profile": active_fraction_profile,
+            "radar_disabled": args.disable_radar,
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")

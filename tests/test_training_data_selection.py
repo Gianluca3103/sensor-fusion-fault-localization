@@ -67,6 +67,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.attention_requests = []
+                self.radar_sums = []
 
             def forward(
                 self,
@@ -79,6 +80,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 return_attention_weights=False,
             ):
                 self.attention_requests.append(return_attention_weights)
+                self.radar_sums.append(float(radar_bev.sum()))
                 erased = faulty_bev * (1.0 - reconstruction_mask)
                 outputs = {
                     "erased_lidar_bev": erased,
@@ -110,7 +112,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
         batch = {
             "clean_bev": torch.zeros(1, 3, 4, 4),
             "faulty_bev": torch.zeros(1, 3, 4, 4),
-            "radar_bev": torch.zeros(1, 4, 4, 4),
+            "radar_bev": torch.ones(1, 4, 4, 4),
             "reconstruction_mask": torch.ones(1, 1, 4, 4),
             "healthy_context_mask": torch.zeros(1, 1, 4, 4),
             "halo_mask": torch.zeros(1, 1, 4, 4),
@@ -132,8 +134,20 @@ class TrainingDataSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(model.attention_requests, [True, False])
+        self.assertEqual(model.radar_sums, [64.0, 64.0])
         self.assertEqual(saved_batches, [True])
         self.assertEqual(active_fractions, [1.0, 1.0])
+
+        ablated_model = RecordingModel()
+        run_coarse_epoch(
+            ablated_model,
+            [batch],
+            MaskedBEVReconstructionLoss(),
+            torch.device("cpu"),
+            disable_radar=True,
+        )
+        self.assertEqual(ablated_model.radar_sums, [0.0])
+        self.assertEqual(float(batch["radar_bev"].sum()), 64.0)
 
     def test_active_fraction_summary_and_recommendation(self):
         summary = _summarize_active_fractions([0.0, 0.25, 0.5, 0.75, 1.0])
