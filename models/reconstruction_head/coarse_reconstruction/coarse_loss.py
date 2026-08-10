@@ -13,6 +13,8 @@ from Fault_Localization_Model.bev_utils import HEIGHT_RANGE_M
 
 
 OBSERVABILITY_TOLERANCE = 1.0e-6
+BEV_RESOLUTION_M = 0.2
+OCCUPANCY_TOLERANCE_M = 0.5
 
 
 @dataclass(frozen=True)
@@ -289,6 +291,8 @@ def _occupancy_metrics(
     target: torch.Tensor,
     mask: torch.Tensor,
     epsilon: float,
+    *,
+    include_tolerant: bool,
 ) -> dict[str, torch.Tensor]:
     predicted = probability >= 0.5
     occupied = target >= 0.5
@@ -299,14 +303,96 @@ def _occupancy_metrics(
     tn = (~predicted & ~occupied & valid).sum(dtype=torch.float32)
     precision = _safe_ratio(tp, tp + fp, epsilon)
     recall = _safe_ratio(tp, tp + fn, epsilon)
-    return {
+    exact_f1 = _safe_ratio(
+        2.0 * precision * recall, precision + recall, epsilon
+    )
+    exact_iou = _safe_ratio(tp, tp + fp + fn, epsilon)
+    result = {
         "occupancy_precision": precision,
         "occupancy_recall": recall,
-        "occupancy_f1": _safe_ratio(
-            2.0 * precision * recall, precision + recall, epsilon
-        ),
-        "occupancy_iou": _safe_ratio(tp, tp + fp + fn, epsilon),
+        "occupancy_f1": exact_f1,
+        "occupancy_iou": exact_iou,
+        "occupancy_exact_precision": precision,
+        "occupancy_exact_recall": recall,
+        "occupancy_exact_f1": exact_f1,
+        "occupancy_exact_iou": exact_iou,
         "occupancy_hallucination_rate": _safe_ratio(fp, fp + tn, epsilon),
+    }
+    if include_tolerant:
+        result.update(
+            _tolerant_occupancy_metrics(
+                predicted,
+                occupied,
+                valid,
+                tolerance_m=OCCUPANCY_TOLERANCE_M,
+                resolution_m=BEV_RESOLUTION_M,
+                epsilon=epsilon,
+            )
+        )
+    return result
+
+
+def _dilate_with_metric_disk(
+    values: torch.Tensor,
+    tolerance_m: float,
+    resolution_m: float,
+) -> torch.Tensor:
+    radius_cells = int(tolerance_m // resolution_m)
+    offsets = torch.arange(
+        -radius_cells,
+        radius_cells + 1,
+        device=values.device,
+        dtype=torch.float32,
+    )
+    rows, columns = torch.meshgrid(offsets, offsets, indexing="ij")
+    kernel = (
+        torch.sqrt(rows.square() + columns.square()) * resolution_m
+        <= tolerance_m + 1.0e-6
+    ).to(dtype=torch.float32)
+    dilated = F.conv2d(
+        values.to(dtype=torch.float32),
+        kernel[None, None],
+        padding=radius_cells,
+    )
+    return dilated > 0
+
+
+def _tolerant_occupancy_metrics(
+    predicted: torch.Tensor,
+    occupied: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    tolerance_m: float,
+    resolution_m: float,
+    epsilon: float,
+) -> dict[str, torch.Tensor]:
+    predicted = predicted & valid
+    occupied = occupied & valid
+    target_neighborhood = _dilate_with_metric_disk(
+        occupied, tolerance_m, resolution_m
+    )
+    prediction_neighborhood = _dilate_with_metric_disk(
+        predicted, tolerance_m, resolution_m
+    )
+    matched_predictions = (predicted & target_neighborhood).sum(
+        dtype=torch.float32
+    )
+    matched_targets = (occupied & prediction_neighborhood).sum(
+        dtype=torch.float32
+    )
+    prediction_count = predicted.sum(dtype=torch.float32)
+    target_count = occupied.sum(dtype=torch.float32)
+    precision = _safe_ratio(matched_predictions, prediction_count, epsilon)
+    recall = _safe_ratio(matched_targets, target_count, epsilon)
+    f1 = _safe_ratio(2.0 * precision * recall, precision + recall, epsilon)
+    # Bidirectional tolerant matching has no single TP count. This monotonic
+    # F1-equivalent reports IoU on the familiar scale: IoU = F1 / (2 - F1).
+    iou = _safe_ratio(f1, 2.0 - f1, epsilon)
+    return {
+        "occupancy_tolerant_0_5m_precision": precision,
+        "occupancy_tolerant_0_5m_recall": recall,
+        "occupancy_tolerant_0_5m_f1": f1,
+        "occupancy_tolerant_0_5m_iou": iou,
     }
 
 
@@ -329,6 +415,8 @@ def coarse_reconstruction_metrics(
     clean_lidar_bev: torch.Tensor,
     epsilon: float = 1.0e-8,
     observability_confidence: torch.Tensor | None = None,
+    *,
+    include_tolerant: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Compare reconstructed and faulty baselines inside the repair region."""
 
@@ -342,12 +430,14 @@ def coarse_reconstruction_metrics(
         occupancy_target,
         mask,
         epsilon,
+        include_tolerant=include_tolerant,
     )
     faulty_metrics = _occupancy_metrics(
         faulty_lidar_bev[:, 0:1],
         occupancy_target,
         mask,
         epsilon,
+        include_tolerant=include_tolerant,
     )
     density_mae, density_rmse = _continuous_metrics(
         coarse[:, 1:2], clean_lidar_bev[:, 1:2], continuous_mask, epsilon

@@ -219,6 +219,7 @@ def _run_epoch(
                 inputs["clean_bev"],
                 loss_fn.config.epsilon,
                 inputs.get("observability_confidence"),
+                include_tolerant=not training,
             )
         batch_size = inputs["faulty_bev"].shape[0]
         samples += batch_size
@@ -426,8 +427,12 @@ def main():
             f"val/occupancy={val_stats['loss_occupancy']:.6f} "
             f"val/density={val_stats['loss_density']:.6f} "
             f"val/height={val_stats['loss_height']:.6f} "
-            f"val/F1={val_stats['coarse_occupancy_f1']:.3%} "
-            f"val/IoU={val_stats['coarse_occupancy_iou']:.3%} "
+            f"val/exact_F1={val_stats['coarse_occupancy_exact_f1']:.3%} "
+            f"val/exact_IoU={val_stats['coarse_occupancy_exact_iou']:.3%} "
+            "val/F1@0.5m="
+            f"{val_stats['coarse_occupancy_tolerant_0_5m_f1']:.3%} "
+            "val/IoU@0.5m="
+            f"{val_stats['coarse_occupancy_tolerant_0_5m_iou']:.3%} "
             f"val/hallucination="
             f"{val_stats['coarse_occupancy_hallucination_rate']:.3%} "
             f"val/height_mae={val_stats['coarse_height_mae_m']:.3f}m "

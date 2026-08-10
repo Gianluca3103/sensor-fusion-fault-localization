@@ -52,6 +52,63 @@ class CoarseBaselineLossTests(unittest.TestCase):
         self.assertEqual(losses["loss_height"].item(), 0.0)
         for name in ("precision", "recall", "f1", "iou"):
             self.assertEqual(metrics[f"coarse_occupancy_{name}"].item(), 1.0)
+            self.assertEqual(
+                metrics[f"coarse_occupancy_exact_{name}"].item(), 1.0
+            )
+        self.assertEqual(
+            metrics["coarse_occupancy_tolerant_0_5m_f1"].item(), 1.0
+        )
+        self.assertEqual(
+            metrics["coarse_occupancy_tolerant_0_5m_iou"].item(), 1.0
+        )
+
+    def test_half_meter_metrics_allow_only_offsets_within_metric_disk(self):
+        clean = torch.zeros(1, 3, 7, 7)
+        clean[:, 0, 3, 3] = 1.0
+        mask = torch.ones(1, 1, 7, 7)
+
+        within_logits = torch.full((1, 1, 7, 7), -20.0)
+        within_logits[:, :, 3, 5] = 20.0  # 2 cells = 0.4 m
+        within = _model_outputs(
+            _raw(
+                within_logits,
+                torch.zeros_like(within_logits),
+                torch.zeros_like(within_logits),
+            ),
+            mask,
+        )
+        within_metrics = coarse_reconstruction_metrics(
+            within, torch.zeros_like(clean), clean
+        )
+        self.assertEqual(
+            within_metrics["coarse_occupancy_exact_iou"].item(), 0.0
+        )
+        self.assertEqual(
+            within_metrics["coarse_occupancy_tolerant_0_5m_f1"].item(), 1.0
+        )
+        self.assertEqual(
+            within_metrics["coarse_occupancy_tolerant_0_5m_iou"].item(), 1.0
+        )
+
+        outside_logits = torch.full((1, 1, 7, 7), -20.0)
+        outside_logits[:, :, 5, 5] = 20.0  # sqrt(8) cells > 0.5 m
+        outside = _model_outputs(
+            _raw(
+                outside_logits,
+                torch.zeros_like(outside_logits),
+                torch.zeros_like(outside_logits),
+            ),
+            mask,
+        )
+        outside_metrics = coarse_reconstruction_metrics(
+            outside, torch.zeros_like(clean), clean
+        )
+        self.assertEqual(
+            outside_metrics["coarse_occupancy_tolerant_0_5m_f1"].item(), 0.0
+        )
+        self.assertEqual(
+            outside_metrics["coarse_occupancy_tolerant_0_5m_iou"].item(), 0.0
+        )
 
     def test_completely_wrong_occupancy(self):
         occupancy = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])

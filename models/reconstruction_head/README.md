@@ -155,8 +155,10 @@ back to baseline BCE.
 
 Empty masks and masks without clean-occupied cells return differentiable zero
 for the corresponding terms. Validation compares coarse and faulty inputs
-inside the repair region using occupancy precision, recall, F1, IoU and
-hallucination rate; density MAE/RMSE; and robust-height MAE/RMSE in normalized
+inside the repair region using exact-cell occupancy precision, recall, F1 and
+IoU at 0.2 m resolution; bidirectional tolerance-matched precision, recall and
+F1 at 0.5 m; its monotonic IoU-equivalent `F1 / (2 - F1)`; and hallucination
+rate. It also reports density MAE/RMSE and robust-height MAE/RMSE in normalized
 units and meters. It also verifies that the result is unchanged outside the
 repair mask.
 
