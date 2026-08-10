@@ -11,6 +11,7 @@ from models.reconstruction_head.coarse_reconstruction.train_coarse_reconstructio
     _run_epoch as run_coarse_epoch,
     _split_paths as coarse_split_paths,
     _summarize_active_fractions,
+    _write_tensorboard_epoch,
 )
 from models.reconstruction_head.diffusion_process.train_residual_diffusion import (
     _move_batch as move_diffusion_batch,
@@ -20,6 +21,47 @@ from models.reconstruction_head import MaskedBEVReconstructionLoss
 
 
 class TrainingDataSelectionTests(unittest.TestCase):
+    def test_tensorboard_tracker_writes_numeric_epoch_metrics_and_learning_rate(self):
+        class RecordingWriter:
+            def __init__(self):
+                self.scalars = []
+                self.flushes = 0
+
+            def add_scalar(self, name, value, epoch):
+                self.scalars.append((name, value, epoch))
+
+            def flush(self):
+                self.flushes += 1
+
+        writer = RecordingWriter()
+        optimizer = type(
+            "OptimizerStub",
+            (),
+            {"param_groups": [{"lr": 2.0e-4}]},
+        )()
+
+        _write_tensorboard_epoch(
+            writer,
+            {
+                "epoch": 3,
+                "train/loss": 0.8,
+                "val/coarse_occupancy_exact_iou": 0.3,
+                "ignored": "text",
+            },
+            optimizer,
+            3,
+        )
+
+        self.assertEqual(
+            writer.scalars,
+            [
+                ("train/loss", 0.8, 3),
+                ("val/coarse_occupancy_exact_iou", 0.3, 3),
+                ("optimizer/learning_rate_group_0", 2.0e-4, 3),
+            ],
+        )
+        self.assertEqual(writer.flushes, 1)
+
     def test_validation_attention_is_requested_only_for_saved_batch(self):
         class RecordingModel(torch.nn.Module):
             def __init__(self):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -49,7 +50,49 @@ def _parse_args():
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--limit-train-samples", type=int)
     parser.add_argument("--limit-val-samples", type=int)
+    parser.add_argument(
+        "--tensorboard",
+        action="store_true",
+        help="Write live training metrics for TensorBoard.",
+    )
+    parser.add_argument(
+        "--tensorboard-log-dir",
+        help="TensorBoard directory (default: <output-root>/tensorboard).",
+    )
     return parser.parse_args()
+
+
+def _create_tensorboard_writer(enabled: bool, log_dir: Path):
+    if not enabled:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorBoard tracking requires the 'tensorboard' package. "
+            "Install the project requirements or run: "
+            "python -m pip install tensorboard"
+        ) from exc
+    writer = SummaryWriter(log_dir=str(log_dir))
+    atexit.register(writer.close)
+    return writer
+
+
+def _write_tensorboard_epoch(writer, row: dict, optimizer, epoch: int) -> None:
+    if writer is None:
+        return
+    for name, value in row.items():
+        if name == "epoch" or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            writer.add_scalar(name, value, epoch)
+    for index, group in enumerate(optimizer.param_groups):
+        writer.add_scalar(
+            f"optimizer/learning_rate_group_{index}",
+            float(group["lr"]),
+            epoch,
+        )
+    writer.flush()
 
 
 def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
@@ -252,6 +295,13 @@ def main():
     device = resolve_device(args.device)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    tensorboard_log_dir = Path(
+        args.tensorboard_log_dir or output_root / "tensorboard"
+    )
+    tensorboard_writer = _create_tensorboard_writer(
+        args.tensorboard,
+        tensorboard_log_dir,
+    )
     data_root = Path(args.data_root)
     radar_root = Path(args.radar_root)
     train_paths = _split_paths(
@@ -411,6 +461,12 @@ def main():
                     }
                 )
         history.append(row)
+        _write_tensorboard_epoch(
+            tensorboard_writer,
+            row,
+            optimizer,
+            epoch,
+        )
         observability_log = ""
         if loss_config.observability_weighting.enabled:
             observability_log = (
@@ -461,6 +517,8 @@ def main():
             history,
             fieldnames=list(history[0]),
         )
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
 
 
 if __name__ == "__main__":

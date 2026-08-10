@@ -162,6 +162,12 @@ rate. It also reports density MAE/RMSE and robust-height MAE/RMSE in normalized
 units and meters. It also verifies that the result is unchanged outside the
 repair mask.
 
+The coarse trainer always writes `history.csv`. Pass `--tensorboard` to also
+stream all numeric train/validation metrics, active-mask statistics, epoch
+runtimes, faulty-input baselines, and optimizer learning rates to
+`<output-root>/tensorboard`. Override that location with
+`--tensorboard-log-dir`.
+
 During the first training and validation pass, the trainer records the
 per-sample fraction of the complete BEV covered by `reconstruction_mask OR
 halo_mask`. It writes train, validation, and combined median, 90th percentile,

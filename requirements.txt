@@ -4,5 +4,6 @@ scipy>=1.10
 matplotlib>=3.7
 pillow>=10.0
 torch>=2.3
+tensorboard>=2.15
 tqdm>=4.66
 PyMieScatt>=1.8
