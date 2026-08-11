@@ -302,7 +302,7 @@ class SparseRegionalAttention(nn.Module):
             width,
             normalized.dtype,
         )
-        packed = features.new_zeros(
+        packed = normalized.new_zeros(
             (group_count, maximum_tokens, features.shape[1])
         )
         valid = torch.zeros(
@@ -320,7 +320,7 @@ class SparseRegionalAttention(nn.Module):
             need_weights=False,
         )
         attended_sorted = attended[sorted_groups, positions]
-        attended_unordered = torch.empty_like(features)
+        attended_unordered = attended_sorted.new_empty(features.shape)
         attended_unordered[order] = attended_sorted
         features = features + attended_unordered
         features = features + self.mlp(self.mlp_norm(features))

@@ -89,6 +89,30 @@ class SSTReconstructionTests(unittest.TestCase):
         self.assertTrue(torch.equal(original[2:], modified[2:]))
         self.assertFalse(torch.equal(original[:2], modified[:2]))
 
+    def test_sparse_attention_supports_mixed_precision_packing(self):
+        config = SSTConfig(
+            token_dim=8,
+            num_blocks=1,
+            num_heads=2,
+            mlp_hidden_dim=16,
+            region_size_cells=4,
+            shift_size_cells=2,
+        )
+        attention = SparseRegionalAttention(
+            config, shift_size_cells=0
+        ).eval()
+        coordinates = torch.tensor(
+            [[0, 0, 0], [0, 0, 1], [0, 5, 5]]
+        )
+        features = torch.randn(3, 8)
+        with torch.no_grad(), torch.autocast(
+            device_type="cpu", dtype=torch.bfloat16
+        ):
+            output, counts = attention(features, coordinates, (8, 8))
+        self.assertEqual(tuple(output.shape), (3, 8))
+        self.assertEqual(int(counts.sum()), 3)
+        self.assertTrue(torch.isfinite(output).all())
+
     def test_backbone_is_single_stride_and_scatter_is_high_resolution(self):
         config = SSTConfig(
             token_dim=8,
