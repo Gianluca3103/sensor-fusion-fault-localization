@@ -35,6 +35,9 @@ class FaultSelectorCacheTests(unittest.TestCase):
         reliability = np.ones_like(heatmap)
         reliability[heatmap > 0] = 0.0
         missing = (heatmap > 0).astype(np.float32)
+        faulty_counts = np.zeros_like(heatmap)
+        faulty_counts[1, :] = 1.0
+        faulty_counts[6, :] = 1.0
         metadata = {
             "scene": "Scene01",
             "session": "01_Day",
@@ -54,7 +57,7 @@ class FaultSelectorCacheTests(unittest.TestCase):
             faulty_density=faulty_density,
             fault_heatmap=heatmap,
             reliability_map=reliability,
-            faulty_counts=np.ones_like(heatmap),
+            faulty_counts=faulty_counts,
             added_faulty_counts=np.zeros_like(heatmap),
             missing_faulty_counts=missing,
             moved_faulty_counts=np.zeros_like(heatmap),
@@ -158,7 +161,10 @@ class FaultSelectorCacheTests(unittest.TestCase):
                 data_root,
                 config,
             )
-            changed = replace(config, min_blob_cells=config.min_blob_cells + 1)
+            changed = replace(
+                config,
+                min_lidar_loss_fraction=config.min_lidar_loss_fraction - 0.05,
+            )
 
             with self.assertRaisesRegex(
                 InvalidSelectorCacheError,

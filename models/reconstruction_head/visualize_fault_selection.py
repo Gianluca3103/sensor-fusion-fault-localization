@@ -48,20 +48,8 @@ def load_fault_selection_sample(sample_path):
     return clean, faulty, reliability, heatmap, evidence
 
 
-def _draw_selected_boxes(axis, selection):
-    for rank, blob in enumerate(selection.selected_blobs, start=1):
-        halo_top, halo_left, halo_bottom, halo_right = blob.halo_bbox
-        axis.add_patch(
-            Rectangle(
-                (halo_left - 0.5, halo_top - 0.5),
-                halo_right - halo_left,
-                halo_bottom - halo_top,
-                fill=False,
-                edgecolor="#00ff66",
-                linewidth=1.6,
-                linestyle="--",
-            )
-        )
+def _draw_repair_boxes(axis, selection):
+    for blob in selection.selected_blobs:
         top, left, bottom, right = blob.bbox
         axis.add_patch(
             Rectangle(
@@ -70,20 +58,8 @@ def _draw_selected_boxes(axis, selection):
                 bottom - top,
                 fill=False,
                 edgecolor="cyan",
-                linewidth=1.4,
+                linewidth=1.2,
             )
-        )
-        axis.text(
-            left,
-            max(0, top - 2),
-            f"#{rank}: repair {100.0 * blob.repair_fault_fraction:.1f}% faulty; "
-            f"halo {100.0 * blob.halo_healthy_fraction:.1f}% healthy, "
-            f"{blob.healthy_occupied_cell_count}/"
-            f"{blob.required_healthy_context_cell_count} cells, "
-            f"+{blob.halo_dilation_cells}px",
-            color="cyan",
-            fontsize=8,
-            bbox={"facecolor": "black", "alpha": 0.65, "pad": 1},
         )
 
 
@@ -135,19 +111,27 @@ def render_fault_selection(sample_path, output_path, selector):
         alpha=0.2,
         interpolation="nearest",
     )
-    _draw_selected_boxes(axes[1], selection)
     axes[1].set_title(
-        "Fault Selector on Reliability Map\n"
+        "Conservative >=95% loss boxes (magenta/cyan) + halo (green)\n"
         f"Excluded added-only cells: {selection.excluded_added_only_cell_count}"
     )
+    _draw_repair_boxes(axes[1], selection)
 
     axes[2].imshow(clean, interpolation="nearest")
     axes[2].set_title("Clean LiDAR BEV")
 
     axes[3].imshow(faulty, interpolation="nearest")
-    _draw_selected_boxes(axes[3], selection)
+    axes[3].imshow(
+        healthy_overlay,
+        cmap=ListedColormap(["#00ff66"]),
+        vmin=0.0,
+        vmax=1.0,
+        alpha=0.65,
+        interpolation="nearest",
+    )
+    _draw_repair_boxes(axes[3], selection)
     axes[3].set_title(
-        "Faulty LiDAR with Reconstruction Boxes\n"
+        "Faulty LiDAR with Repair Box Outline and Context\n"
         f"Repair area: {selection.selected_cell_count}; halo area: {selection.halo_cell_count}; "
         f"fault evidence: {selection.selected_fault_cell_count}; "
         f"healthy context: {selection.healthy_context_cell_count}"
@@ -184,8 +168,9 @@ def main():
             f"halo_target_met={blob.halo_target_met}"
         )
     print(
-        f"Rejected {len(selection.rejected_small_blobs)} blobs smaller than "
-        f"{selector_config.min_blob_cells} cells."
+        f"Selected repair box area: {selection.selected_cell_count} cells; "
+        f"severe-loss evidence inside: {selection.selected_fault_cell_count} cells "
+        f"at >= {100.0 * selector_config.min_lidar_loss_fraction:.1f}% loss."
     )
     print(
         f"Excluded {selection.excluded_added_only_cell_count} added-only fault cells."

@@ -465,25 +465,20 @@ class CoarseReconstructionModel(nn.Module):
     def _empty_radar_pillar_output(
         self,
         lidar: PointPillarsOutput,
-        *,
-        batch_size: int,
     ) -> PointPillarsOutput:
+        batch, _, height, width = lidar.dense_features.shape
         channels = self.config.radar_channels
-        dense_features = None
-        if lidar.dense_features is not None:
-            batch, _, height, width = lidar.dense_features.shape
-            dense_features = lidar.dense_features.new_zeros(
-                (batch, channels, height, width)
-            )
         return PointPillarsOutput(
-            dense_features=dense_features,
+            dense_features=lidar.dense_features.new_zeros(
+                (batch, channels, height, width)
+            ),
             sparse_features=lidar.sparse_features.new_empty((0, channels)),
             sparse_coordinates=lidar.sparse_coordinates.new_empty((0, 3)),
             statistics={
                 "nonempty_pillars": torch.zeros(
-                    batch_size,
+                    batch,
                     dtype=torch.long,
-                    device=lidar.sparse_features.device,
+                    device=lidar.dense_features.device,
                 )
             },
         )
@@ -508,11 +503,9 @@ class CoarseReconstructionModel(nn.Module):
         pointpillars_started = _profile_start(
             faulty_lidar_bev, profile_sst
         )
-        sparse_only = self.config.sst.sparse_pointpillars_only
         lidar = self.lidar_pillar_encoder(
             self._select_lidar_point_fields(faulty_lidar_points),
             return_sparse=True,
-            return_dense=not sparse_only,
         )
         assert isinstance(lidar, PointPillarsOutput)
         if radar_enabled:
@@ -521,23 +514,19 @@ class CoarseReconstructionModel(nn.Module):
             radar = self.radar_pillar_encoder(
                 self._select_radar_point_fields(radar_points),
                 return_sparse=True,
-                return_dense=not sparse_only,
             )
             assert isinstance(radar, PointPillarsOutput)
         else:
-            radar = self._empty_radar_pillar_output(
-                lidar,
-                batch_size=faulty_lidar_bev.shape[0],
-            )
+            radar = self._empty_radar_pillar_output(lidar)
         pointpillars_ms = _profile_elapsed_ms(
             faulty_lidar_bev, pointpillars_started
         )
 
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
         active_mask = torch.maximum(reconstruction_mask, halo_mask)
-        erased_lidar_bev = (1.0 - reconstruction_mask) * (
-            faulty_lidar_bev if sparse_only else lidar.dense_features
-        )
+        erased_lidar_bev = (
+            1.0 - reconstruction_mask
+        ) * lidar.dense_features
         tokens = self.sst_token_builder(
             lidar,
             radar,
@@ -545,7 +534,6 @@ class CoarseReconstructionModel(nn.Module):
             healthy_context_mask,
             include_repair_tokens=self.config.sst.include_repair_tokens,
             radar_enabled=radar_enabled,
-            use_dense_sensor_features=not sparse_only,
         )
         grid_shape = faulty_lidar_bev.shape[-2:]
         final_tokens, sst_debug = self.sst_backbone(
@@ -599,9 +587,13 @@ class CoarseReconstructionModel(nn.Module):
             **sst_debug["timing_ms"],
             "reconstruction_head_ms": reconstruction_head_ms,
         }
-        outputs = {
+        return {
             "erased_lidar_bev": erased_lidar_bev,
             "erased_lidar_features": erased_lidar_bev,
+            "lidar_sensor_bev": lidar.dense_features,
+            "radar_sensor_bev": radar.dense_features,
+            "lidar_pillar_bev": lidar.dense_features,
+            "radar_pillar_bev": radar.dense_features,
             "lidar_pillar_statistics": lidar.statistics,
             "radar_pillar_statistics": radar.statistics,
             "trusted_lidar_coordinates": tokens.trusted_lidar_coordinates,
@@ -626,16 +618,6 @@ class CoarseReconstructionModel(nn.Module):
             "halo_mask": halo_mask,
             "active_mask": active_mask,
         }
-        if not sparse_only:
-            outputs.update(
-                {
-                    "lidar_sensor_bev": lidar.dense_features,
-                    "radar_sensor_bev": radar.dense_features,
-                    "lidar_pillar_bev": lidar.dense_features,
-                    "radar_pillar_bev": radar.dense_features,
-                }
-            )
-        return outputs
 
     def forward(
         self,

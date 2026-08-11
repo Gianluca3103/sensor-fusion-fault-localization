@@ -66,9 +66,11 @@ from .coarse_reconstruction.sst_backbone import (
     SSTConfig,
     SSTReconstructionHead,
     SparseMultimodalTokens,
+    SparseRegionLayout,
     SparseRegionalAttention,
     SparseToDenseScatter,
     SparseTokenBuilder,
+    build_sparse_region_layout,
     regional_group_indices,
 )
 from .diffusion_process.diffusion_process import (
@@ -135,9 +137,11 @@ __all__ = [
     "SSTConfig",
     "SSTReconstructionHead",
     "SparseMultimodalTokens",
+    "SparseRegionLayout",
     "SparseRegionalAttention",
     "SparseToDenseScatter",
     "SparseTokenBuilder",
+    "build_sparse_region_layout",
     "regional_group_indices",
     "FaultBlob",
     "FaultSelection",

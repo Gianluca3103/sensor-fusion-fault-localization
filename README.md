@@ -241,17 +241,19 @@ the projection of `[LiDAR PFN (64), radar PFN (64), reconstruction mask,
 healthy-context mask]`. LiDAR pillars inside the reconstruction mask are
 removed before this fusion. Missing modalities are represented by zeros.
 
+PointPillars voxelization is performed over each complete sensor batch with
+native PyTorch tensor operations. When the inputs are on CUDA, coordinate
+assignment, sorting, aggregation, PFN pooling, and dense scattering stay on
+CUDA; no optional compiled extension is required. SST similarly constructs
+its normal and shifted regional layouts once per forward pass and reuses them
+across all blocks because token coordinates are single-stride and immutable.
+
 Use `configs/coarse_reconstruction_pointpillars.json` for the U-Net experiment
-and `configs/coarse_reconstruction_pointpillars_sst.json` for SST. A third
-controlled experiment is available through
-`configs/coarse_reconstruction_pointpillars_sst_sparse.json`: it sends the
-PFNs' sparse pillar features and coordinates directly to SST, avoiding the
-otherwise redundant sensor pseudo-image scatter and sparse re-gather. The SST
-blocks, token definition, output scatter, reconstruction head, dataset splits,
-PointPillars settings, masks, targets, loss, metrics, optimizer, and training
-schedule remain identical. `include_repair_tokens` intentionally defaults to
-`false`; enabling it is a separate reconstruction-specific ablation rather
-than part of the strict backbone comparison.
+and `configs/coarse_reconstruction_pointpillars_sst.json` for SST. Dataset
+splits, PointPillars settings, masks, targets, loss, metrics, optimizer, and
+training schedule remain identical. `include_repair_tokens` intentionally
+defaults to `false`; enabling it is a separate reconstruction-specific
+ablation rather than part of the strict backbone comparison.
 
 ## Evaluation Protocol
 

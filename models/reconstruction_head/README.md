@@ -132,6 +132,16 @@ its default configuration is `configs/coarse_reconstruction.json`.
 Fault Selector masks are precomputed once rather than recalculated in every
 epoch. Generate the cache before coarse or diffusion training:
 
+The selector first marks cells whose fraction of original LiDAR returns lost
+is at least `min_lidar_loss_fraction` (0.95 by default). It then chooses one
+dominant depth band containing the most severe-loss evidence and crops its
+left and right edges to the outermost severe-loss cells, avoiding empty side
+columns, while requiring
+at least `min_repair_fault_fraction` (0.95 by default) of occupied informative
+cells inside the box to be severe. Empty cells are neutral. Extending the box
+into a healthier depth range is rejected even when that leaves additional
+fault cells unreconstructed. Only the separate context halo is dilated outward.
+
 ```powershell
 python -m models.reconstruction_head.cache_fault_selector_masks `
   --data-root "C:\path\to\grid_reliability_dataset" `

@@ -538,12 +538,20 @@ def main():
     if model_config.pointpillars.enabled:
         geometry = train_dataset.grid_geometry
         print(
+            "PointPillars voxelization: batched native PyTorch "
+            f"on {device.type.upper()}"
+        )
+        print(
             "PointPillars grid: "
             f"{geometry.height}x{geometry.width}; "
             f"pillar={geometry.pillar_size_x:.3f}m x "
             f"{geometry.pillar_size_y:.3f}m"
         )
         if model_config.backbone == "sst":
+            print(
+                "SST regional layouts: normal and shifted assignments "
+                "reused across all blocks"
+            )
             print(
                 "SST regions: "
                 f"{model_config.sst.region_size_cells}x"

@@ -54,7 +54,8 @@ def config_defaults(config):
         "observability_ray_support_tau": config_get(
             config, "observability.ray_support_tau", 4.0
         ),
-        "grid_size": config_get(config, "bev.grid_size", 100),
+        # Keep reliability/fault evidence cell-aligned with the 320 x 320 BEV.
+        "grid_size": config_get(config, "bev.grid_size", 320),
         "x_min": config_get(config, "bev.x_min", 0.0),
         "x_max": config_get(config, "bev.x_max", 64.0),
         "y_min": config_get(config, "bev.y_min", -32.0),

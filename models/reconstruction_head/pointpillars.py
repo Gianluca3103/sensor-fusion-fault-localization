@@ -106,7 +106,7 @@ class PillarizedPointCloud:
 class PointPillarsOutput:
     """Dense and sparse views of one batched PointPillars encoding."""
 
-    dense_features: torch.Tensor | None
+    dense_features: torch.Tensor
     sparse_features: torch.Tensor
     sparse_coordinates: torch.Tensor
     statistics: dict[str, torch.Tensor]
@@ -168,7 +168,10 @@ class Pillarizer(nn.Module):
         if pillar_count <= self.max_pillars:
             return torch.ones(pillar_count, dtype=torch.bool, device=inverse.device)
         selected = torch.zeros(pillar_count, dtype=torch.bool, device=inverse.device)
-        if self.training:
+        over_capacity = torch.any(
+            available_per_sample > self.pillarizer.max_pillars
+        )
+        if self.training and bool(over_capacity.item()):
             indices = torch.randperm(pillar_count, device=inverse.device)[
                 : self.max_pillars
             ]
@@ -351,6 +354,33 @@ class PillarScatter(nn.Module):
             self.channels, self.geometry.height, self.geometry.width
         )
 
+    def forward_batch(
+        self,
+        pillar_features: torch.Tensor,
+        pillar_batches: torch.Tensor,
+        pillar_rows: torch.Tensor,
+        pillar_cols: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Scatter every sample with one device-side indexed write."""
+
+        dense = pillar_features.new_zeros(
+            (
+                batch_size,
+                self.channels,
+                self.geometry.height * self.geometry.width,
+            )
+        )
+        if len(pillar_features):
+            flat = pillar_rows * self.geometry.width + pillar_cols
+            dense[pillar_batches, :, flat] = pillar_features
+        return dense.reshape(
+            batch_size,
+            self.channels,
+            self.geometry.height,
+            self.geometry.width,
+        )
+
 
 class PointPillarsEncoder(nn.Module):
     """Encode a batch of variable-sized point clouds as dense pseudo-BEVs."""
@@ -374,86 +404,271 @@ class PointPillarsEncoder(nn.Module):
         self.feature_net = PillarFeatureNet(raw_channels + 5, output_channels)
         self.scatter = PillarScatter(geometry, output_channels)
 
+    def _select_batched_pillars(
+        self,
+        pillar_batches: torch.Tensor,
+        available_per_sample: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select at most the configured pillar count without sample loops."""
+
+        pillar_count = len(pillar_batches)
+        if pillar_count == 0:
+            return torch.empty(
+                0, dtype=torch.bool, device=pillar_batches.device
+            )
+        if self.training:
+            randomized = torch.argsort(
+                torch.rand(pillar_count, device=pillar_batches.device),
+                stable=True,
+            )
+            grouped = torch.argsort(
+                pillar_batches[randomized], stable=True
+            )
+            candidates = randomized[grouped]
+        else:
+            candidates = torch.arange(
+                pillar_count, device=pillar_batches.device
+            )
+        starts = torch.cumsum(available_per_sample, dim=0) - available_per_sample
+        ranks = torch.arange(
+            pillar_count, device=pillar_batches.device
+        ) - torch.repeat_interleave(starts, available_per_sample)
+        chosen = candidates[
+            ranks < self.pillarizer.max_pillars
+        ]
+        selected = torch.zeros(
+            pillar_count, dtype=torch.bool, device=pillar_batches.device
+        )
+        selected[chosen] = True
+        return selected
+
+    def _pillarize_batch(
+        self,
+        point_clouds: Sequence[torch.Tensor],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        """Pillarize a complete sensor batch with batched CPU/CUDA kernels."""
+
+        batch_size = len(point_clouds)
+        reference = point_clouds[0]
+        for points in point_clouds:
+            if points.ndim != 2 or points.shape[1] != self.pillarizer.raw_channels:
+                raise ValueError(
+                    "Each point cloud must have shape "
+                    f"[N,{self.pillarizer.raw_channels}], got "
+                    f"{tuple(points.shape)}"
+                )
+            if points.device != reference.device or points.dtype != reference.dtype:
+                raise ValueError(
+                    "All point clouds in a batch must share device and dtype"
+                )
+        lengths = torch.as_tensor(
+            [len(points) for points in point_clouds],
+            dtype=torch.long,
+            device=reference.device,
+        )
+        all_points = torch.cat(point_clouds, dim=0)
+        point_batches = torch.repeat_interleave(
+            torch.arange(batch_size, device=reference.device), lengths
+        )
+        rows, cols, valid = self.pillarizer.grid_indices(all_points[:, :3])
+        points = all_points[valid]
+        point_batches = point_batches[valid]
+        rows = rows[valid]
+        cols = cols[valid]
+        raw_points = torch.bincount(point_batches, minlength=batch_size)
+        cells = (
+            self.pillarizer.geometry.height
+            * self.pillarizer.geometry.width
+        )
+
+        if not len(points):
+            empty_long = torch.empty(
+                0, dtype=torch.long, device=reference.device
+            )
+            empty_features = reference.new_empty(
+                (0, self.pillarizer.raw_channels + 5)
+            )
+            zeros_long = torch.zeros(
+                batch_size, dtype=torch.long, device=reference.device
+            )
+            zeros_float = reference.new_zeros(batch_size)
+            return (
+                empty_features,
+                empty_long,
+                empty_long,
+                empty_long,
+                empty_long,
+                {
+                    "raw_points": zeros_long,
+                    "nonempty_pillars": zeros_long,
+                    "available_nonempty_pillars": zeros_long,
+                    "retained_points": zeros_long,
+                    "average_points_per_pillar": zeros_float,
+                    "maximum_points_per_pillar": zeros_long,
+                    "empty_pillar_fraction": reference.new_ones(batch_size),
+                },
+            )
+
+        local_flat = rows * self.pillarizer.geometry.width + cols
+        global_flat = point_batches * cells + local_flat
+        available_flat, inverse, available_counts = torch.unique(
+            global_flat,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        available_batches = torch.div(
+            available_flat, cells, rounding_mode="floor"
+        )
+        available_per_sample = torch.bincount(
+            available_batches, minlength=batch_size
+        )
+        maximum_points = torch.zeros(
+            batch_size, dtype=torch.long, device=reference.device
+        )
+        maximum_points.scatter_reduce_(
+            0,
+            available_batches,
+            available_counts,
+            reduce="amax",
+            include_self=True,
+        )
+        selected_pillars = self._select_batched_pillars(
+            available_batches, available_per_sample
+        )
+        selected_points = selected_pillars[inverse]
+        points = points[selected_points]
+        global_flat = global_flat[selected_points]
+
+        order = torch.argsort(global_flat, stable=True)
+        points = points[order]
+        global_flat = global_flat[order]
+        _, counts_before_cap = torch.unique_consecutive(
+            global_flat, return_counts=True
+        )
+        starts = torch.cumsum(counts_before_cap, dim=0) - counts_before_cap
+        point_rank = torch.arange(
+            len(points), device=reference.device
+        ) - torch.repeat_interleave(starts, counts_before_cap)
+        keep = point_rank < self.pillarizer.max_points_per_pillar
+        points = points[keep]
+        global_flat = global_flat[keep]
+
+        pillar_flat, point_to_pillar, retained_counts = torch.unique_consecutive(
+            global_flat,
+            return_inverse=True,
+            return_counts=True,
+        )
+        pillar_count = len(pillar_flat)
+        pillar_batches = torch.div(
+            pillar_flat, cells, rounding_mode="floor"
+        )
+        pillar_local_flat = pillar_flat.remainder(cells)
+        pillar_rows = torch.div(
+            pillar_local_flat,
+            self.pillarizer.geometry.width,
+            rounding_mode="floor",
+        )
+        pillar_cols = pillar_local_flat.remainder(
+            self.pillarizer.geometry.width
+        )
+
+        xyz = points[:, :3]
+        cluster_sum = xyz.new_zeros((pillar_count, 3))
+        cluster_sum.index_add_(0, point_to_pillar, xyz)
+        cluster_mean = cluster_sum / retained_counts.to(xyz.dtype).unsqueeze(1)
+        cluster_offsets = xyz - cluster_mean[point_to_pillar]
+        rows_from_bottom = self.pillarizer.geometry.height - 1 - pillar_rows
+        center_x = self.pillarizer.geometry.x_min + (
+            rows_from_bottom.to(xyz.dtype) + 0.5
+        ) * self.pillarizer.geometry.pillar_size_x
+        center_y = self.pillarizer.geometry.y_min + (
+            pillar_cols.to(xyz.dtype) + 0.5
+        ) * self.pillarizer.geometry.pillar_size_y
+        center_offsets = torch.stack(
+            (
+                xyz[:, 0] - center_x[point_to_pillar],
+                xyz[:, 1] - center_y[point_to_pillar],
+            ),
+            dim=1,
+        )
+        decorated = torch.cat(
+            (points, cluster_offsets, center_offsets), dim=1
+        )
+
+        nonempty = torch.bincount(pillar_batches, minlength=batch_size)
+        retained = torch.bincount(
+            pillar_batches[point_to_pillar], minlength=batch_size
+        )
+        average = retained.to(torch.float32) / nonempty.clamp_min(1)
+        statistics = {
+            "raw_points": raw_points,
+            "nonempty_pillars": nonempty,
+            "available_nonempty_pillars": available_per_sample,
+            "retained_points": retained,
+            "average_points_per_pillar": average,
+            "maximum_points_per_pillar": maximum_points,
+            "empty_pillar_fraction": 1.0 - nonempty.to(reference.dtype) / cells,
+        }
+        return (
+            decorated,
+            point_to_pillar,
+            pillar_batches,
+            pillar_rows,
+            pillar_cols,
+            statistics,
+        )
+
     def forward(
         self,
         point_clouds: Sequence[torch.Tensor],
         *,
         return_sparse: bool = False,
-        return_dense: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | PointPillarsOutput:
         if not point_clouds:
             raise ValueError("point_clouds must contain at least one sample")
-        if not return_sparse and not return_dense:
-            raise ValueError(
-                "At least one PointPillars representation must be requested"
-            )
-        pillarized_batch = [self.pillarizer(points) for points in point_clouds]
-        pillar_counts = [len(item.pillar_rows) for item in pillarized_batch]
-        total_pillars = sum(pillar_counts)
+        (
+            features,
+            point_to_pillar,
+            pillar_batches,
+            pillar_rows,
+            pillar_cols,
+            statistics,
+        ) = self._pillarize_batch(point_clouds)
+        total_pillars = len(pillar_rows)
         if total_pillars:
-            features = torch.cat(
-                [item.features for item in pillarized_batch if len(item.features)]
-            )
-            offsets = []
-            offset = 0
-            for item, pillar_count in zip(pillarized_batch, pillar_counts):
-                if len(item.features):
-                    offsets.append(item.point_to_pillar + offset)
-                offset += pillar_count
-            point_to_pillar = torch.cat(offsets)
             all_pillar_features = self.feature_net(
                 features,
                 point_to_pillar,
                 total_pillars,
             )
-            split_features = all_pillar_features.split(pillar_counts)
         else:
-            split_features = tuple(
-                point_clouds[0].new_empty((0, self.feature_net.output_channels))
-                for _ in pillar_counts
+            all_pillar_features = point_clouds[0].new_empty(
+                (0, self.feature_net.output_channels)
             )
-
-        canvases = []
-        statistics: dict[str, list[torch.Tensor]] = {}
-        for pillarized, pillar_features in zip(
-            pillarized_batch, split_features
-        ):
-            if return_dense:
-                canvases.append(
-                    self.scatter(
-                        pillar_features,
-                        pillarized.pillar_rows,
-                        pillarized.pillar_cols,
-                    )
-                )
-            for name, value in pillarized.statistics.items():
-                statistics.setdefault(name, []).append(value)
-        dense_features = torch.stack(canvases) if return_dense else None
-        stacked_statistics = {
-            name: torch.stack(values) for name, values in statistics.items()
-        }
+        dense_features = self.scatter.forward_batch(
+            all_pillar_features,
+            pillar_batches,
+            pillar_rows,
+            pillar_cols,
+            len(point_clouds),
+        )
         if not return_sparse:
-            assert dense_features is not None
-            return dense_features, stacked_statistics
+            return dense_features, statistics
 
-        sparse_features = torch.cat(split_features, dim=0)
-        sparse_coordinates = torch.cat(
-            [
-                torch.stack(
-                    (
-                        torch.full_like(item.pillar_rows, batch_index),
-                        item.pillar_rows,
-                        item.pillar_cols,
-                    ),
-                    dim=1,
-                )
-                for batch_index, item in enumerate(pillarized_batch)
-            ],
-            dim=0,
+        sparse_coordinates = torch.stack(
+            (pillar_batches, pillar_rows, pillar_cols), dim=1
         )
         return PointPillarsOutput(
             dense_features=dense_features,
-            sparse_features=sparse_features,
+            sparse_features=all_pillar_features,
             sparse_coordinates=sparse_coordinates,
-            statistics=stacked_statistics,
+            statistics=statistics,
         )

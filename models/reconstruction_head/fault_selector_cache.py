@@ -14,7 +14,7 @@ from .fault_selector import FaultSelector, FaultSelectorConfig
 
 
 MASK_SIZE = (320, 320)
-CACHE_VERSION = 3
+CACHE_VERSION = 8
 MASK_NAMES = (
     "reconstruction_mask",
     "halo_mask",

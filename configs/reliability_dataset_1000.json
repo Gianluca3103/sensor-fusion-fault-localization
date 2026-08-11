@@ -14,7 +14,7 @@
     "y_min": -32.0,
     "y_max": 32.0,
     "resolution": 0.20,
-    "grid_size": 100,
+    "grid_size": 320,
     "min_range": 1.0,
     "max_range": 118.037109375
   },

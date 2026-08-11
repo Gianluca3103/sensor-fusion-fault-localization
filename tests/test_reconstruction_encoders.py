@@ -75,312 +75,179 @@ class ReconstructionEncoderTests(unittest.TestCase):
         self.assertTrue(torch.all(item["faulty_bev"] == 0.0))
         self.assertTrue(torch.all(item["observability_confidence"] == 0.625))
 
-    def test_fault_selector_rejects_isolated_cells_and_combines_major_regions(self):
-        heatmap = np.zeros((40, 20), dtype=np.float32)
-        heatmap[34:37, 2:4] = 0.8  # Six-cell near blob.
-        heatmap[20:24, 8:11] = 0.7  # Larger middle-distance blob.
-        heatmap[2:5, 14:17] = 1.0  # Nine-cell far blob.
-        heatmap[39, 19] = 1.0  # Isolated closest cell; must be rejected.
-        zeros = np.zeros_like(heatmap)
-        missing = (heatmap > 0).astype(np.float32)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=5,
-                max_blobs=2,
-                merge_radius_cells=0,
-                box_padding_cells=0,
-                distance_bin_m=2.0,
-                x_cell_size_m=0.2,
-                min_repair_fault_fraction=0.0,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-            )
-        ).select(
+    def _select_loss(self, faulty, missing, **config):
+        zeros = np.zeros_like(faulty, dtype=np.float32)
+        original = faulty + missing
+        heatmap = np.zeros_like(faulty, dtype=np.float32)
+        occupied = original > 0
+        heatmap[occupied] = missing[occupied] / original[occupied]
+        return FaultSelector(FaultSelectorConfig(**config)).select(
             heatmap,
+            reliability_map=1.0 - heatmap,
+            faulty_counts=faulty,
             added_faulty_counts=zeros,
             missing_faulty_counts=missing,
             moved_faulty_counts=zeros,
         )
 
-        self.assertEqual([blob.cell_count for blob in selection.selected_blobs], [27])
-        self.assertEqual(selection.selected_fault_cell_count, 27)
-        self.assertEqual(len(selection.rejected_small_blobs), 1)
-        self.assertFalse(selection.reconstruction_mask[39, 19])
-        self.assertTrue(selection.reconstruction_mask[35, 2])
-        self.assertTrue(selection.reconstruction_mask[22, 9])
-        self.assertTrue(selection.reconstruction_mask[3, 15])
+    def test_fault_selector_uses_ninety_five_percent_loss_threshold(self):
+        faulty = np.zeros((12, 12), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        faulty[3, 3] = 1
+        missing[3, 3] = 18  # Below 95% loss: retain the real LiDAR.
+        faulty[4, 4] = 1
+        missing[4, 4] = 19  # Exactly 95% lost: reconstruct.
+        faulty[5, 5] = 1
+        missing[5, 5] = 20  # More than 95% lost: reconstruct.
 
-    def test_fault_selector_clips_repair_and_halo_to_valid_support(self):
-        support = np.tri(12, 12, dtype=bool)
-        heatmap = support.astype(np.float32)
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_repair_box_cells=1,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=2,
+        )
+
+        self.assertFalse(selection.reconstruction_mask[3, 3])
+        self.assertTrue(selection.reconstruction_mask[4, 4])
+        self.assertTrue(selection.reconstruction_mask[5, 5])
+        self.assertEqual(selection.selected_blobs[0].bbox, (4, 4, 6, 6))
+        self.assertEqual(selection.selected_cell_count, 4)
+
+    def test_fault_selector_uses_exact_cells_without_filling_rectangle(self):
+        faulty = np.zeros((12, 12), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        faulty[3, 3] = 0
+        missing[3, 3] = 1
+        faulty[8, 9] = 0
+        missing[8, 9] = 1
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_repair_box_cells=1,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        expected = np.zeros_like(faulty, dtype=bool)
+        expected[3:9, 3:10] = True
+        self.assertTrue(np.array_equal(selection.reconstruction_mask, expected))
+
+    def test_fault_selector_leaves_severe_cells_out_instead_of_adding_healthy_cells(self):
+        faulty = np.zeros((20, 10), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        severe = np.zeros_like(faulty, dtype=bool)
+        severe[0:5, 0:4] = True
+        severe[12, 0:5] = True
+        missing[severe] = 1
+        faulty[0, 9] = 1
+        faulty[12, 5:10] = 1
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_repair_box_cells=2,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertEqual(selection.selected_blobs[0].bbox, (0, 0, 5, 4))
+        self.assertFalse(selection.reconstruction_mask[0, 9])
+        self.assertFalse(selection.reconstruction_mask[12, 0])
+        self.assertAlmostEqual(
+            selection.selected_blobs[0].repair_fault_fraction,
+            1.0,
+        )
+
+    def test_fault_selector_ignores_added_points_as_surviving_lidar(self):
+        shape = (8, 8)
+        faulty = np.zeros(shape, dtype=np.float32)
+        missing = np.zeros(shape, dtype=np.float32)
+        added = np.zeros(shape, dtype=np.float32)
+        faulty[4, 4] = 10
+        added[4, 4] = 10
+        missing[4, 4] = 2
+        heatmap = np.zeros(shape, dtype=np.float32)
 
         selection = FaultSelector(
             FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=1,
-                merge_radius_cells=0,
-                box_padding_cells=0,
-                bbox_quantile=0.0,
-                min_repair_fault_fraction=0.0,
+                min_repair_box_cells=1,
                 min_halo_healthy_fraction=0.0,
                 min_halo_healthy_cells=0,
                 min_halo_context_ratio=0.0,
                 min_halo_width_cells=1,
-                ignore_added_only=False,
+                max_halo_dilation_cells=1,
             )
         ).select(
             heatmap,
+            faulty_counts=faulty,
+            added_faulty_counts=added,
+            missing_faulty_counts=missing,
+        )
+
+        self.assertTrue(selection.reconstruction_mask[4, 4])
+
+    def test_fault_selector_halo_contains_only_occupied_trusted_cells(self):
+        faulty = np.zeros((20, 20), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        faulty[9, 8:13] = 1
+        faulty[11, 8:13] = 1
+        missing[10, 10] = 1
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_repair_box_cells=1,
+            min_halo_healthy_fraction=1.0,
+            min_halo_healthy_cells=8,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=4,
+        )
+
+        self.assertTrue(selection.selected_blobs[0].halo_target_met)
+        self.assertFalse(
+            np.any(selection.healthy_context_mask & ~(faulty > 0))
+        )
+        self.assertFalse(
+            np.any(selection.reconstruction_mask & selection.halo_mask)
+        )
+
+    def test_fault_selector_clips_masks_to_valid_radar_support(self):
+        faulty = np.zeros((10, 10), dtype=np.float32)
+        missing = np.ones_like(faulty)
+        support = np.tri(10, 10, dtype=bool)
+        zeros = np.zeros_like(faulty)
+
+        selection = FaultSelector(
+            FaultSelectorConfig(
+                min_repair_box_cells=1,
+                min_halo_healthy_fraction=0.0,
+                min_halo_healthy_cells=0,
+                min_halo_context_ratio=0.0,
+                min_halo_width_cells=1,
+                max_halo_dilation_cells=1,
+            )
+        ).select(
+            np.ones_like(faulty),
+            faulty_counts=faulty,
+            added_faulty_counts=zeros,
+            missing_faulty_counts=missing,
             valid_support_mask=support,
         )
 
         self.assertTrue(np.array_equal(selection.reconstruction_mask, support))
         self.assertFalse(np.any(selection.halo_mask & ~support))
-        self.assertFalse(np.any(selection.healthy_context_mask & ~support))
-
-    def test_fault_selector_prefers_larger_blob_within_distance_bin(self):
-        heatmap = np.zeros((20, 20), dtype=np.float32)
-        heatmap[15:17, 1:3] = 1.0
-        heatmap[13:16, 10:13] = 0.6
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=1,
-                merge_radius_cells=0,
-                box_padding_cells=0,
-                combine_gap_cells=0,
-                distance_bin_m=10.0,
-                x_cell_size_m=0.2,
-                min_repair_fault_fraction=0.0,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-            )
-        ).select(
-            heatmap,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=(heatmap > 0).astype(np.float32),
-            moved_faulty_counts=zeros,
-        )
-
-        self.assertEqual(selection.selected_blobs[0].cell_count, 9)
-
-    def test_fault_selector_excludes_added_only_cells_but_keeps_mixed_cells(self):
-        heatmap = np.zeros((12, 12), dtype=np.float32)
-        heatmap[8:11, 1:4] = 1.0
-        heatmap[2:5, 7:10] = 0.8
-        added = np.zeros_like(heatmap)
-        missing = np.zeros_like(heatmap)
-        moved = np.zeros_like(heatmap)
-        added[8:11, 1:4] = 2
-        added[2:5, 7:10] = 1
-        missing[2:5, 7:10] = 1
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=None,
-                merge_radius_cells=0,
-                box_padding_cells=0,
-                min_repair_fault_fraction=0.0,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-            )
-        ).select(
-            heatmap,
-            added_faulty_counts=added,
-            missing_faulty_counts=missing,
-            moved_faulty_counts=moved,
-        )
-
-        self.assertEqual(selection.original_fault_cell_count, 18)
-        self.assertEqual(selection.excluded_added_only_cell_count, 9)
-        self.assertEqual(selection.thresholded_cell_count, 9)
-        self.assertFalse(selection.reconstruction_mask[9, 2])
-        self.assertTrue(selection.reconstruction_mask[3, 8])
-
-    def test_fault_selector_merges_nearby_missing_fragments_into_one_rectangle(self):
-        heatmap = np.zeros((40, 40), dtype=np.float32)
-        heatmap[5:8, 5:8] = 1.0
-        heatmap[5:8, 13:16] = 1.0
-        heatmap[35, 35] = 1.0
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=5,
-                max_blobs=1,
-                merge_radius_cells=3,
-                box_padding_cells=1,
-                min_repair_fault_fraction=0.0,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-            )
-        ).select(
-            heatmap,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=(heatmap > 0).astype(np.float32),
-            moved_faulty_counts=zeros,
-        )
-
-        self.assertEqual(selection.selected_fault_cell_count, 18)
-        self.assertEqual(selection.selected_blobs[0].bbox, (4, 4, 9, 17))
-        self.assertEqual(selection.selected_cell_count, 5 * 13)
-        self.assertEqual(len(selection.rejected_small_blobs), 1)
-
-    def test_fault_selector_ignores_sparse_satellite_of_dominant_region(self):
-        heatmap = np.zeros((80, 80), dtype=np.float32)
-        heatmap[5:15, 5:15] = 1.0
-        heatmap[65:67, 65:68] = 1.0
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=5,
-                max_blobs=3,
-                merge_radius_cells=0,
-                combine_gap_cells=5,
-                min_relative_blob_size=0.1,
-                box_padding_cells=0,
-                bbox_quantile=0.0,
-                min_repair_fault_fraction=0.0,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-            )
-        ).select(
-            heatmap,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=(heatmap > 0).astype(np.float32),
-            moved_faulty_counts=zeros,
-        )
-
-        self.assertEqual(len(selection.selected_blobs), 1)
-        self.assertEqual(selection.selected_blobs[0].cell_count, 100)
-        self.assertFalse(selection.reconstruction_mask[65, 65])
-
-    def test_fault_selector_builds_healthy_halo_around_repair_box(self):
-        heatmap = np.zeros((40, 40), dtype=np.float32)
-        heatmap[15:25, 15:25] = 1.0
-        reliability = 1.0 - heatmap
-        faulty_counts = np.zeros_like(heatmap)
-        faulty_counts[13:27, 13:27] = 1.0
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=1,
-                merge_radius_cells=0,
-                combine_gap_cells=0,
-                box_padding_cells=0,
-                bbox_quantile=0.0,
-                min_repair_fault_fraction=0.75,
-                min_halo_healthy_fraction=0.90,
-                min_halo_width_cells=1,
-            )
-        ).select(
-            heatmap,
-            reliability_map=reliability,
-            faulty_counts=faulty_counts,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=heatmap,
-            moved_faulty_counts=zeros,
-        )
-
-        blob = selection.selected_blobs[0]
-        self.assertEqual(blob.bbox, (15, 15, 25, 25))
-        self.assertEqual(blob.halo_bbox, (13, 13, 27, 27))
-        self.assertEqual(blob.halo_dilation_cells, 2)
-        self.assertTrue(blob.repair_target_met)
-        self.assertTrue(blob.halo_target_met)
-        self.assertGreaterEqual(blob.repair_fault_fraction, 0.75)
-        self.assertGreaterEqual(blob.halo_healthy_fraction, 0.90)
-        self.assertEqual(selection.selected_cell_count, 100)
-        self.assertEqual(blob.required_healthy_context_cell_count, 64)
-        self.assertEqual(selection.halo_cell_count, 96)
-        self.assertEqual(selection.healthy_context_cell_count, 96)
-        self.assertFalse(
-            np.logical_and(selection.reconstruction_mask, selection.halo_mask).any()
-        )
-
-    def test_fault_selector_does_not_count_reliable_empty_cells_as_context(self):
-        heatmap = np.zeros((20, 20), dtype=np.float32)
-        heatmap[8:12, 8:12] = 1.0
-        reliability = 1.0 - heatmap
-        faulty_counts = np.zeros_like(heatmap)
-        faulty_counts[8:12, 8:12] = 1.0
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=1,
-                merge_radius_cells=0,
-                combine_gap_cells=0,
-                box_padding_cells=0,
-                bbox_quantile=0.0,
-                min_repair_fault_fraction=0.75,
-                min_halo_healthy_fraction=0.90,
-                min_halo_width_cells=1,
-                max_halo_dilation_cells=4,
-            )
-        ).select(
-            heatmap,
-            reliability_map=reliability,
-            faulty_counts=faulty_counts,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=heatmap,
-            moved_faulty_counts=zeros,
-        )
-
-        blob = selection.selected_blobs[0]
-        self.assertFalse(blob.halo_target_met)
-        self.assertEqual(blob.healthy_occupied_cell_count, 0)
-        self.assertEqual(selection.healthy_context_cell_count, 0)
-
-    def test_fault_selector_trims_repair_box_to_fault_fraction_target(self):
-        heatmap = np.zeros((30, 30), dtype=np.float32)
-        heatmap[8:22, 8] = 1.0
-        heatmap[8:22, 21] = 1.0
-        heatmap[8, 8:22] = 1.0
-        heatmap[21, 8:22] = 1.0
-        reliability = 1.0 - heatmap
-        faulty_counts = np.ones_like(heatmap)
-        zeros = np.zeros_like(heatmap)
-
-        selection = FaultSelector(
-            FaultSelectorConfig(
-                min_blob_cells=1,
-                max_blobs=1,
-                merge_radius_cells=0,
-                combine_gap_cells=20,
-                box_padding_cells=0,
-                bbox_quantile=0.0,
-                min_repair_fault_fraction=0.75,
-                min_halo_healthy_fraction=0.0,
-                min_halo_healthy_cells=0,
-                min_halo_context_ratio=0.0,
-                min_halo_width_cells=1,
-            )
-        ).select(
-            heatmap,
-            reliability_map=reliability,
-            faulty_counts=faulty_counts,
-            added_faulty_counts=zeros,
-            missing_faulty_counts=heatmap,
-            moved_faulty_counts=zeros,
-        )
-
-        blob = selection.selected_blobs[0]
-        self.assertTrue(blob.repair_target_met)
-        self.assertGreaterEqual(blob.repair_fault_fraction, 0.75)
-        self.assertLess(selection.selected_cell_count, 14 * 14)
 
 
 if __name__ == "__main__":

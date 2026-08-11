@@ -71,6 +71,69 @@ class PointPillarsTests(unittest.TestCase):
         self.assertEqual(int(statistics["maximum_points_per_pillar"][0]), 3)
         self.assertGreater(float(statistics["empty_pillar_fraction"][0]), 0.99)
 
+    def test_batched_encoder_matches_per_sample_reference(self):
+        encoder = PointPillarsEncoder(
+            _geometry(),
+            raw_channels=4,
+            output_channels=8,
+            max_points_per_pillar=2,
+            max_pillars=12000,
+        ).eval()
+        point_clouds = (
+            torch.tensor(
+                [
+                    [1.01, 0.01, 0.0, 10.0],
+                    [1.02, 0.02, 0.1, 11.0],
+                    [1.03, 0.03, 0.2, 12.0],
+                    [5.0, 5.0, 1.0, 20.0],
+                ]
+            ),
+            torch.tensor(
+                [
+                    [2.01, -1.01, 0.0, 13.0],
+                    [2.02, -1.02, 0.1, 14.0],
+                    [8.0, 4.0, 1.0, 21.0],
+                ]
+            ),
+        )
+        with torch.no_grad():
+            actual, actual_statistics = encoder(point_clouds)
+            pillarized = tuple(
+                encoder.pillarizer(points) for points in point_clouds
+            )
+            pillar_counts = [len(item.pillar_rows) for item in pillarized]
+            features = torch.cat([item.features for item in pillarized])
+            offsets = []
+            offset = 0
+            for item, count in zip(pillarized, pillar_counts):
+                offsets.append(item.point_to_pillar + offset)
+                offset += count
+            encoded = encoder.feature_net(
+                features,
+                torch.cat(offsets),
+                sum(pillar_counts),
+            )
+            expected = torch.stack(
+                [
+                    encoder.scatter(features, item.pillar_rows, item.pillar_cols)
+                    for features, item in zip(
+                        encoded.split(pillar_counts), pillarized
+                    )
+                ]
+            )
+        self.assertTrue(torch.equal(actual, expected))
+        for name in actual_statistics:
+            expected_statistic = torch.stack(
+                [item.statistics[name] for item in pillarized]
+            )
+            self.assertTrue(
+                torch.allclose(
+                    actual_statistics[name],
+                    expected_statistic,
+                ),
+                name,
+            )
+
     def test_enabled_config_changes_inputs_but_not_three_channel_target(self):
         model_config, _, _ = build_configs(
             {

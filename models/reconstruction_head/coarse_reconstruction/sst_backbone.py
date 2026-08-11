@@ -42,7 +42,6 @@ class SSTConfig:
     shift_size_cells: int = 6
     dropout: float = 0.0
     include_repair_tokens: bool = False
-    sparse_pointpillars_only: bool = False
 
     def validate(self) -> None:
         for name in (
@@ -64,8 +63,6 @@ class SSTConfig:
             raise ValueError("sst.dropout must be in [0,1)")
         if not isinstance(self.include_repair_tokens, bool):
             raise ValueError("sst.include_repair_tokens must be boolean")
-        if not isinstance(self.sparse_pointpillars_only, bool):
-            raise ValueError("sst.sparse_pointpillars_only must be boolean")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -77,6 +74,60 @@ class SparseMultimodalTokens:
     coordinates: torch.Tensor
     trusted_lidar_coordinates: torch.Tensor
     statistics: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class SparseRegionLayout:
+    """Reusable packing metadata for one fixed sparse token layout."""
+
+    counts: torch.Tensor
+    order: torch.Tensor
+    sorted_groups: torch.Tensor
+    positions: torch.Tensor
+    valid: torch.Tensor
+
+
+def build_sparse_region_layout(
+    coordinates: torch.Tensor,
+    region_size_cells: int,
+    *,
+    shift_size_cells: int,
+) -> SparseRegionLayout:
+    """Build region packing once for reuse by every SST block."""
+
+    group_coordinates = regional_group_indices(
+        coordinates,
+        region_size_cells,
+        shift_size_cells=shift_size_cells,
+    )
+    _, group_assignment = torch.unique(
+        group_coordinates,
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+    counts = torch.bincount(group_assignment)
+    group_count = len(counts)
+    maximum_tokens = int(counts.max())
+    order = torch.argsort(group_assignment, stable=True)
+    sorted_groups = group_assignment[order]
+    starts = torch.cumsum(counts, dim=0) - counts
+    positions = torch.arange(
+        len(coordinates), device=coordinates.device
+    ) - torch.repeat_interleave(starts, counts)
+    valid = torch.zeros(
+        (group_count, maximum_tokens),
+        dtype=torch.bool,
+        device=coordinates.device,
+    )
+    valid[sorted_groups, positions] = True
+    return SparseRegionLayout(
+        counts=counts,
+        order=order,
+        sorted_groups=sorted_groups,
+        positions=positions,
+        valid=valid,
+    )
 
 
 def regional_group_indices(
@@ -143,9 +194,8 @@ class SparseTokenBuilder(nn.Module):
         *,
         include_repair_tokens: bool,
         radar_enabled: bool,
-        use_dense_sensor_features: bool = True,
     ) -> SparseMultimodalTokens:
-        batch, _, height, width = reconstruction_mask.shape
+        batch, _, height, width = lidar.dense_features.shape
         expected_mask_shape = (batch, 1, height, width)
         if reconstruction_mask.shape != expected_mask_shape:
             raise ValueError(
@@ -164,10 +214,8 @@ class SparseTokenBuilder(nn.Module):
                 lidar_coordinates[:, 2],
             ] > 0.5
             trusted_lidar_coordinates = lidar_coordinates[~lidar_untrusted]
-            trusted_lidar_features = lidar.sparse_features[~lidar_untrusted]
         else:
             trusted_lidar_coordinates = lidar_coordinates
-            trusted_lidar_features = lidar.sparse_features
 
         coordinate_parts = [trusted_lidar_coordinates]
         if radar_enabled:
@@ -190,48 +238,14 @@ class SparseTokenBuilder(nn.Module):
         coordinates = self._coordinates_from_keys(union_keys, height, width)
         batch_index, rows, cols = coordinates.unbind(dim=1)
 
-        if use_dense_sensor_features:
-            if lidar.dense_features is None or radar.dense_features is None:
-                raise ValueError(
-                    "Dense SST fusion requires dense PointPillars features"
-                )
-            trusted_lidar_dense = (
-                lidar.dense_features * (1.0 - reconstruction_mask)
-            )
-            lidar_features = trusted_lidar_dense[
-                batch_index, :, rows, cols
-            ]
-            if radar_enabled:
-                radar_features = radar.dense_features[
-                    batch_index, :, rows, cols
-                ]
-            else:
-                radar_features = lidar_features.new_zeros(
-                    (len(coordinates), radar.sparse_features.shape[1])
-                )
+        trusted_lidar_dense = lidar.dense_features * (1.0 - reconstruction_mask)
+        lidar_features = trusted_lidar_dense[batch_index, :, rows, cols]
+        if radar_enabled:
+            radar_features = radar.dense_features[batch_index, :, rows, cols]
         else:
-            lidar_features = lidar.sparse_features.new_zeros(
-                (len(coordinates), lidar.sparse_features.shape[1])
+            radar_features = lidar_features.new_zeros(
+                (len(coordinates), radar.dense_features.shape[1])
             )
-            if len(trusted_lidar_coordinates):
-                lidar_positions = torch.searchsorted(
-                    union_keys,
-                    self._flat_keys(
-                        trusted_lidar_coordinates, height, width
-                    ),
-                )
-                lidar_features[lidar_positions] = trusted_lidar_features
-            radar_features = radar.sparse_features.new_zeros(
-                (len(coordinates), radar.sparse_features.shape[1])
-            )
-            if radar_enabled and len(radar.sparse_coordinates):
-                radar_positions = torch.searchsorted(
-                    union_keys,
-                    self._flat_keys(
-                        radar.sparse_coordinates, height, width
-                    ),
-                )
-                radar_features[radar_positions] = radar.sparse_features
         repair_values = reconstruction_mask[batch_index, 0, rows, cols, None]
         healthy_values = healthy_context_mask[batch_index, 0, rows, cols, None]
         fused = torch.cat(
@@ -344,29 +358,18 @@ class SparseRegionalAttention(nn.Module):
         grid_shape: tuple[int, int],
         *,
         profile: bool = False,
+        layout: SparseRegionLayout | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         height, width = grid_shape
         grouping_started = _profile_start(features, profile)
-        group_coordinates = regional_group_indices(
-            coordinates,
-            self.region_size_cells,
-            shift_size_cells=self.shift_size_cells,
-        )
-        _, group_assignment = torch.unique(
-            group_coordinates,
-            dim=0,
-            sorted=True,
-            return_inverse=True,
-        )
-        counts = torch.bincount(group_assignment)
-        group_count = len(counts)
-        maximum_tokens = int(counts.max())
-        order = torch.argsort(group_assignment, stable=True)
-        sorted_groups = group_assignment[order]
-        starts = torch.cumsum(counts, dim=0) - counts
-        positions = torch.arange(
-            len(features), device=features.device
-        ) - torch.repeat_interleave(starts, counts)
+        if layout is None:
+            layout = build_sparse_region_layout(
+                coordinates,
+                self.region_size_cells,
+                shift_size_cells=self.shift_size_cells,
+            )
+        elif len(layout.order) != len(features):
+            raise ValueError("Sparse region layout does not match token count")
         normalized = self.attention_norm(features)
         normalized = normalized + self.position_encoding(
             coordinates,
@@ -375,31 +378,29 @@ class SparseRegionalAttention(nn.Module):
             normalized.dtype,
         )
         packed = normalized.new_zeros(
-            (group_count, maximum_tokens, features.shape[1])
+            (*layout.valid.shape, features.shape[1])
         )
-        valid = torch.zeros(
-            (group_count, maximum_tokens),
-            dtype=torch.bool,
-            device=features.device,
-        )
-        packed[sorted_groups, positions] = normalized[order]
-        valid[sorted_groups, positions] = True
+        packed[layout.sorted_groups, layout.positions] = normalized[
+            layout.order
+        ]
         grouping_ms = _profile_elapsed_ms(features, grouping_started)
         attention_started = _profile_start(features, profile)
         attended, _ = self.attention(
             packed,
             packed,
             packed,
-            key_padding_mask=~valid,
+            key_padding_mask=~layout.valid,
             need_weights=False,
         )
-        attended_sorted = attended[sorted_groups, positions]
+        attended_sorted = attended[
+            layout.sorted_groups, layout.positions
+        ]
         attended_unordered = attended_sorted.new_empty(features.shape)
-        attended_unordered[order] = attended_sorted
+        attended_unordered[layout.order] = attended_sorted
         features = features + attended_unordered
         features = features + self.mlp(self.mlp_norm(features))
         attention_ms = _profile_elapsed_ms(features, attention_started)
-        return features, counts, {
+        return features, layout.counts, {
             "grouping_ms": grouping_ms,
             "attention_ms": attention_ms,
         }
@@ -424,16 +425,26 @@ class SSTBlock(nn.Module):
         grid_shape: tuple[int, int],
         *,
         profile: bool = False,
+        normal_layout: SparseRegionLayout | None = None,
+        shifted_layout: SparseRegionLayout | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, torch.Tensor],
         dict[str, float],
     ]:
         features, normal_counts, normal_timing = self.normal_attention(
-            features, coordinates, grid_shape, profile=profile
+            features,
+            coordinates,
+            grid_shape,
+            profile=profile,
+            layout=normal_layout,
         )
         features, shifted_counts, shifted_timing = self.shifted_attention(
-            features, coordinates, grid_shape, profile=profile
+            features,
+            coordinates,
+            grid_shape,
+            profile=profile,
+            layout=shifted_layout,
         )
         return features, (normal_counts, shifted_counts), {
             "regional_grouping_ms": (
@@ -465,14 +476,31 @@ class SSTBackbone(nn.Module):
         coordinates_before = coordinates.clone()
         first_block_features = None
         final_normal_counts = None
+        grouping_started = _profile_start(features, profile)
+        normal_layout = build_sparse_region_layout(
+            coordinates,
+            self.config.region_size_cells,
+            shift_size_cells=0,
+        )
+        shifted_layout = build_sparse_region_layout(
+            coordinates,
+            self.config.region_size_cells,
+            shift_size_cells=self.config.shift_size_cells,
+        )
+        grouping_ms = _profile_elapsed_ms(features, grouping_started)
         timing = {
-            "regional_grouping_ms": 0.0,
+            "regional_grouping_ms": grouping_ms,
             "normal_attention_ms": 0.0,
             "shifted_attention_ms": 0.0,
         }
         for index, block in enumerate(self.blocks):
             features, (normal_counts, _), block_timing = block(
-                features, coordinates, grid_shape, profile=profile
+                features,
+                coordinates,
+                grid_shape,
+                profile=profile,
+                normal_layout=normal_layout,
+                shifted_layout=shifted_layout,
             )
             for name, value in block_timing.items():
                 timing[name] += value

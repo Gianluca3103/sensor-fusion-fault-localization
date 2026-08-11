@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from Fault_Localization_Model.config.defaults import config_defaults
 from Fault_Localization_Model.create_grid_reliability_heatmaps import (
     make_reliability_maps,
     mark_bev_point_statuses,
@@ -10,6 +11,18 @@ from Fault_Localization_Model.create_grid_reliability_heatmaps import (
 
 
 class ReliabilityMapTests(unittest.TestCase):
+    def test_default_reliability_grid_matches_bev_resolution(self):
+        defaults = config_defaults({})
+
+        self.assertEqual(defaults["grid_size"], 320)
+        self.assertEqual(
+            defaults["grid_size"],
+            round(
+                (defaults["x_max"] - defaults["x_min"])
+                / defaults["resolution"]
+            ),
+        )
+
     def test_tolerated_motion_counts_as_correct_at_observed_location(self):
         clean = np.asarray([[0.99, 0.5, 0.0, 1.0]], dtype=np.float32)
         faulty = np.asarray(
