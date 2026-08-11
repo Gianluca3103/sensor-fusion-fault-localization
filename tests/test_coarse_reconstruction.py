@@ -7,6 +7,7 @@ from models.reconstruction_head import (
     CoarseReconstructionConfig,
     CoarseReconstructionModel,
     MaskedBEVReconstructionLoss,
+    build_configs,
     coarse_reconstruction_metrics,
 )
 
@@ -39,6 +40,17 @@ def _inputs(batch=2, size=32):
 
 
 class CoarseReconstructionTests(unittest.TestCase):
+    def test_config_can_disable_healthy_context_mask_input(self):
+        model_config, _loss_config, _selector_config = build_configs(
+            {
+                "coarse_reconstruction": {
+                    "unet": {"use_healthy_context_mask": False}
+                }
+            }
+        )
+        self.assertFalse(model_config.use_healthy_context_mask)
+        self.assertEqual(model_config.local_input_channels, 8)
+
     def test_local_attention_projection_is_used_only_when_channels_differ(self):
         matching = CoarseReconstructionModel(_config())
         self.assertIsInstance(
@@ -109,6 +121,35 @@ class CoarseReconstructionTests(unittest.TestCase):
         self.assertEqual(output["attention_weights"].shape, (2, 4, 64, 64))
         self.assertEqual(
             output["fused_bottleneck"].shape, output["local_bottleneck"].shape
+        )
+
+    def test_full_faulty_lidar_context_uses_only_reconstruction_mask_channel(self):
+        config = CoarseReconstructionConfig(
+            unet_base_channels=4,
+            unet_depth=3,
+            global_base_channels=4,
+            global_channel_multipliers=(1, 2, 4),
+            attention_dim=16,
+            num_heads=4,
+            use_healthy_context_mask=False,
+        )
+        model = CoarseReconstructionModel(config).eval()
+        faulty, radar, reconstruction, healthy, halo, _clean = _inputs()
+        with torch.no_grad():
+            output = model(faulty, radar, reconstruction, healthy, halo)
+
+        expected_context_mask = 1.0 - reconstruction
+        expected_context = expected_context_mask * faulty
+        self.assertEqual(output["local_input"].shape, (2, 8, 32, 32))
+        self.assertTrue(
+            torch.equal(output["local_context_mask"], expected_context_mask)
+        )
+        self.assertTrue(
+            torch.equal(output["local_lidar_context"], expected_context)
+        )
+        self.assertTrue(torch.equal(output["local_input"][:, :3], expected_context))
+        self.assertTrue(
+            torch.equal(output["local_input"][:, -1:], reconstruction)
         )
 
     def test_default_spatial_progression_reaches_twenty_by_twenty(self):

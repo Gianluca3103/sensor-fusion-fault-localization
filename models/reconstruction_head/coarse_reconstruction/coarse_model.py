@@ -319,7 +319,13 @@ class CoarseReconstructionModel(nn.Module):
         active_mask = torch.maximum(reconstruction_mask, halo_mask)
 
         erased_lidar_bev = (1.0 - reconstruction_mask) * faulty_lidar_bev
-        local_lidar_context = healthy_context_mask * faulty_lidar_bev
+        if self.config.use_healthy_context_mask:
+            local_context_mask = healthy_context_mask
+            local_mask_channels = (reconstruction_mask, healthy_context_mask)
+        else:
+            local_context_mask = 1.0 - reconstruction_mask
+            local_mask_channels = (reconstruction_mask,)
+        local_lidar_context = local_context_mask * faulty_lidar_bev
         if local_radar_bev is None:
             local_radar_bev = radar_bev
         local_radar_active = active_mask * local_radar_bev
@@ -327,8 +333,7 @@ class CoarseReconstructionModel(nn.Module):
             (
                 local_lidar_context,
                 local_radar_active,
-                reconstruction_mask,
-                healthy_context_mask,
+                *local_mask_channels,
             ),
             dim=1,
         )
@@ -399,6 +404,8 @@ class CoarseReconstructionModel(nn.Module):
             "healthy_context_mask": healthy_context_mask,
             "halo_mask": halo_mask,
             "active_mask": active_mask,
+            "local_context_mask": local_context_mask,
+            "local_lidar_context": local_lidar_context,
             "local_input": local_input,
             "local_bottleneck": local_bottleneck,
             "fused_bottleneck": fused_bottleneck,

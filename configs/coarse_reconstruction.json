@@ -6,7 +6,8 @@
       "depth": 4,
       "normalization": "group_norm",
       "activation": "silu",
-      "dropout": 0.0
+      "dropout": 0.0,
+      "use_healthy_context_mask": true
     },
     "global_context": {
       "base_channels": 16,

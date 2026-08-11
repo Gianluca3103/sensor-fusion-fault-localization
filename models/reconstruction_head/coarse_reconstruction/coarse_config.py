@@ -17,6 +17,7 @@ class CoarseReconstructionConfig:
     unet_base_channels: int = 16
     unet_depth: int = 4
     dropout: float = 0.025
+    use_healthy_context_mask: bool = True
     global_base_channels: int = 16
     global_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8, 16)
     attention_dim: int = 128
@@ -25,7 +26,8 @@ class CoarseReconstructionConfig:
 
     @property
     def local_input_channels(self) -> int:
-        return self.lidar_channels + self.radar_channels + 2
+        mask_channels = 2 if self.use_healthy_context_mask else 1
+        return self.lidar_channels + self.radar_channels + mask_channels
 
     def validate(self) -> None:
         integer_values = {
@@ -48,6 +50,8 @@ class CoarseReconstructionConfig:
             raise ValueError("attention_dim must be divisible by num_heads")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0,1)")
+        if not isinstance(self.use_healthy_context_mask, bool):
+            raise ValueError("use_healthy_context_mask must be boolean")
         if not 0.0 <= self.attention_dropout < 1.0:
             raise ValueError("attention_dropout must be in [0,1)")
 
@@ -94,6 +98,9 @@ def build_configs(payload: dict):
         ),
         unet_depth=unet.get("depth", defaults.unet_depth),
         dropout=unet.get("dropout", defaults.dropout),
+        use_healthy_context_mask=unet.get(
+            "use_healthy_context_mask", defaults.use_healthy_context_mask
+        ),
         global_base_channels=global_context.get(
             "base_channels", defaults.global_base_channels
         ),
