@@ -212,8 +212,8 @@ python -m models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fa
 The evaluator reads radar/global-map ablation settings from the checkpoint and
 writes `per_sample_metrics.csv`, `by_fault_metrics.csv`, and `summary.json`.
 It reports macro per-sample metrics as well as micro exact-cell IoU/F1 formed
-from summed TP/FP/FN counts. Clean/reconstructed/error comparison PNGs are
-organized under `visualizations/<fault>_s<severity>/`.
+from summed TP/FP/FN counts. Clean/reconstructed/faulty-LiDAR-plus-radar
+comparison PNGs are organized under `visualizations/<fault>_s<severity>/`.
 
 ## Masked residual diffusion
 

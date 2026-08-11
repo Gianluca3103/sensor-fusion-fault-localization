@@ -16,6 +16,9 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
             destination = Path(directory) / "comparison.png"
             clean = torch.zeros(3, 8, 8)
             clean[0, 2:5, 2:5] = 1.0
+            faulty = clean.clone()
+            radar = torch.zeros(4, 8, 8)
+            radar[0, 1:4, 1:4] = 1.0
             coarse = clean.clone()
             coarse[:, 3, 3] = 0.5
             mask = torch.zeros(1, 8, 8)
@@ -23,6 +26,8 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
             _save_comparison(
                 destination,
                 clean,
+                faulty,
+                radar,
                 coarse,
                 mask,
                 {

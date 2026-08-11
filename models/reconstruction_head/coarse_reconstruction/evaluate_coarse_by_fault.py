@@ -193,19 +193,42 @@ def _bev_rgb(bev: torch.Tensor) -> np.ndarray:
 def _save_comparison(
     destination: Path,
     clean_bev: torch.Tensor,
+    faulty_bev: torch.Tensor,
+    radar_bev: torch.Tensor,
     coarse_bev: torch.Tensor,
     reconstruction_mask: torch.Tensor,
     record: dict,
 ) -> None:
     clean = _bev_rgb(clean_bev)
     coarse = _bev_rgb(coarse_bev)
+    faulty_support = faulty_bev[0].detach().cpu().numpy() >= 0.5
+    radar_support = (
+        radar_bev.detach()
+        .to(dtype=torch.float32)
+        .abs()
+        .amax(dim=0)
+        .cpu()
+        .numpy()
+        > 0.0
+    )
+    faulty_radar_overlay = np.stack(
+        (
+            radar_support,
+            faulty_support,
+            faulty_support | radar_support,
+        ),
+        axis=-1,
+    ).astype(np.float32)
     mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    difference = np.mean(np.abs(coarse - clean), axis=-1) * mask
     figure, axes = plt.subplots(1, 3, figsize=(16, 5), facecolor="black")
     panels = (
         (clean, "Clean LiDAR BEV", None),
         (coarse, "Coarse reconstructed LiDAR BEV", None),
-        (difference, "Absolute error inside repair mask", "magma"),
+        (
+            faulty_radar_overlay,
+            "Faulty LiDAR + trusted radar\nCyan: LiDAR | Magenta: radar | White: overlap",
+            None,
+        ),
     )
     for axis, (image, title, cmap) in zip(axes, panels):
         axis.imshow(
@@ -379,6 +402,8 @@ def main() -> None:
                         / record["fault_group"]
                         / f"{visual_index:03d}_{Path(sample_path).stem}.png",
                         inputs["clean_bev"][index],
+                        inputs["faulty_bev"][index],
+                        inputs["radar_bev"][index],
                         outputs["coarse_lidar_bev"][index],
                         inputs["reconstruction_mask"][index],
                         record,

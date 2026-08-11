@@ -191,14 +191,19 @@ def choose_samples(bins, num_samples, seed, plan, shuffle=True):
         raise ValueError("At least one fault-plan item is required.")
     rng = random.Random(seed)
     bin_order = list(bins)
+    if len(set(bin_order)) != len(bin_order):
+        raise ValueError("LiDAR candidate paths must be unique.")
+    if int(num_samples) > len(bin_order):
+        raise ValueError(
+            f"Requested {num_samples} samples from only {len(bin_order)} "
+            "unique LiDAR frames. Source frames are never repeated."
+        )
     if shuffle:
         rng.shuffle(bin_order)
 
     samples = []
     for index in range(num_samples):
-        if shuffle and index > 0 and index % len(bin_order) == 0:
-            rng.shuffle(bin_order)
-        bin_path = bin_order[index % len(bin_order)]
+        bin_path = bin_order[index]
         fault, severity = plan[index % len(plan)]
         samples.append((bin_path, fault, severity))
     if shuffle:

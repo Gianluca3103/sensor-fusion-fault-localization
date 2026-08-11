@@ -252,7 +252,9 @@ class LocalUNetDecoder(nn.Module):
         tensor = bottleneck
         for block, skip in zip(self.blocks, reversed(skips)):
             tensor = F.interpolate(
-                tensor, size=skip.shape[-2:], mode="bilinear", align_corners=False
+                tensor,
+                size=skip.shape[-2:],
+                mode="nearest",
             )
             if tensor.shape[0] != skip.shape[0] or tensor.shape[-2:] != skip.shape[-2:]:
                 raise ValueError("Decoder and skip features are not aligned")
@@ -367,8 +369,7 @@ class CoarseReconstructionModel(nn.Module):
             decoder_feature = F.interpolate(
                 decoder_feature,
                 size=faulty_lidar_bev.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
+                mode="nearest",
             )
         replacement_raw = self.replacement_head(decoder_feature)
         occupancy_logits = replacement_raw[:, 0:1]

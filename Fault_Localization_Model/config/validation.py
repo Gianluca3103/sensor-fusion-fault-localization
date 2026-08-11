@@ -58,6 +58,15 @@ def validate_generation_args(args):
         raise ValueError("observability_num_z_bins must be an integer")
     require_positive(args.movement_tolerance_m, "movement_tolerance_m")
     require_non_negative(args.seed, "--seed")
+    if args.sequences:
+        if any(sequence <= 0 for sequence in args.sequences):
+            raise ValueError("--sequences must contain positive sequence IDs")
+        if len(set(args.sequences)) != len(args.sequences):
+            raise ValueError("--sequences must not contain duplicate IDs")
+        if args.temporal_split:
+            raise ValueError(
+                "--sequences cannot be combined with --temporal-split"
+            )
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("--train-ratio + --val-ratio must be less than 1.0 so a test split remains.")
     require_range(args.x_min, args.x_max, "x range")

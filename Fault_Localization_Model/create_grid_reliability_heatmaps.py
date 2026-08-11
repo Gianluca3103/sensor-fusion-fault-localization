@@ -904,6 +904,27 @@ def main():
 
     # Find every locally available os2-64 frame with an exact pc10p pairing.
     lidar_frames, sequence_dirs = list_all_kradar_lidar_frames(data_root)
+    if args.sequences:
+        requested_sequences = {str(sequence) for sequence in args.sequences}
+        available_sequences = {path.name for path in sequence_dirs}
+        missing_sequences = requested_sequences - available_sequences
+        if missing_sequences:
+            raise FileNotFoundError(
+                "Requested K-Radar sequences are unavailable: "
+                + ", ".join(sorted(missing_sequences, key=int))
+            )
+        lidar_frames = [
+            frame
+            for frame in lidar_frames
+            if frame.parents[1].name in requested_sequences
+        ]
+        sequence_dirs = [
+            path for path in sequence_dirs if path.name in requested_sequences
+        ]
+        LOGGER.info(
+            "Sequence-disjoint selection uses sequences: %s",
+            ", ".join(sorted(requested_sequences, key=int)),
+        )
     source_description = (
         f"{len(sequence_dirs)} K-Radar sequences under {data_root}"
     )

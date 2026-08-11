@@ -37,9 +37,19 @@ class FaultInjectorTests(unittest.TestCase):
     def test_choose_samples_is_reproducible(self):
         bins = [Path("a.bin"), Path("b.bin"), Path("c.bin")]
         plan = [("fog_sim", 4), ("rain_sim", 5)]
-        first = choose_samples(bins, 6, seed=7, plan=plan, shuffle=True)
-        second = choose_samples(bins, 6, seed=7, plan=plan, shuffle=True)
+        first = choose_samples(bins, 3, seed=7, plan=plan, shuffle=True)
+        second = choose_samples(bins, 3, seed=7, plan=plan, shuffle=True)
         self.assertEqual(first, second)
+        self.assertEqual(len({sample[0] for sample in first}), 3)
+
+    def test_choose_samples_rejects_repeated_source_frames(self):
+        with self.assertRaisesRegex(ValueError, "never repeated"):
+            choose_samples(
+                [Path("a.bin"), Path("b.bin")],
+                3,
+                seed=7,
+                plan=[("fog_sim", 4)],
+            )
 
     def test_choose_samples_draws_from_shuffled_candidate_pool(self):
         bins = [Path(f"{index}.bin") for index in range(20)]

@@ -18,6 +18,16 @@ def parse_args():
     parser.add_argument("--num-samples", type=int, default=defaults["num_samples"])
     parser.add_argument("--frames", type=int, nargs="*", default=None)
     parser.add_argument(
+        "--sequences",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Use only these complete K-Radar sequence IDs. This is intended "
+            "for sequence-disjoint train/validation datasets."
+        ),
+    )
+    parser.add_argument(
         "--temporal-split",
         choices=["train", "val", "test"],
         default=None,
