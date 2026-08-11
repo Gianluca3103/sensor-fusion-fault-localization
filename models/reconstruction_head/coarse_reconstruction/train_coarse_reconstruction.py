@@ -204,9 +204,15 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
     sst_statistics = outputs.get("sst_token_statistics")
     if sst_statistics:
         result["sst_token_statistics"] = {
-            key: float(value.detach().cpu())
+            key: (
+                float(value.detach().cpu())
+                if value.numel() == 1
+                else value.detach().cpu().tolist()
+            )
             for key, value in sst_statistics.items()
         }
+    if "sst_timing_ms" in outputs:
+        result["sst_timing_ms"] = dict(outputs["sst_timing_ms"])
     return result
 
 
@@ -279,6 +285,7 @@ def _run_epoch(
     active_fraction_samples=None,
     radar_mode="full",
     use_global_map=True,
+    profile_first_batch=False,
 ):
     training = optimizer is not None
     model.train(training)
@@ -303,6 +310,10 @@ def _run_epoch(
                 False,
             )
         )
+        sst_enabled = (
+            getattr(getattr(model, "config", None), "backbone", None)
+            == "sst"
+        )
         if radar_mode == "none":
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
         elif radar_mode == "global-only":
@@ -310,8 +321,9 @@ def _run_epoch(
                 local_radar_bev = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
-        measure_forward = logged_shapes is None
-        if measure_forward:
+        capture_debug = logged_shapes is None
+        measure_runtime = capture_debug and profile_first_batch
+        if measure_runtime:
             _synchronize_device(device)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
@@ -329,6 +341,8 @@ def _run_epoch(
                         return_attention and batch_index == 0
                     ),
                 }
+                if sst_enabled:
+                    model_options["profile_sst"] = measure_runtime
                 if pointpillars_enabled:
                     model_options.update(
                         {
@@ -348,7 +362,7 @@ def _run_epoch(
                     inputs["halo_mask"],
                     **model_options,
                 )
-                if measure_forward:
+                if measure_runtime:
                     _synchronize_device(device)
                     forward_time_ms = 1000.0 * (
                         time.perf_counter() - forward_started
@@ -359,7 +373,15 @@ def _run_epoch(
                     inputs.get("observability_confidence"),
                 )
             if training:
+                if measure_runtime:
+                    _synchronize_device(device)
+                    backward_started = time.perf_counter()
                 scaler.scale(losses["loss"]).backward()
+                if measure_runtime:
+                    _synchronize_device(device)
+                    backward_time_ms = 1000.0 * (
+                        time.perf_counter() - backward_started
+                    )
                 if grad_clip > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -381,23 +403,28 @@ def _run_epoch(
             sums[key] = sums.get(key, 0.0) + float(value.detach()) * batch_size
         if logged_shapes is None:
             logged_shapes = _shape_log(inputs, outputs)
-            logged_shapes["runtime"] = {
-                "forward_time_ms": forward_time_ms,
-            }
-            if device.type == "cuda":
-                logged_shapes["runtime"].update(
-                    {
-                        "memory_allocated_bytes": torch.cuda.memory_allocated(
-                            device
-                        ),
-                        "memory_reserved_bytes": torch.cuda.memory_reserved(
-                            device
-                        ),
-                        "peak_memory_allocated_bytes": (
-                            torch.cuda.max_memory_allocated(device)
-                        ),
-                    }
-                )
+            if measure_runtime:
+                logged_shapes["runtime"] = {
+                    "forward_time_ms": forward_time_ms,
+                }
+                if training:
+                    logged_shapes["runtime"]["backward_pass_ms"] = (
+                        backward_time_ms
+                    )
+                if device.type == "cuda":
+                    logged_shapes["runtime"].update(
+                        {
+                            "memory_allocated_bytes": torch.cuda.memory_allocated(
+                                device
+                            ),
+                            "memory_reserved_bytes": torch.cuda.memory_reserved(
+                                device
+                            ),
+                            "peak_memory_allocated_bytes": (
+                                torch.cuda.max_memory_allocated(device)
+                            ),
+                        }
+                    )
         if conditioning_callback is not None and batch_index == 0:
             conditioning_callback(batch, outputs)
     return {key: value / max(samples, 1) for key, value in sums.items()}, logged_shapes
@@ -545,6 +572,7 @@ def main():
             active_fraction_samples=train_active_fractions,
             radar_mode=radar_mode,
             use_global_map=not args.disable_global_map,
+            profile_first_batch=epoch == 1,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -567,6 +595,7 @@ def main():
                 active_fraction_samples=val_active_fractions,
                 radar_mode=radar_mode,
                 use_global_map=not args.disable_global_map,
+                profile_first_batch=epoch == 1,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started

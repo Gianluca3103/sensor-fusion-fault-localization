@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Sequence
+import time
 
 import torch
 from torch import nn
@@ -22,6 +23,25 @@ from .sst_backbone import (
     SparseTokenBuilder,
     region_statistics,
 )
+
+
+def _profile_start(tensor: torch.Tensor, enabled: bool) -> float | None:
+    if not enabled:
+        return None
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+    return time.perf_counter()
+
+
+def _profile_elapsed_ms(
+    tensor: torch.Tensor,
+    started: float | None,
+) -> float:
+    if started is None:
+        return 0.0
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+    return 1000.0 * (time.perf_counter() - started)
 
 
 class ResidualCoarseBlock(nn.Module):
@@ -474,11 +494,15 @@ class CoarseReconstructionModel(nn.Module):
         faulty_lidar_points: Sequence[torch.Tensor] | None,
         radar_points: Sequence[torch.Tensor] | None,
         radar_enabled: bool,
+        profile_sst: bool,
     ) -> dict[str, torch.Tensor]:
         if faulty_lidar_points is None:
             raise ValueError("faulty_lidar_points are required by the SST backbone")
         assert self.lidar_pillar_encoder is not None
         assert self.radar_pillar_encoder is not None
+        pointpillars_started = _profile_start(
+            faulty_lidar_bev, profile_sst
+        )
         lidar = self.lidar_pillar_encoder(
             self._select_lidar_point_fields(faulty_lidar_points),
             return_sparse=True,
@@ -494,6 +518,9 @@ class CoarseReconstructionModel(nn.Module):
             assert isinstance(radar, PointPillarsOutput)
         else:
             radar = self._empty_radar_pillar_output(lidar)
+        pointpillars_ms = _profile_elapsed_ms(
+            faulty_lidar_bev, pointpillars_started
+        )
 
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
         active_mask = torch.maximum(reconstruction_mask, halo_mask)
@@ -513,6 +540,10 @@ class CoarseReconstructionModel(nn.Module):
             tokens.features,
             tokens.coordinates,
             grid_shape,
+            profile=profile_sst,
+        )
+        reconstruction_started = _profile_start(
+            final_tokens, profile_sst
         )
         dense_sst_features = self.sst_scatter(
             final_tokens,
@@ -539,6 +570,9 @@ class CoarseReconstructionModel(nn.Module):
             (1.0 - reconstruction_mask) * faulty_lidar_bev
             + reconstruction_mask * replacement_bev
         )
+        reconstruction_head_ms = _profile_elapsed_ms(
+            coarse_lidar_bev, reconstruction_started
+        )
         token_statistics = dict(tokens.statistics)
         token_statistics.update(
             region_statistics(
@@ -548,6 +582,11 @@ class CoarseReconstructionModel(nn.Module):
                 region_size_cells=self.config.sst.region_size_cells,
             )
         )
+        sst_timing_ms = {
+            "pointpillars_ms": pointpillars_ms,
+            **sst_debug["timing_ms"],
+            "reconstruction_head_ms": reconstruction_head_ms,
+        }
         return {
             "erased_lidar_bev": erased_lidar_bev,
             "erased_lidar_features": erased_lidar_bev,
@@ -567,6 +606,7 @@ class CoarseReconstructionModel(nn.Module):
             "sst_dense_features": dense_sst_features,
             "sst_reconstruction_features": reconstruction_features,
             "sst_token_statistics": token_statistics,
+            "sst_timing_ms": sst_timing_ms,
             "replacement_raw": replacement_raw,
             "replacement_bev": replacement_bev,
             "occupancy_logits": occupancy_logits,
@@ -594,6 +634,7 @@ class CoarseReconstructionModel(nn.Module):
         local_radar_enabled: bool = True,
         use_global_map: bool = True,
         return_attention_weights: bool = False,
+        profile_sst: bool = False,
     ) -> dict[str, torch.Tensor]:
         if self.config.backbone == "sst":
             return self._forward_sst(
@@ -605,6 +646,7 @@ class CoarseReconstructionModel(nn.Module):
                 faulty_lidar_points=faulty_lidar_points,
                 radar_points=radar_points,
                 radar_enabled=radar_enabled,
+                profile_sst=profile_sst,
             )
         (
             lidar_sensor_bev,

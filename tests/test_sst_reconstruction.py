@@ -84,8 +84,8 @@ class SSTReconstructionTests(unittest.TestCase):
         changed = features.clone()
         changed[0] += 100.0
         with torch.no_grad():
-            original, _ = attention(features, coordinates, (12, 12))
-            modified, _ = attention(changed, coordinates, (12, 12))
+            original, _, _ = attention(features, coordinates, (12, 12))
+            modified, _, _ = attention(changed, coordinates, (12, 12))
         self.assertTrue(torch.equal(original[2:], modified[2:]))
         self.assertFalse(torch.equal(original[:2], modified[:2]))
 
@@ -108,10 +108,14 @@ class SSTReconstructionTests(unittest.TestCase):
         with torch.no_grad(), torch.autocast(
             device_type="cpu", dtype=torch.bfloat16
         ):
-            output, counts = attention(features, coordinates, (8, 8))
+            output, counts, timing = attention(
+                features, coordinates, (8, 8), profile=True
+            )
         self.assertEqual(tuple(output.shape), (3, 8))
         self.assertEqual(int(counts.sum()), 3)
         self.assertTrue(torch.isfinite(output).all())
+        self.assertGreaterEqual(timing["grouping_ms"], 0.0)
+        self.assertGreaterEqual(timing["attention_ms"], 0.0)
 
     def test_backbone_is_single_stride_and_scatter_is_high_resolution(self):
         config = SSTConfig(
@@ -198,6 +202,7 @@ class SSTReconstructionTests(unittest.TestCase):
             halo,
             faulty_lidar_points=lidar_points,
             radar_points=radar_points,
+            profile_sst=True,
         )
         self.assertEqual(tuple(outputs["coarse_lidar_bev"].shape), (1, 3, 320, 320))
         self.assertTrue(
@@ -211,6 +216,34 @@ class SSTReconstructionTests(unittest.TestCase):
             trusted[:, 0], 0, trusted[:, 1], trusted[:, 2]
         ]
         self.assertEqual(float(trusted_mask_values.max()), 0.0)
+        statistics = outputs["sst_token_statistics"]
+        self.assertEqual(
+            tuple(statistics["lidar_nonempty_pillars_per_sample"].shape),
+            (1,),
+        )
+        self.assertEqual(
+            tuple(statistics["radar_nonempty_pillars_per_sample"].shape),
+            (1,),
+        )
+        self.assertEqual(
+            tuple(statistics["union_tokens_per_sample"].shape), (1,)
+        )
+        self.assertEqual(int(statistics["total_possible_cells"]), 102400)
+        self.assertGreaterEqual(float(statistics["total_region_count"]), 1.0)
+        self.assertGreaterEqual(
+            float(statistics["total_region_count"]),
+            float(statistics["occupied_region_count"]),
+        )
+        self.assertEqual(
+            set(outputs["sst_timing_ms"]),
+            {
+                "pointpillars_ms",
+                "regional_grouping_ms",
+                "normal_attention_ms",
+                "shifted_attention_ms",
+                "reconstruction_head_ms",
+            },
+        )
         outside = 1.0 - reconstruction
         self.assertTrue(
             torch.equal(outputs["coarse_lidar_bev"] * outside, faulty * outside)

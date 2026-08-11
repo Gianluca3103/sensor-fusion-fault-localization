@@ -4,12 +4,32 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+import time
 
 import torch
 from torch import nn
 
 from ..encoders import _group_count
 from ..pointpillars import PointPillarsOutput
+
+
+def _profile_start(tensor: torch.Tensor, enabled: bool) -> float | None:
+    if not enabled:
+        return None
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+    return time.perf_counter()
+
+
+def _profile_elapsed_ms(
+    tensor: torch.Tensor,
+    started: float | None,
+) -> float:
+    if started is None:
+        return 0.0
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+    return 1000.0 * (time.perf_counter() - started)
 
 
 @dataclass(frozen=True)
@@ -194,23 +214,32 @@ class SparseTokenBuilder(nn.Module):
                 raise AssertionError(
                     "Trusted LiDAR SST tokens include reconstruction-mask cells"
                 )
+        trusted_per_sample = torch.bincount(
+            trusted_lidar_coordinates[:, 0], minlength=batch
+        )
+        union_per_sample = torch.bincount(
+            coordinates[:, 0], minlength=batch
+        )
+        total_possible_cells = height * width
         return SparseMultimodalTokens(
             features=self.projection(fused),
             coordinates=coordinates,
             trusted_lidar_coordinates=trusted_lidar_coordinates,
             statistics={
-                "lidar_nonempty_pillars": lidar.statistics[
+                "lidar_nonempty_pillars_per_sample": lidar.statistics[
                     "nonempty_pillars"
-                ].sum(),
-                "trusted_lidar_pillars": torch.as_tensor(
-                    len(trusted_lidar_coordinates),
-                    device=coordinates.device,
+                ],
+                "trusted_lidar_pillars_per_sample": trusted_per_sample,
+                "radar_nonempty_pillars_per_sample": radar.statistics[
+                    "nonempty_pillars"
+                ],
+                "union_tokens_per_sample": union_per_sample,
+                "total_possible_cells": torch.as_tensor(
+                    total_possible_cells, device=coordinates.device
                 ),
-                "radar_nonempty_pillars": radar.statistics[
-                    "nonempty_pillars"
-                ].sum() if radar_enabled else coordinates.new_zeros(()),
-                "union_token_count": torch.as_tensor(
-                    len(coordinates), device=coordinates.device
+                "token_coverage_percent_per_sample": (
+                    100.0 * union_per_sample.to(torch.float32)
+                    / total_possible_cells
                 ),
             },
         )
@@ -273,8 +302,11 @@ class SparseRegionalAttention(nn.Module):
         features: torch.Tensor,
         coordinates: torch.Tensor,
         grid_shape: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        profile: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         height, width = grid_shape
+        grouping_started = _profile_start(features, profile)
         group_coordinates = regional_group_indices(
             coordinates,
             self.region_size_cells,
@@ -312,6 +344,8 @@ class SparseRegionalAttention(nn.Module):
         )
         packed[sorted_groups, positions] = normalized[order]
         valid[sorted_groups, positions] = True
+        grouping_ms = _profile_elapsed_ms(features, grouping_started)
+        attention_started = _profile_start(features, profile)
         attended, _ = self.attention(
             packed,
             packed,
@@ -324,7 +358,11 @@ class SparseRegionalAttention(nn.Module):
         attended_unordered[order] = attended_sorted
         features = features + attended_unordered
         features = features + self.mlp(self.mlp_norm(features))
-        return features, counts
+        attention_ms = _profile_elapsed_ms(features, attention_started)
+        return features, counts, {
+            "grouping_ms": grouping_ms,
+            "attention_ms": attention_ms,
+        }
 
 
 class SSTBlock(nn.Module):
@@ -344,14 +382,27 @@ class SSTBlock(nn.Module):
         features: torch.Tensor,
         coordinates: torch.Tensor,
         grid_shape: tuple[int, int],
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        features, normal_counts = self.normal_attention(
-            features, coordinates, grid_shape
+        *,
+        profile: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        dict[str, float],
+    ]:
+        features, normal_counts, normal_timing = self.normal_attention(
+            features, coordinates, grid_shape, profile=profile
         )
-        features, shifted_counts = self.shifted_attention(
-            features, coordinates, grid_shape
+        features, shifted_counts, shifted_timing = self.shifted_attention(
+            features, coordinates, grid_shape, profile=profile
         )
-        return features, (normal_counts, shifted_counts)
+        return features, (normal_counts, shifted_counts), {
+            "regional_grouping_ms": (
+                normal_timing["grouping_ms"]
+                + shifted_timing["grouping_ms"]
+            ),
+            "normal_attention_ms": normal_timing["attention_ms"],
+            "shifted_attention_ms": shifted_timing["attention_ms"],
+        }
 
 
 class SSTBackbone(nn.Module):
@@ -368,14 +419,23 @@ class SSTBackbone(nn.Module):
         features: torch.Tensor,
         coordinates: torch.Tensor,
         grid_shape: tuple[int, int],
+        *,
+        profile: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coordinates_before = coordinates.clone()
         first_block_features = None
         final_normal_counts = None
+        timing = {
+            "regional_grouping_ms": 0.0,
+            "normal_attention_ms": 0.0,
+            "shifted_attention_ms": 0.0,
+        }
         for index, block in enumerate(self.blocks):
-            features, (normal_counts, _) = block(
-                features, coordinates, grid_shape
+            features, (normal_counts, _), block_timing = block(
+                features, coordinates, grid_shape, profile=profile
             )
+            for name, value in block_timing.items():
+                timing[name] += value
             if index == 0:
                 first_block_features = features
             final_normal_counts = normal_counts
@@ -389,6 +449,7 @@ class SSTBackbone(nn.Module):
             "sst_block_1": first_block_features,
             "sst_block_final": features,
             "tokens_per_region": final_normal_counts,
+            "timing_ms": timing,
         }
 
 
@@ -446,6 +507,8 @@ def region_statistics(
     counts_float = counts.to(torch.float32)
     maximum_capacity = region_size_cells**2
     return {
+        "occupied_region_count": counts_float.new_tensor(len(counts)),
+        "total_region_count": counts_float.new_tensor(total_regions),
         "minimum": counts_float.min(),
         "mean": counts_float.mean(),
         "median": counts_float.median(),
