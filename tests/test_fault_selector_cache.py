@@ -58,11 +58,17 @@ class FaultSelectorCacheTests(unittest.TestCase):
             added_faulty_counts=np.zeros_like(heatmap),
             missing_faulty_counts=missing,
             moved_faulty_counts=np.zeros_like(heatmap),
+            faulty_lidar_points=np.asarray(
+                [[1.0, 0.0, 0.0, 12.0]], dtype=np.float32
+            ),
             metadata_json=np.asarray(json.dumps(metadata)),
         )
         np.savez_compressed(
             radar_path,
             radar_bev=np.zeros((4, 320, 320), dtype=np.float32),
+            radar_points=np.asarray(
+                [[1.0, 0.0, 0.0, 0.2, -0.1]], dtype=np.float32
+            ),
         )
         return data_root, sample_path, radar_root
 
@@ -130,6 +136,17 @@ class FaultSelectorCacheTests(unittest.TestCase):
             self.assertNotIn("fault_heatmap", item)
             self.assertNotIn("faulty_counts", item)
             self.assertLess(cache_path.stat().st_size, 50_000)
+
+            point_dataset = CoarseReconstructionDataset(
+                [sample_path],
+                radar_root,
+                data_root=data_root,
+                selector_config=config,
+                use_pointpillars=True,
+            )
+            point_item = point_dataset[0]
+            self.assertEqual(point_item["faulty_lidar_points"].shape, (1, 4))
+            self.assertEqual(point_item["radar_points"].shape, (1, 5))
 
     def test_changed_selector_configuration_rejects_stale_cache(self):
         with tempfile.TemporaryDirectory() as directory:

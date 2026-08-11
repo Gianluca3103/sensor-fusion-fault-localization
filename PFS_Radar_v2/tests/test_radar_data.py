@@ -1,4 +1,6 @@
 import unittest
+import json
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -12,6 +14,51 @@ from PFS_Radar_v2.radar_data import DopplerConfig, compensate_doppler, project_r
 
 
 class PFSRadarV2Tests(unittest.TestCase):
+    def test_cache_contract_requires_aligned_pointpillars_radar_points(self):
+        config = DopplerConfig()
+        metadata = {
+            "cache_format_version": radar_data.RADAR_CACHE_VERSION,
+            "policy": radar_data.POLICY_NAME,
+            "channels": radar_data.CHANNELS,
+            "sequence": "1",
+            "radar_index": "00033",
+            "lidar_index": "00001",
+            "timestamp_ns": 123,
+            "x_range": [0.0, 64.0],
+            "y_range": [-32.0, 32.0],
+            "resolution": 0.2,
+            "doppler": asdict(config),
+        }
+        compatibility = dict(
+            sequence="1",
+            radar_index="33",
+            lidar_index="1",
+            timestamp=123,
+            x_range=(0.0, 64.0),
+            y_range=(-32.0, 32.0),
+            resolution=0.2,
+            doppler_config=config,
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.npz"
+            np.savez_compressed(
+                path,
+                radar_bev=np.zeros((4, 320, 320), dtype=np.float16),
+                metadata_json=np.asarray(json.dumps(metadata)),
+            )
+            self.assertFalse(
+                radar_data.radar_cache_is_compatible(path, **compatibility)
+            )
+            np.savez_compressed(
+                path,
+                radar_bev=np.zeros((4, 320, 320), dtype=np.float16),
+                radar_points=np.zeros((2, 5), dtype=np.float32),
+                metadata_json=np.asarray(json.dumps(metadata)),
+            )
+            self.assertTrue(
+                radar_data.radar_cache_is_compatible(path, **compatibility)
+            )
+
     def test_shared_cache_lookup_supports_kradar_metadata(self):
         path = radar_cache_path(
             Path("cache"), {"sequence": "01", "radar_index": "33"}

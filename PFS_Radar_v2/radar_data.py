@@ -21,7 +21,7 @@ from PFS_Radar_v2.radar_types import DopplerConfig, RadarAlignmentUnavailableErr
 from PFS_Radar_v2.tracking import compensate_doppler
 
 
-RADAR_CACHE_VERSION = 8
+RADAR_CACHE_VERSION = 9
 POLICY_NAME = "kradar_pc10p_single_frame_power_height_doppler_v3"
 CHANNELS = [
     "static_occupancy",
@@ -324,9 +324,12 @@ def radar_cache_is_compatible(
         return False
     try:
         with np.load(cache_path, allow_pickle=False) as data:
-            if not {"radar_bev", "metadata_json"}.issubset(data.files):
+            if not {"radar_bev", "radar_points", "metadata_json"}.issubset(
+                data.files
+            ):
                 return False
             radar_bev = np.asarray(data["radar_bev"])
+            radar_points = np.asarray(data["radar_points"])
             metadata = json.loads(str(data["metadata_json"]))
         expected_shape = (
             4,
@@ -338,6 +341,12 @@ def radar_cache_is_compatible(
             or not np.isfinite(radar_bev).all()
             or float(radar_bev.min(initial=0.0)) < 0.0
             or float(radar_bev.max(initial=0.0)) > 1.0
+        ):
+            return False
+        if (
+            radar_points.ndim != 2
+            or radar_points.shape[1] != 5
+            or not np.isfinite(radar_points).all()
         ):
             return False
         if int(metadata.get("cache_format_version", 0)) != RADAR_CACHE_VERSION:
@@ -441,6 +450,13 @@ def build_radar_cache_entry(
     else:
         dynamic = np.zeros(0, dtype=bool)
     points[:, :3] = transform_xyz(points[:, :3], lidar_from_radar)
+    pointpillars_points = np.column_stack(
+        (
+            points[:, :3],
+            points[:, 4],
+            points[:, 3],
+        )
+    ).astype(np.float32, copy=False)
     radar_bev = project_radar_bev(
         points,
         residual,
@@ -474,6 +490,13 @@ def build_radar_cache_entry(
         },
         "pose_source": "K-Radar resources/odometry/gt (ego-Doppler only)",
         "channels": CHANNELS,
+        "pointpillars_radar_fields": [
+            "x",
+            "y",
+            "z",
+            "power",
+            "doppler",
+        ],
         "power_normalization_quantile": POWER_NORMALIZATION_QUANTILE,
         "upper_height_quantile": UPPER_HEIGHT_QUANTILE,
         "height_range_m": HEIGHT_RANGE_M,
@@ -484,6 +507,7 @@ def build_radar_cache_entry(
     atomic_savez_compressed(
         output_path,
         radar_bev=radar_bev.astype(np.float16),
+        radar_points=pointpillars_points,
         metadata_json=np.asarray(json.dumps(cache_metadata)),
     )
     return output_path

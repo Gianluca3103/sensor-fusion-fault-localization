@@ -45,7 +45,20 @@ from .coarse_reconstruction.coarse_loss import (
     coarse_reconstruction_metrics,
     occupancy_bce_weights,
 )
-from .coarse_dataset import CoarseReconstructionDataset, load_bev_triplet
+from .coarse_dataset import (
+    CoarseReconstructionDataset,
+    coarse_reconstruction_collate,
+    load_bev_grid_geometry,
+    load_bev_triplet,
+)
+from .pointpillars import (
+    BEVGridGeometry,
+    PillarFeatureNet,
+    PillarScatter,
+    Pillarizer,
+    PointPillarsConfig,
+    PointPillarsEncoder,
+)
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
@@ -77,6 +90,7 @@ from .diffusion_process.diffusion_metrics import (
 
 __all__ = [
     "BEVChannelNormalization",
+    "BEVGridGeometry",
     "AbsolutePositionEncoder",
     "BottleneckFusionBlock",
     "CoarseReplacementHead",
@@ -98,6 +112,11 @@ __all__ = [
     "ObservabilityWeightingConfig",
     "MaskedEpsilonMSELoss",
     "MaskedResidualDiffusion",
+    "PillarFeatureNet",
+    "PillarScatter",
+    "Pillarizer",
+    "PointPillarsConfig",
+    "PointPillarsEncoder",
     "FaultBlob",
     "FaultSelection",
     "FaultSelector",
@@ -115,10 +134,12 @@ __all__ = [
     "FrozenCoarseDiffusionPipeline",
     "load_bev_triplet",
     "coarse_reconstruction_metrics",
+    "coarse_reconstruction_collate",
     "build_configs",
     "build_selector_config",
     "build_selector_cache_entry",
     "load_config",
+    "load_bev_grid_geometry",
     "occupancy_bce_weights",
     "bev_occupancy",
     "load_frozen_coarse_model",

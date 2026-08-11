@@ -32,8 +32,9 @@ def write_ascii_pcd(path, points):
         "DATA ascii",
     ]
     rows.extend(
-        f"{x} {y} {z} {intensity} 0 0 0 0 0"
-        for x, y, z, intensity in points
+        f"{point[0]} {point[1]} {point[2]} {point[3]} 0 "
+        f"{point[4] if len(point) > 4 else 0} 0 0 0"
+        for point in points
     )
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
@@ -100,6 +101,20 @@ class KRadarDatasetTests(unittest.TestCase):
             write_ascii_pcd(path, expected)
             actual = read_kradar_lidar_pcd(path)
         self.assertEqual(actual.dtype, np.float32)
+        self.assertTrue(np.array_equal(actual, expected))
+
+    def test_pcd_reader_can_expose_reflectivity_for_pointpillars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frame.pcd"
+            expected = np.asarray(
+                [[1.0, 2.0, 3.0, 4.0, 17.0], [5.0, 6.0, 7.0, 8.0, 29.0]],
+                dtype=np.float32,
+            )
+            write_ascii_pcd(path, expected)
+            actual = read_kradar_lidar_pcd(
+                path,
+                include_reflectivity=True,
+            )
         self.assertTrue(np.array_equal(actual, expected))
 
     def test_radar_overlap_uses_radar_origin_and_azimuth(self):

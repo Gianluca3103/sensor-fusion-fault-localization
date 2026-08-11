@@ -12,6 +12,9 @@ reconstruction_head/
 └── fault_selector_cache.py  shared deterministic mask cache
 ```
 
+`pointpillars.py` contains the optional learned LiDAR/radar pillar encoders used
+by the first representation ablation.
+
 The coarse stage directly predicts replacement LiDAR BEV content. It has no
 separate reconstruction-latent encoder and does not predict a correction to
 hidden LiDAR values. It contains no diffusion process.
@@ -84,6 +87,43 @@ Thus, output cells outside the reconstruction mask are exactly unchanged and
 all cells inside it come from the replacement prediction.
 
 ## Training
+
+### Experiment 1: learned PointPillars sensor representation
+
+`configs/coarse_reconstruction_pointpillars.json` enables two independent
+PointPillars-style encoders while leaving the reconstruction U-Net, global
+fusion, masks, three-channel target, loss, and metrics unchanged. Generated
+sample metadata remains the only source of BEV geometry. With the production
+range `x=[0,64)` and `y=[-32,32)`, the aligned 320x320 pillars are 0.20 m by
+0.20 m.
+
+LiDAR uses raw `[x,y,z,reflectivity]` plus XYZ cluster offsets and XY
+pillar-center offsets (9 decorated values). Radar uses aligned
+`[x,y,z,power,doppler]` plus the same decorations (10 values). Each independent
+Pillar Feature Network produces `[B,64,320,320]`. The local model therefore
+receives 130 channels in the default masked-context experiment, while the
+replacement head still predicts the original three target channels.
+
+PointPillars requires generated samples from generator version 11 or newer,
+which store `faulty_lidar_points`, and K-Radar RadarV2 caches from format version
+9 or newer, which store shared aligned `radar_points`. Re-run the normal sample
+generator and RadarV2 cache builder after updating the code; obsolete artifacts
+are rejected or regenerated instead of reconstructing points from BEVs.
+
+Train the representation ablation with the same split and schedule as the
+baseline, changing only the configuration path:
+
+```powershell
+python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction `
+  --data-root "C:\path\to\generated_samples_v11" `
+  --radar-root "C:\path\to\radar_v2_cache_v9" `
+  --output-root "C:\path\to\coarse_pointpillars_run" `
+  --config "configs\coarse_reconstruction_pointpillars.json" `
+  --device cuda
+```
+
+Keep `configs/coarse_reconstruction.json` selected for the handcrafted-BEV
+baseline.
 
 The independent trainer is
 `models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction`;

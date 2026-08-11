@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
 
 from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
 from ..fault_selector import FaultSelectorConfig
+from ..pointpillars import PointPillarsConfig
 
 
 @dataclass(frozen=True)
 class CoarseReconstructionConfig:
     lidar_channels: int = 3
     radar_channels: int = 4
+    target_lidar_channels: int = 3
     unet_base_channels: int = 16
     unet_depth: int = 4
     dropout: float = 0.025
@@ -23,6 +25,7 @@ class CoarseReconstructionConfig:
     attention_dim: int = 128
     num_heads: int = 4
     attention_dropout: float = 0.025
+    pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
 
     @property
     def local_input_channels(self) -> int:
@@ -33,6 +36,7 @@ class CoarseReconstructionConfig:
         integer_values = {
             "lidar_channels": self.lidar_channels,
             "radar_channels": self.radar_channels,
+            "target_lidar_channels": self.target_lidar_channels,
             "unet_base_channels": self.unet_base_channels,
             "unet_depth": self.unet_depth,
             "global_base_channels": self.global_base_channels,
@@ -42,6 +46,11 @@ class CoarseReconstructionConfig:
         for name, value in integer_values.items():
             if value < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.target_lidar_channels != 3:
+            raise ValueError(
+                "The coarse reconstruction target remains the existing "
+                "three-channel LiDAR BEV"
+            )
         if not self.global_channel_multipliers or any(
             value < 1 for value in self.global_channel_multipliers
         ):
@@ -54,9 +63,42 @@ class CoarseReconstructionConfig:
             raise ValueError("use_healthy_context_mask must be boolean")
         if not 0.0 <= self.attention_dropout < 1.0:
             raise ValueError("attention_dropout must be in [0,1)")
+        self.pointpillars.validate()
+        expected_lidar = (
+            self.pointpillars.output_channels
+            if self.pointpillars.enabled
+            else 3
+        )
+        expected_radar = (
+            self.pointpillars.output_channels
+            if self.pointpillars.enabled
+            else 4
+        )
+        if self.lidar_channels != expected_lidar:
+            raise ValueError(
+                "lidar_channels does not match the selected sensor representation: "
+                f"expected {expected_lidar}, got {self.lidar_channels}"
+            )
+        if self.radar_channels != expected_radar:
+            raise ValueError(
+                "radar_channels does not match the selected sensor representation: "
+                f"expected {expected_radar}, got {self.radar_channels}"
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "CoarseReconstructionConfig":
+        values = dict(payload)
+        if "global_channel_multipliers" in values:
+            values["global_channel_multipliers"] = tuple(
+                values["global_channel_multipliers"]
+            )
+        pointpillars = values.get("pointpillars", {})
+        if isinstance(pointpillars, dict):
+            values["pointpillars"] = PointPillarsConfig(**pointpillars)
+        return cls(**values)
 
 
 def load_config(path: str | Path) -> dict:
@@ -92,7 +134,27 @@ def build_configs(payload: dict):
     if unet.get("activation", "silu") != "silu":
         raise ValueError("The coarse U-Net currently supports silu activation only")
     defaults = CoarseReconstructionConfig()
+    pointpillars_payload = payload.get("pointpillars", {})
+    if not isinstance(pointpillars_payload, dict):
+        raise ValueError("pointpillars must be an object")
+    valid_pointpillars_fields = {
+        field.name for field in fields(PointPillarsConfig)
+    }
+    unknown_pointpillars_fields = (
+        set(pointpillars_payload) - valid_pointpillars_fields
+    )
+    if unknown_pointpillars_fields:
+        raise ValueError(
+            "Unknown pointpillars settings: "
+            + ", ".join(sorted(unknown_pointpillars_fields))
+        )
+    pointpillars = PointPillarsConfig(**pointpillars_payload)
+    pointpillars.validate()
+    lidar_channels = pointpillars.output_channels if pointpillars.enabled else 3
+    radar_channels = pointpillars.output_channels if pointpillars.enabled else 4
     model_config = CoarseReconstructionConfig(
+        lidar_channels=lidar_channels,
+        radar_channels=radar_channels,
         unet_base_channels=unet.get(
             "base_channels", defaults.unet_base_channels
         ),
@@ -116,6 +178,7 @@ def build_configs(payload: dict):
         attention_dropout=global_context.get(
             "attention_dropout", defaults.attention_dropout
         ),
+        pointpillars=pointpillars,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

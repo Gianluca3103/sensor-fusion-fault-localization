@@ -1,6 +1,6 @@
 {
   "pointpillars": {
-    "enabled": false,
+    "enabled": true,
     "output_channels": 64,
     "max_points_per_pillar": 100,
     "max_pillars": 12000,

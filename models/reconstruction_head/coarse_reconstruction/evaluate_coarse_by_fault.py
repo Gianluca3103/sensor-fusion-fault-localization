@@ -21,7 +21,9 @@ from models.reconstruction_head import (
     CoarseReconstructionConfig,
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
+    BEVGridGeometry,
     build_selector_config,
+    coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
     load_config,
 )
@@ -65,6 +67,11 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    for key in ("faulty_lidar_points", "radar_points"):
+        if key in batch:
+            moved[key] = tuple(
+                points.to(device, non_blocking=True) for points in batch[key]
+            )
     if "observability_confidence" in batch:
         moved["observability_confidence"] = batch[
             "observability_confidence"
@@ -274,10 +281,7 @@ def main() -> None:
         model_payload["global_channel_multipliers"] = tuple(
             model_payload["global_channel_multipliers"]
         )
-    model_config = CoarseReconstructionConfig(**model_payload)
-    model = CoarseReconstructionModel(model_config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    model.eval()
+    model_config = CoarseReconstructionConfig.from_dict(model_payload)
 
     selector_config = build_selector_config(load_config(args.config))
     sample_paths = _split_paths(
@@ -292,7 +296,20 @@ def main() -> None:
         args.radar_root,
         data_root=args.data_root,
         selector_config=selector_config,
+        use_pointpillars=model_config.pointpillars.enabled,
     )
+    geometry_payload = checkpoint.get("grid_geometry")
+    grid_geometry = (
+        BEVGridGeometry(**geometry_payload)
+        if geometry_payload is not None
+        else dataset.grid_geometry
+    )
+    model = CoarseReconstructionModel(
+        model_config,
+        grid_geometry=(grid_geometry if model_config.pointpillars.enabled else None),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.eval()
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -300,6 +317,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
+        collate_fn=coarse_reconstruction_collate,
     )
     radar_mode = str(checkpoint.get("radar_mode", "full"))
     use_global_map = bool(checkpoint.get("global_map_enabled", True))
@@ -313,10 +331,13 @@ def main() -> None:
         for batch in loader:
             inputs = _move_batch(batch, device)
             local_radar_bev = None
+            radar_enabled = radar_mode != "none"
+            local_radar_enabled = radar_mode == "full"
             if radar_mode == "none":
                 inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
             elif radar_mode == "global-only":
-                local_radar_bev = torch.zeros_like(inputs["radar_bev"])
+                if not model_config.pointpillars.enabled:
+                    local_radar_bev = torch.zeros_like(inputs["radar_bev"])
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
@@ -329,6 +350,10 @@ def main() -> None:
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
                     local_radar_bev=local_radar_bev,
+                    faulty_lidar_points=inputs.get("faulty_lidar_points"),
+                    radar_points=inputs.get("radar_points"),
+                    radar_enabled=radar_enabled,
+                    local_radar_enabled=local_radar_enabled,
                     use_global_map=use_global_map,
                 )
             batch_size = inputs["faulty_bev"].shape[0]

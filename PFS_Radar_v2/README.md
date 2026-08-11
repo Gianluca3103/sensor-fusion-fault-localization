@@ -38,6 +38,11 @@ The downstream contract remains `[4, H, W]`:
 3. dynamic speed
 4. robust upper height
 
+Cache format version 9 also stores the same frame's aligned raw
+`radar_points` as `[x,y,z,power,doppler]`. The dense four-channel raster remains
+unchanged and is used by the handcrafted-BEV baseline; the shared raw array is
+used only when the PointPillars coarse-reconstruction ablation is enabled.
+
 Power is the maximum point power in each BEV cell, log-scaled
 against the 99th percentile of occupied cells. Upper height is the per-cell
 90th percentile of physically plausible aligned radar heights in `[-3, 5]`

@@ -357,6 +357,9 @@ class RobustnessTests(unittest.TestCase):
                 "missing_point_ids": np.asarray([1], dtype=np.int64),
                 "moved_point_ids": np.empty(0, dtype=np.int64),
                 "added_point_ids": np.empty(0, dtype=np.int64),
+                "faulty_lidar_points": np.asarray(
+                    [[1.0, 0.0, 0.0, 32.0]], dtype=np.float32
+                ),
                 "observability_confidence": np.zeros((2, 2), dtype=np.float16),
                 "observability_ray_count": np.zeros((2, 2), dtype=np.uint32),
                 "observability_vertical_coverage": np.zeros(

@@ -30,6 +30,7 @@ from models.reconstruction_head import (
     CoarseReconstructionModel,
     MaskedBEVReconstructionLoss,
     build_configs,
+    coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
     load_config,
 )
@@ -131,6 +132,11 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    for key in ("faulty_lidar_points", "radar_points"):
+        if key in batch:
+            moved[key] = tuple(
+                points.to(device, non_blocking=True) for points in batch[key]
+            )
     if "observability_confidence" in batch:
         moved["observability_confidence"] = batch[
             "observability_confidence"
@@ -166,11 +172,27 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "attention_context",
         "fused_bottleneck",
         "global_context_map",
+        "lidar_pillar_bev",
+        "radar_pillar_bev",
     )
-    result = {key: list(value.shape) for key, value in inputs.items()}
+    result = {
+        key: (
+            list(value.shape)
+            if isinstance(value, torch.Tensor)
+            else [list(points.shape) for points in value]
+        )
+        for key, value in inputs.items()
+    }
     result.update(
         {key: list(outputs[key].shape) for key in names if key in outputs}
     )
+    for sensor in ("lidar", "radar"):
+        statistics = outputs.get(f"{sensor}_pillar_statistics")
+        if statistics:
+            result[f"{sensor}_pillar_statistics"] = {
+                key: value.detach().cpu().tolist()
+                for key, value in statistics.items()
+            }
     return result
 
 
@@ -258,10 +280,20 @@ def _run_epoch(
             active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
         local_radar_bev = None
+        radar_enabled = radar_mode != "none"
+        local_radar_enabled = radar_mode == "full"
+        pointpillars_enabled = bool(
+            getattr(
+                getattr(getattr(model, "config", None), "pointpillars", None),
+                "enabled",
+                False,
+            )
+        )
         if radar_mode == "none":
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
         elif radar_mode == "global-only":
-            local_radar_bev = torch.zeros_like(inputs["radar_bev"])
+            if not pointpillars_enabled:
+                local_radar_bev = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
@@ -270,15 +302,31 @@ def _run_epoch(
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
                 enabled=use_amp,
             ):
+                model_options = {
+                    "local_radar_bev": local_radar_bev,
+                    "use_global_map": use_global_map,
+                    "return_attention_weights": (
+                        return_attention and batch_index == 0
+                    ),
+                }
+                if pointpillars_enabled:
+                    model_options.update(
+                        {
+                            "faulty_lidar_points": inputs.get(
+                                "faulty_lidar_points"
+                            ),
+                            "radar_points": inputs.get("radar_points"),
+                            "radar_enabled": radar_enabled,
+                            "local_radar_enabled": local_radar_enabled,
+                        }
+                    )
                 outputs = model(
                     inputs["faulty_bev"],
                     inputs["radar_bev"],
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
-                    local_radar_bev=local_radar_bev,
-                    use_global_map=use_global_map,
-                    return_attention_weights=return_attention and batch_index == 0,
+                    **model_options,
                 )
                 losses = loss_fn(
                     outputs,
@@ -360,18 +408,29 @@ def main():
         "radar_root": radar_root,
         "data_root": data_root,
         "selector_config": selector_config,
+        "use_pointpillars": model_config.pointpillars.enabled,
     }
     train_dataset = CoarseReconstructionDataset(train_paths, **dataset_options)
     val_dataset = CoarseReconstructionDataset(val_paths, **dataset_options)
+    if train_dataset.grid_geometry != val_dataset.grid_geometry:
+        raise ValueError("Training and validation BEV geometry must match")
     loader_options = {
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": num_workers > 0,
+        "collate_fn": coarse_reconstruction_collate,
     }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
-    model = CoarseReconstructionModel(model_config).to(device)
+    model = CoarseReconstructionModel(
+        model_config,
+        grid_geometry=(
+            train_dataset.grid_geometry
+            if model_config.pointpillars.enabled
+            else None
+        ),
+    ).to(device)
     loss_fn = MaskedBEVReconstructionLoss(loss_config)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -395,12 +454,25 @@ def main():
             "selector": selector_config.__dict__,
             "training": training,
             "args": vars(args),
+            "grid_geometry": train_dataset.grid_geometry.to_dict(),
         },
     )
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
     print(f"Radar mode: {radar_mode}")
     print(f"Global map enabled: {not args.disable_global_map}")
+    print(
+        "Sensor representation: "
+        + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
+    )
+    if model_config.pointpillars.enabled:
+        geometry = train_dataset.grid_geometry
+        print(
+            "PointPillars grid: "
+            f"{geometry.height}x{geometry.width}; "
+            f"pillar={geometry.pillar_size_x:.3f}m x "
+            f"{geometry.pillar_size_y:.3f}m"
+        )
     history = []
     best_validation = float("inf")
     active_fraction_profile = None
@@ -563,6 +635,7 @@ def main():
             "radar_mode": radar_mode,
             "radar_disabled": radar_mode == "none",
             "global_map_enabled": not args.disable_global_map,
+            "grid_geometry": train_dataset.grid_geometry.to_dict(),
             "history": history,
         }
         atomic_torch_save(checkpoint, output_root / "last_checkpoint.pt")

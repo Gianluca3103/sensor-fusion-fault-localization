@@ -72,7 +72,7 @@ FAULT_PLAN = [
 ]
 GROUND_TRUTH_METHOD = "point_id_provenance_v2_literature_fov"
 VISUALIZATION_METHOD = "point_status_overlay_v1"
-GENERATOR_VERSION = 10
+GENERATOR_VERSION = 11
 RESUME_REQUIRED_ARRAYS = (
     "fault_heatmap",
     "reliability_map",
@@ -82,6 +82,7 @@ RESUME_REQUIRED_ARRAYS = (
     "faulty_point_ids",
     "faulty_source_ids",
     "faulty_injector_labels",
+    "faulty_lidar_points",
     "clean_point_counts",
     "faulty_point_counts",
     "missing_faulty_counts",
@@ -222,7 +223,10 @@ def _load_clean_artifacts(lidar_path_text):
     radar_from_lidar = load_radar_from_lidar_transform(
         source_meta["calibration_path"]
     )
-    clean_raw = read_kradar_lidar_pcd(lidar_path)
+    clean_raw = read_kradar_lidar_pcd(
+        lidar_path,
+        include_reflectivity=True,
+    )
     _, range_mask = filter_pointcloud(
         clean_raw,
         cfg["min_range"],
@@ -230,7 +234,9 @@ def _load_clean_artifacts(lidar_path_text):
         return_mask=True,
     )
     overlap_mask = radar_overlap_mask(clean_raw, radar_from_lidar)
-    clean_points = clean_raw[range_mask & overlap_mask, :4]
+    clean_filtered = clean_raw[range_mask & overlap_mask]
+    clean_points = clean_filtered[:, :4]
+    clean_reflectivity = clean_filtered[:, 4]
     if len(clean_points) == 0:
         raise UnusableSourceFrameError(
             "No LiDAR points remain after range and K-Radar FOV filtering "
@@ -255,6 +261,7 @@ def _load_clean_artifacts(lidar_path_text):
     )
     return (
         clean_points,
+        clean_reflectivity,
         clean_point_ids,
         clean_rgb,
         clean_layers["raw_density"],
@@ -641,6 +648,7 @@ def create_one_sample(task):
 
     (
         cached_clean_points,
+        cached_clean_reflectivity,
         cached_clean_point_ids,
         clean_rgb,
         clean_density,
@@ -679,6 +687,15 @@ def create_one_sample(task):
     faulty_point_ids = injection.point_ids[active_mask]
     faulty_source_ids = injection.source_ids[active_mask]
     faulty_injector_labels = injection.injector_labels[active_mask]
+    faulty_reflectivity = np.zeros(len(faulty_points), dtype=np.float32)
+    sourced = faulty_source_ids >= 0
+    if np.any(sourced):
+        faulty_reflectivity[sourced] = cached_clean_reflectivity[
+            faulty_source_ids[sourced]
+        ]
+    faulty_lidar_points = np.column_stack(
+        (faulty_points[:, :3], faulty_reflectivity)
+    ).astype(np.float32, copy=False)
     faulty_rgb, faulty_layers = clean_bev_rgb(
         faulty_points[:, :4],
         x_range=(cfg["x_min"], cfg["x_max"]),
@@ -812,6 +829,7 @@ def create_one_sample(task):
         "radar_elevation_range_rad": list(K_RADAR_ELEVATION_RANGE_RAD),
         "radar_range_m": list(K_RADAR_RANGE_M),
         "lidar_channels": list(LIDAR_CHANNELS),
+        "pointpillars_lidar_fields": ["x", "y", "z", "reflectivity"],
         "lidar_upper_height_quantile": UPPER_HEIGHT_QUANTILE,
         "lidar_height_range_m": list(HEIGHT_RANGE_M),
         "lidar_sensor_origin_m": list(LIDAR_SENSOR_ORIGIN),
@@ -859,6 +877,7 @@ def create_one_sample(task):
         faulty_point_ids=faulty_point_ids,
         faulty_source_ids=faulty_source_ids,
         faulty_injector_labels=faulty_injector_labels,
+        faulty_lidar_points=faulty_lidar_points,
         observability_confidence=observability[
             "observability_confidence"
         ].astype(np.float16),

@@ -89,12 +89,20 @@ def _pcd_header(path: Path) -> tuple[list[str], int, int]:
     return fields, point_count, header_lines
 
 
-def read_kradar_lidar_pcd(path: str | Path) -> np.ndarray:
-    """Load K-Radar os2-64 x, y, z, intensity as float32."""
+def read_kradar_lidar_pcd(
+    path: str | Path,
+    *,
+    include_reflectivity: bool = False,
+) -> np.ndarray:
+    """Load K-Radar os2-64 XYZI, optionally followed by reflectivity."""
 
     path = Path(path)
     fields, point_count, header_lines = _pcd_header(path)
-    required = ("x", "y", "z", "intensity")
+    required = (
+        ("x", "y", "z", "intensity", "reflectivity")
+        if include_reflectivity
+        else ("x", "y", "z", "intensity")
+    )
     try:
         columns = tuple(fields.index(name) for name in required)
     except ValueError as exc:

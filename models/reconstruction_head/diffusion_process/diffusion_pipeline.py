@@ -22,7 +22,13 @@ def load_frozen_coarse_model(checkpoint_path, device="cpu"):
         config_payload["global_channel_multipliers"] = tuple(
             config_payload["global_channel_multipliers"]
         )
-    model = CoarseReconstructionModel(CoarseReconstructionConfig(**config_payload))
+    config = CoarseReconstructionConfig.from_dict(config_payload)
+    if config.pointpillars.enabled:
+        raise ValueError(
+            "PointPillars coarse checkpoints require raw point-cloud inputs and "
+            "are not compatible with the current diffusion-stage dataset"
+        )
+    model = CoarseReconstructionModel(config)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval().requires_grad_(False)
     return model, checkpoint
