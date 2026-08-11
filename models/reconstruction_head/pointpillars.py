@@ -106,7 +106,7 @@ class PillarizedPointCloud:
 class PointPillarsOutput:
     """Dense and sparse views of one batched PointPillars encoding."""
 
-    dense_features: torch.Tensor
+    dense_features: torch.Tensor | None
     sparse_features: torch.Tensor
     sparse_coordinates: torch.Tensor
     statistics: dict[str, torch.Tensor]
@@ -379,9 +379,14 @@ class PointPillarsEncoder(nn.Module):
         point_clouds: Sequence[torch.Tensor],
         *,
         return_sparse: bool = False,
+        return_dense: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | PointPillarsOutput:
         if not point_clouds:
             raise ValueError("point_clouds must contain at least one sample")
+        if not return_sparse and not return_dense:
+            raise ValueError(
+                "At least one PointPillars representation must be requested"
+            )
         pillarized_batch = [self.pillarizer(points) for points in point_clouds]
         pillar_counts = [len(item.pillar_rows) for item in pillarized_batch]
         total_pillars = sum(pillar_counts)
@@ -413,20 +418,22 @@ class PointPillarsEncoder(nn.Module):
         for pillarized, pillar_features in zip(
             pillarized_batch, split_features
         ):
-            canvases.append(
-                self.scatter(
-                    pillar_features,
-                    pillarized.pillar_rows,
-                    pillarized.pillar_cols,
+            if return_dense:
+                canvases.append(
+                    self.scatter(
+                        pillar_features,
+                        pillarized.pillar_rows,
+                        pillarized.pillar_cols,
+                    )
                 )
-            )
             for name, value in pillarized.statistics.items():
                 statistics.setdefault(name, []).append(value)
-        dense_features = torch.stack(canvases)
+        dense_features = torch.stack(canvases) if return_dense else None
         stacked_statistics = {
             name: torch.stack(values) for name, values in statistics.items()
         }
         if not return_sparse:
+            assert dense_features is not None
             return dense_features, stacked_statistics
 
         sparse_features = torch.cat(split_features, dim=0)

@@ -13,6 +13,7 @@ from models.reconstruction_head import (
     SSTConfig,
     SparseRegionalAttention,
     SparseToDenseScatter,
+    SparseTokenBuilder,
     regional_group_indices,
 )
 
@@ -55,6 +56,90 @@ class SSTReconstructionTests(unittest.TestCase):
                     output.dense_features[batch, :, row, col],
                 )
             )
+
+    def test_sparse_only_pointpillars_skips_dense_scatter(self):
+        encoder = PointPillarsEncoder(
+            _geometry(),
+            raw_channels=4,
+            output_channels=8,
+            max_points_per_pillar=10,
+            max_pillars=100,
+        ).eval()
+        points = (
+            torch.tensor(
+                [
+                    [1.01, 0.01, 0.0, 0.1],
+                    [1.02, 0.02, 0.1, 0.2],
+                    [5.00, 2.00, 0.5, 0.3],
+                ]
+            ),
+        )
+        with torch.no_grad():
+            dense = encoder(points, return_sparse=True)
+            sparse = encoder(
+                points,
+                return_sparse=True,
+                return_dense=False,
+            )
+        self.assertIsNone(sparse.dense_features)
+        self.assertTrue(
+            torch.equal(dense.sparse_coordinates, sparse.sparse_coordinates)
+        )
+        self.assertTrue(
+            torch.equal(dense.sparse_features, sparse.sparse_features)
+        )
+
+    def test_direct_sparse_token_fusion_matches_dense_regather(self):
+        encoder = PointPillarsEncoder(
+            _geometry(),
+            raw_channels=4,
+            output_channels=8,
+            max_points_per_pillar=10,
+            max_pillars=100,
+        ).eval()
+        points = (
+            torch.tensor(
+                [
+                    [1.01, 0.01, 0.0, 0.1],
+                    [5.00, 2.00, 0.5, 0.3],
+                ]
+            ),
+        )
+        with torch.no_grad():
+            dense = encoder(points, return_sparse=True)
+            sparse = encoder(
+                points,
+                return_sparse=True,
+                return_dense=False,
+            )
+        mask = torch.zeros(1, 1, 320, 320)
+        healthy = torch.zeros_like(mask)
+        row, col = dense.sparse_coordinates[0, 1:].tolist()
+        mask[0, 0, row, col] = 1.0
+        builder = SparseTokenBuilder(8, 8, 16).eval()
+        with torch.no_grad():
+            gathered = builder(
+                dense,
+                dense,
+                mask,
+                healthy,
+                include_repair_tokens=False,
+                radar_enabled=True,
+                use_dense_sensor_features=True,
+            )
+            direct = builder(
+                sparse,
+                sparse,
+                mask,
+                healthy,
+                include_repair_tokens=False,
+                radar_enabled=True,
+                use_dense_sensor_features=False,
+            )
+        self.assertTrue(torch.equal(gathered.coordinates, direct.coordinates))
+        self.assertTrue(
+            torch.allclose(gathered.features, direct.features, atol=1e-6)
+        )
 
     def test_normal_and_shifted_region_membership(self):
         coordinates = torch.tensor([[0, 11, 3], [0, 12, 3]])
@@ -269,6 +354,73 @@ class SSTReconstructionTests(unittest.TestCase):
                 sum(float(gradient.abs().sum()) for gradient in gradients),
                 0.0,
             )
+
+    def test_full_sparse_only_sst_avoids_sensor_dense_pseudo_images(self):
+        config = CoarseReconstructionConfig(
+            backbone="sst",
+            lidar_channels=8,
+            radar_channels=8,
+            pointpillars=PointPillarsConfig(
+                enabled=True,
+                output_channels=8,
+                max_points_per_pillar=10,
+                max_pillars=100,
+            ),
+            sst=SSTConfig(
+                token_dim=8,
+                num_blocks=1,
+                num_heads=2,
+                mlp_hidden_dim=16,
+                region_size_cells=12,
+                shift_size_cells=6,
+                sparse_pointpillars_only=True,
+            ),
+        )
+        model = CoarseReconstructionModel(
+            config, grid_geometry=_geometry()
+        ).train()
+        faulty = torch.rand(1, 3, 320, 320)
+        reconstruction = torch.zeros(1, 1, 320, 320)
+        reconstruction[:, :, 293:297, 159:163] = 1.0
+        healthy = torch.zeros_like(reconstruction)
+        halo = healthy.clone()
+        lidar_points = (
+            torch.tensor(
+                [[5.0, 0.0, 0.0, 0.1], [5.6, 0.0, 0.2, 0.3]]
+            ),
+        )
+        radar_points = (
+            torch.tensor(
+                [[5.0, 0.0, 0.0, 0.4, -0.2], [5.6, 0.0, 0.2, 0.2, 0.3]]
+            ),
+        )
+        outputs = model(
+            faulty,
+            torch.zeros(1, 4, 320, 320),
+            reconstruction,
+            healthy,
+            halo,
+            faulty_lidar_points=lidar_points,
+            radar_points=radar_points,
+        )
+        for name in (
+            "lidar_sensor_bev",
+            "radar_sensor_bev",
+            "lidar_pillar_bev",
+            "radar_pillar_bev",
+        ):
+            self.assertNotIn(name, outputs)
+        outside = 1.0 - reconstruction
+        self.assertTrue(
+            torch.equal(outputs["coarse_lidar_bev"] * outside, faulty * outside)
+        )
+        outputs["coarse_lidar_bev"].sum().backward()
+        self.assertIsNotNone(
+            model.lidar_pillar_encoder.feature_net.linear.weight.grad
+        )
+        self.assertIsNotNone(
+            model.radar_pillar_encoder.feature_net.linear.weight.grad
+        )
 
 
 if __name__ == "__main__":

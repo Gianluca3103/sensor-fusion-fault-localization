@@ -11,7 +11,7 @@
     "shift_size_cells": 6,
     "dropout": 0.0,
     "include_repair_tokens": false,
-    "sparse_pointpillars_only": false
+    "sparse_pointpillars_only": true
   },
   "pointpillars": {
     "enabled": true,

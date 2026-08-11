@@ -42,6 +42,7 @@ class SSTConfig:
     shift_size_cells: int = 6
     dropout: float = 0.0
     include_repair_tokens: bool = False
+    sparse_pointpillars_only: bool = False
 
     def validate(self) -> None:
         for name in (
@@ -63,6 +64,8 @@ class SSTConfig:
             raise ValueError("sst.dropout must be in [0,1)")
         if not isinstance(self.include_repair_tokens, bool):
             raise ValueError("sst.include_repair_tokens must be boolean")
+        if not isinstance(self.sparse_pointpillars_only, bool):
+            raise ValueError("sst.sparse_pointpillars_only must be boolean")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -140,8 +143,9 @@ class SparseTokenBuilder(nn.Module):
         *,
         include_repair_tokens: bool,
         radar_enabled: bool,
+        use_dense_sensor_features: bool = True,
     ) -> SparseMultimodalTokens:
-        batch, _, height, width = lidar.dense_features.shape
+        batch, _, height, width = reconstruction_mask.shape
         expected_mask_shape = (batch, 1, height, width)
         if reconstruction_mask.shape != expected_mask_shape:
             raise ValueError(
@@ -160,8 +164,10 @@ class SparseTokenBuilder(nn.Module):
                 lidar_coordinates[:, 2],
             ] > 0.5
             trusted_lidar_coordinates = lidar_coordinates[~lidar_untrusted]
+            trusted_lidar_features = lidar.sparse_features[~lidar_untrusted]
         else:
             trusted_lidar_coordinates = lidar_coordinates
+            trusted_lidar_features = lidar.sparse_features
 
         coordinate_parts = [trusted_lidar_coordinates]
         if radar_enabled:
@@ -184,14 +190,48 @@ class SparseTokenBuilder(nn.Module):
         coordinates = self._coordinates_from_keys(union_keys, height, width)
         batch_index, rows, cols = coordinates.unbind(dim=1)
 
-        trusted_lidar_dense = lidar.dense_features * (1.0 - reconstruction_mask)
-        lidar_features = trusted_lidar_dense[batch_index, :, rows, cols]
-        if radar_enabled:
-            radar_features = radar.dense_features[batch_index, :, rows, cols]
-        else:
-            radar_features = lidar_features.new_zeros(
-                (len(coordinates), radar.dense_features.shape[1])
+        if use_dense_sensor_features:
+            if lidar.dense_features is None or radar.dense_features is None:
+                raise ValueError(
+                    "Dense SST fusion requires dense PointPillars features"
+                )
+            trusted_lidar_dense = (
+                lidar.dense_features * (1.0 - reconstruction_mask)
             )
+            lidar_features = trusted_lidar_dense[
+                batch_index, :, rows, cols
+            ]
+            if radar_enabled:
+                radar_features = radar.dense_features[
+                    batch_index, :, rows, cols
+                ]
+            else:
+                radar_features = lidar_features.new_zeros(
+                    (len(coordinates), radar.sparse_features.shape[1])
+                )
+        else:
+            lidar_features = lidar.sparse_features.new_zeros(
+                (len(coordinates), lidar.sparse_features.shape[1])
+            )
+            if len(trusted_lidar_coordinates):
+                lidar_positions = torch.searchsorted(
+                    union_keys,
+                    self._flat_keys(
+                        trusted_lidar_coordinates, height, width
+                    ),
+                )
+                lidar_features[lidar_positions] = trusted_lidar_features
+            radar_features = radar.sparse_features.new_zeros(
+                (len(coordinates), radar.sparse_features.shape[1])
+            )
+            if radar_enabled and len(radar.sparse_coordinates):
+                radar_positions = torch.searchsorted(
+                    union_keys,
+                    self._flat_keys(
+                        radar.sparse_coordinates, height, width
+                    ),
+                )
+                radar_features[radar_positions] = radar.sparse_features
         repair_values = reconstruction_mask[batch_index, 0, rows, cols, None]
         healthy_values = healthy_context_mask[batch_index, 0, rows, cols, None]
         fused = torch.cat(

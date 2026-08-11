@@ -10,7 +10,8 @@
     "region_size_cells": 12,
     "shift_size_cells": 6,
     "dropout": 0.0,
-    "include_repair_tokens": false
+    "include_repair_tokens": false,
+    "sparse_pointpillars_only": false
   },
   "pointpillars": {
     "enabled": true,
