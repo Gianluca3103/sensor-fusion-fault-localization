@@ -102,6 +102,16 @@ class PillarizedPointCloud:
     statistics: dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class PointPillarsOutput:
+    """Dense and sparse views of one batched PointPillars encoding."""
+
+    dense_features: torch.Tensor
+    sparse_features: torch.Tensor
+    sparse_coordinates: torch.Tensor
+    statistics: dict[str, torch.Tensor]
+
+
 class Pillarizer(nn.Module):
     """Assign one variable-sized point cloud to the reconstruction BEV grid."""
 
@@ -365,8 +375,11 @@ class PointPillarsEncoder(nn.Module):
         self.scatter = PillarScatter(geometry, output_channels)
 
     def forward(
-        self, point_clouds: Sequence[torch.Tensor]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self,
+        point_clouds: Sequence[torch.Tensor],
+        *,
+        return_sparse: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | PointPillarsOutput:
         if not point_clouds:
             raise ValueError("point_clouds must contain at least one sample")
         pillarized_batch = [self.pillarizer(points) for points in point_clouds]
@@ -409,6 +422,31 @@ class PointPillarsEncoder(nn.Module):
             )
             for name, value in pillarized.statistics.items():
                 statistics.setdefault(name, []).append(value)
-        return torch.stack(canvases), {
+        dense_features = torch.stack(canvases)
+        stacked_statistics = {
             name: torch.stack(values) for name, values in statistics.items()
         }
+        if not return_sparse:
+            return dense_features, stacked_statistics
+
+        sparse_features = torch.cat(split_features, dim=0)
+        sparse_coordinates = torch.cat(
+            [
+                torch.stack(
+                    (
+                        torch.full_like(item.pillar_rows, batch_index),
+                        item.pillar_rows,
+                        item.pillar_cols,
+                    ),
+                    dim=1,
+                )
+                for batch_index, item in enumerate(pillarized_batch)
+            ],
+            dim=0,
+        )
+        return PointPillarsOutput(
+            dense_features=dense_features,
+            sparse_features=sparse_features,
+            sparse_coordinates=sparse_coordinates,
+            statistics=stacked_statistics,
+        )

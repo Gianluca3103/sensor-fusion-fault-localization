@@ -174,6 +174,14 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "global_context_map",
         "lidar_pillar_bev",
         "radar_pillar_bev",
+        "sst_token_projection",
+        "sst_token_coordinates",
+        "sst_coordinates_before",
+        "sst_coordinates_after",
+        "sst_block_1",
+        "sst_block_final",
+        "sst_dense_features",
+        "sst_reconstruction_features",
     )
     result = {
         key: (
@@ -193,6 +201,12 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
                 key: value.detach().cpu().tolist()
                 for key, value in statistics.items()
             }
+    sst_statistics = outputs.get("sst_token_statistics")
+    if sst_statistics:
+        result["sst_token_statistics"] = {
+            key: float(value.detach().cpu())
+            for key, value in sst_statistics.items()
+        }
     return result
 
 
@@ -296,6 +310,12 @@ def _run_epoch(
                 local_radar_bev = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
+        measure_forward = logged_shapes is None
+        if measure_forward:
+            _synchronize_device(device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            forward_started = time.perf_counter()
         with torch.set_grad_enabled(training):
             with torch.autocast(
                 device_type=device.type,
@@ -328,6 +348,11 @@ def _run_epoch(
                     inputs["halo_mask"],
                     **model_options,
                 )
+                if measure_forward:
+                    _synchronize_device(device)
+                    forward_time_ms = 1000.0 * (
+                        time.perf_counter() - forward_started
+                    )
                 losses = loss_fn(
                     outputs,
                     inputs["clean_bev"],
@@ -356,6 +381,23 @@ def _run_epoch(
             sums[key] = sums.get(key, 0.0) + float(value.detach()) * batch_size
         if logged_shapes is None:
             logged_shapes = _shape_log(inputs, outputs)
+            logged_shapes["runtime"] = {
+                "forward_time_ms": forward_time_ms,
+            }
+            if device.type == "cuda":
+                logged_shapes["runtime"].update(
+                    {
+                        "memory_allocated_bytes": torch.cuda.memory_allocated(
+                            device
+                        ),
+                        "memory_reserved_bytes": torch.cuda.memory_reserved(
+                            device
+                        ),
+                        "peak_memory_allocated_bytes": (
+                            torch.cuda.max_memory_allocated(device)
+                        ),
+                    }
+                )
         if conditioning_callback is not None and batch_index == 0:
             conditioning_callback(batch, outputs)
     return {key: value / max(samples, 1) for key, value in sums.items()}, logged_shapes
@@ -442,7 +484,7 @@ def main():
     grad_clip = float(training.get("grad_clip", 1.0))
     save_conditioning_samples = int(training.get("save_conditioning_samples", 4))
     return_attention = bool(
-        payload["coarse_reconstruction"]["global_context"].get(
+        payload.get("coarse_reconstruction", {}).get("global_context", {}).get(
             "return_attention_during_validation", True
         )
     )
@@ -465,6 +507,7 @@ def main():
         "Sensor representation: "
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
+    print(f"Reconstruction backbone: {model_config.backbone}")
     if model_config.pointpillars.enabled:
         geometry = train_dataset.grid_geometry
         print(
@@ -473,6 +516,15 @@ def main():
             f"pillar={geometry.pillar_size_x:.3f}m x "
             f"{geometry.pillar_size_y:.3f}m"
         )
+        if model_config.backbone == "sst":
+            print(
+                "SST regions: "
+                f"{model_config.sst.region_size_cells}x"
+                f"{model_config.sst.region_size_cells} cells; "
+                f"{model_config.sst.region_size_cells * geometry.pillar_size_x:.3f}m x "
+                f"{model_config.sst.region_size_cells * geometry.pillar_size_y:.3f}m; "
+                f"shift={model_config.sst.shift_size_cells} cells"
+            )
     history = []
     best_validation = float("inf")
     active_fraction_profile = None

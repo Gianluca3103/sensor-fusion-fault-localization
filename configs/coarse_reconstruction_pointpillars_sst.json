@@ -1,6 +1,6 @@
 {
   "model": {
-    "backbone": "unet"
+    "backbone": "sst"
   },
   "sst": {
     "token_dim": 128,

@@ -224,6 +224,30 @@ and overfitting-analysis commands.
 These variants share one data loader, trainer, evaluator, and visualization
 implementation.
 
+## Coarse Reconstruction Backbone Ablation
+
+The PointPillars coarse-reconstruction stage supports two controlled backbones:
+
+- `model.backbone: unet` keeps the original dense compressive U-Net, global
+  encoders, and bottleneck cross-attention.
+- `model.backbone: sst` keeps the same independent LiDAR and radar PFNs but
+  operates on their union of sparse pillar coordinates with six single-stride
+  regional Transformer blocks. Coordinates remain on the original `320x320`
+  grid throughout; no pooling or stride-2 operation is used.
+
+The strict SST experiment uses 12-cell (2.4 m) regions, a six-cell shift,
+128-D tokens, eight attention heads, and no repair-query tokens. Each token is
+the projection of `[LiDAR PFN (64), radar PFN (64), reconstruction mask,
+healthy-context mask]`. LiDAR pillars inside the reconstruction mask are
+removed before this fusion. Missing modalities are represented by zeros.
+
+Use `configs/coarse_reconstruction_pointpillars.json` for the U-Net experiment
+and `configs/coarse_reconstruction_pointpillars_sst.json` for SST. Dataset
+splits, PointPillars settings, masks, targets, loss, metrics, optimizer, and
+training schedule remain identical. `include_repair_tokens` intentionally
+defaults to `false`; enabling it is a separate reconstruction-specific
+ablation rather than part of the strict backbone comparison.
+
 ## Evaluation Protocol
 
 Choose the prediction threshold on validation data, freeze it, and evaluate the

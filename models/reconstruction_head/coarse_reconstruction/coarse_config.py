@@ -9,10 +9,12 @@ from pathlib import Path
 from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
 from ..fault_selector import FaultSelectorConfig
 from ..pointpillars import PointPillarsConfig
+from .sst_backbone import SSTConfig
 
 
 @dataclass(frozen=True)
 class CoarseReconstructionConfig:
+    backbone: str = "unet"
     lidar_channels: int = 3
     radar_channels: int = 4
     target_lidar_channels: int = 3
@@ -26,6 +28,7 @@ class CoarseReconstructionConfig:
     num_heads: int = 4
     attention_dropout: float = 0.025
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
+    sst: SSTConfig = field(default_factory=SSTConfig)
 
     @property
     def local_input_channels(self) -> int:
@@ -33,6 +36,8 @@ class CoarseReconstructionConfig:
         return self.lidar_channels + self.radar_channels + mask_channels
 
     def validate(self) -> None:
+        if self.backbone not in {"unet", "sst"}:
+            raise ValueError("model.backbone must be 'unet' or 'sst'")
         integer_values = {
             "lidar_channels": self.lidar_channels,
             "radar_channels": self.radar_channels,
@@ -64,6 +69,9 @@ class CoarseReconstructionConfig:
         if not 0.0 <= self.attention_dropout < 1.0:
             raise ValueError("attention_dropout must be in [0,1)")
         self.pointpillars.validate()
+        self.sst.validate()
+        if self.backbone == "sst" and not self.pointpillars.enabled:
+            raise ValueError("The SST backbone requires PointPillars inputs")
         expected_lidar = (
             self.pointpillars.output_channels
             if self.pointpillars.enabled
@@ -98,6 +106,9 @@ class CoarseReconstructionConfig:
         pointpillars = values.get("pointpillars", {})
         if isinstance(pointpillars, dict):
             values["pointpillars"] = PointPillarsConfig(**pointpillars)
+        sst = values.get("sst", {})
+        if isinstance(sst, dict):
+            values["sst"] = SSTConfig(**sst)
         return cls(**values)
 
 
@@ -134,6 +145,25 @@ def build_configs(payload: dict):
     if unet.get("activation", "silu") != "silu":
         raise ValueError("The coarse U-Net currently supports silu activation only")
     defaults = CoarseReconstructionConfig()
+    model_payload = payload.get("model", {})
+    if not isinstance(model_payload, dict):
+        raise ValueError("model must be an object")
+    unknown_model_fields = set(model_payload) - {"backbone"}
+    if unknown_model_fields:
+        raise ValueError(
+            "Unknown model settings: " + ", ".join(sorted(unknown_model_fields))
+        )
+    backbone = model_payload.get("backbone", defaults.backbone)
+    sst_payload = payload.get("sst", {})
+    if not isinstance(sst_payload, dict):
+        raise ValueError("sst must be an object")
+    valid_sst_fields = {field.name for field in fields(SSTConfig)}
+    unknown_sst_fields = set(sst_payload) - valid_sst_fields
+    if unknown_sst_fields:
+        raise ValueError(
+            "Unknown sst settings: " + ", ".join(sorted(unknown_sst_fields))
+        )
+    sst = SSTConfig(**sst_payload)
     pointpillars_payload = payload.get("pointpillars", {})
     if not isinstance(pointpillars_payload, dict):
         raise ValueError("pointpillars must be an object")
@@ -153,6 +183,7 @@ def build_configs(payload: dict):
     lidar_channels = pointpillars.output_channels if pointpillars.enabled else 3
     radar_channels = pointpillars.output_channels if pointpillars.enabled else 4
     model_config = CoarseReconstructionConfig(
+        backbone=backbone,
         lidar_channels=lidar_channels,
         radar_channels=radar_channels,
         unet_base_channels=unet.get(
@@ -179,6 +210,7 @@ def build_configs(payload: dict):
             "attention_dropout", defaults.attention_dropout
         ),
         pointpillars=pointpillars,
+        sst=sst,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

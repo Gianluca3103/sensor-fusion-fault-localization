@@ -9,8 +9,19 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..encoders import BEVEncoder, _group_count
-from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
+from ..pointpillars import (
+    BEVGridGeometry,
+    PointPillarsEncoder,
+    PointPillarsOutput,
+)
 from .coarse_config import CoarseReconstructionConfig
+from .sst_backbone import (
+    SSTBackbone,
+    SSTReconstructionHead,
+    SparseToDenseScatter,
+    SparseTokenBuilder,
+    region_statistics,
+)
 
 
 class ResidualCoarseBlock(nn.Module):
@@ -313,30 +324,45 @@ class CoarseReconstructionModel(nn.Module):
                 max_points_per_pillar=pointpillars.max_points_per_pillar,
                 max_pillars=pointpillars.max_pillars,
             )
-        self.local_unet_encoder = LocalUNetEncoder(
-            self.config.local_input_channels,
-            self.config.unet_base_channels,
-            self.config.unet_depth,
-            self.config.dropout,
-        )
-        self.global_lidar_encoder = GlobalLidarEncoder(self.config)
-        self.global_radar_encoder = GlobalRadarEncoder(self.config)
-        self.global_fusion = GlobalFusionBlock(
-            self.global_lidar_encoder.out_channels
-            + self.global_radar_encoder.out_channels,
-            self.config.attention_dim,
-        )
-        local_channels = self.local_unet_encoder.channels[-1]
-        self.cross_attention = LocalToGlobalCrossAttention(local_channels, self.config)
-        self.bottleneck_fusion = BottleneckFusionBlock(
-            local_channels, self.config.attention_dim
-        )
-        self.local_unet_decoder = LocalUNetDecoder(
-            self.local_unet_encoder.channels, self.config.dropout
-        )
+        if self.config.backbone == "unet":
+            self.local_unet_encoder = LocalUNetEncoder(
+                self.config.local_input_channels,
+                self.config.unet_base_channels,
+                self.config.unet_depth,
+                self.config.dropout,
+            )
+            self.global_lidar_encoder = GlobalLidarEncoder(self.config)
+            self.global_radar_encoder = GlobalRadarEncoder(self.config)
+            self.global_fusion = GlobalFusionBlock(
+                self.global_lidar_encoder.out_channels
+                + self.global_radar_encoder.out_channels,
+                self.config.attention_dim,
+            )
+            local_channels = self.local_unet_encoder.channels[-1]
+            self.cross_attention = LocalToGlobalCrossAttention(
+                local_channels, self.config
+            )
+            self.bottleneck_fusion = BottleneckFusionBlock(
+                local_channels, self.config.attention_dim
+            )
+            self.local_unet_decoder = LocalUNetDecoder(
+                self.local_unet_encoder.channels, self.config.dropout
+            )
+            replacement_channels = self.local_unet_decoder.out_channels
+        else:
+            self.sst_token_builder = SparseTokenBuilder(
+                self.config.lidar_channels,
+                self.config.radar_channels,
+                self.config.sst.token_dim,
+            )
+            self.sst_backbone = SSTBackbone(self.config.sst)
+            self.sst_scatter = SparseToDenseScatter(self.config.sst.token_dim)
+            self.sst_reconstruction_head = SSTReconstructionHead(
+                self.config.sst.token_dim
+            )
+            replacement_channels = self.sst_reconstruction_head.out_channels
         self.replacement_head = CoarseReplacementHead(
-            self.local_unet_decoder.out_channels,
-            self.config.target_lidar_channels,
+            replacement_channels, self.config.target_lidar_channels
         )
 
     def _select_lidar_point_fields(
@@ -416,6 +442,143 @@ class CoarseReconstructionModel(nn.Module):
             radar_statistics = {}
         return lidar_features, radar_features, lidar_statistics, radar_statistics
 
+    def _empty_radar_pillar_output(
+        self,
+        lidar: PointPillarsOutput,
+    ) -> PointPillarsOutput:
+        batch, _, height, width = lidar.dense_features.shape
+        channels = self.config.radar_channels
+        return PointPillarsOutput(
+            dense_features=lidar.dense_features.new_zeros(
+                (batch, channels, height, width)
+            ),
+            sparse_features=lidar.sparse_features.new_empty((0, channels)),
+            sparse_coordinates=lidar.sparse_coordinates.new_empty((0, 3)),
+            statistics={
+                "nonempty_pillars": torch.zeros(
+                    batch,
+                    dtype=torch.long,
+                    device=lidar.dense_features.device,
+                )
+            },
+        )
+
+    def _forward_sst(
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        healthy_context_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        faulty_lidar_points: Sequence[torch.Tensor] | None,
+        radar_points: Sequence[torch.Tensor] | None,
+        radar_enabled: bool,
+    ) -> dict[str, torch.Tensor]:
+        if faulty_lidar_points is None:
+            raise ValueError("faulty_lidar_points are required by the SST backbone")
+        assert self.lidar_pillar_encoder is not None
+        assert self.radar_pillar_encoder is not None
+        lidar = self.lidar_pillar_encoder(
+            self._select_lidar_point_fields(faulty_lidar_points),
+            return_sparse=True,
+        )
+        assert isinstance(lidar, PointPillarsOutput)
+        if radar_enabled:
+            if radar_points is None:
+                raise ValueError("radar_points are required by the SST backbone")
+            radar = self.radar_pillar_encoder(
+                self._select_radar_point_fields(radar_points),
+                return_sparse=True,
+            )
+            assert isinstance(radar, PointPillarsOutput)
+        else:
+            radar = self._empty_radar_pillar_output(lidar)
+
+        halo_mask = halo_mask * (1.0 - reconstruction_mask)
+        active_mask = torch.maximum(reconstruction_mask, halo_mask)
+        erased_lidar_bev = (
+            1.0 - reconstruction_mask
+        ) * lidar.dense_features
+        tokens = self.sst_token_builder(
+            lidar,
+            radar,
+            reconstruction_mask,
+            healthy_context_mask,
+            include_repair_tokens=self.config.sst.include_repair_tokens,
+            radar_enabled=radar_enabled,
+        )
+        grid_shape = faulty_lidar_bev.shape[-2:]
+        final_tokens, sst_debug = self.sst_backbone(
+            tokens.features,
+            tokens.coordinates,
+            grid_shape,
+        )
+        dense_sst_features = self.sst_scatter(
+            final_tokens,
+            tokens.coordinates,
+            faulty_lidar_bev.shape[0],
+            grid_shape,
+        )
+        reconstruction_features = self.sst_reconstruction_head(
+            dense_sst_features
+        )
+        replacement_raw = self.replacement_head(reconstruction_features)
+        occupancy_logits = replacement_raw[:, 0:1]
+        predicted_density = replacement_raw[:, 1:2]
+        predicted_height = replacement_raw[:, 2:3]
+        replacement_bev = torch.cat(
+            (
+                torch.sigmoid(occupancy_logits),
+                predicted_density,
+                predicted_height,
+            ),
+            dim=1,
+        )
+        coarse_lidar_bev = (
+            (1.0 - reconstruction_mask) * faulty_lidar_bev
+            + reconstruction_mask * replacement_bev
+        )
+        token_statistics = dict(tokens.statistics)
+        token_statistics.update(
+            region_statistics(
+                sst_debug["tokens_per_region"],
+                batch_size=faulty_lidar_bev.shape[0],
+                grid_shape=grid_shape,
+                region_size_cells=self.config.sst.region_size_cells,
+            )
+        )
+        return {
+            "erased_lidar_bev": erased_lidar_bev,
+            "erased_lidar_features": erased_lidar_bev,
+            "lidar_sensor_bev": lidar.dense_features,
+            "radar_sensor_bev": radar.dense_features,
+            "lidar_pillar_bev": lidar.dense_features,
+            "radar_pillar_bev": radar.dense_features,
+            "lidar_pillar_statistics": lidar.statistics,
+            "radar_pillar_statistics": radar.statistics,
+            "trusted_lidar_coordinates": tokens.trusted_lidar_coordinates,
+            "sst_token_coordinates": tokens.coordinates,
+            "sst_token_projection": tokens.features,
+            "sst_block_1": sst_debug["sst_block_1"],
+            "sst_block_final": sst_debug["sst_block_final"],
+            "sst_coordinates_before": sst_debug["coordinates_before"],
+            "sst_coordinates_after": sst_debug["coordinates_after"],
+            "sst_dense_features": dense_sst_features,
+            "sst_reconstruction_features": reconstruction_features,
+            "sst_token_statistics": token_statistics,
+            "replacement_raw": replacement_raw,
+            "replacement_bev": replacement_bev,
+            "occupancy_logits": occupancy_logits,
+            "predicted_density": predicted_density,
+            "predicted_height": predicted_height,
+            "coarse_lidar_bev": coarse_lidar_bev,
+            "reconstruction_mask": reconstruction_mask,
+            "healthy_context_mask": healthy_context_mask,
+            "halo_mask": halo_mask,
+            "active_mask": active_mask,
+        }
+
     def forward(
         self,
         faulty_lidar_bev: torch.Tensor,
@@ -432,6 +595,17 @@ class CoarseReconstructionModel(nn.Module):
         use_global_map: bool = True,
         return_attention_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
+        if self.config.backbone == "sst":
+            return self._forward_sst(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+                radar_enabled=radar_enabled,
+            )
         (
             lidar_sensor_bev,
             radar_sensor_bev,
