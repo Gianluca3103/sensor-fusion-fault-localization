@@ -12,10 +12,86 @@ from models.reconstruction_head import (
     load_bev_triplet,
 )
 from models.reconstruction_head.encoders import BEVEncoder
-from models.reconstruction_head.fault_selector import _best_repair_box
+from models.reconstruction_head.fault_selector import (
+    _adaptive_halo,
+    _best_repair_box,
+)
 
 
 class ReconstructionEncoderTests(unittest.TestCase):
+    def test_incremental_halo_matches_large_kernel_reference(self):
+        from scipy.ndimage import binary_dilation
+
+        shape = (32, 30)
+        reconstruction = np.zeros(shape, dtype=bool)
+        reconstruction[5:16, 8:19] = True
+        trusted = np.zeros(shape, dtype=bool)
+        trusted[2:22:2, 4:26:3] = True
+        occupied = trusted | reconstruction
+        support = np.ones(shape, dtype=bool)
+        support[:, :2] = False
+        config = FaultSelectorConfig(
+            min_halo_healthy_fraction=0.75,
+            min_halo_healthy_cells=30,
+            min_halo_context_ratio=0.25,
+            min_halo_width_cells=2,
+            max_halo_dilation_cells=8,
+        )
+
+        def reference():
+            required = max(
+                config.min_halo_healthy_cells,
+                int(np.ceil(80 * config.min_halo_context_ratio)),
+            )
+            best = None
+            previous = None
+            for amount in range(
+                config.min_halo_width_cells,
+                config.max_halo_dilation_cells + 1,
+            ):
+                expanded = binary_dilation(
+                    reconstruction,
+                    structure=np.ones(
+                        (2 * amount + 1, 2 * amount + 1), dtype=bool
+                    ),
+                )
+                halo = expanded & support & ~reconstruction
+                if previous is not None and np.array_equal(halo, previous):
+                    break
+                previous = halo
+                healthy_count = int((halo & trusted).sum())
+                occupied_count = int((halo & occupied).sum())
+                fraction = healthy_count / occupied_count if occupied_count else 0.0
+                met = healthy_count >= required and fraction >= 0.75
+                candidate = (halo, amount, healthy_count, fraction, met)
+                if best is None or (
+                    met,
+                    min(healthy_count, required),
+                    fraction,
+                    -amount,
+                ) > (
+                    best[4],
+                    min(best[2], required),
+                    best[3],
+                    -best[1],
+                ):
+                    best = candidate
+                if met:
+                    break
+            return best
+
+        actual = _adaptive_halo(
+            reconstruction,
+            80,
+            trusted,
+            occupied,
+            support,
+            config,
+        )
+        expected = reference()
+        self.assertTrue(np.array_equal(actual[0], expected[0]))
+        self.assertEqual(actual[1:], expected[1:])
+
     def test_vectorized_repair_box_matches_reference_search(self):
         def reference(severe, healthy, min_cells, min_fraction):
             height, _ = severe.shape

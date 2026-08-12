@@ -207,14 +207,18 @@ def _adaptive_halo(
     )
     best = None
     previous = None
+    structure = np.ones((3, 3), dtype=bool)
+    expanded = binary_dilation(
+        reconstruction_mask,
+        structure=structure,
+        iterations=config.min_halo_width_cells,
+    )
     for amount in range(
         config.min_halo_width_cells,
         config.max_halo_dilation_cells + 1,
     ):
-        expanded = binary_dilation(
-            reconstruction_mask,
-            structure=np.ones((2 * amount + 1, 2 * amount + 1), dtype=bool),
-        )
+        if amount > config.min_halo_width_cells:
+            expanded = binary_dilation(expanded, structure=structure)
         halo = expanded & valid_support & ~reconstruction_mask
         if previous is not None and np.array_equal(halo, previous):
             break
