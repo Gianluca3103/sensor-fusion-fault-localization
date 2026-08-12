@@ -81,6 +81,14 @@ from .coarse_reconstruction.repair_query import (
     XYPositionEncoder,
     normalized_xy,
 )
+from .coarse_reconstruction.hrnet_backbone import (
+    HRNetBackbone,
+    HRNetConfig,
+    HRNetFusion,
+    HRNetModule,
+    HRNetResidualBlock,
+    HRNetTransition,
+)
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
@@ -126,6 +134,12 @@ __all__ = [
     "GlobalFusionBlock",
     "GlobalLidarEncoder",
     "GlobalRadarEncoder",
+    "HRNetBackbone",
+    "HRNetConfig",
+    "HRNetFusion",
+    "HRNetModule",
+    "HRNetResidualBlock",
+    "HRNetTransition",
     "GaussianNoiseSchedule",
     "LocalToGlobalCrossAttention",
     "LocalUNetDecoder",

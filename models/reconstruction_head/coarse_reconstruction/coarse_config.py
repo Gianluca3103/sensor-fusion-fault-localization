@@ -11,6 +11,7 @@ from ..fault_selector import FaultSelectorConfig
 from ..pointpillars import PointPillarsConfig
 from .sst_backbone import SSTConfig
 from .repair_query import RepairQueryConfig
+from .hrnet_backbone import HRNetConfig
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class CoarseReconstructionConfig:
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
     sst: SSTConfig = field(default_factory=SSTConfig)
     repair_query: RepairQueryConfig = field(default_factory=RepairQueryConfig)
+    hrnet: HRNetConfig = field(default_factory=HRNetConfig)
 
     @property
     def local_input_channels(self) -> int:
@@ -38,9 +40,9 @@ class CoarseReconstructionConfig:
         return self.lidar_channels + self.radar_channels + mask_channels
 
     def validate(self) -> None:
-        if self.backbone not in {"unet", "sst", "repair_query"}:
+        if self.backbone not in {"unet", "sst", "repair_query", "hrnet"}:
             raise ValueError(
-                "model.backbone must be 'unet', 'sst', or 'repair_query'"
+                "model.backbone must be 'unet', 'sst', 'repair_query', or 'hrnet'"
             )
         integer_values = {
             "lidar_channels": self.lidar_channels,
@@ -75,8 +77,9 @@ class CoarseReconstructionConfig:
         self.pointpillars.validate()
         self.sst.validate()
         self.repair_query.validate()
+        self.hrnet.validate()
         if (
-            self.backbone in {"sst", "repair_query"}
+            self.backbone in {"sst", "repair_query", "hrnet"}
             and not self.pointpillars.enabled
         ):
             raise ValueError(
@@ -122,6 +125,9 @@ class CoarseReconstructionConfig:
         repair_query = values.get("repair_query", {})
         if isinstance(repair_query, dict):
             values["repair_query"] = RepairQueryConfig(**repair_query)
+        hrnet = values.get("hrnet", {})
+        if isinstance(hrnet, dict):
+            values["hrnet"] = HRNetConfig(**hrnet)
         return cls(**values)
 
 
@@ -192,6 +198,17 @@ def build_configs(payload: dict):
             + ", ".join(sorted(unknown_repair_query_fields))
         )
     repair_query = RepairQueryConfig(**repair_query_payload)
+    hrnet_payload = payload.get("hrnet", {})
+    if not isinstance(hrnet_payload, dict):
+        raise ValueError("hrnet must be an object")
+    valid_hrnet_fields = {field.name for field in fields(HRNetConfig)}
+    unknown_hrnet_fields = set(hrnet_payload) - valid_hrnet_fields
+    if unknown_hrnet_fields:
+        raise ValueError(
+            "Unknown hrnet settings: "
+            + ", ".join(sorted(unknown_hrnet_fields))
+        )
+    hrnet = HRNetConfig(**hrnet_payload)
     pointpillars_payload = payload.get("pointpillars", {})
     if not isinstance(pointpillars_payload, dict):
         raise ValueError("pointpillars must be an object")
@@ -240,6 +257,7 @@ def build_configs(payload: dict):
         pointpillars=pointpillars,
         sst=sst,
         repair_query=repair_query,
+        hrnet=hrnet,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

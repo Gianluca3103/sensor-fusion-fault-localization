@@ -17,6 +17,7 @@ from ..pointpillars import (
 )
 from .coarse_config import CoarseReconstructionConfig
 from .repair_query import RepairQueryDecoder
+from .hrnet_backbone import HRNetBackbone
 from .sst_backbone import (
     SSTBackbone,
     SSTReconstructionHead,
@@ -382,6 +383,12 @@ class CoarseReconstructionModel(nn.Module):
                 self.config.sst.token_dim
             )
             replacement_channels = self.sst_reconstruction_head.out_channels
+        elif self.config.backbone == "hrnet":
+            self.hrnet_backbone = HRNetBackbone(
+                self.config.local_input_channels,
+                self.config.hrnet,
+            )
+            replacement_channels = self.hrnet_backbone.out_channels
         else:
             self.repair_query_decoder = RepairQueryDecoder(
                 self.config.lidar_channels,
@@ -473,6 +480,105 @@ class CoarseReconstructionModel(nn.Module):
             )
             radar_statistics = {}
         return lidar_features, radar_features, lidar_statistics, radar_statistics
+
+    def _forward_hrnet(
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        healthy_context_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        local_radar_bev: torch.Tensor | None,
+        faulty_lidar_points: Sequence[torch.Tensor] | None,
+        radar_points: Sequence[torch.Tensor] | None,
+        radar_enabled: bool,
+        local_radar_enabled: bool,
+    ) -> dict[str, torch.Tensor]:
+        (
+            lidar_sensor_bev,
+            radar_sensor_bev,
+            lidar_pillar_statistics,
+            radar_pillar_statistics,
+        ) = self._sensor_features(
+            faulty_lidar_bev,
+            radar_bev,
+            faulty_lidar_points,
+            radar_points,
+            radar_enabled=radar_enabled,
+        )
+        halo_mask = halo_mask * (1.0 - reconstruction_mask)
+        active_mask = torch.maximum(reconstruction_mask, halo_mask)
+        erased_lidar_bev = (1.0 - reconstruction_mask) * lidar_sensor_bev
+
+        if self.config.use_healthy_context_mask:
+            local_context_mask = healthy_context_mask * (
+                1.0 - reconstruction_mask
+            )
+            local_mask_channels = (reconstruction_mask, healthy_context_mask)
+        else:
+            local_context_mask = 1.0 - reconstruction_mask
+            local_mask_channels = (reconstruction_mask,)
+        local_lidar_context = local_context_mask * lidar_sensor_bev
+
+        if local_radar_bev is None:
+            local_radar_bev = radar_sensor_bev
+        if not local_radar_enabled:
+            local_radar_bev = torch.zeros_like(radar_sensor_bev)
+        local_radar_active = active_mask * local_radar_bev
+        local_input = torch.cat(
+            (
+                local_lidar_context,
+                local_radar_active,
+                *local_mask_channels,
+            ),
+            dim=1,
+        )
+        hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
+        assert self.replacement_head is not None
+        replacement_raw = self.replacement_head(hrnet_features)
+        occupancy_logits = replacement_raw[:, 0:1]
+        predicted_density = replacement_raw[:, 1:2]
+        predicted_height = replacement_raw[:, 2:3]
+        replacement_bev = torch.cat(
+            (
+                torch.sigmoid(occupancy_logits),
+                predicted_density,
+                predicted_height,
+            ),
+            dim=1,
+        )
+        coarse_lidar_bev = (
+            (1.0 - reconstruction_mask) * faulty_lidar_bev
+            + reconstruction_mask * replacement_bev
+        )
+        outputs = {
+            "erased_lidar_bev": erased_lidar_bev,
+            "erased_lidar_features": erased_lidar_bev,
+            "lidar_sensor_bev": lidar_sensor_bev,
+            "radar_sensor_bev": radar_sensor_bev,
+            "replacement_raw": replacement_raw,
+            "replacement_bev": replacement_bev,
+            "occupancy_logits": occupancy_logits,
+            "predicted_density": predicted_density,
+            "predicted_height": predicted_height,
+            "coarse_lidar_bev": coarse_lidar_bev,
+            "reconstruction_mask": reconstruction_mask,
+            "healthy_context_mask": healthy_context_mask,
+            "halo_mask": halo_mask,
+            "active_mask": active_mask,
+            "local_context_mask": local_context_mask,
+            "local_lidar_context": local_lidar_context,
+            "local_radar_active": local_radar_active,
+            "local_input": local_input,
+            "hrnet_features": hrnet_features,
+            "lidar_pillar_bev": lidar_sensor_bev,
+            "radar_pillar_bev": radar_sensor_bev,
+            "lidar_pillar_statistics": lidar_pillar_statistics,
+            "radar_pillar_statistics": radar_pillar_statistics,
+        }
+        outputs.update(hrnet_debug)
+        return outputs
 
     def _empty_radar_pillar_output(
         self,
@@ -806,6 +912,19 @@ class CoarseReconstructionModel(nn.Module):
                 radar_points=radar_points,
                 radar_enabled=radar_enabled,
                 profile_sst=profile_sst,
+            )
+        if self.config.backbone == "hrnet":
+            return self._forward_hrnet(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                local_radar_bev=local_radar_bev,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+                radar_enabled=radar_enabled,
+                local_radar_enabled=local_radar_enabled,
             )
         (
             lidar_sensor_bev,
