@@ -43,6 +43,7 @@ from .coarse_reconstruction.coarse_loss import (
     MaskedBEVReconstructionLoss,
     ObservabilityWeightingConfig,
     coarse_reconstruction_metrics,
+    coarse_reconstruction_range_metrics,
     occupancy_bce_weights,
 )
 from .coarse_dataset import (
@@ -128,6 +129,7 @@ __all__ = [
     "CoarseLossConfig",
     "CoarseReconstructionConfig",
     "CoarseReconstructionModel",
+    "coarse_reconstruction_range_metrics",
     "DiffusionDownBlock",
     "DiffusionProcessConfig",
     "DiffusionUpBlock",

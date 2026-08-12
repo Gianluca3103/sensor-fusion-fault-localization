@@ -188,6 +188,18 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "repair_context_coordinates",
         "trusted_lidar_coordinates",
         "radar_context_coordinates",
+        "hrnet_stage_1_branch_0",
+        "hrnet_stage_2_branch_0",
+        "hrnet_stage_2_branch_1",
+        "hrnet_stage_3_branch_0",
+        "hrnet_stage_3_branch_1",
+        "hrnet_stage_3_branch_2",
+        "hrnet_stage_4_branch_0",
+        "hrnet_stage_4_branch_1",
+        "hrnet_stage_4_branch_2",
+        "hrnet_stage_4_branch_3",
+        "hrnet_final_concatenated",
+        "hrnet_final_features",
     )
     result = {
         key: (
@@ -460,6 +472,9 @@ def main():
     radar_mode = "none" if args.disable_radar else args.radar_mode
     payload = load_config(args.config)
     model_config, loss_config, selector_config = build_configs(payload)
+    use_global_map = not args.disable_global_map
+    if model_config.backbone == "hrnet":
+        use_global_map = False
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 8))
@@ -552,12 +567,18 @@ def main():
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
     print(f"Radar mode: {radar_mode}")
-    print(f"Global map enabled: {not args.disable_global_map}")
+    print(f"Global map enabled: {use_global_map}")
     print(
         "Sensor representation: "
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
     print(f"Reconstruction backbone: {model_config.backbone}")
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(f"Trainable parameters: {trainable_parameters:,}")
     if model_config.pointpillars.enabled:
         geometry = train_dataset.grid_geometry
         print(
@@ -602,7 +623,7 @@ def main():
             use_amp=use_amp,
             active_fraction_samples=train_active_fractions,
             radar_mode=radar_mode,
-            use_global_map=not args.disable_global_map,
+            use_global_map=use_global_map,
             profile_first_batch=epoch == 1,
         )
         _synchronize_device(device)
@@ -625,7 +646,7 @@ def main():
                 ),
                 active_fraction_samples=val_active_fractions,
                 radar_mode=radar_mode,
-                use_global_map=not args.disable_global_map,
+                use_global_map=use_global_map,
                 profile_first_batch=epoch == 1,
             )
         _synchronize_device(device)
@@ -746,7 +767,7 @@ def main():
             "active_fraction_profile": active_fraction_profile,
             "radar_mode": radar_mode,
             "radar_disabled": radar_mode == "none",
-            "global_map_enabled": not args.disable_global_map,
+            "global_map_enabled": use_global_map,
             "grid_geometry": train_dataset.grid_geometry.to_dict(),
             "history": history,
         }

@@ -125,6 +125,36 @@ python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstr
 Keep `configs/coarse_reconstruction.json` selected for the handcrafted-BEV
 baseline.
 
+### Experiment: full-resolution HRNet reconstruction backbone
+
+`configs/coarse_reconstruction_pointpillars_hrnet.json` changes only the dense
+coarse reconstruction backbone. The PointPillars encoders, 130-channel masked
+local input, three-channel target, losses, masks, optimizer, and final masked
+replacement rule remain unchanged.
+
+Unlike the U-Net, HRNet has no single encoder bottleneck and decoder. It keeps
+parallel `[320,160,80,40]` spatial streams with `[16,32,64,128]` channels.
+Every active branch is processed by GroupNorm/SiLU residual blocks, and every
+fusion sends information from all active resolutions to all output
+resolutions. Low-to-high paths use 1x1 projection and bilinear interpolation;
+high-to-low paths use learned stride-2 3x3 convolutions. The final HRNetV2 head
+upsamples the three lower-resolution branches, concatenates 240 channels at
+320x320, and fuses them to 32 channels before the unchanged three-channel
+replacement head.
+
+The 320x320 branch remains present throughout the complete backbone. HRNet
+does not use the U-Net global-attention map because its persistent 40x40 branch
+and repeated multiresolution fusion provide broad context inside the backbone.
+
+```powershell
+python -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction `
+  --data-root "C:\path\to\pointpillars_samples" `
+  --radar-root "C:\path\to\radar_v2_cache_v9" `
+  --output-root "C:\path\to\coarse_hrnet_run" `
+  --config "configs\coarse_reconstruction_pointpillars_hrnet.json" `
+  --device cuda
+```
+
 The independent trainer is
 `models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction`;
 its default configuration is `configs/coarse_reconstruction.json`.

@@ -510,3 +510,58 @@ def coarse_reconstruction_metrics(
             )
             result[f"empty_cells_{name}_observability"] = count
     return result
+
+
+@torch.no_grad()
+def coarse_reconstruction_range_metrics(
+    outputs: dict[str, torch.Tensor],
+    clean_lidar_bev: torch.Tensor,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    epsilon: float = 1.0e-8,
+    include_tolerant: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Report occupancy reconstruction metrics in fixed radial-distance bins."""
+
+    mask = outputs["reconstruction_mask"]
+    batch, _, height, width = mask.shape
+    device = mask.device
+    dtype = mask.dtype
+    x_step = (x_range[1] - x_range[0]) / height
+    y_step = (y_range[1] - y_range[0]) / width
+    x = x_range[1] - (
+        torch.arange(height, device=device, dtype=dtype) + 0.5
+    ) * x_step
+    y = y_range[0] + (
+        torch.arange(width, device=device, dtype=dtype) + 0.5
+    ) * y_step
+    xx, yy = torch.meshgrid(x, y, indexing="ij")
+    distance = torch.sqrt(xx.square() + yy.square())[None, None]
+    distance = distance.expand(batch, -1, -1, -1)
+    probability = torch.sigmoid(outputs["occupancy_logits"])
+    target = clean_lidar_bev[:, 0:1]
+    bins = (
+        ("0_15m", 0.0, 15.0),
+        ("15_30m", 15.0, 30.0),
+        ("30_45m", 30.0, 45.0),
+        ("45_60m", 45.0, 60.0),
+        ("over_60m", 60.0, float("inf")),
+    )
+    result = {}
+    for name, minimum, maximum in bins:
+        range_mask = (distance >= minimum) & (distance < maximum)
+        metrics = _occupancy_metrics(
+            probability,
+            target,
+            mask * range_mask.to(dtype=mask.dtype),
+            epsilon,
+            include_tolerant=include_tolerant,
+        )
+        result.update(
+            {f"range_{name}/{key}": value for key, value in metrics.items()}
+        )
+        result[f"range_{name}/repair_cells"] = (
+            mask * range_mask.to(dtype=mask.dtype)
+        ).sum(dtype=torch.float32)
+    return result

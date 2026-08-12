@@ -25,6 +25,7 @@ from models.reconstruction_head import (
     build_selector_config,
     coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
+    coarse_reconstruction_range_metrics,
     load_config,
 )
 
@@ -265,6 +266,84 @@ def _save_comparison(
     plt.close(figure)
 
 
+def _save_hrnet_debug(
+    destination: Path,
+    clean_bev: torch.Tensor,
+    faulty_bev: torch.Tensor,
+    coarse_bev: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    occupancy_logits: torch.Tensor,
+    activations: dict[str, torch.Tensor],
+) -> None:
+    """Save the required output and multiresolution HRNet diagnostics."""
+
+    clean = _bev_rgb(clean_bev)
+    faulty = _bev_rgb(faulty_bev)
+    coarse = _bev_rgb(coarse_bev)
+    mask = reconstruction_mask.detach().float().squeeze().cpu().numpy()
+    occupancy = (
+        torch.sigmoid(occupancy_logits)
+        .detach()
+        .float()
+        .squeeze()
+        .cpu()
+        .numpy()
+    )
+    thresholded = occupancy >= 0.5
+    absolute_error = np.abs(coarse - clean).mean(axis=-1)
+    output_panels = (
+        (clean, "Clean LiDAR BEV", None),
+        (faulty, "Faulty LiDAR BEV", None),
+        (mask, "Reconstruction mask", "gray"),
+        (coarse, "HRNet coarse reconstruction", None),
+        (occupancy, "Occupancy probability", "viridis"),
+        (thresholded, "Occupancy thresholded", "gray"),
+        (absolute_error, "Absolute reconstruction error", "magma"),
+    )
+    figure, axes = plt.subplots(2, 4, figsize=(20, 10), facecolor="black")
+    for axis, (image, title, cmap) in zip(axes.flat, output_panels):
+        axis.imshow(image, cmap=cmap, interpolation="nearest")
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    axes.flat[-1].axis("off")
+    destination.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        destination / "hrnet_reconstruction_debug.png",
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)
+
+    feature_names = (
+        ("hrnet_stage_4_branch_0", "320x320 branch"),
+        ("hrnet_stage_4_branch_1", "160x160 branch"),
+        ("hrnet_stage_4_branch_2", "80x80 branch"),
+        ("hrnet_stage_4_branch_3", "40x40 branch"),
+    )
+    figure, axes = plt.subplots(1, 4, figsize=(18, 5), facecolor="black")
+    for axis, (key, title) in zip(axes, feature_names):
+        feature = (
+            activations[key]
+            .detach()
+            .float()
+            .abs()
+            .mean(dim=0)
+            .cpu()
+            .numpy()
+        )
+        axis.imshow(feature, cmap="viridis", interpolation="nearest")
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    figure.savefig(
+        destination / "hrnet_branch_activations.png",
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)
+
+
 def main() -> None:
     args = _parse_args()
     if args.batch_size < 1 or args.num_workers < 0:
@@ -325,6 +404,7 @@ def main() -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     records = []
     visualized = defaultdict(int)
+    hrnet_debug_saved = False
     completed = 0
 
     with torch.inference_mode():
@@ -379,6 +459,16 @@ def main() -> None:
                     observability,
                     include_tolerant=True,
                 )
+                metrics.update(
+                    coarse_reconstruction_range_metrics(
+                        sample_outputs,
+                        inputs["clean_bev"][index : index + 1],
+                        x_range=(grid_geometry.x_min, grid_geometry.x_max),
+                        y_range=(grid_geometry.y_min, grid_geometry.y_max),
+                        epsilon=epsilon,
+                        include_tolerant=True,
+                    )
+                )
                 sample_path = str(batch["sample_path"][index])
                 sample_metadata = metadata[sample_path]
                 severity = sample_metadata.get("severity", "")
@@ -416,6 +506,25 @@ def main() -> None:
                     - record["faulty_occupancy_exact_iou"]
                 )
                 records.append(record)
+                if model_config.backbone == "hrnet" and not hrnet_debug_saved:
+                    _save_hrnet_debug(
+                        args.output_root / "visualizations" / "hrnet_debug",
+                        inputs["clean_bev"][index],
+                        inputs["faulty_bev"][index],
+                        outputs["coarse_lidar_bev"][index],
+                        inputs["reconstruction_mask"][index],
+                        outputs["occupancy_logits"][index],
+                        {
+                            key: outputs[key][index]
+                            for key in (
+                                "hrnet_stage_4_branch_0",
+                                "hrnet_stage_4_branch_1",
+                                "hrnet_stage_4_branch_2",
+                                "hrnet_stage_4_branch_3",
+                            )
+                        },
+                    )
+                    hrnet_debug_saved = True
                 if (
                     visualized[record["fault_group"]]
                     < args.visualize_samples_per_fault
