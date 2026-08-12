@@ -73,6 +73,14 @@ from .coarse_reconstruction.sst_backbone import (
     build_sparse_region_layout,
     regional_group_indices,
 )
+from .coarse_reconstruction.repair_query import (
+    RepairQueryConfig,
+    RepairQueryDecoder,
+    RepairQueryDecoderBlock,
+    RepairQueryTokenBuilder,
+    XYPositionEncoder,
+    normalized_xy,
+)
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
@@ -132,6 +140,10 @@ __all__ = [
     "PointPillarsConfig",
     "PointPillarsEncoder",
     "PointPillarsOutput",
+    "RepairQueryConfig",
+    "RepairQueryDecoder",
+    "RepairQueryDecoderBlock",
+    "RepairQueryTokenBuilder",
     "SSTBackbone",
     "SSTBlock",
     "SSTConfig",
@@ -143,6 +155,8 @@ __all__ = [
     "SparseTokenBuilder",
     "build_sparse_region_layout",
     "regional_group_indices",
+    "XYPositionEncoder",
+    "normalized_xy",
     "FaultBlob",
     "FaultSelection",
     "FaultSelector",

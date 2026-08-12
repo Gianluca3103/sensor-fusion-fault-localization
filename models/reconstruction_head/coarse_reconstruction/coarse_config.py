@@ -10,6 +10,7 @@ from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
 from ..fault_selector import FaultSelectorConfig
 from ..pointpillars import PointPillarsConfig
 from .sst_backbone import SSTConfig
+from .repair_query import RepairQueryConfig
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class CoarseReconstructionConfig:
     attention_dropout: float = 0.025
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
     sst: SSTConfig = field(default_factory=SSTConfig)
+    repair_query: RepairQueryConfig = field(default_factory=RepairQueryConfig)
 
     @property
     def local_input_channels(self) -> int:
@@ -36,8 +38,10 @@ class CoarseReconstructionConfig:
         return self.lidar_channels + self.radar_channels + mask_channels
 
     def validate(self) -> None:
-        if self.backbone not in {"unet", "sst"}:
-            raise ValueError("model.backbone must be 'unet' or 'sst'")
+        if self.backbone not in {"unet", "sst", "repair_query"}:
+            raise ValueError(
+                "model.backbone must be 'unet', 'sst', or 'repair_query'"
+            )
         integer_values = {
             "lidar_channels": self.lidar_channels,
             "radar_channels": self.radar_channels,
@@ -70,8 +74,14 @@ class CoarseReconstructionConfig:
             raise ValueError("attention_dropout must be in [0,1)")
         self.pointpillars.validate()
         self.sst.validate()
-        if self.backbone == "sst" and not self.pointpillars.enabled:
-            raise ValueError("The SST backbone requires PointPillars inputs")
+        self.repair_query.validate()
+        if (
+            self.backbone in {"sst", "repair_query"}
+            and not self.pointpillars.enabled
+        ):
+            raise ValueError(
+                f"The {self.backbone} backbone requires PointPillars inputs"
+            )
         expected_lidar = (
             self.pointpillars.output_channels
             if self.pointpillars.enabled
@@ -109,6 +119,9 @@ class CoarseReconstructionConfig:
         sst = values.get("sst", {})
         if isinstance(sst, dict):
             values["sst"] = SSTConfig(**sst)
+        repair_query = values.get("repair_query", {})
+        if isinstance(repair_query, dict):
+            values["repair_query"] = RepairQueryConfig(**repair_query)
         return cls(**values)
 
 
@@ -164,6 +177,21 @@ def build_configs(payload: dict):
             "Unknown sst settings: " + ", ".join(sorted(unknown_sst_fields))
         )
     sst = SSTConfig(**sst_payload)
+    repair_query_payload = payload.get("repair_query", {})
+    if not isinstance(repair_query_payload, dict):
+        raise ValueError("repair_query must be an object")
+    valid_repair_query_fields = {
+        field.name for field in fields(RepairQueryConfig)
+    }
+    unknown_repair_query_fields = (
+        set(repair_query_payload) - valid_repair_query_fields
+    )
+    if unknown_repair_query_fields:
+        raise ValueError(
+            "Unknown repair_query settings: "
+            + ", ".join(sorted(unknown_repair_query_fields))
+        )
+    repair_query = RepairQueryConfig(**repair_query_payload)
     pointpillars_payload = payload.get("pointpillars", {})
     if not isinstance(pointpillars_payload, dict):
         raise ValueError("pointpillars must be an object")
@@ -211,6 +239,7 @@ def build_configs(payload: dict):
         ),
         pointpillars=pointpillars,
         sst=sst,
+        repair_query=repair_query,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

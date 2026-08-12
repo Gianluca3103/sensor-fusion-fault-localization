@@ -16,6 +16,7 @@ from ..pointpillars import (
     PointPillarsOutput,
 )
 from .coarse_config import CoarseReconstructionConfig
+from .repair_query import RepairQueryDecoder
 from .sst_backbone import (
     SSTBackbone,
     SSTReconstructionHead,
@@ -369,7 +370,7 @@ class CoarseReconstructionModel(nn.Module):
                 self.local_unet_encoder.channels, self.config.dropout
             )
             replacement_channels = self.local_unet_decoder.out_channels
-        else:
+        elif self.config.backbone == "sst":
             self.sst_token_builder = SparseTokenBuilder(
                 self.config.lidar_channels,
                 self.config.radar_channels,
@@ -381,8 +382,19 @@ class CoarseReconstructionModel(nn.Module):
                 self.config.sst.token_dim
             )
             replacement_channels = self.sst_reconstruction_head.out_channels
-        self.replacement_head = CoarseReplacementHead(
-            replacement_channels, self.config.target_lidar_channels
+        else:
+            self.repair_query_decoder = RepairQueryDecoder(
+                self.config.lidar_channels,
+                self.config.radar_channels,
+                self.config.repair_query,
+            )
+            replacement_channels = None
+        self.replacement_head = (
+            CoarseReplacementHead(
+                replacement_channels, self.config.target_lidar_channels
+            )
+            if replacement_channels is not None
+            else None
         )
 
     def _select_lidar_point_fields(
@@ -482,6 +494,141 @@ class CoarseReconstructionModel(nn.Module):
                 )
             },
         )
+
+    def _trusted_lidar_points(
+        self,
+        point_clouds: Sequence[torch.Tensor],
+        reconstruction_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Remove raw points whose XY pillar belongs to the repair mask."""
+        assert self.lidar_pillar_encoder is not None
+        trusted = []
+        for batch_index, points in enumerate(point_clouds):
+            rows, cols, valid = self.lidar_pillar_encoder.pillarizer.grid_indices(
+                points[:, :3]
+            )
+            untrusted = torch.zeros(
+                len(points), dtype=torch.bool, device=points.device
+            )
+            untrusted[valid] = reconstruction_mask[
+                batch_index, 0, rows[valid], cols[valid]
+            ] > 0.5
+            trusted.append(points[~untrusted])
+        return tuple(trusted)
+
+    def _forward_repair_query(
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        healthy_context_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        faulty_lidar_points: Sequence[torch.Tensor] | None,
+        radar_points: Sequence[torch.Tensor] | None,
+        radar_enabled: bool,
+        profile: bool,
+    ) -> dict[str, torch.Tensor]:
+        if faulty_lidar_points is None:
+            raise ValueError(
+                "faulty_lidar_points are required by the repair_query backbone"
+            )
+        assert self.lidar_pillar_encoder is not None
+        assert self.radar_pillar_encoder is not None
+        complete_started = _profile_start(faulty_lidar_bev, profile)
+        if profile and faulty_lidar_bev.is_cuda:
+            torch.cuda.reset_peak_memory_stats(faulty_lidar_bev.device)
+        pointpillars_started = _profile_start(faulty_lidar_bev, profile)
+        selected_lidar = self._select_lidar_point_fields(faulty_lidar_points)
+        trusted_points = self._trusted_lidar_points(
+            selected_lidar, reconstruction_mask
+        )
+        lidar = self.lidar_pillar_encoder(trusted_points, return_sparse=True)
+        assert isinstance(lidar, PointPillarsOutput)
+        if radar_enabled:
+            if radar_points is None:
+                raise ValueError(
+                    "radar_points are required by the repair_query backbone"
+                )
+            radar = self.radar_pillar_encoder(
+                self._select_radar_point_fields(radar_points),
+                return_sparse=True,
+            )
+            assert isinstance(radar, PointPillarsOutput)
+        else:
+            radar = self._empty_radar_pillar_output(lidar)
+        pointpillars_ms = _profile_elapsed_ms(
+            faulty_lidar_bev, pointpillars_started
+        )
+        decoder_outputs = self.repair_query_decoder(
+            lidar,
+            radar,
+            reconstruction_mask,
+            radar_enabled=radar_enabled,
+            profile=profile,
+        )
+        replacement_raw = decoder_outputs["replacement_raw"]
+        occupancy_logits = replacement_raw[:, 0:1]
+        predicted_density = replacement_raw[:, 1:2]
+        predicted_height = replacement_raw[:, 2:3]
+        replacement_bev = torch.cat(
+            (
+                torch.sigmoid(occupancy_logits),
+                predicted_density,
+                predicted_height,
+            ),
+            dim=1,
+        )
+        coarse_lidar_bev = (
+            (1.0 - reconstruction_mask) * faulty_lidar_bev
+            + reconstruction_mask * replacement_bev
+        )
+        complete_ms = _profile_elapsed_ms(coarse_lidar_bev, complete_started)
+        timing = {
+            "pointpillars_ms": pointpillars_ms,
+            **decoder_outputs["timing_ms"],
+            "complete_forward_ms": complete_ms,
+        }
+        peak_memory = (
+            torch.cuda.max_memory_allocated(faulty_lidar_bev.device)
+            if faulty_lidar_bev.is_cuda and profile
+            else 0
+        )
+        erased_lidar = lidar.dense_features * (1.0 - reconstruction_mask)
+        halo_mask = halo_mask * (1.0 - reconstruction_mask)
+        return {
+            "erased_lidar_bev": erased_lidar,
+            "erased_lidar_features": erased_lidar,
+            "lidar_sensor_bev": lidar.dense_features,
+            "radar_sensor_bev": radar.dense_features,
+            "lidar_pillar_bev": lidar.dense_features,
+            "radar_pillar_bev": radar.dense_features,
+            "lidar_pillar_statistics": lidar.statistics,
+            "radar_pillar_statistics": radar.statistics,
+            "repair_query_features": decoder_outputs["query_features"],
+            "repair_query_coordinates": decoder_outputs["query_coordinates"],
+            "repair_context_features": decoder_outputs["context_features"],
+            "repair_context_coordinates": decoder_outputs["context_coordinates"],
+            "trusted_lidar_coordinates": decoder_outputs[
+                "trusted_lidar_coordinates"
+            ],
+            "radar_context_coordinates": decoder_outputs[
+                "radar_context_coordinates"
+            ],
+            "repair_query_statistics": decoder_outputs["statistics"],
+            "repair_query_timing_ms": timing,
+            "repair_query_peak_memory_bytes": peak_memory,
+            "replacement_raw": replacement_raw,
+            "replacement_bev": replacement_bev,
+            "occupancy_logits": occupancy_logits,
+            "predicted_density": predicted_density,
+            "predicted_height": predicted_height,
+            "coarse_lidar_bev": coarse_lidar_bev,
+            "reconstruction_mask": reconstruction_mask,
+            "healthy_context_mask": healthy_context_mask,
+            "halo_mask": halo_mask,
+            "active_mask": torch.maximum(reconstruction_mask, halo_mask),
+        }
 
     def _forward_sst(
         self,
@@ -636,6 +783,18 @@ class CoarseReconstructionModel(nn.Module):
         return_attention_weights: bool = False,
         profile_sst: bool = False,
     ) -> dict[str, torch.Tensor]:
+        if self.config.backbone == "repair_query":
+            return self._forward_repair_query(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+                radar_enabled=radar_enabled,
+                profile=profile_sst,
+            )
         if self.config.backbone == "sst":
             return self._forward_sst(
                 faulty_lidar_bev,

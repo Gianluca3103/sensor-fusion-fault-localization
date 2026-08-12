@@ -226,7 +226,7 @@ implementation.
 
 ## Coarse Reconstruction Backbone Ablation
 
-The PointPillars coarse-reconstruction stage supports two controlled backbones:
+The PointPillars coarse-reconstruction stage supports three controlled backbones:
 
 - `model.backbone: unet` keeps the original dense compressive U-Net, global
   encoders, and bottleneck cross-attention.
@@ -234,6 +234,11 @@ The PointPillars coarse-reconstruction stage supports two controlled backbones:
   operates on their union of sparse pillar coordinates with six single-stride
   regional Transformer blocks. Coordinates remain on the original `320x320`
   grid throughout; no pooling or stride-2 operation is used.
+- `model.backbone: repair_query` creates one learned query only for each
+  reconstruction-mask cell. Queries perform local self-attention and attend
+  only to trusted LiDAR/radar context in the surrounding `3x3` regions. Raw
+  LiDAR points in the reconstruction mask are removed before the LiDAR PFN;
+  radar remains available there as evidence.
 
 The strict SST experiment uses 12-cell (2.4 m) regions, a six-cell shift,
 128-D tokens, eight attention heads, and no repair-query tokens. Each token is
@@ -249,7 +254,9 @@ its normal and shifted regional layouts once per forward pass and reuses them
 across all blocks because token coordinates are single-stride and immutable.
 
 Use `configs/coarse_reconstruction_pointpillars.json` for the U-Net experiment
-and `configs/coarse_reconstruction_pointpillars_sst.json` for SST. Dataset
+and `configs/coarse_reconstruction_pointpillars_sst.json` for SST. Use
+`configs/coarse_reconstruction_pointpillars_repair_query.json` for the sparse
+repair-query decoder. Dataset
 splits, PointPillars settings, masks, targets, loss, metrics, optimizer, and
 training schedule remain identical. `include_repair_tokens` intentionally
 defaults to `false`; enabling it is a separate reconstruction-specific

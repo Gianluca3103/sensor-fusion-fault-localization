@@ -182,6 +182,12 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "sst_block_final",
         "sst_dense_features",
         "sst_reconstruction_features",
+        "repair_query_features",
+        "repair_query_coordinates",
+        "repair_context_features",
+        "repair_context_coordinates",
+        "trusted_lidar_coordinates",
+        "radar_context_coordinates",
     )
     result = {
         key: (
@@ -213,6 +219,24 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         }
     if "sst_timing_ms" in outputs:
         result["sst_timing_ms"] = dict(outputs["sst_timing_ms"])
+    repair_statistics = outputs.get("repair_query_statistics")
+    if repair_statistics:
+        result["repair_query_statistics"] = {
+            key: (
+                float(value.detach().cpu())
+                if value.numel() == 1
+                else value.detach().cpu().tolist()
+            )
+            for key, value in repair_statistics.items()
+        }
+    if "repair_query_timing_ms" in outputs:
+        result["repair_query_timing_ms"] = dict(
+            outputs["repair_query_timing_ms"]
+        )
+    if "repair_query_peak_memory_bytes" in outputs:
+        result["repair_query_peak_memory_bytes"] = int(
+            outputs["repair_query_peak_memory_bytes"]
+        )
     return result
 
 
@@ -310,10 +334,9 @@ def _run_epoch(
                 False,
             )
         )
-        sst_enabled = (
-            getattr(getattr(model, "config", None), "backbone", None)
-            == "sst"
-        )
+        sparse_backbone_enabled = getattr(
+            getattr(model, "config", None), "backbone", None
+        ) in {"sst", "repair_query"}
         if radar_mode == "none":
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
         elif radar_mode == "global-only":
@@ -341,7 +364,7 @@ def _run_epoch(
                         return_attention and batch_index == 0
                     ),
                 }
-                if sst_enabled:
+                if sparse_backbone_enabled:
                     model_options["profile_sst"] = measure_runtime
                 if pointpillars_enabled:
                     model_options.update(
