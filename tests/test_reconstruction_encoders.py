@@ -12,9 +12,52 @@ from models.reconstruction_head import (
     load_bev_triplet,
 )
 from models.reconstruction_head.encoders import BEVEncoder
+from models.reconstruction_head.fault_selector import _best_repair_box
 
 
 class ReconstructionEncoderTests(unittest.TestCase):
+    def test_vectorized_repair_box_matches_reference_search(self):
+        def reference(severe, healthy, min_cells, min_fraction):
+            height, _ = severe.shape
+            best_score = None
+            best_box = None
+            for top in range(height):
+                for bottom in range(top + 1, height + 1):
+                    fault_count = int(severe[top:bottom].sum())
+                    if fault_count < min_cells:
+                        continue
+                    healthy_count = int(healthy[top:bottom].sum())
+                    fraction = fault_count / (fault_count + healthy_count)
+                    if fraction < min_fraction:
+                        continue
+                    score = (fault_count, -healthy_count, -(bottom - top), -top)
+                    if best_score is None or score > best_score:
+                        columns = np.flatnonzero(severe[top:bottom].any(axis=0))
+                        best_score = score
+                        best_box = (
+                            top,
+                            int(columns[0]),
+                            bottom,
+                            int(columns[-1]) + 1,
+                        )
+            return best_box
+
+        rng = np.random.default_rng(17)
+        for _ in range(100):
+            severe = rng.random((12, 9)) < 0.12
+            healthy = (rng.random((12, 9)) < 0.18) & ~severe
+            min_cells = int(rng.integers(1, 5))
+            min_fraction = float(rng.choice((0.5, 0.75, 0.95, 1.0)))
+            self.assertEqual(
+                _best_repair_box(
+                    severe,
+                    healthy,
+                    min_cells,
+                    min_fraction,
+                ),
+                reference(severe, healthy, min_cells, min_fraction),
+            )
+
     def test_bev_encoder_produces_expected_bottleneck(self):
         encoder = BEVEncoder(
             in_channels=3,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from functools import lru_cache
 
 import numpy as np
 from scipy.ndimage import binary_dilation
@@ -129,6 +130,13 @@ def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     )
 
 
+@lru_cache(maxsize=None)
+def _row_intervals(height: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return every non-empty ``[top, bottom)`` row interval."""
+    tops, inclusive_bottoms = np.triu_indices(height)
+    return tops, inclusive_bottoms + 1
+
+
 def _best_repair_box(
     severe_loss: np.ndarray,
     healthy_occupied: np.ndarray,
@@ -143,29 +151,44 @@ def _best_repair_box(
     healthy_prefix = np.concatenate(
         ([0], np.cumsum(healthy_occupied.sum(axis=1), dtype=np.int64))
     )
-    best_score = None
-    best_box = None
-    for top in range(height):
-        for bottom in range(top + 1, height + 1):
-            fault_count = int(fault_prefix[bottom] - fault_prefix[top])
-            if fault_count < min_fault_cells:
-                continue
-            healthy_count = int(healthy_prefix[bottom] - healthy_prefix[top])
-            informative = fault_count + healthy_count
-            fault_fraction = fault_count / informative
-            if fault_fraction < min_fault_fraction:
-                continue
-            score = (fault_count, -healthy_count, -(bottom - top), -top)
-            if best_score is None or score > best_score:
-                band_columns = np.flatnonzero(severe_loss[top:bottom].any(axis=0))
-                best_score = score
-                best_box = (
-                    top,
-                    int(band_columns[0]),
-                    bottom,
-                    int(band_columns[-1]) + 1,
-                )
-    return best_box
+    tops, bottoms = _row_intervals(height)
+    fault_counts = fault_prefix[bottoms] - fault_prefix[tops]
+    healthy_counts = healthy_prefix[bottoms] - healthy_prefix[tops]
+    informative_counts = fault_counts + healthy_counts
+    valid = fault_counts >= min_fault_cells
+    fault_fractions = np.divide(
+        fault_counts,
+        informative_counts,
+        out=np.zeros_like(fault_counts, dtype=np.float64),
+        where=informative_counts > 0,
+    )
+    valid &= fault_fractions >= min_fault_fraction
+    candidate_indices = np.flatnonzero(valid)
+    if not len(candidate_indices):
+        return None
+
+    candidate_tops = tops[candidate_indices]
+    candidate_bottoms = bottoms[candidate_indices]
+    # This ascending lexicographic order is exactly equivalent to maximizing
+    # (fault_count, -healthy_count, -height, -top) in the former Python loop.
+    order = np.lexsort(
+        (
+            candidate_tops,
+            candidate_bottoms - candidate_tops,
+            healthy_counts[candidate_indices],
+            -fault_counts[candidate_indices],
+        )
+    )
+    selected = candidate_indices[int(order[0])]
+    top = int(tops[selected])
+    bottom = int(bottoms[selected])
+    band_columns = np.flatnonzero(severe_loss[top:bottom].any(axis=0))
+    return (
+        top,
+        int(band_columns[0]),
+        bottom,
+        int(band_columns[-1]) + 1,
+    )
 
 
 def _adaptive_halo(
