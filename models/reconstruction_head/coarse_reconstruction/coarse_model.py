@@ -19,6 +19,7 @@ from .coarse_config import CoarseReconstructionConfig
 from .repair_query import RepairQueryDecoder
 from .hrnet_backbone import HRNetBackbone
 from .range_aware_radar import RangeAwareRadarAggregation
+from .radar_pillar_attention import RadarPillarAttention
 from .sst_backbone import (
     SSTBackbone,
     SSTReconstructionHead,
@@ -355,6 +356,7 @@ class CoarseReconstructionModel(nn.Module):
         self.radar_pillar_encoder = None
         self.radar_context_encoder: nn.Module = nn.Identity()
         self.range_aware_radar = None
+        self.radar_pillar_attention = None
         if self.config.pointpillars.enabled:
             if grid_geometry is None:
                 raise ValueError(
@@ -381,6 +383,11 @@ class CoarseReconstructionModel(nn.Module):
                 max_points_per_pillar=pointpillars.max_points_per_pillar,
                 max_pillars=pointpillars.max_pillars,
             )
+            if self.config.radar_pillar_attention.enabled:
+                self.radar_pillar_attention = RadarPillarAttention(
+                    pointpillars.output_channels,
+                    self.config.radar_pillar_attention,
+                )
         if self.config.backbone == "unet":
             self.local_unet_encoder = LocalUNetEncoder(
                 self.config.local_input_channels,
@@ -495,9 +502,10 @@ class CoarseReconstructionModel(nn.Module):
         torch.Tensor,
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
+        dict[str, object],
     ]:
         if not self.config.pointpillars.enabled:
-            return faulty_lidar_bev, radar_bev, {}, {}
+            return faulty_lidar_bev, radar_bev, {}, {}, {}
         if faulty_lidar_points is None:
             raise ValueError(
                 "faulty_lidar_points are required when PointPillars is enabled"
@@ -512,9 +520,38 @@ class CoarseReconstructionModel(nn.Module):
                 raise ValueError(
                     "radar_points are required when PointPillars is enabled"
                 )
-            radar_features, radar_statistics = self.radar_pillar_encoder(
-                self._select_radar_point_fields(radar_points)
+            selected_radar_points = self._select_radar_point_fields(
+                radar_points
             )
+            if self.radar_pillar_attention is not None:
+                radar_output = self.radar_pillar_encoder(
+                    selected_radar_points,
+                    return_sparse=True,
+                )
+                assert isinstance(radar_output, PointPillarsOutput)
+                attended, radar_attention_debug = (
+                    self.radar_pillar_attention(
+                        radar_output.sparse_features,
+                        radar_output.sparse_coordinates,
+                        lidar_features.shape[0],
+                    )
+                )
+                coordinates = radar_output.sparse_coordinates
+                radar_features = (
+                    self.radar_pillar_encoder.scatter.forward_batch(
+                        attended,
+                        coordinates[:, 0],
+                        coordinates[:, 1],
+                        coordinates[:, 2],
+                        lidar_features.shape[0],
+                    )
+                )
+                radar_statistics = radar_output.statistics
+            else:
+                radar_features, radar_statistics = self.radar_pillar_encoder(
+                    selected_radar_points
+                )
+                radar_attention_debug = {}
         else:
             radar_features = lidar_features.new_zeros(
                 (
@@ -525,7 +562,14 @@ class CoarseReconstructionModel(nn.Module):
                 )
             )
             radar_statistics = {}
-        return lidar_features, radar_features, lidar_statistics, radar_statistics
+            radar_attention_debug = {}
+        return (
+            lidar_features,
+            radar_features,
+            lidar_statistics,
+            radar_statistics,
+            radar_attention_debug,
+        )
 
     def _forward_hrnet(
         self,
@@ -546,6 +590,7 @@ class CoarseReconstructionModel(nn.Module):
             radar_sensor_bev,
             lidar_pillar_statistics,
             radar_pillar_statistics,
+            radar_pillar_attention_debug,
         ) = self._sensor_features(
             faulty_lidar_bev,
             radar_bev,
@@ -632,6 +677,7 @@ class CoarseReconstructionModel(nn.Module):
             "radar_pillar_bev": radar_sensor_bev,
             "lidar_pillar_statistics": lidar_pillar_statistics,
             "radar_pillar_statistics": radar_pillar_statistics,
+            "radar_pillar_attention_debug": radar_pillar_attention_debug,
         }
         outputs.update(hrnet_debug)
         outputs.update(
@@ -993,6 +1039,7 @@ class CoarseReconstructionModel(nn.Module):
             radar_sensor_bev,
             lidar_pillar_statistics,
             radar_pillar_statistics,
+            radar_pillar_attention_debug,
         ) = self._sensor_features(
             faulty_lidar_bev,
             radar_bev,
@@ -1107,6 +1154,9 @@ class CoarseReconstructionModel(nn.Module):
                     "radar_pillar_bev": radar_sensor_bev,
                     "lidar_pillar_statistics": lidar_pillar_statistics,
                     "radar_pillar_statistics": radar_pillar_statistics,
+                    "radar_pillar_attention_debug": (
+                        radar_pillar_attention_debug
+                    ),
                 }
             )
         outputs.update(global_outputs)

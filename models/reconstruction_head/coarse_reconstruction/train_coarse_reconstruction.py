@@ -219,6 +219,13 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
                 key: value.detach().cpu().tolist()
                 for key, value in statistics.items()
             }
+    pillar_attention = outputs.get("radar_pillar_attention_debug")
+    if pillar_attention:
+        result["radar_pillar_attention_debug"] = {
+            key: value.detach().cpu().tolist()
+            for key, value in pillar_attention.items()
+            if isinstance(value, torch.Tensor)
+        }
     sst_statistics = outputs.get("sst_token_statistics")
     if sst_statistics:
         result["sst_token_statistics"] = {

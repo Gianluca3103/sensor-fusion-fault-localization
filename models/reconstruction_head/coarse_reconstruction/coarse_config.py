@@ -13,6 +13,7 @@ from .sst_backbone import SSTConfig
 from .repair_query import RepairQueryConfig
 from .hrnet_backbone import HRNetConfig
 from .range_aware_radar import RangeAwareRadarConfig
+from .radar_pillar_attention import RadarPillarAttentionConfig
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,9 @@ class CoarseReconstructionConfig:
     hrnet: HRNetConfig = field(default_factory=HRNetConfig)
     range_aware_radar: RangeAwareRadarConfig = field(
         default_factory=RangeAwareRadarConfig
+    )
+    radar_pillar_attention: RadarPillarAttentionConfig = field(
+        default_factory=RadarPillarAttentionConfig
     )
 
     @property
@@ -88,6 +92,7 @@ class CoarseReconstructionConfig:
         self.repair_query.validate()
         self.hrnet.validate()
         self.range_aware_radar.validate()
+        self.radar_pillar_attention.validate()
         if self.range_aware_radar.enabled and self.backbone != "hrnet":
             raise ValueError(
                 "range-aware Radar aggregation is isolated to the HRNet backbone"
@@ -103,6 +108,23 @@ class CoarseReconstructionConfig:
             raise ValueError(
                 "Use either fixed RF Radar context or range-aware Radar, not both"
             )
+        if self.radar_pillar_attention.enabled:
+            if self.backbone != "hrnet":
+                raise ValueError(
+                    "Radar PillarAttention is isolated to the HRNet backbone"
+                )
+            if not self.pointpillars.enabled:
+                raise ValueError(
+                    "Radar PillarAttention requires PointPillars inputs"
+                )
+            if self.range_aware_radar.enabled:
+                raise ValueError(
+                    "Radar PillarAttention cannot be combined with range-aware Radar"
+                )
+            if self.hrnet.radar_context_layers:
+                raise ValueError(
+                    "Radar PillarAttention cannot be combined with fixed RF Radar context"
+                )
         if (
             self.backbone in {"sst", "repair_query"}
             and not self.pointpillars.enabled
@@ -157,6 +179,11 @@ class CoarseReconstructionConfig:
         if isinstance(range_aware_radar, dict):
             values["range_aware_radar"] = RangeAwareRadarConfig(
                 **range_aware_radar
+            )
+        radar_pillar_attention = values.get("radar_pillar_attention", {})
+        if isinstance(radar_pillar_attention, dict):
+            values["radar_pillar_attention"] = RadarPillarAttentionConfig(
+                **radar_pillar_attention
             )
         return cls(**values)
 
@@ -254,6 +281,23 @@ def build_configs(payload: dict):
             + ", ".join(sorted(unknown_range_aware_fields))
         )
     range_aware_radar = RangeAwareRadarConfig(**range_aware_payload)
+    pillar_attention_payload = payload.get("radar_pillar_attention", {})
+    if not isinstance(pillar_attention_payload, dict):
+        raise ValueError("radar_pillar_attention must be an object")
+    valid_pillar_attention_fields = {
+        field.name for field in fields(RadarPillarAttentionConfig)
+    }
+    unknown_pillar_attention_fields = (
+        set(pillar_attention_payload) - valid_pillar_attention_fields
+    )
+    if unknown_pillar_attention_fields:
+        raise ValueError(
+            "Unknown radar_pillar_attention settings: "
+            + ", ".join(sorted(unknown_pillar_attention_fields))
+        )
+    radar_pillar_attention = RadarPillarAttentionConfig(
+        **pillar_attention_payload
+    )
     pointpillars_payload = payload.get("pointpillars", {})
     if not isinstance(pointpillars_payload, dict):
         raise ValueError("pointpillars must be an object")
@@ -304,6 +348,7 @@ def build_configs(payload: dict):
         repair_query=repair_query,
         hrnet=hrnet,
         range_aware_radar=range_aware_radar,
+        radar_pillar_attention=radar_pillar_attention,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

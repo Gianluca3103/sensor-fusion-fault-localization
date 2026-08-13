@@ -94,6 +94,11 @@ from .coarse_reconstruction.range_aware_radar import (
     RangeAwareRadarAggregation,
     RangeAwareRadarConfig,
 )
+from .coarse_reconstruction.radar_pillar_attention import (
+    RadarPillarAttention,
+    RadarPillarAttentionBlock,
+    RadarPillarAttentionConfig,
+)
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
@@ -148,6 +153,9 @@ __all__ = [
     "HRNetTransition",
     "RangeAwareRadarAggregation",
     "RangeAwareRadarConfig",
+    "RadarPillarAttention",
+    "RadarPillarAttentionBlock",
+    "RadarPillarAttentionConfig",
     "GaussianNoiseSchedule",
     "LocalToGlobalCrossAttention",
     "LocalUNetDecoder",

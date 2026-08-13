@@ -209,7 +209,7 @@ class HRNetIntegrationTests(unittest.TestCase):
         halo *= 1 - repair
         healthy = halo.clone()
 
-        sensor_result = (lidar_features, radar_features, {}, {})
+        sensor_result = (lidar_features, radar_features, {}, {}, {})
         with patch.object(model, "_sensor_features", return_value=sensor_result):
             outputs = model(faulty, radar, repair, healthy, halo)
 
