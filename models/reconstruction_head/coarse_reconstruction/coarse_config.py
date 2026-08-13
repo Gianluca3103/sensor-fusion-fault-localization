@@ -12,6 +12,7 @@ from ..pointpillars import PointPillarsConfig
 from .sst_backbone import SSTConfig
 from .repair_query import RepairQueryConfig
 from .hrnet_backbone import HRNetConfig
+from .range_aware_radar import RangeAwareRadarConfig
 
 
 @dataclass(frozen=True)
@@ -33,11 +34,19 @@ class CoarseReconstructionConfig:
     sst: SSTConfig = field(default_factory=SSTConfig)
     repair_query: RepairQueryConfig = field(default_factory=RepairQueryConfig)
     hrnet: HRNetConfig = field(default_factory=HRNetConfig)
+    range_aware_radar: RangeAwareRadarConfig = field(
+        default_factory=RangeAwareRadarConfig
+    )
 
     @property
     def local_input_channels(self) -> int:
         mask_channels = 2 if self.use_healthy_context_mask else 1
-        return self.lidar_channels + self.radar_channels + mask_channels
+        radar_channels = (
+            self.range_aware_radar.output_channels
+            if self.range_aware_radar.enabled
+            else self.radar_channels
+        )
+        return self.lidar_channels + radar_channels + mask_channels
 
     def validate(self) -> None:
         if self.backbone not in {"unet", "sst", "repair_query", "hrnet"}:
@@ -78,6 +87,22 @@ class CoarseReconstructionConfig:
         self.sst.validate()
         self.repair_query.validate()
         self.hrnet.validate()
+        self.range_aware_radar.validate()
+        if self.range_aware_radar.enabled and self.backbone != "hrnet":
+            raise ValueError(
+                "range-aware Radar aggregation is isolated to the HRNet backbone"
+            )
+        if self.range_aware_radar.enabled and self.pointpillars.enabled:
+            raise ValueError(
+                "range-aware Radar aggregation requires handcrafted Radar BEVs"
+            )
+        if (
+            self.range_aware_radar.enabled
+            and self.hrnet.radar_context_layers
+        ):
+            raise ValueError(
+                "Use either fixed RF Radar context or range-aware Radar, not both"
+            )
         if (
             self.backbone in {"sst", "repair_query"}
             and not self.pointpillars.enabled
@@ -128,6 +153,11 @@ class CoarseReconstructionConfig:
         hrnet = values.get("hrnet", {})
         if isinstance(hrnet, dict):
             values["hrnet"] = HRNetConfig(**hrnet)
+        range_aware_radar = values.get("range_aware_radar", {})
+        if isinstance(range_aware_radar, dict):
+            values["range_aware_radar"] = RangeAwareRadarConfig(
+                **range_aware_radar
+            )
         return cls(**values)
 
 
@@ -209,6 +239,21 @@ def build_configs(payload: dict):
             + ", ".join(sorted(unknown_hrnet_fields))
         )
     hrnet = HRNetConfig(**hrnet_payload)
+    range_aware_payload = payload.get("range_aware_radar", {})
+    if not isinstance(range_aware_payload, dict):
+        raise ValueError("range_aware_radar must be an object")
+    valid_range_aware_fields = {
+        field.name for field in fields(RangeAwareRadarConfig)
+    }
+    unknown_range_aware_fields = (
+        set(range_aware_payload) - valid_range_aware_fields
+    )
+    if unknown_range_aware_fields:
+        raise ValueError(
+            "Unknown range_aware_radar settings: "
+            + ", ".join(sorted(unknown_range_aware_fields))
+        )
+    range_aware_radar = RangeAwareRadarConfig(**range_aware_payload)
     pointpillars_payload = payload.get("pointpillars", {})
     if not isinstance(pointpillars_payload, dict):
         raise ValueError("pointpillars must be an object")
@@ -258,6 +303,7 @@ def build_configs(payload: dict):
         sst=sst,
         repair_query=repair_query,
         hrnet=hrnet,
+        range_aware_radar=range_aware_radar,
     )
     loss_payload = coarse.get("loss", {})
     allowed_loss_fields = {

@@ -90,6 +90,10 @@ from .coarse_reconstruction.hrnet_backbone import (
     HRNetResidualBlock,
     HRNetTransition,
 )
+from .coarse_reconstruction.range_aware_radar import (
+    RangeAwareRadarAggregation,
+    RangeAwareRadarConfig,
+)
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
@@ -142,6 +146,8 @@ __all__ = [
     "HRNetModule",
     "HRNetResidualBlock",
     "HRNetTransition",
+    "RangeAwareRadarAggregation",
+    "RangeAwareRadarConfig",
     "GaussianNoiseSchedule",
     "LocalToGlobalCrossAttention",
     "LocalUNetDecoder",

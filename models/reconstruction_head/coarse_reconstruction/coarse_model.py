@@ -18,6 +18,7 @@ from ..pointpillars import (
 from .coarse_config import CoarseReconstructionConfig
 from .repair_query import RepairQueryDecoder
 from .hrnet_backbone import HRNetBackbone
+from .range_aware_radar import RangeAwareRadarAggregation
 from .sst_backbone import (
     SSTBackbone,
     SSTReconstructionHead,
@@ -353,6 +354,7 @@ class CoarseReconstructionModel(nn.Module):
         self.lidar_pillar_encoder = None
         self.radar_pillar_encoder = None
         self.radar_context_encoder: nn.Module = nn.Identity()
+        self.range_aware_radar = None
         if self.config.pointpillars.enabled:
             if grid_geometry is None:
                 raise ValueError(
@@ -417,7 +419,12 @@ class CoarseReconstructionModel(nn.Module):
             )
             replacement_channels = self.sst_reconstruction_head.out_channels
         elif self.config.backbone == "hrnet":
-            if self.config.hrnet.radar_context_layers:
+            if self.config.range_aware_radar.enabled:
+                self.range_aware_radar = RangeAwareRadarAggregation(
+                    self.config.radar_channels,
+                    self.config.range_aware_radar,
+                )
+            elif self.config.hrnet.radar_context_layers:
                 self.radar_context_encoder = RadarSpatialContextEncoder(
                     self.config.radar_channels,
                     self.config.hrnet.radar_context_channels,
@@ -565,9 +572,15 @@ class CoarseReconstructionModel(nn.Module):
         if not local_radar_enabled:
             local_radar_bev = torch.zeros_like(radar_sensor_bev)
         local_radar_active = active_mask * local_radar_bev
-        local_radar_context = active_mask * self.radar_context_encoder(
-            local_radar_active
-        )
+        radar_context_debug = {}
+        if self.range_aware_radar is not None:
+            local_radar_context, radar_context_debug = (
+                self.range_aware_radar(local_radar_active, active_mask)
+            )
+        else:
+            local_radar_context = active_mask * self.radar_context_encoder(
+                local_radar_active
+            )
         local_input = torch.cat(
             (
                 local_lidar_context,
@@ -621,6 +634,12 @@ class CoarseReconstructionModel(nn.Module):
             "radar_pillar_statistics": radar_pillar_statistics,
         }
         outputs.update(hrnet_debug)
+        outputs.update(
+            {
+                f"range_aware_radar_{name}": value
+                for name, value in radar_context_debug.items()
+            }
+        )
         return outputs
 
     def _empty_radar_pillar_output(
