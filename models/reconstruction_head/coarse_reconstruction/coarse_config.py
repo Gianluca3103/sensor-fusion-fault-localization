@@ -79,7 +79,7 @@ class CoarseReconstructionConfig:
         self.repair_query.validate()
         self.hrnet.validate()
         if (
-            self.backbone in {"sst", "repair_query", "hrnet"}
+            self.backbone in {"sst", "repair_query"}
             and not self.pointpillars.enabled
         ):
             raise ValueError(

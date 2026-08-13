@@ -110,6 +110,37 @@ class HRNetBackboneTests(unittest.TestCase):
 
 
 class HRNetIntegrationTests(unittest.TestCase):
+    def test_handcrafted_bev_inputs_do_not_require_pointpillars(self):
+        config, _loss, _selector = build_configs(
+            {
+                "model": {"backbone": "hrnet"},
+                "hrnet": {
+                    "base_channels": 2,
+                    "blocks_per_stage": 1,
+                    "residual_blocks_per_branch": 1,
+                },
+                "pointpillars": {"enabled": False},
+                "coarse_reconstruction": {},
+            }
+        )
+        model = CoarseReconstructionModel(config).eval()
+        faulty = torch.rand(1, 3, 32, 32)
+        radar = torch.rand(1, 4, 32, 32)
+        repair = torch.zeros(1, 1, 32, 32)
+        repair[:, :, 8:24, 8:24] = 1
+        halo = torch.zeros_like(repair)
+        halo[:, :, 6:26, 6:26] = 1
+        halo *= 1 - repair
+
+        with torch.no_grad():
+            outputs = model(faulty, radar, repair, halo, halo)
+
+        self.assertFalse(config.pointpillars.enabled)
+        self.assertEqual(config.lidar_channels, 3)
+        self.assertEqual(config.radar_channels, 4)
+        self.assertEqual(outputs["local_input"].shape, (1, 9, 32, 32))
+        self.assertEqual(outputs["coarse_lidar_bev"].shape, faulty.shape)
+
     def test_input_erasure_output_heads_and_outside_mask_invariant(self):
         pointpillars = PointPillarsConfig(enabled=True, output_channels=2)
         config = CoarseReconstructionConfig(
