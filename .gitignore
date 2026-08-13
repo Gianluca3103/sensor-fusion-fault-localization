@@ -26,6 +26,8 @@ Fault_Localization_Model/grid_reliability*/
 Fault_Localization_Model/*dataset*/
 !Fault_Localization_Model/kradar_dataset/
 !Fault_Localization_Model/kradar_dataset/*.py
+!Fault_Localization_Model/vod_dataset/
+!Fault_Localization_Model/vod_dataset/*.py
 Fault_Localization_Model/*smoke*/
 Fault_Localization_Model/test_*heatmaps*/
 Fault_Localization_Model/**/*.npz

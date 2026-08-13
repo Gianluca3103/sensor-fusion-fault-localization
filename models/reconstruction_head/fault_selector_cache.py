@@ -60,6 +60,19 @@ def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:
             for name in names
         }
         metadata = json.loads(str(sample["metadata_json"].item()))
+        stored_support = (
+            np.asarray(sample["valid_support_mask"], dtype=np.float32)
+            if "valid_support_mask" in sample.files
+            else None
+        )
+    if stored_support is not None:
+        if stored_support.shape != arrays["fault_heatmap"].shape:
+            raise ValueError(
+                "valid_support_mask must align with fault_heatmap; got "
+                f"{stored_support.shape} and {arrays['fault_heatmap'].shape}"
+            )
+        arrays["valid_support_mask"] = stored_support
+        return arrays
     try:
         arrays["valid_support_mask"] = radar_bev_support_mask(
             arrays["fault_heatmap"].shape,

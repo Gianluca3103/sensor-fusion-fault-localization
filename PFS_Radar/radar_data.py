@@ -64,6 +64,19 @@ def session_name_from_metadata(metadata: dict) -> str:
 
 
 def radar_cache_path(radar_root: Path, metadata: dict) -> Path:
+    if str(metadata.get("dataset", "")).strip().lower() in {
+        "view-of-delft",
+        "view of delft",
+        "vod",
+    }:
+        split = _safe_metadata_component(metadata.get("split"), "split")
+        frame_id = _safe_metadata_component(
+            metadata.get("frame_id", metadata.get("radar_index")),
+            "frame_id",
+        )
+        if not frame_id.isdigit():
+            raise ValueError("View-of-Delft frame_id must be numeric")
+        return Path(radar_root) / split / f"{int(frame_id):05d}.npz"
     if "sequence" in metadata and "radar_index" in metadata:
         sequence = _safe_metadata_component(metadata["sequence"], "sequence")
         radar_index = _safe_metadata_component(
