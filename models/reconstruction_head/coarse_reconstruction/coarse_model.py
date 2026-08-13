@@ -70,6 +70,38 @@ class ResidualCoarseBlock(nn.Module):
         return self.activation(self.main(tensor) + self.shortcut(tensor))
 
 
+class RadarSpatialContextEncoder(nn.Module):
+    """Aggregate neighboring radar cells without changing the BEV grid."""
+
+    def __init__(self, channels: int, hidden_channels: int, layer_count: int):
+        super().__init__()
+        if layer_count < 1:
+            raise ValueError("layer_count must be positive")
+        layers: list[nn.Module] = []
+        for index in range(layer_count):
+            in_channels = channels if index == 0 else hidden_channels
+            out_channels = channels if index == layer_count - 1 else hidden_channels
+            layers.extend(
+                (
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        dilation=1,
+                        bias=False,
+                    ),
+                    nn.SiLU(inplace=True),
+                )
+            )
+        self.network = nn.Sequential(*layers)
+        self.effective_receptive_field_cells = 1 + 2 * layer_count
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self.network(tensor)
+
+
 class LocalUNetEncoder(nn.Module):
     def __init__(self, in_channels: int, base_channels: int, depth: int, dropout: float):
         super().__init__()
@@ -320,6 +352,7 @@ class CoarseReconstructionModel(nn.Module):
         self.grid_geometry = grid_geometry
         self.lidar_pillar_encoder = None
         self.radar_pillar_encoder = None
+        self.radar_context_encoder: nn.Module = nn.Identity()
         if self.config.pointpillars.enabled:
             if grid_geometry is None:
                 raise ValueError(
@@ -384,6 +417,12 @@ class CoarseReconstructionModel(nn.Module):
             )
             replacement_channels = self.sst_reconstruction_head.out_channels
         elif self.config.backbone == "hrnet":
+            if self.config.hrnet.radar_context_layers:
+                self.radar_context_encoder = RadarSpatialContextEncoder(
+                    self.config.radar_channels,
+                    self.config.hrnet.radar_context_channels,
+                    self.config.hrnet.radar_context_layers,
+                )
             self.hrnet_backbone = HRNetBackbone(
                 self.config.local_input_channels,
                 self.config.hrnet,
@@ -526,10 +565,13 @@ class CoarseReconstructionModel(nn.Module):
         if not local_radar_enabled:
             local_radar_bev = torch.zeros_like(radar_sensor_bev)
         local_radar_active = active_mask * local_radar_bev
+        local_radar_context = active_mask * self.radar_context_encoder(
+            local_radar_active
+        )
         local_input = torch.cat(
             (
                 local_lidar_context,
-                local_radar_active,
+                local_radar_context,
                 *local_mask_channels,
             ),
             dim=1,
@@ -570,6 +612,7 @@ class CoarseReconstructionModel(nn.Module):
             "local_context_mask": local_context_mask,
             "local_lidar_context": local_lidar_context,
             "local_radar_active": local_radar_active,
+            "local_radar_context": local_radar_context,
             "local_input": local_input,
             "hrnet_features": hrnet_features,
             "lidar_pillar_bev": lidar_sensor_bev,

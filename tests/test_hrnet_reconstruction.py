@@ -110,6 +110,48 @@ class HRNetBackboneTests(unittest.TestCase):
 
 
 class HRNetIntegrationTests(unittest.TestCase):
+    def test_three_layer_radar_stem_has_exact_seven_cell_receptive_field(self):
+        config, _loss, _selector = build_configs(
+            {
+                "model": {"backbone": "hrnet"},
+                "hrnet": {
+                    "base_channels": 2,
+                    "blocks_per_stage": 1,
+                    "residual_blocks_per_branch": 1,
+                    "radar_context_layers": 3,
+                    "radar_context_channels": 8,
+                },
+                "pointpillars": {"enabled": False},
+                "coarse_reconstruction": {},
+            }
+        )
+        model = CoarseReconstructionModel(config)
+        encoder = model.radar_context_encoder
+        convolutions = [
+            module
+            for module in encoder.modules()
+            if isinstance(module, torch.nn.Conv2d)
+        ]
+        self.assertEqual(len(convolutions), 3)
+        self.assertEqual(encoder.effective_receptive_field_cells, 7)
+        for convolution in convolutions:
+            self.assertEqual(convolution.kernel_size, (3, 3))
+            self.assertEqual(convolution.stride, (1, 1))
+            self.assertEqual(convolution.padding, (1, 1))
+            self.assertEqual(convolution.dilation, (1, 1))
+
+        for convolution in convolutions:
+            torch.nn.init.ones_(convolution.weight)
+        radar = torch.zeros(1, 4, 15, 15)
+        radar[:, 0, 7, 7] = 1.0
+        with torch.no_grad():
+            context = encoder(radar)
+        support = context.abs().sum(dim=1)[0] > 0
+        rows, cols = support.nonzero(as_tuple=True)
+        self.assertEqual((int(rows.min()), int(rows.max())), (4, 10))
+        self.assertEqual((int(cols.min()), int(cols.max())), (4, 10))
+        self.assertEqual(int(support.sum()), 49)
+
     def test_handcrafted_bev_inputs_do_not_require_pointpillars(self):
         config, _loss, _selector = build_configs(
             {

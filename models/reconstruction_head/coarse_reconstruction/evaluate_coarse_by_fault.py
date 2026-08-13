@@ -209,6 +209,25 @@ def _save_comparison(
 ) -> None:
     clean = _bev_rgb(clean_bev)
     coarse = _bev_rgb(coarse_bev)
+    radar = (
+        radar_bev.detach()
+        .to(dtype=torch.float32)
+        .clamp(0.0, 1.0)
+        .cpu()
+        .numpy()
+    )
+    if radar.shape[0] != 4:
+        raise ValueError(
+            f"Expected four radar BEV channels for visualization, got {radar.shape}"
+        )
+    radar_composite = np.stack(
+        (
+            radar[2],
+            radar[3],
+            np.maximum(radar[1], 0.15 * radar[0]),
+        ),
+        axis=-1,
+    ).clip(0.0, 1.0)
     faulty_support = faulty_bev[0].detach().cpu().numpy() >= 0.5
     radar_support = (
         radar_bev.detach()
@@ -228,7 +247,7 @@ def _save_comparison(
         axis=-1,
     ).astype(np.float32)
     mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    figure, axes = plt.subplots(1, 3, figsize=(16, 5), facecolor="black")
+    figure, axes = plt.subplots(2, 4, figsize=(20, 10), facecolor="black")
     panels = (
         (clean, "Clean LiDAR BEV", None),
         (coarse, "Coarse reconstructed LiDAR BEV", None),
@@ -237,8 +256,17 @@ def _save_comparison(
             "Faulty LiDAR + trusted radar\nCyan: LiDAR | Magenta: radar | White: overlap",
             None,
         ),
+        (
+            radar_composite,
+            "Radar composite\nR: speed | G: height | B: power/occupancy",
+            None,
+        ),
+        (radar[0], "Radar 0: Static occupancy", "gray"),
+        (radar[1], "Radar 1: Normalized power", "inferno"),
+        (radar[2], "Radar 2: Dynamic speed", "turbo"),
+        (radar[3], "Radar 3: Robust upper height", "viridis"),
     )
-    for axis, (image, title, cmap) in zip(axes, panels):
+    for axis, (image, title, cmap) in zip(axes.flat, panels):
         axis.imshow(
             image,
             cmap=cmap,
