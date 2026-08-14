@@ -34,9 +34,19 @@ from .coarse_reconstruction.coarse_model import (
 )
 from .coarse_reconstruction.coarse_config import (
     CoarseReconstructionConfig,
+    build_augmentation_config,
     build_configs,
     build_selector_config,
     load_config,
+)
+from .geometric_augmentation import (
+    GeometricAugmentationConfig,
+    GeometricTransform,
+    HorizontalFlipConfig,
+    ReconstructionGeometricAugmentation,
+    ScaleAugmentationConfig,
+    TranslationAugmentationConfig,
+    YawAugmentationConfig,
 )
 from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
@@ -138,6 +148,13 @@ __all__ = [
     "CoarseLossConfig",
     "CoarseReconstructionConfig",
     "CoarseReconstructionModel",
+    "GeometricAugmentationConfig",
+    "GeometricTransform",
+    "HorizontalFlipConfig",
+    "ReconstructionGeometricAugmentation",
+    "ScaleAugmentationConfig",
+    "TranslationAugmentationConfig",
+    "YawAugmentationConfig",
     "coarse_reconstruction_range_metrics",
     "DiffusionDownBlock",
     "DiffusionProcessConfig",
@@ -206,6 +223,7 @@ __all__ = [
     "coarse_reconstruction_metrics",
     "coarse_reconstruction_collate",
     "build_configs",
+    "build_augmentation_config",
     "build_selector_config",
     "build_selector_cache_entry",
     "load_config",

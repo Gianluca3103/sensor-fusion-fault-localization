@@ -13,6 +13,7 @@ from models.reconstruction_head.cache_fault_selector_masks import (
 from models.reconstruction_head import (
     CoarseReconstructionDataset,
     FaultSelectorConfig,
+    GeometricAugmentationConfig,
     InvalidSelectorCacheError,
     build_selector_cache_entry,
     load_selector_cache,
@@ -150,6 +151,18 @@ class FaultSelectorCacheTests(unittest.TestCase):
             point_item = point_dataset[0]
             self.assertEqual(point_item["faulty_lidar_points"].shape, (1, 4))
             self.assertEqual(point_item["radar_points"].shape, (1, 5))
+
+            augmented_dataset = CoarseReconstructionDataset(
+                [sample_path],
+                radar_root,
+                data_root=data_root,
+                selector_config=config,
+                augmentation_config=GeometricAugmentationConfig.from_dict(
+                    {"enabled": True}
+                ),
+            )
+            self.assertIsNotNone(augmented_dataset.augmentation)
+            self.assertIsNone(dataset.augmentation)
 
     def test_changed_selector_configuration_rejects_stale_cache(self):
         with tempfile.TemporaryDirectory() as directory:

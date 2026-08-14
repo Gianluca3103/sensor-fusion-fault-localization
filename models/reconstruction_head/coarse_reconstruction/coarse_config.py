@@ -9,6 +9,7 @@ from pathlib import Path
 from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
 from ..fault_selector import FaultSelectorConfig
 from ..pointpillars import PointPillarsConfig
+from ..geometric_augmentation import GeometricAugmentationConfig
 from .sst_backbone import SSTConfig
 from .repair_query import RepairQueryConfig
 from .hrnet_backbone import HRNetConfig
@@ -211,6 +212,10 @@ def build_selector_config(payload: dict) -> FaultSelectorConfig:
     config = FaultSelectorConfig(**selector_payload)
     config.validate()
     return config
+
+
+def build_augmentation_config(payload: dict) -> GeometricAugmentationConfig:
+    return GeometricAugmentationConfig.from_dict(payload.get("augmentation", {}))
 
 
 def build_configs(payload: dict):

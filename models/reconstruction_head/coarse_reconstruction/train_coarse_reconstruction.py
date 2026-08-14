@@ -29,6 +29,7 @@ from models.reconstruction_head import (
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
     MaskedBEVReconstructionLoss,
+    build_augmentation_config,
     build_configs,
     coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
@@ -479,6 +480,7 @@ def main():
     radar_mode = "none" if args.disable_radar else args.radar_mode
     payload = load_config(args.config)
     model_config, loss_config, selector_config = build_configs(payload)
+    augmentation_config = build_augmentation_config(payload)
     use_global_map = not args.disable_global_map
     if model_config.backbone == "hrnet":
         use_global_map = False
@@ -524,7 +526,11 @@ def main():
         "selector_config": selector_config,
         "use_pointpillars": model_config.pointpillars.enabled,
     }
-    train_dataset = CoarseReconstructionDataset(train_paths, **dataset_options)
+    train_dataset = CoarseReconstructionDataset(
+        train_paths,
+        augmentation_config=augmentation_config,
+        **dataset_options,
+    )
     val_dataset = CoarseReconstructionDataset(val_paths, **dataset_options)
     if train_dataset.grid_geometry != val_dataset.grid_geometry:
         raise ValueError("Training and validation BEV geometry must match")
@@ -566,6 +572,7 @@ def main():
             "model": model_config.to_dict(),
             "loss": asdict(loss_config),
             "selector": selector_config.__dict__,
+            "augmentation": augmentation_config.to_dict(),
             "training": training,
             "args": vars(args),
             "grid_geometry": train_dataset.grid_geometry.to_dict(),
@@ -575,6 +582,7 @@ def main():
     print(f"Device: {device}; AMP: {use_amp}")
     print(f"Radar mode: {radar_mode}")
     print(f"Global map enabled: {use_global_map}")
+    print(f"Training augmentation enabled: {augmentation_config.enabled}")
     print(
         "Sensor representation: "
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
@@ -771,6 +779,7 @@ def main():
             "scaler_state_dict": scaler.state_dict(),
             "model_config": model_config.to_dict(),
             "loss_config": asdict(loss_config),
+            "augmentation_config": augmentation_config.to_dict(),
             "active_fraction_profile": active_fraction_profile,
             "radar_mode": radar_mode,
             "radar_disabled": radar_mode == "none",

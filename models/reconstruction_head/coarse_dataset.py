@@ -15,6 +15,10 @@ from PFS_Radar.radar_data import radar_cache_path
 
 from .fault_selector import FaultSelectorConfig
 from .pointpillars import BEVGridGeometry
+from .geometric_augmentation import (
+    GeometricAugmentationConfig,
+    ReconstructionGeometricAugmentation,
+)
 from .fault_selector_cache import (
     load_selector_cache,
     selector_cache_path,
@@ -165,6 +169,7 @@ class CoarseReconstructionDataset(Dataset):
         data_root: str | Path,
         selector_config: FaultSelectorConfig | None = None,
         use_pointpillars: bool = False,
+        augmentation_config: GeometricAugmentationConfig | None = None,
     ):
         self.sample_paths = tuple(Path(path) for path in sample_paths)
         if not self.sample_paths:
@@ -174,6 +179,14 @@ class CoarseReconstructionDataset(Dataset):
         self.selector_config = selector_config or FaultSelectorConfig()
         self.use_pointpillars = bool(use_pointpillars)
         self.grid_geometry = load_bev_grid_geometry(self.sample_paths[0])
+        self.augmentation = (
+            ReconstructionGeometricAugmentation(
+                augmentation_config,
+                self.grid_geometry,
+            )
+            if augmentation_config is not None and augmentation_config.enabled
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -205,4 +218,6 @@ class CoarseReconstructionDataset(Dataset):
                 )[None],
             }
         )
+        if self.augmentation is not None:
+            item = self.augmentation.apply(item)
         return item
