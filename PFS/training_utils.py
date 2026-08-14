@@ -197,7 +197,11 @@ def split_paths(paths, val_ratio, seed):
 
 
 def _split_paths(data_root, split, limit, seed):
-    """Select samples from an existing dataset split."""
+    """Select a deterministic subset from an existing dataset split.
+
+    Preserve the sorted split order when every available sample is requested.
+    Random sampling is only needed when ``limit`` actually reduces the split.
+    """
     split_root = Path(data_root) / split
     if not split_root.is_dir():
         raise FileNotFoundError(
@@ -208,7 +212,8 @@ def _split_paths(data_root, split, limit, seed):
     if limit is not None:
         if limit < 1:
             raise ValueError("Split sample limits must be positive")
-        paths = random.Random(seed).sample(paths, k=min(limit, len(paths)))
+        if limit < len(paths):
+            paths = random.Random(seed).sample(paths, k=limit)
     if not paths:
         raise FileNotFoundError(f"No samples were found under {split_root}")
     return paths

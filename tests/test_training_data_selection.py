@@ -208,11 +208,15 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 )
 
             all_paths = coarse_split_paths(data_root, "train", None, 17)
+            exact_limit = coarse_split_paths(data_root, "train", 6, 17)
+            oversized_limit = coarse_split_paths(data_root, "train", 10, 17)
             coarse_first = coarse_split_paths(data_root, "train", 3, 17)
             coarse_second = coarse_split_paths(data_root, "train", 3, 17)
             diffusion = diffusion_split_paths(data_root, "train", 3, 17)
 
             self.assertEqual(len(all_paths), 6)
+            self.assertEqual(exact_limit, all_paths)
+            self.assertEqual(oversized_limit, all_paths)
             self.assertEqual(coarse_first, coarse_second)
             self.assertEqual(coarse_first, diffusion)
             self.assertEqual(len(coarse_first), 3)
