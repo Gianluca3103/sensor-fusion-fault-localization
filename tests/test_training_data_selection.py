@@ -1,4 +1,5 @@
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
@@ -215,8 +216,15 @@ class TrainingDataSelectionTests(unittest.TestCase):
             diffusion = diffusion_split_paths(data_root, "train", 3, 17)
 
             self.assertEqual(len(all_paths), 6)
-            self.assertEqual(exact_limit, all_paths)
-            self.assertEqual(oversized_limit, all_paths)
+            expected_full_order = random.Random(17).sample(
+                all_paths,
+                k=len(all_paths),
+            )
+            self.assertEqual(
+                exact_limit,
+                expected_full_order,
+            )
+            self.assertEqual(oversized_limit, expected_full_order)
             self.assertEqual(coarse_first, coarse_second)
             self.assertEqual(coarse_first, diffusion)
             self.assertEqual(len(coarse_first), 3)
