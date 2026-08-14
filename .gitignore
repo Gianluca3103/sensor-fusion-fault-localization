@@ -18,14 +18,11 @@ env/
 data/**
 !data/
 /HerculesFiles/
-/K-Radar-main/
 !data/.gitkeep
 
 # Generated reliability datasets and previews
 Fault_Localization_Model/grid_reliability*/
 Fault_Localization_Model/*dataset*/
-!Fault_Localization_Model/kradar_dataset/
-!Fault_Localization_Model/kradar_dataset/*.py
 !Fault_Localization_Model/vod_dataset/
 !Fault_Localization_Model/vod_dataset/*.py
 Fault_Localization_Model/*smoke*/

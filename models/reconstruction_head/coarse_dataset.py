@@ -60,7 +60,7 @@ def load_bev_triplet(
             if include_pointpillars_inputs and "radar_points" not in radar_cache.files:
                 raise InvalidSampleError(
                     f"{radar_path} has no aligned raw radar points; rebuild the "
-                    "K-Radar RadarV2 cache with cache format version 9 or newer"
+                    "View-of-Delft radar cache"
                 )
             radar = np.asarray(radar_cache["radar_bev"], dtype=np.float32)
             radar_points = (
@@ -102,8 +102,8 @@ def load_bev_triplet(
         if radar_points is None or radar_points.ndim != 2 or radar_points.shape[1] != 5:
             raise InvalidSampleError(
                 f"{radar_path} requires radar_points with shape [N,5] "
-                "([x,y,z,power,doppler]); rebuild the RadarV2 cache for the "
-                "PointPillars experiment"
+                "([x,y,z,power,doppler]); rebuild the View-of-Delft radar "
+                "cache for the PointPillars experiment"
             )
         item["faulty_lidar_points"] = torch.from_numpy(faulty_lidar_points)
         item["radar_points"] = torch.from_numpy(radar_points)

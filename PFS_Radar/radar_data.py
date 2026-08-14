@@ -77,16 +77,6 @@ def radar_cache_path(radar_root: Path, metadata: dict) -> Path:
         if not frame_id.isdigit():
             raise ValueError("View-of-Delft frame_id must be numeric")
         return Path(radar_root) / split / f"{int(frame_id):05d}.npz"
-    if "sequence" in metadata and "radar_index" in metadata:
-        sequence = _safe_metadata_component(metadata["sequence"], "sequence")
-        radar_index = _safe_metadata_component(
-            metadata["radar_index"], "radar_index"
-        )
-        if not sequence.isdigit() or not radar_index.isdigit():
-            raise ValueError(
-                "K-Radar sample metadata sequence and radar_index must be numeric"
-            )
-        return Path(radar_root) / str(int(sequence)) / f"{int(radar_index):05d}.npz"
     timestamp = _safe_metadata_component(metadata.get("timestamp"), "timestamp")
     if not timestamp.isdigit():
         raise ValueError(

@@ -9,7 +9,6 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
-from Fault_Localization_Model.kradar_dataset import radar_bev_support_mask
 from .fault_selector import FaultSelector, FaultSelectorConfig
 
 
@@ -59,33 +58,22 @@ def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:
             name: np.asarray(sample[name], dtype=np.float32)
             for name in names
         }
-        metadata = json.loads(str(sample["metadata_json"].item()))
         stored_support = (
             np.asarray(sample["valid_support_mask"], dtype=np.float32)
             if "valid_support_mask" in sample.files
             else None
         )
-    if stored_support is not None:
-        if stored_support.shape != arrays["fault_heatmap"].shape:
-            raise ValueError(
-                "valid_support_mask must align with fault_heatmap; got "
-                f"{stored_support.shape} and {arrays['fault_heatmap'].shape}"
-            )
-        arrays["valid_support_mask"] = stored_support
-        return arrays
-    try:
-        arrays["valid_support_mask"] = radar_bev_support_mask(
-            arrays["fault_heatmap"].shape,
-            tuple(metadata["x_range"]),
-            tuple(metadata["y_range"]),
-            np.asarray(metadata["radar_from_lidar"], dtype=np.float64),
-            azimuth_range_rad=tuple(metadata["radar_azimuth_range_rad"]),
-            radar_range_m=tuple(metadata["radar_range_m"]),
-        ).astype(np.float32)
-    except (KeyError, TypeError, ValueError) as exc:
+    if stored_support is None:
         raise ValueError(
-            f"Cannot derive nominal radar support for {sample_path}: {exc}"
-        ) from exc
+            f"{sample_path} does not contain valid_support_mask; regenerate the "
+            "View-of-Delft sample before building selector caches"
+        )
+    if stored_support.shape != arrays["fault_heatmap"].shape:
+        raise ValueError(
+            "valid_support_mask must align with fault_heatmap; got "
+            f"{stored_support.shape} and {arrays['fault_heatmap'].shape}"
+        )
+    arrays["valid_support_mask"] = stored_support
     return arrays
 
 

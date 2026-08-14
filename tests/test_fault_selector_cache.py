@@ -28,7 +28,7 @@ class FaultSelectorCacheTests(unittest.TestCase):
         sample_path = data_root / "train" / "sample.npz"
         sample_path.parent.mkdir(parents=True)
         radar_root = root / "radar"
-        radar_path = radar_root / "Scene01" / "01_Day" / "123.npz"
+        radar_path = radar_root / "train" / "00123.npz"
         radar_path.parent.mkdir(parents=True)
 
         heatmap = np.zeros((8, 6), dtype=np.float32)
@@ -40,14 +40,11 @@ class FaultSelectorCacheTests(unittest.TestCase):
         faulty_counts[1, :] = 1.0
         faulty_counts[6, :] = 1.0
         metadata = {
-            "scene": "Scene01",
-            "session": "01_Day",
-            "timestamp": "123",
+            "dataset": "View-of-Delft",
+            "split": "train",
+            "frame_id": "00123",
             "x_range": [0.0, 8.0],
             "y_range": [-3.0, 3.0],
-            "radar_from_lidar": np.eye(4).tolist(),
-            "radar_azimuth_range_rad": [-np.pi, np.pi],
-            "radar_range_m": [0.0, 100.0],
         }
         faulty_density = np.zeros((320, 320), dtype=np.float32)
         faulty_density[::2, ::2] = 1.0
@@ -62,6 +59,7 @@ class FaultSelectorCacheTests(unittest.TestCase):
             added_faulty_counts=np.zeros_like(heatmap),
             missing_faulty_counts=missing,
             moved_faulty_counts=np.zeros_like(heatmap),
+            valid_support_mask=np.ones_like(heatmap, dtype=np.uint8),
             faulty_lidar_points=np.asarray(
                 [[1.0, 0.0, 0.0, 12.0]], dtype=np.float32
             ),

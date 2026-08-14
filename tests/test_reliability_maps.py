@@ -2,27 +2,13 @@ import unittest
 
 import numpy as np
 
-from Fault_Localization_Model.config.defaults import config_defaults
-from Fault_Localization_Model.create_grid_reliability_heatmaps import (
+from Fault_Localization_Model.reliability_maps import (
     make_reliability_maps,
-    mark_bev_point_statuses,
     point_counts_grid,
 )
 
 
 class ReliabilityMapTests(unittest.TestCase):
-    def test_default_reliability_grid_matches_bev_resolution(self):
-        defaults = config_defaults({})
-
-        self.assertEqual(defaults["grid_size"], 320)
-        self.assertEqual(
-            defaults["grid_size"],
-            round(
-                (defaults["x_max"] - defaults["x_min"])
-                / defaults["resolution"]
-            ),
-        )
-
     def test_tolerated_motion_counts_as_correct_at_observed_location(self):
         clean = np.asarray([[0.99, 0.5, 0.0, 1.0]], dtype=np.float32)
         faulty = np.asarray(
@@ -190,32 +176,6 @@ class ReliabilityMapTests(unittest.TestCase):
         counts = point_counts_grid(points, 0, 10, -5, 5, 10, 10)
         self.assertEqual(counts.shape, (10, 10))
         self.assertEqual(float(counts.sum()), 2.0)
-
-    def test_status_overlay_uses_only_id_based_fault_classes(self):
-        clean = np.array([[0.25, 0.25, 0.0, 1.0]], dtype=np.float32)
-        faulty = np.array(
-            [[1.0, 1.0, 0.0, 1.0], [1.75, 1.75, 0.0, 1.0]],
-            dtype=np.float32,
-        )
-        overlay, counts = mark_bev_point_statuses(
-            clean,
-            faulty,
-            np.array([1], dtype=np.int8),
-            np.array([2, 3], dtype=np.int8),
-            np.zeros((20, 20, 3), dtype=np.uint8),
-            0,
-            2,
-            0,
-            2,
-        )
-
-        self.assertEqual(counts["missing_points_marked"], 1)
-        self.assertEqual(counts["moved_points_marked"], 1)
-        self.assertEqual(counts["added_points_marked"], 1)
-        self.assertTrue(np.any(np.all(overlay == np.array([255, 80, 0]), axis=2)))
-        self.assertTrue(np.any(np.all(overlay == np.array([0, 255, 255]), axis=2)))
-        self.assertTrue(np.any(np.all(overlay == np.array([255, 255, 0]), axis=2)))
-
 
 if __name__ == "__main__":
     unittest.main()
