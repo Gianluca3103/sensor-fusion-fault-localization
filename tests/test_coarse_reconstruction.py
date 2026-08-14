@@ -152,6 +152,33 @@ class CoarseReconstructionTests(unittest.TestCase):
             torch.equal(output["local_input"][:, -1:], reconstruction)
         )
 
+    def test_halo_context_can_be_disabled_without_disabling_global_map(self):
+        config = CoarseReconstructionConfig(
+            unet_base_channels=4,
+            unet_depth=3,
+            global_base_channels=4,
+            global_channel_multipliers=(1, 2, 4),
+            attention_dim=16,
+            num_heads=4,
+            use_halo_context=False,
+        )
+        model = CoarseReconstructionModel(config).eval()
+        faulty, radar, reconstruction, healthy, halo, _clean = _inputs()
+        with torch.no_grad():
+            output = model(faulty, radar, reconstruction, healthy, halo)
+
+        self.assertEqual(output["local_input"].shape, (2, 9, 32, 32))
+        self.assertTrue(torch.count_nonzero(output["local_lidar_context"]) == 0)
+        self.assertTrue(torch.equal(output["active_mask"], reconstruction))
+        self.assertTrue(
+            torch.count_nonzero(
+                output["local_input"][:, 3:7] * (1.0 - reconstruction)
+            )
+            == 0
+        )
+        self.assertIn("global_context_map", output)
+        self.assertIn("attention_context", output)
+
     def test_default_spatial_progression_reaches_twenty_by_twenty(self):
         config = CoarseReconstructionConfig(
             unet_base_channels=2,

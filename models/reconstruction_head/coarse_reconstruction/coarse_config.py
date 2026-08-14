@@ -26,6 +26,7 @@ class CoarseReconstructionConfig:
     unet_depth: int = 4
     dropout: float = 0.025
     use_healthy_context_mask: bool = True
+    use_halo_context: bool = True
     global_base_channels: int = 16
     global_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8, 16)
     attention_dim: int = 128
@@ -85,6 +86,8 @@ class CoarseReconstructionConfig:
             raise ValueError("dropout must be in [0,1)")
         if not isinstance(self.use_healthy_context_mask, bool):
             raise ValueError("use_healthy_context_mask must be boolean")
+        if not isinstance(self.use_halo_context, bool):
+            raise ValueError("use_halo_context must be boolean")
         if not 0.0 <= self.attention_dropout < 1.0:
             raise ValueError("attention_dropout must be in [0,1)")
         self.pointpillars.validate()
@@ -327,6 +330,9 @@ def build_configs(payload: dict):
         dropout=unet.get("dropout", defaults.dropout),
         use_healthy_context_mask=unet.get(
             "use_healthy_context_mask", defaults.use_healthy_context_mask
+        ),
+        use_halo_context=unet.get(
+            "use_halo_context", defaults.use_halo_context
         ),
         global_base_channels=global_context.get(
             "base_channels", defaults.global_base_channels
