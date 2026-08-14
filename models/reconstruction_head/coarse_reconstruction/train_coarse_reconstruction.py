@@ -133,6 +133,10 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    if "lidar_input_bev" in batch:
+        moved["lidar_input_bev"] = batch["lidar_input_bev"].to(
+            device, non_blocking=True
+        )
     for key in ("faulty_lidar_points", "radar_points"):
         if key in batch:
             moved[key] = tuple(
@@ -386,6 +390,10 @@ def _run_epoch(
                 }
                 if sparse_backbone_enabled:
                     model_options["profile_sst"] = measure_runtime
+                if "lidar_input_bev" in inputs:
+                    model_options["lidar_input_bev"] = inputs[
+                        "lidar_input_bev"
+                    ]
                 if pointpillars_enabled:
                     model_options.update(
                         {

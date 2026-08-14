@@ -55,6 +55,11 @@ def load_bev_triplet(
                 if "observability_confidence" in sample.files
                 else None
             )
+            lidar_input_bev = (
+                np.asarray(sample["faulty_lidar_input_bev"], dtype=np.float32)
+                if "faulty_lidar_input_bev" in sample.files
+                else None
+            )
         radar_path = radar_cache_path(radar_root, metadata)
         with np.load(radar_path, allow_pickle=False) as radar_cache:
             if include_pointpillars_inputs and "radar_points" not in radar_cache.files:
@@ -85,6 +90,13 @@ def load_bev_triplet(
         ),
         "sample_path": str(sample_path),
     }
+    if lidar_input_bev is not None:
+        if lidar_input_bev.ndim != 3 or lidar_input_bev.shape[1:] != clean.shape[:2]:
+            raise InvalidSampleError(
+                "faulty_lidar_input_bev must have shape [C,H,W] aligned with "
+                f"the target BEV; got {lidar_input_bev.shape}"
+            )
+        item["lidar_input_bev"] = torch.from_numpy(lidar_input_bev)
     if observability is not None:
         if observability.shape != clean.shape[:2]:
             raise InvalidSampleError(

@@ -1,0 +1,71 @@
+{
+  "model": {
+    "backbone": "hrnet",
+    "lidar_channels": 6,
+    "radar_channels": 7
+  },
+  "hrnet": {
+    "base_channels": 16,
+    "num_stages": 4,
+    "blocks_per_stage": 2,
+    "residual_blocks_per_branch": 2,
+    "dropout": 0.1
+  },
+  "pointpillars": {
+    "enabled": false
+  },
+  "coarse_reconstruction": {
+    "enabled": true,
+    "unet": {
+      "base_channels": 16,
+      "depth": 4,
+      "normalization": "group_norm",
+      "activation": "silu",
+      "dropout": 0.0,
+      "use_healthy_context_mask": true,
+      "use_halo_context": true
+    },
+    "global_context": {
+      "base_channels": 16,
+      "channel_multipliers": [1, 2, 4, 8, 16],
+      "attention_dim": 128,
+      "num_heads": 4,
+      "attention_dropout": 0.0,
+      "return_attention_during_validation": false
+    },
+    "loss": {
+      "lambda_occupancy": 1.0,
+      "lambda_density": 1.0,
+      "lambda_height": 1.0,
+      "epsilon": 1e-8,
+      "observability_weighting": {
+        "enabled": true,
+        "min_empty_weight": 0.1
+      }
+    }
+  },
+  "fault_selector": {
+    "min_lidar_loss_fraction": 0.95,
+    "min_repair_box_cells": 5,
+    "min_repair_fault_fraction": 0.95,
+    "min_halo_healthy_fraction": 0.9,
+    "min_halo_healthy_cells": 64,
+    "min_halo_context_ratio": 0.25,
+    "min_halo_width_cells": 4,
+    "max_halo_dilation_cells": 64
+  },
+  "augmentation": {
+    "enabled": false
+  },
+  "training": {
+    "epochs": 150,
+    "batch_size": 12,
+    "num_workers": 8,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.005,
+    "grad_clip": 1.0,
+    "mixed_precision": true,
+    "save_conditioning_samples": 4,
+    "seed": 42
+  }
+}

@@ -136,22 +136,14 @@ class CoarseReconstructionConfig:
             raise ValueError(
                 f"The {self.backbone} backbone requires PointPillars inputs"
             )
-        expected_lidar = (
-            self.pointpillars.output_channels
-            if self.pointpillars.enabled
-            else 3
-        )
-        expected_radar = (
-            self.pointpillars.output_channels
-            if self.pointpillars.enabled
-            else 4
-        )
-        if self.lidar_channels != expected_lidar:
+        expected_lidar = self.pointpillars.output_channels
+        expected_radar = self.pointpillars.output_channels
+        if self.pointpillars.enabled and self.lidar_channels != expected_lidar:
             raise ValueError(
                 "lidar_channels does not match the selected sensor representation: "
                 f"expected {expected_lidar}, got {self.lidar_channels}"
             )
-        if self.radar_channels != expected_radar:
+        if self.pointpillars.enabled and self.radar_channels != expected_radar:
             raise ValueError(
                 "radar_channels does not match the selected sensor representation: "
                 f"expected {expected_radar}, got {self.radar_channels}"
@@ -232,7 +224,11 @@ def build_configs(payload: dict):
     model_payload = payload.get("model", {})
     if not isinstance(model_payload, dict):
         raise ValueError("model must be an object")
-    unknown_model_fields = set(model_payload) - {"backbone"}
+    unknown_model_fields = set(model_payload) - {
+        "backbone",
+        "lidar_channels",
+        "radar_channels",
+    }
     if unknown_model_fields:
         raise ValueError(
             "Unknown model settings: " + ", ".join(sorted(unknown_model_fields))
@@ -322,8 +318,16 @@ def build_configs(payload: dict):
         )
     pointpillars = PointPillarsConfig(**pointpillars_payload)
     pointpillars.validate()
-    lidar_channels = pointpillars.output_channels if pointpillars.enabled else 3
-    radar_channels = pointpillars.output_channels if pointpillars.enabled else 4
+    lidar_channels = (
+        pointpillars.output_channels
+        if pointpillars.enabled
+        else int(model_payload.get("lidar_channels", 3))
+    )
+    radar_channels = (
+        pointpillars.output_channels
+        if pointpillars.enabled
+        else int(model_payload.get("radar_channels", 4))
+    )
     model_config = CoarseReconstructionConfig(
         backbone=backbone,
         lidar_channels=lidar_channels,

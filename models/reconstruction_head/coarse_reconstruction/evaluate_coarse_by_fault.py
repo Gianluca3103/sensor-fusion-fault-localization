@@ -68,6 +68,10 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
+    if "lidar_input_bev" in batch:
+        moved["lidar_input_bev"] = batch["lidar_input_bev"].to(
+            device, non_blocking=True
+        )
     for key in ("faulty_lidar_points", "radar_points"):
         if key in batch:
             moved[key] = tuple(
@@ -457,6 +461,7 @@ def main() -> None:
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
+                    lidar_input_bev=inputs.get("lidar_input_bev"),
                     local_radar_bev=local_radar_bev,
                     faulty_lidar_points=inputs.get("faulty_lidar_points"),
                     radar_points=inputs.get("radar_points"),

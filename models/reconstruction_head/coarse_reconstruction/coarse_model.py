@@ -579,6 +579,7 @@ class CoarseReconstructionModel(nn.Module):
         healthy_context_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         *,
+        lidar_input_bev: torch.Tensor | None,
         local_radar_bev: torch.Tensor | None,
         faulty_lidar_points: Sequence[torch.Tensor] | None,
         radar_points: Sequence[torch.Tensor] | None,
@@ -592,7 +593,11 @@ class CoarseReconstructionModel(nn.Module):
             radar_pillar_statistics,
             radar_pillar_attention_debug,
         ) = self._sensor_features(
-            faulty_lidar_bev,
+            (
+                lidar_input_bev
+                if lidar_input_bev is not None
+                else faulty_lidar_bev
+            ),
             radar_bev,
             faulty_lidar_points,
             radar_points,
@@ -988,6 +993,7 @@ class CoarseReconstructionModel(nn.Module):
         healthy_context_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         *,
+        lidar_input_bev: torch.Tensor | None = None,
         local_radar_bev: torch.Tensor | None = None,
         faulty_lidar_points: Sequence[torch.Tensor] | None = None,
         radar_points: Sequence[torch.Tensor] | None = None,
@@ -1028,6 +1034,7 @@ class CoarseReconstructionModel(nn.Module):
                 reconstruction_mask,
                 healthy_context_mask,
                 halo_mask,
+                lidar_input_bev=lidar_input_bev,
                 local_radar_bev=local_radar_bev,
                 faulty_lidar_points=faulty_lidar_points,
                 radar_points=radar_points,
@@ -1041,7 +1048,11 @@ class CoarseReconstructionModel(nn.Module):
             radar_pillar_statistics,
             radar_pillar_attention_debug,
         ) = self._sensor_features(
-            faulty_lidar_bev,
+            (
+                lidar_input_bev
+                if lidar_input_bev is not None
+                else faulty_lidar_bev
+            ),
             radar_bev,
             faulty_lidar_points,
             radar_points,

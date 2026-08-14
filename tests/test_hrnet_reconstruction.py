@@ -183,6 +183,55 @@ class HRNetIntegrationTests(unittest.TestCase):
         self.assertEqual(outputs["local_input"].shape, (1, 9, 32, 32))
         self.assertEqual(outputs["coarse_lidar_bev"].shape, faulty.shape)
 
+    def test_engineered_bev_inputs_keep_three_channel_target(self):
+        config, _loss, _selector = build_configs(
+            {
+                "model": {
+                    "backbone": "hrnet",
+                    "lidar_channels": 6,
+                    "radar_channels": 7,
+                },
+                "hrnet": {
+                    "base_channels": 2,
+                    "blocks_per_stage": 1,
+                    "residual_blocks_per_branch": 1,
+                },
+                "pointpillars": {"enabled": False},
+                "coarse_reconstruction": {},
+            }
+        )
+        model = CoarseReconstructionModel(config).eval()
+        faulty_target = torch.rand(1, 3, 32, 32)
+        lidar_input = torch.rand(1, 6, 32, 32)
+        radar = torch.rand(1, 7, 32, 32)
+        repair = torch.zeros(1, 1, 32, 32)
+        repair[:, :, 8:24, 8:24] = 1
+        halo = torch.zeros_like(repair)
+        halo[:, :, 6:26, 6:26] = 1
+        halo *= 1 - repair
+
+        with torch.no_grad():
+            outputs = model(
+                faulty_target,
+                radar,
+                repair,
+                halo,
+                halo,
+                lidar_input_bev=lidar_input,
+            )
+
+        self.assertEqual(outputs["lidar_sensor_bev"].shape[1], 6)
+        self.assertEqual(outputs["radar_sensor_bev"].shape[1], 7)
+        self.assertEqual(outputs["local_input"].shape, (1, 15, 32, 32))
+        self.assertEqual(outputs["coarse_lidar_bev"].shape, faulty_target.shape)
+        outside = 1 - repair
+        self.assertTrue(
+            torch.equal(
+                outputs["coarse_lidar_bev"] * outside,
+                faulty_target * outside,
+            )
+        )
+
     def test_input_erasure_output_heads_and_outside_mask_invariant(self):
         pointpillars = PointPillarsConfig(enabled=True, output_channels=2)
         config = CoarseReconstructionConfig(

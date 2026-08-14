@@ -368,6 +368,10 @@ class ReconstructionGeometricAugmentation:
                 output[key] = self._warp_lidar_bev(
                     output[key], transform, grid
                 )
+        if "lidar_input_bev" in output:
+            output["lidar_input_bev"] = self._warp_radar_bev(
+                output["lidar_input_bev"], transform, grid
+            )
         if "radar_bev" in output:
             output["radar_bev"] = self._warp_radar_bev(
                 output["radar_bev"], transform, grid
