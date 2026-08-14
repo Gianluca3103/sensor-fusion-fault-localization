@@ -6,6 +6,7 @@ import argparse
 import atexit
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -445,7 +446,9 @@ def _run_epoch(
                 inputs["clean_bev"],
                 loss_fn.config.epsilon,
                 inputs.get("observability_confidence"),
-                include_tolerant=not training,
+                include_tolerant=True,
+                resolution_m=loss_fn.bev_resolution_m,
+                tolerance_m=loss_fn.config.occupancy.tolerance_radius_m,
             )
         batch_size = inputs["faulty_bev"].shape[0]
         samples += batch_size
@@ -559,7 +562,22 @@ def main():
             else None
         ),
     ).to(device)
-    loss_fn = MaskedBEVReconstructionLoss(loss_config)
+    geometry = train_dataset.grid_geometry
+    if not math.isclose(
+        geometry.pillar_size_x,
+        geometry.pillar_size_y,
+        rel_tol=1.0e-6,
+        abs_tol=1.0e-9,
+    ):
+        raise ValueError(
+            "Tolerance-aware occupancy requires square BEV cells; got "
+            f"{geometry.pillar_size_x:.6f}m x "
+            f"{geometry.pillar_size_y:.6f}m"
+        )
+    loss_fn = MaskedBEVReconstructionLoss(
+        loss_config,
+        bev_resolution_m=geometry.pillar_size_x,
+    )
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=float(training.get("learning_rate", 2.0e-4)),
@@ -596,6 +614,19 @@ def main():
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
     print(f"Reconstruction backbone: {model_config.backbone}")
+    print(f"Occupancy loss: {loss_config.occupancy.type}")
+    if loss_config.occupancy.type == "tolerance_aware":
+        print(
+            "Tolerance-aware occupancy: "
+            f"exact={loss_config.occupancy.exact_weight:g}, "
+            "tolerant_recall="
+            f"{loss_config.occupancy.tolerant_recall_weight:g}, "
+            f"far_fp={loss_config.occupancy.far_fp_weight:g}, "
+            f"requested_radius={loss_config.occupancy.tolerance_radius_m:.3f}m, "
+            f"cell_radius={loss_fn.tolerance_radius_cells}, "
+            "effective_axis_radius="
+            f"{loss_fn.tolerance_radius_cells * loss_fn.bev_resolution_m:.3f}m"
+        )
     trainable_parameters = sum(
         parameter.numel()
         for parameter in model.parameters()
@@ -629,6 +660,7 @@ def main():
             )
     history = []
     best_validation = float("inf")
+    best_tolerant_iou = float("-inf")
     active_fraction_profile = None
     for epoch in range(1, epochs + 1):
         train_active_fractions = [] if epoch == 1 else None
@@ -751,6 +783,22 @@ def main():
                 "val/high_obs_hallucination="
                 f"{val_stats['hallucination_rate_high_observability']:.3%} "
             )
+        occupancy_component_log = ""
+        if loss_config.occupancy.type == "tolerance_aware":
+            occupancy_component_log = (
+                "train/occ_exact="
+                f"{train_stats['loss_occupancy_exact']:.6f} "
+                "train/occ_tol_recall="
+                f"{train_stats['loss_occupancy_tolerant_recall']:.6f} "
+                "train/occ_far_fp="
+                f"{train_stats['loss_occupancy_far_fp']:.6f} "
+                "val/occ_exact="
+                f"{val_stats['loss_occupancy_exact']:.6f} "
+                "val/occ_tol_recall="
+                f"{val_stats['loss_occupancy_tolerant_recall']:.6f} "
+                "val/occ_far_fp="
+                f"{val_stats['loss_occupancy_far_fp']:.6f} "
+            )
         print(
             f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
             f"train/occupancy={train_stats['loss_occupancy']:.6f} "
@@ -760,20 +808,31 @@ def main():
             f"{train_stats['coarse_occupancy_exact_f1']:.3%} "
             "train/exact_IoU="
             f"{train_stats['coarse_occupancy_exact_iou']:.3%} "
+            f"train/exact_P={train_stats['coarse_occupancy_exact_precision']:.3%} "
+            f"train/exact_R={train_stats['coarse_occupancy_exact_recall']:.3%} "
+            f"train/tol_P={train_stats['coarse_occupancy_tolerant_precision']:.3%} "
+            f"train/tol_R={train_stats['coarse_occupancy_tolerant_recall']:.3%} "
             f"val/loss={val_stats['loss']:.6f} "
             f"val/occupancy={val_stats['loss_occupancy']:.6f} "
             f"val/density={val_stats['loss_density']:.6f} "
             f"val/height={val_stats['loss_height']:.6f} "
             f"val/exact_F1={val_stats['coarse_occupancy_exact_f1']:.3%} "
             f"val/exact_IoU={val_stats['coarse_occupancy_exact_iou']:.3%} "
+            f"val/exact_P={val_stats['coarse_occupancy_exact_precision']:.3%} "
+            f"val/exact_R={val_stats['coarse_occupancy_exact_recall']:.3%} "
             "val/F1@0.5m="
             f"{val_stats['coarse_occupancy_tolerant_0_5m_f1']:.3%} "
             "val/IoU@0.5m="
             f"{val_stats['coarse_occupancy_tolerant_0_5m_iou']:.3%} "
+            "val/P@0.5m="
+            f"{val_stats['coarse_occupancy_tolerant_0_5m_precision']:.3%} "
+            "val/R@0.5m="
+            f"{val_stats['coarse_occupancy_tolerant_0_5m_recall']:.3%} "
             f"val/hallucination="
             f"{val_stats['coarse_occupancy_hallucination_rate']:.3%} "
             f"val/height_mae={val_stats['coarse_height_mae_m']:.3f}m "
             f"{observability_log}"
+            f"{occupancy_component_log}"
             f"outside_change={val_stats['outside_mask_max_change']:.3e} "
             f"train_time={train_seconds:.1f}s "
             f"val_time={validation_seconds:.1f}s "
@@ -799,6 +858,13 @@ def main():
         if val_stats["loss"] < best_validation:
             best_validation = val_stats["loss"]
             atomic_torch_save(checkpoint, output_root / "best_model.pt")
+        validation_tolerant_iou = val_stats["coarse_occupancy_tolerant_iou"]
+        if validation_tolerant_iou > best_tolerant_iou:
+            best_tolerant_iou = validation_tolerant_iou
+            atomic_torch_save(
+                checkpoint,
+                output_root / "best_tolerant_iou.pt",
+            )
         write_csv_rows(
             output_root / "history.csv",
             history,

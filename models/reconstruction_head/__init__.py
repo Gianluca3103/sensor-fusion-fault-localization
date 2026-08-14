@@ -52,9 +52,11 @@ from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
     ObservabilityWeightingConfig,
+    OccupancyLossConfig,
     coarse_reconstruction_metrics,
     coarse_reconstruction_range_metrics,
     occupancy_bce_weights,
+    tolerance_radius_cells,
 )
 from .coarse_dataset import (
     CoarseReconstructionDataset,
@@ -179,6 +181,7 @@ __all__ = [
     "LocalUNetEncoder",
     "MaskedBEVReconstructionLoss",
     "ObservabilityWeightingConfig",
+    "OccupancyLossConfig",
     "MaskedEpsilonMSELoss",
     "MaskedResidualDiffusion",
     "PillarFeatureNet",
@@ -229,6 +232,7 @@ __all__ = [
     "load_config",
     "load_bev_grid_geometry",
     "occupancy_bce_weights",
+    "tolerance_radius_cells",
     "bev_occupancy",
     "load_frozen_coarse_model",
     "load_selector_cache",

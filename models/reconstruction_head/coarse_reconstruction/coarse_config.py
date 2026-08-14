@@ -6,7 +6,11 @@ from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
 
-from .coarse_loss import CoarseLossConfig, ObservabilityWeightingConfig
+from .coarse_loss import (
+    CoarseLossConfig,
+    ObservabilityWeightingConfig,
+    OccupancyLossConfig,
+)
 from ..fault_selector import FaultSelectorConfig
 from ..pointpillars import PointPillarsConfig
 from ..geometric_augmentation import GeometricAugmentationConfig
@@ -372,6 +376,7 @@ def build_configs(payload: dict):
         "lambda_height",
         "epsilon",
         "observability_weighting",
+        "occupancy",
     }
     unknown_loss_fields = set(loss_payload) - allowed_loss_fields
     if unknown_loss_fields:
@@ -391,6 +396,22 @@ def build_configs(payload: dict):
             "Unknown observability_weighting settings: "
             + ", ".join(sorted(unknown_observability_fields))
         )
+    occupancy_payload = loss_payload.get("occupancy", {})
+    if not isinstance(occupancy_payload, dict):
+        raise ValueError("coarse loss occupancy must be an object")
+    allowed_occupancy_fields = {
+        "type",
+        "exact_weight",
+        "tolerant_recall_weight",
+        "far_fp_weight",
+        "tolerance_radius_m",
+    }
+    unknown_occupancy_fields = set(occupancy_payload) - allowed_occupancy_fields
+    if unknown_occupancy_fields:
+        raise ValueError(
+            "Unknown occupancy loss settings: "
+            + ", ".join(sorted(unknown_occupancy_fields))
+        )
     loss_config = CoarseLossConfig(
         lambda_occupancy=loss_payload.get("lambda_occupancy", 1.0),
         lambda_density=loss_payload.get("lambda_density", 1.0),
@@ -400,6 +421,17 @@ def build_configs(payload: dict):
             enabled=observability_payload.get("enabled", False),
             min_empty_weight=observability_payload.get(
                 "min_empty_weight", 0.1
+            ),
+        ),
+        occupancy=OccupancyLossConfig(
+            type=occupancy_payload.get("type", "existing"),
+            exact_weight=occupancy_payload.get("exact_weight", 0.25),
+            tolerant_recall_weight=occupancy_payload.get(
+                "tolerant_recall_weight", 1.0
+            ),
+            far_fp_weight=occupancy_payload.get("far_fp_weight", 0.5),
+            tolerance_radius_m=occupancy_payload.get(
+                "tolerance_radius_m", 0.5
             ),
         ),
     )
