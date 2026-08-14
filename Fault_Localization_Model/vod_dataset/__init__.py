@@ -1,6 +1,7 @@
 """View-of-Delft discovery, decoding, and calibration helpers."""
 
 from .vod_io import (
+    SUPPORTED_RADAR_VARIANTS,
     VOD_LIDAR_FIELDS,
     VOD_RADAR_FIELDS,
     VODFrame,
@@ -10,8 +11,22 @@ from .vod_io import (
     load_vod_radar,
     load_vod_radar_to_lidar,
 )
+from .radar_accumulation import (
+    accumulate_vod_radar_scans,
+    load_vod_odom_from_camera,
+    radar_current_from_source,
+    transform_radar_scan,
+)
+from .channel_analysis import (
+    BEVGeometry,
+    LIDAR_UNAVAILABLE_CHANNELS,
+    RADAR_CHANNEL_NOTES,
+    lidar_analysis_channels,
+    radar_analysis_channels,
+)
 
 __all__ = [
+    "SUPPORTED_RADAR_VARIANTS",
     "VOD_LIDAR_FIELDS",
     "VOD_RADAR_FIELDS",
     "VODFrame",
@@ -20,4 +35,13 @@ __all__ = [
     "load_vod_lidar",
     "load_vod_radar",
     "load_vod_radar_to_lidar",
+    "accumulate_vod_radar_scans",
+    "load_vod_odom_from_camera",
+    "radar_current_from_source",
+    "transform_radar_scan",
+    "BEVGeometry",
+    "LIDAR_UNAVAILABLE_CHANNELS",
+    "RADAR_CHANNEL_NOTES",
+    "lidar_analysis_channels",
+    "radar_analysis_channels",
 ]

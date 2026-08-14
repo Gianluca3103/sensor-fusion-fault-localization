@@ -78,7 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radar-variant",
         default="radar_3frames",
-        choices=("radar", "radar_3frames", "radar_5frames"),
+        choices=(
+            "radar",
+            "radar_3frames",
+            "radar_5frames",
+            "radar_10frames",
+            "radar_20frames",
+        ),
         help="Use the official accumulated three-scan radar release by default.",
     )
     parser.add_argument("--num-samples", type=int)

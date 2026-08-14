@@ -19,7 +19,13 @@ VOD_RADAR_FIELDS = (
     "compensated_radial_velocity",
     "time_index",
 )
-SUPPORTED_RADAR_VARIANTS = ("radar", "radar_3frames", "radar_5frames")
+SUPPORTED_RADAR_VARIANTS = (
+    "radar",
+    "radar_3frames",
+    "radar_5frames",
+    "radar_10frames",
+    "radar_20frames",
+)
 
 
 @dataclass(frozen=True)

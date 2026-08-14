@@ -39,6 +39,22 @@ Repeat with `--split val` and `--split test`. The generated samples contain a
 320x320 `valid_support_mask`, so selector-cache generation has no dependency on
 dataset-specific geometry code.
 
+To inspect the full set of physical and derived channels supported by VoD's
+five-frame radar release alongside LiDAR statistics:
+
+```powershell
+python -m scripts.export_vod_channel_analysis `
+  --vod-root "C:\path\to\View-Of-Delft dataset" `
+  --output-root "C:\path\to\vod_5stack_channel_analysis" `
+  --split train `
+  --limit 50
+```
+
+The command writes physical-unit channel arrays to compressed NPZ files and
+separate radar/LiDAR channel-grid PNGs. Its manifest explicitly distinguishes
+measured fields from radial-only derived velocity projections and unavailable
+LiDAR timestamps.
+
 ```powershell
 python -m models.reconstruction_head.cache_fault_selector_masks `
   --data-root "C:\path\to\reconstruction_vod_radar3_unique" `
@@ -69,3 +85,20 @@ configurations are available under `configs/` with the
 ```powershell
 python -m unittest discover -s tests -v
 ```
+### View-of-Delft 10/20-frame radar accumulation
+
+Generate ego-motion compensated radar histories from the single-frame VoD
+release. Histories never cross recording boundaries; RCS and Doppler fields
+are retained and `time_index` runs from the oldest scan to zero for the
+current scan.
+
+```powershell
+python -m scripts.generate_vod_accumulated_radar `
+  --vod-root "C:\Users\gianl\Desktop\Thesis\View-Of-Delft dataset" `
+  --stack-sizes 10 20 `
+  --num-workers 8
+```
+
+The output is written under `view_of_delft_PUBLIC/radar_10frames` and
+`view_of_delft_PUBLIC/radar_20frames`. Both variants can be selected with
+`--radar-variant` when creating reconstruction inputs.
