@@ -19,10 +19,14 @@ from .radar_accumulation import (
 )
 from .channel_analysis import (
     BEVGeometry,
+    ENGINEERED_LIDAR_CHANNELS,
+    ENGINEERED_RADAR_CHANNELS,
     LIDAR_UNAVAILABLE_CHANNELS,
     RADAR_CHANNEL_NOTES,
     lidar_analysis_channels,
+    lidar_model_channels,
     radar_analysis_channels,
+    radar_model_channels,
 )
 
 __all__ = [
@@ -40,8 +44,12 @@ __all__ = [
     "radar_current_from_source",
     "transform_radar_scan",
     "BEVGeometry",
+    "ENGINEERED_LIDAR_CHANNELS",
+    "ENGINEERED_RADAR_CHANNELS",
     "LIDAR_UNAVAILABLE_CHANNELS",
     "RADAR_CHANNEL_NOTES",
     "lidar_analysis_channels",
+    "lidar_model_channels",
     "radar_analysis_channels",
+    "radar_model_channels",
 ]

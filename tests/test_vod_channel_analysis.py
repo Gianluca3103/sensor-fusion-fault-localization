@@ -5,7 +5,9 @@ import numpy as np
 from Fault_Localization_Model.vod_dataset import (
     BEVGeometry,
     lidar_analysis_channels,
+    lidar_model_channels,
     radar_analysis_channels,
+    radar_model_channels,
 )
 
 
@@ -67,6 +69,32 @@ class ViewOfDelftChannelAnalysisTests(unittest.TestCase):
         )
         self.assertAlmostEqual(channels["reflectivity_mean"][cell], 15.0)
         self.assertAlmostEqual(channels["reflectivity_max"][cell], 20.0)
+
+    def test_engineered_model_channels_have_fixed_shapes_and_scales(self):
+        lidar = np.asarray(
+            [[1.2, 0.2, -1.0, 10.0], [1.3, 0.2, 1.0, 20.0]],
+            dtype=np.float32,
+        )
+        radar = np.asarray(
+            [
+                [1.2, 0.2, -1.0, -20.0, -2.0, -1.0, -4.0],
+                [1.3, 0.2, 1.0, 20.0, 4.0, 3.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        lidar_bev = lidar_model_channels(lidar, self.geometry)
+        radar_bev = radar_model_channels(radar, radar.copy(), self.geometry)
+
+        self.assertEqual(lidar_bev.shape, (6, 2, 2))
+        self.assertEqual(radar_bev.shape, (7, 2, 2))
+        self.assertTrue(np.isfinite(lidar_bev).all())
+        self.assertTrue(np.isfinite(radar_bev).all())
+        self.assertGreaterEqual(float(lidar_bev.min()), 0.0)
+        self.assertLessEqual(float(lidar_bev.max()), 1.0)
+        self.assertGreaterEqual(float(radar_bev.min()), 0.0)
+        self.assertLessEqual(float(radar_bev.max()), 1.0)
+        self.assertEqual(lidar_bev[0, 0, 1], 1.0)
+        self.assertEqual(radar_bev[0, 0, 1], 1.0)
 
 
 if __name__ == "__main__":

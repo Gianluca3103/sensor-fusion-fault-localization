@@ -39,6 +39,15 @@ Repeat with `--split val` and `--split test`. The generated samples contain a
 320x320 `valid_support_mask`, so selector-cache generation has no dependency on
 dataset-specific geometry code.
 
+For the handcrafted direct-BEV ablation, add
+`--bev-channel-profile engineered` and use separate output/cache roots. This
+writes six LiDAR inputs (occupancy, log count, P90-P10 height spread, P90 upper
+height, mean range, P90 reflectivity) and seven Radar inputs (the analogous
+channels with P90 RCS plus mean compensated radial velocity). Train them with
+`configs/coarse_reconstruction_vod_radar5_engineered_bev_hrnet_dropout010.json`.
+Use `--radar-cache-only` when comparing stack lengths; it builds the aligned
+engineered Radar cache without repeating LiDAR fault injection.
+
 To inspect the full set of physical and derived channels supported by VoD's
 five-frame radar release alongside LiDAR statistics:
 

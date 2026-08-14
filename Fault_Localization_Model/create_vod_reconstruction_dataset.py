@@ -44,12 +44,17 @@ from Fault_Localization_Model.reliability_maps import (
     make_reliability_maps,
 )
 from Fault_Localization_Model.vod_dataset import (
+    BEVGeometry,
+    ENGINEERED_LIDAR_CHANNELS,
+    ENGINEERED_RADAR_CHANNELS,
     VODFrame,
     align_radar_to_lidar,
     discover_vod_frames,
     load_vod_lidar,
     load_vod_radar,
     load_vod_radar_to_lidar,
+    lidar_model_channels,
+    radar_model_channels,
 )
 
 
@@ -68,8 +73,13 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--vod-root", required=True, type=Path)
-    parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--radar-cache-root", required=True, type=Path)
+    parser.add_argument(
+        "--radar-cache-only",
+        action="store_true",
+        help="Build aligned Radar BEV caches without creating LiDAR fault samples.",
+    )
     parser.add_argument(
         "--split",
         required=True,
@@ -86,6 +96,16 @@ def parse_args() -> argparse.Namespace:
             "radar_20frames",
         ),
         help="Use the official accumulated three-scan radar release by default.",
+    )
+    parser.add_argument(
+        "--bev-channel-profile",
+        choices=("baseline", "engineered"),
+        default="baseline",
+        help=(
+            "baseline keeps the existing 3-channel LiDAR/4-channel Radar "
+            "rasters; engineered writes the 6-channel LiDAR and 7-channel "
+            "Radar direct-BEV ablation inputs"
+        ),
     )
     parser.add_argument("--num-samples", type=int)
     parser.add_argument(
@@ -115,6 +135,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if not args.radar_cache_only and args.output_root is None:
+        raise ValueError("output-root is required unless --radar-cache-only is used")
     if args.num_samples is not None and args.num_samples < 1:
         raise ValueError("num-samples must be positive")
     if args.num_workers < 1:
@@ -138,6 +160,11 @@ def _worker_init(config: dict) -> None:
     global WORKER_CONFIG, LIDAR_CORRUPTIONS
     WORKER_CONFIG = config
     LIDAR_CORRUPTIONS = load_fault_injector(DEFAULT_INJECTOR_ROOT)
+
+
+def _radar_cache_worker_init(config: dict) -> None:
+    global WORKER_CONFIG
+    WORKER_CONFIG = config
 
 
 def _within_bev(points: np.ndarray, config: dict) -> np.ndarray:
@@ -180,7 +207,12 @@ def _radar_bev(aligned: np.ndarray, config: dict) -> np.ndarray:
     return output
 
 
-def _write_radar_cache(frame: VODFrame, aligned: np.ndarray, config: dict) -> Path:
+def _write_radar_cache(
+    frame: VODFrame,
+    raw: np.ndarray,
+    aligned: np.ndarray,
+    config: dict,
+) -> Path:
     destination = (
         Path(config["radar_cache_root"])
         / frame.split
@@ -189,8 +221,11 @@ def _write_radar_cache(frame: VODFrame, aligned: np.ndarray, config: dict) -> Pa
     if destination.is_file():
         try:
             with np.load(destination, allow_pickle=False) as cached:
+                expected_channels = (
+                    7 if config["bev_channel_profile"] == "engineered" else 4
+                )
                 if (
-                    cached["radar_bev"].shape == (4, 320, 320)
+                    cached["radar_bev"].shape == (expected_channels, 320, 320)
                     and cached["radar_points"].ndim == 2
                     and cached["radar_points"].shape[1] == 5
                 ):
@@ -229,10 +264,31 @@ def _write_radar_cache(frame: VODFrame, aligned: np.ndarray, config: dict) -> Pa
         "x_range": [config["x_min"], config["x_max"]],
         "y_range": [config["y_min"], config["y_max"]],
         "resolution": config["resolution"],
+        "bev_channel_profile": config["bev_channel_profile"],
+        "radar_bev_channels": (
+            list(ENGINEERED_RADAR_CHANNELS)
+            if config["bev_channel_profile"] == "engineered"
+            else [
+                "occupancy",
+                "log_density",
+                "absolute_compensated_radial_velocity",
+                "normalized_rcs",
+            ]
+        ),
     }
+    geometry = BEVGeometry(
+        x_range=(config["x_min"], config["x_max"]),
+        y_range=(config["y_min"], config["y_max"]),
+        resolution=config["resolution"],
+    )
+    radar_bev = (
+        radar_model_channels(raw, aligned, geometry)
+        if config["bev_channel_profile"] == "engineered"
+        else _radar_bev(aligned, config)
+    )
     atomic_savez_compressed(
         destination,
-        radar_bev=_radar_bev(aligned, config).astype(np.float16),
+        radar_bev=radar_bev.astype(np.float16),
         radar_points=pointpillars_points,
         metadata_json=np.asarray(json.dumps(metadata)),
     )
@@ -318,6 +374,12 @@ def _create_sample(task: dict) -> dict:
     }
     clean_layers = project_lidar_bev(clean, **geometry)
     faulty_layers = project_lidar_bev(faulty, **geometry)
+    engineered_lidar = None
+    if config["bev_channel_profile"] == "engineered":
+        engineered_lidar = lidar_model_channels(
+            faulty[:, :4],
+            BEVGeometry(**geometry),
+        )
     observability = create_observability_map(
         clean,
         LIDAR_SENSOR_ORIGIN,
@@ -333,7 +395,7 @@ def _create_sample(task: dict) -> dict:
         frame.radar_calibration_path,
     )
     aligned_radar = align_radar_to_lidar(radar, lidar_from_radar)
-    _write_radar_cache(frame, aligned_radar, config)
+    _write_radar_cache(frame, radar, aligned_radar, config)
 
     metadata = {
         "dataset": "View-of-Delft",
@@ -361,6 +423,12 @@ def _create_sample(task: dict) -> dict:
         "image_height": 320,
         "image_width": 320,
         "lidar_channels": list(LIDAR_CHANNELS),
+        "bev_channel_profile": config["bev_channel_profile"],
+        "lidar_input_channels": (
+            list(ENGINEERED_LIDAR_CHANNELS)
+            if engineered_lidar is not None
+            else list(LIDAR_CHANNELS)
+        ),
         "pointpillars_lidar_fields": ["x", "y", "z", "reflectivity"],
         "pointpillars_radar_fields": [
             "x_lidar",
@@ -375,6 +443,9 @@ def _create_sample(task: dict) -> dict:
         "injection_seed": task["injection_seed"],
         "injection_metadata": injection_metadata,
     }
+    sample_arrays = {
+        "faulty_lidar_input_bev": engineered_lidar.astype(np.float16)
+    } if engineered_lidar is not None else {}
     atomic_savez_compressed(
         destination,
         **canonical_maps_for_storage(maps),
@@ -397,6 +468,31 @@ def _create_sample(task: dict) -> dict:
         observability_ray_support=observability["ray_support"].astype(np.float16),
         valid_support_mask=np.ones((320, 320), dtype=np.uint8),
         metadata_json=np.asarray(json.dumps(metadata)),
+        **sample_arrays,
+    )
+    return {"path": str(destination), "cached": False}
+
+
+def _create_radar_cache(task: dict) -> dict:
+    if WORKER_CONFIG is None:
+        raise RuntimeError("VoD Radar-cache worker was not initialized")
+    frame = VODFrame(
+        **{
+            key: Path(value) if key.endswith("_path") else value
+            for key, value in task["frame"].items()
+        }
+    )
+    radar = load_vod_radar(frame.radar_path)
+    lidar_from_radar = load_vod_radar_to_lidar(
+        frame.lidar_calibration_path,
+        frame.radar_calibration_path,
+    )
+    aligned_radar = align_radar_to_lidar(radar, lidar_from_radar)
+    destination = _write_radar_cache(
+        frame,
+        radar,
+        aligned_radar,
+        WORKER_CONFIG,
     )
     return {"path": str(destination), "cached": False}
 
@@ -433,10 +529,8 @@ def main() -> None:
             f"Requested {count} unique samples from only {len(frames)} {args.split} frames"
         )
     frames = frames[:count]
-    plan = build_fault_plan(args.fault_plan, None, None, DEFAULT_FAULT_PLAN)
-
     config = {
-        "output_root": str(args.output_root),
+        "output_root": str(args.output_root) if args.output_root else "",
         "radar_cache_root": str(args.radar_cache_root),
         "x_min": args.x_min,
         "x_max": args.x_max,
@@ -449,23 +543,33 @@ def main() -> None:
         "observability_num_z_bins": args.observability_num_z_bins,
         "observability_ray_support_tau": args.observability_ray_support_tau,
         "remove_added_points": args.remove_added_points,
+        "bev_channel_profile": args.bev_channel_profile,
     }
-    tasks = []
-    for index, frame in enumerate(frames):
-        fault, severity = plan[index % len(plan)]
-        injection_seed = int(
-            np.random.SeedSequence([args.seed, index]).generate_state(1)[0]
-        )
-        tasks.append(
-            {
-                "frame": _serialize_frame(frame),
-                "fault": fault,
-                "severity": severity,
-                "injection_seed": injection_seed,
-            }
-        )
+    if args.radar_cache_only:
+        tasks = [{"frame": _serialize_frame(frame)} for frame in frames]
+        worker_initializer = _radar_cache_worker_init
+        worker_function = _create_radar_cache
+    else:
+        plan = build_fault_plan(args.fault_plan, None, None, DEFAULT_FAULT_PLAN)
+        tasks = []
+        for index, frame in enumerate(frames):
+            fault, severity = plan[index % len(plan)]
+            injection_seed = int(
+                np.random.SeedSequence([args.seed, index]).generate_state(1)[0]
+            )
+            tasks.append(
+                {
+                    "frame": _serialize_frame(frame),
+                    "fault": fault,
+                    "severity": severity,
+                    "injection_seed": injection_seed,
+                }
+            )
+        worker_initializer = _worker_init
+        worker_function = _create_sample
     LOGGER.info(
-        "Generating %d %s samples using %s and %d workers",
+        "%s %d %s frames using %s and %d workers",
+        "Caching Radar for" if args.radar_cache_only else "Generating",
         len(tasks),
         args.split,
         args.radar_variant,
@@ -473,16 +577,16 @@ def main() -> None:
     )
     created = cached = 0
     if args.num_workers == 1:
-        _worker_init(config)
-        results = map(_create_sample, tasks)
+        worker_initializer(config)
+        results = map(worker_function, tasks)
         executor = None
     else:
         executor = ProcessPoolExecutor(
             max_workers=args.num_workers,
-            initializer=_worker_init,
+            initializer=worker_initializer,
             initargs=(config,),
         )
-        results = executor.map(_create_sample, tasks, chunksize=1)
+        results = executor.map(worker_function, tasks, chunksize=1)
     try:
         for completed, result in enumerate(results, 1):
             cached += int(result["cached"])
@@ -498,7 +602,8 @@ def main() -> None:
     finally:
         if executor is not None:
             executor.shutdown()
-    LOGGER.info("Samples: %s", Path(args.output_root) / args.split)
+    if not args.radar_cache_only:
+        LOGGER.info("Samples: %s", Path(args.output_root) / args.split)
     LOGGER.info("Radar cache: %s", Path(args.radar_cache_root) / args.split)
 
 
