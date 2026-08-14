@@ -22,12 +22,43 @@ from models.reconstruction_head import (
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
     BEVGridGeometry,
+    FaultSelectorConfig,
     build_selector_config,
     coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
     coarse_reconstruction_range_metrics,
     load_config,
 )
+
+
+def _load_selector_config(path: Path) -> FaultSelectorConfig:
+    """Load either a source training config or a run's resolved config."""
+
+    payload = load_config(path)
+    if "selector" not in payload:
+        return build_selector_config(payload)
+    selector_payload = payload["selector"]
+    if not isinstance(selector_payload, dict):
+        raise ValueError("resolved selector configuration must be an object")
+    config = FaultSelectorConfig(**selector_payload)
+    config.validate()
+    return config
+
+
+def _model_lidar_input(
+    inputs: dict[str, torch.Tensor],
+    model_config: CoarseReconstructionConfig,
+) -> torch.Tensor | None:
+    """Return engineered BEV input only for models configured to consume it."""
+
+    engineered = inputs.get("lidar_input_bev")
+    if engineered is None or model_config.pointpillars.enabled:
+        return None
+    if engineered.shape[1] != model_config.lidar_channels:
+        return None
+    if engineered.shape[1] == inputs["faulty_bev"].shape[1]:
+        return None
+    return engineered
 
 
 def _parse_args() -> argparse.Namespace:
@@ -394,7 +425,7 @@ def main() -> None:
         )
     model_config = CoarseReconstructionConfig.from_dict(model_payload)
 
-    selector_config = build_selector_config(load_config(args.config))
+    selector_config = _load_selector_config(args.config)
     sample_paths = _split_paths(
         args.data_root, args.split, args.limit_samples, args.seed
     )
@@ -461,7 +492,7 @@ def main() -> None:
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
-                    lidar_input_bev=inputs.get("lidar_input_bev"),
+                    lidar_input_bev=_model_lidar_input(inputs, model_config),
                     local_radar_bev=local_radar_bev,
                     faulty_lidar_points=inputs.get("faulty_lidar_points"),
                     radar_points=inputs.get("radar_points"),
@@ -608,7 +639,7 @@ def main() -> None:
     write_csv_rows(args.output_root / "by_fault_metrics.csv", summary_rows)
     atomic_write_json(args.output_root / "summary.json", summary)
     print()
-    print("PER-FAULT VALIDATION RESULTS")
+    print(f"PER-FAULT {args.split.upper()} RESULTS")
     _print_table(by_fault_severity)
     print(f"\nSaved evaluation to {args.output_root}")
 
