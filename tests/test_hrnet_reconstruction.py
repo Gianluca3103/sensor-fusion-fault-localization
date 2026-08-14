@@ -232,6 +232,49 @@ class HRNetIntegrationTests(unittest.TestCase):
             )
         )
 
+    def test_disabling_halo_removes_all_halo_context_from_hrnet(self):
+        config, _loss, _selector = build_configs(
+            {
+                "model": {"backbone": "hrnet"},
+                "hrnet": {
+                    "base_channels": 2,
+                    "blocks_per_stage": 1,
+                    "residual_blocks_per_branch": 1,
+                },
+                "pointpillars": {"enabled": False},
+                "coarse_reconstruction": {
+                    "unet": {
+                        "use_healthy_context_mask": True,
+                        "use_halo_context": False,
+                    }
+                },
+            }
+        )
+        model = CoarseReconstructionModel(config).eval()
+        faulty = torch.rand(1, 3, 32, 32)
+        radar = torch.rand(1, 4, 32, 32)
+        repair = torch.zeros(1, 1, 32, 32)
+        repair[:, :, 10:20, 10:20] = 1
+        halo = torch.zeros_like(repair)
+        halo[:, :, 6:24, 6:24] = 1
+        halo *= 1 - repair
+
+        with torch.no_grad():
+            outputs = model(faulty, radar, repair, halo, halo)
+
+        self.assertEqual(int(outputs["halo_mask"].count_nonzero()), 0)
+        self.assertTrue(torch.equal(outputs["active_mask"], repair))
+        self.assertEqual(
+            int(outputs["local_context_mask"].count_nonzero()), 0
+        )
+        self.assertEqual(
+            int(outputs["local_lidar_context"].count_nonzero()), 0
+        )
+        self.assertEqual(
+            int((outputs["local_radar_active"] * (1 - repair)).count_nonzero()),
+            0,
+        )
+
     def test_input_erasure_output_heads_and_outside_mask_invariant(self):
         pointpillars = PointPillarsConfig(enabled=True, output_channels=2)
         config = CoarseReconstructionConfig(
