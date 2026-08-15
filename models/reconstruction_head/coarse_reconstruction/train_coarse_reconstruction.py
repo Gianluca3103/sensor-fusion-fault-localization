@@ -773,72 +773,73 @@ def main():
             optimizer,
             epoch,
         )
-        observability_log = ""
-        if loss_config.observability_weighting.enabled:
-            observability_log = (
-                "val/empty_observability="
-                f"{val_stats['mean_empty_observability_repair']:.3f} "
-                "val/empty_weight="
-                f"{val_stats['mean_empty_occupancy_weight']:.3f} "
-                "val/high_obs_hallucination="
-                f"{val_stats['hallucination_rate_high_observability']:.3%} "
-            )
-        occupancy_component_log = ""
+        summary_lines = [
+            "",
+            (
+                f"Epoch {epoch:03d}/{epochs:03d}  |  "
+                f"{epoch_seconds:.1f}s "
+                f"(train {train_seconds:.1f}s, val {validation_seconds:.1f}s)"
+            ),
+            (
+                f"  Train  loss={train_stats['loss']:.6f}  "
+                "exact_IoU="
+                f"{train_stats['coarse_occupancy_exact_iou']:.3%}"
+            ),
+            "  Validation loss      total       occupancy   density     height",
+            (
+                f"                      {val_stats['loss']:10.6f}  "
+                f"{val_stats['loss_occupancy']:10.6f}  "
+                f"{val_stats['loss_density']:10.6f}  "
+                f"{val_stats['loss_height']:10.6f}"
+            ),
+        ]
         if loss_config.occupancy.type == "tolerance_aware":
-            occupancy_component_log = (
-                "train/occ_exact="
-                f"{train_stats['loss_occupancy_exact']:.6f} "
-                "train/occ_tol_recall="
-                f"{train_stats['loss_occupancy_tolerant_recall']:.6f} "
-                "train/occ_far_fp="
-                f"{train_stats['loss_occupancy_far_fp']:.6f} "
-                "val/occ_exact="
-                f"{val_stats['loss_occupancy_exact']:.6f} "
-                "val/occ_tol_recall="
-                f"{val_stats['loss_occupancy_tolerant_recall']:.6f} "
-                "val/occ_far_fp="
-                f"{val_stats['loss_occupancy_far_fp']:.6f} "
+            summary_lines.extend(
+                [
+                    "  Occupancy terms         exact   tolerant-recall      far-FP",
+                    (
+                        "                      "
+                        f"{val_stats['loss_occupancy_exact']:10.6f}  "
+                        f"{val_stats['loss_occupancy_tolerant_recall']:16.6f}  "
+                        f"{val_stats['loss_occupancy_far_fp']:10.6f}"
+                    ),
+                ]
             )
-        print(
-            f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
-            f"train/occupancy={train_stats['loss_occupancy']:.6f} "
-            f"train/density={train_stats['loss_density']:.6f} "
-            f"train/height={train_stats['loss_height']:.6f} "
-            "train/exact_F1="
-            f"{train_stats['coarse_occupancy_exact_f1']:.3%} "
-            "train/exact_IoU="
-            f"{train_stats['coarse_occupancy_exact_iou']:.3%} "
-            f"train/exact_P={train_stats['coarse_occupancy_exact_precision']:.3%} "
-            f"train/exact_R={train_stats['coarse_occupancy_exact_recall']:.3%} "
-            f"train/tol_P={train_stats['coarse_occupancy_tolerant_precision']:.3%} "
-            f"train/tol_R={train_stats['coarse_occupancy_tolerant_recall']:.3%} "
-            f"val/loss={val_stats['loss']:.6f} "
-            f"val/occupancy={val_stats['loss_occupancy']:.6f} "
-            f"val/density={val_stats['loss_density']:.6f} "
-            f"val/height={val_stats['loss_height']:.6f} "
-            f"val/exact_F1={val_stats['coarse_occupancy_exact_f1']:.3%} "
-            f"val/exact_IoU={val_stats['coarse_occupancy_exact_iou']:.3%} "
-            f"val/exact_P={val_stats['coarse_occupancy_exact_precision']:.3%} "
-            f"val/exact_R={val_stats['coarse_occupancy_exact_recall']:.3%} "
-            "val/F1@0.5m="
-            f"{val_stats['coarse_occupancy_tolerant_0_5m_f1']:.3%} "
-            "val/IoU@0.5m="
-            f"{val_stats['coarse_occupancy_tolerant_0_5m_iou']:.3%} "
-            "val/P@0.5m="
-            f"{val_stats['coarse_occupancy_tolerant_0_5m_precision']:.3%} "
-            "val/R@0.5m="
-            f"{val_stats['coarse_occupancy_tolerant_0_5m_recall']:.3%} "
-            f"val/hallucination="
-            f"{val_stats['coarse_occupancy_hallucination_rate']:.3%} "
-            f"val/height_mae={val_stats['coarse_height_mae_m']:.3f}m "
-            f"{observability_log}"
-            f"{occupancy_component_log}"
-            f"outside_change={val_stats['outside_mask_max_change']:.3e} "
-            f"train_time={train_seconds:.1f}s "
-            f"val_time={validation_seconds:.1f}s "
-            f"epoch_time={epoch_seconds:.1f}s",
-            flush=True,
+        summary_lines.extend(
+            [
+                "  Exact occupancy           precision     recall         F1        IoU",
+                (
+                    "                      "
+                    f"{val_stats['coarse_occupancy_exact_precision']:10.3%}  "
+                    f"{val_stats['coarse_occupancy_exact_recall']:9.3%}  "
+                    f"{val_stats['coarse_occupancy_exact_f1']:9.3%}  "
+                    f"{val_stats['coarse_occupancy_exact_iou']:9.3%}"
+                ),
+                "  Tolerant occupancy        precision     recall         F1        IoU",
+                (
+                    "                      "
+                    f"{val_stats['coarse_occupancy_tolerant_precision']:10.3%}  "
+                    f"{val_stats['coarse_occupancy_tolerant_recall']:9.3%}  "
+                    f"{val_stats['coarse_occupancy_tolerant_f1']:9.3%}  "
+                    f"{val_stats['coarse_occupancy_tolerant_iou']:9.3%}"
+                ),
+                (
+                    "  Validation quality  "
+                    f"hallucination={val_stats['coarse_occupancy_hallucination_rate']:.3%}  "
+                    f"height_MAE={val_stats['coarse_height_mae_m']:.3f}m  "
+                    f"outside_change={val_stats['outside_mask_max_change']:.3e}"
+                ),
+            ]
         )
+        if loss_config.observability_weighting.enabled:
+            summary_lines.append(
+                "  Observability       "
+                f"empty={val_stats['mean_empty_observability_repair']:.3f}  "
+                f"empty_weight={val_stats['mean_empty_occupancy_weight']:.3f}  "
+                "high-observability hallucination="
+                f"{val_stats['hallucination_rate_high_observability']:.3%}"
+            )
+        print("\n".join(summary_lines), flush=True)
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
