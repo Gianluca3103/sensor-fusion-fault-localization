@@ -20,11 +20,19 @@ EVALUATOR_MODULE = (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs-root", type=Path, default=Path("/workspace"))
-    parser.add_argument("--data-root", required=True, type=Path)
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        type=Path,
+        help="Fallback test dataset when a run's saved data root is unavailable.",
+    )
+    parser.add_argument("--engineered-data-root", type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--radar3-root", type=Path)
     parser.add_argument("--radar5-root", type=Path)
     parser.add_argument("--radar5-engineered-root", type=Path)
+    parser.add_argument("--radar10-root", type=Path)
+    parser.add_argument("--radar20-root", type=Path)
     parser.add_argument("--pattern", default="coarse_*")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -57,7 +65,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _run_stack(run: Path, resolved: dict[str, Any]) -> int | None:
     saved_root = str(resolved.get("args", {}).get("radar_root", ""))
     searchable = f"{run.name} {saved_root}".lower()
-    match = re.search(r"radar[_-]?(3|5)(?:\D|$)", searchable)
+    match = re.search(r"radar[_-]?(20|10|5|3)(?:\D|$)", searchable)
     return int(match.group(1)) if match else None
 
 
@@ -84,11 +92,15 @@ def _choose_radar_root(
     if stack == 3:
         candidates = [args.radar3_root, saved_root]
     elif stack == 5 and pointpillars:
-        candidates = [args.radar5_engineered_root, args.radar5_root, saved_root]
+        candidates = [args.radar5_root, saved_root]
     elif stack == 5 and radar_channels > 4:
         candidates = [args.radar5_engineered_root, saved_root]
     elif stack == 5:
         candidates = [args.radar5_root, saved_root]
+    elif stack == 10:
+        candidates = [args.radar10_root, saved_root]
+    elif stack == 20:
+        candidates = [args.radar20_root, saved_root]
     else:
         candidates = [saved_root]
 
@@ -109,6 +121,34 @@ def _choose_radar_root(
     return None, requirement
 
 
+def _choose_data_root(
+    resolved: dict[str, Any],
+    args: argparse.Namespace,
+) -> Path | None:
+    saved = resolved.get("args", {}).get("data_root")
+    candidates = [
+        Path(saved) if saved else None,
+        args.engineered_data_root,
+        args.data_root,
+    ]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _has_test_files(candidate):
+            return candidate
+    return None
+
+
+def _checkpoint_path(run: Path) -> Path:
+    tolerant = run / "best_tolerant_iou.pt"
+    return tolerant if tolerant.is_file() else run / "best_model.pt"
+
+
 def _discover_runs(root: Path, pattern: str) -> list[Path]:
     return sorted(
         path
@@ -123,6 +163,8 @@ def _run_metadata(
     run: Path,
     resolved: dict[str, Any],
     radar_root: Path | None,
+    data_root: Path | None,
+    checkpoint: Path,
 ) -> dict[str, Any]:
     model = resolved.get("model", {})
     loss = resolved.get("loss", {})
@@ -134,6 +176,8 @@ def _run_metadata(
         "backbone": model.get("backbone", ""),
         "radar_stack": _run_stack(run, resolved) or "",
         "radar_root": str(radar_root or ""),
+        "data_root": str(data_root or ""),
+        "checkpoint": checkpoint.name,
         "pointpillars": bool(pointpillars.get("enabled", False)),
         "lidar_channels": model.get("lidar_channels", ""),
         "radar_channels": model.get("radar_channels", ""),
@@ -172,6 +216,58 @@ def _write_comparison(output_root: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    complete = [row for row in rows if row.get("status") == "complete"]
+    complete.sort(
+        key=lambda row: float(row.get("tolerant_iou_0_5m", 0.0)),
+        reverse=True,
+    )
+    leaderboard_fields = [
+        "run",
+        "checkpoint",
+        "exact_iou",
+        "exact_f1",
+        "exact_precision",
+        "exact_recall",
+        "tolerant_iou_0_5m",
+        "tolerant_f1_0_5m",
+        "tolerant_precision_0_5m",
+        "tolerant_recall_0_5m",
+    ]
+    with (output_root / "coarse_model_leaderboard.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=leaderboard_fields)
+        writer.writeheader()
+        writer.writerows(
+            {key: row.get(key, "") for key in leaderboard_fields}
+            for row in complete
+        )
+
+
+def _print_leaderboard(rows: list[dict[str, Any]]) -> None:
+    complete = [row for row in rows if row.get("status") == "complete"]
+    complete.sort(
+        key=lambda row: float(row.get("tolerant_iou_0_5m", 0.0)),
+        reverse=True,
+    )
+    print("\nFINAL TEST LEADERBOARD (ranked by tolerant IoU@0.5m)")
+    for rank, row in enumerate(complete, 1):
+        print(f"\n{rank:2d}. {row['run']}  [{row['checkpoint']}]")
+        print(
+            "    Exact:  "
+            f"IoU={row['exact_iou']:.3%}  "
+            f"F1={row['exact_f1']:.3%}  "
+            f"P={row['exact_precision']:.3%}  "
+            f"R={row['exact_recall']:.3%}"
+        )
+        print(
+            "    @0.5m:  "
+            f"IoU={row['tolerant_iou_0_5m']:.3%}  "
+            f"F1={row['tolerant_f1_0_5m']:.3%}  "
+            f"P={row['tolerant_precision_0_5m']:.3%}  "
+            f"R={row['tolerant_recall_0_5m']:.3%}"
+        )
+
 
 def main() -> None:
     args = _parse_args()
@@ -192,7 +288,9 @@ def main() -> None:
         resolved_path = run / "resolved_config.json"
         resolved = _read_json(resolved_path)
         radar_root, radar_description = _choose_radar_root(run, resolved, args)
-        row = _run_metadata(run, resolved, radar_root)
+        data_root = _choose_data_root(resolved, args)
+        checkpoint = _checkpoint_path(run)
+        row = _run_metadata(run, resolved, radar_root, data_root, checkpoint)
         destination = args.output_root / run.name
         summary_path = destination / "summary.json"
         print(f"\n[{index}/{len(runs)}] {run.name}", flush=True)
@@ -206,6 +304,12 @@ def main() -> None:
             rows.append(row)
             _write_comparison(args.output_root, rows)
             continue
+        if data_root is None:
+            row.update(status="skipped", error="No compatible test dataset found")
+            print(f"  SKIP: {row['error']}", flush=True)
+            rows.append(row)
+            _write_comparison(args.output_root, rows)
+            continue
 
         command = [
             sys.executable,
@@ -213,9 +317,9 @@ def main() -> None:
             "-m",
             EVALUATOR_MODULE,
             "--checkpoint",
-            str(run / "best_model.pt"),
+            str(checkpoint),
             "--data-root",
-            str(args.data_root),
+            str(data_root),
             "--radar-root",
             str(radar_root),
             "--output-root",
@@ -287,7 +391,26 @@ def main() -> None:
             radar_mode=summary.get("radar_mode", ""),
             global_map_enabled=summary.get("global_map_enabled", ""),
         )
-        row.update(_flatten_scalars("", summary.get("overall", {})))
+        overall = summary.get("overall", {})
+        row.update(_flatten_scalars("", overall))
+        row.update(
+            exact_iou=overall.get("micro/coarse_iou", 0.0),
+            exact_f1=overall.get("micro/coarse_f1", 0.0),
+            exact_precision=overall.get("micro/coarse_precision", 0.0),
+            exact_recall=overall.get("micro/coarse_recall", 0.0),
+            tolerant_iou_0_5m=overall.get(
+                "macro/coarse_occupancy_tolerant_0_5m_iou", 0.0
+            ),
+            tolerant_f1_0_5m=overall.get(
+                "macro/coarse_occupancy_tolerant_0_5m_f1", 0.0
+            ),
+            tolerant_precision_0_5m=overall.get(
+                "macro/coarse_occupancy_tolerant_0_5m_precision", 0.0
+            ),
+            tolerant_recall_0_5m=overall.get(
+                "macro/coarse_occupancy_tolerant_0_5m_recall", 0.0
+            ),
+        )
         rows.append(row)
         _write_comparison(args.output_root, rows)
         print(
@@ -306,6 +429,8 @@ def main() -> None:
         flush=True,
     )
     print(f"Comparison: {args.output_root / 'all_models_test_metrics.csv'}")
+    print(f"Leaderboard: {args.output_root / 'coarse_model_leaderboard.csv'}")
+    _print_leaderboard(rows)
     if failed:
         raise SystemExit(1)
 
