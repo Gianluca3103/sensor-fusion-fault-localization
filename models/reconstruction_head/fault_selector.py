@@ -7,7 +7,7 @@ import math
 from functools import lru_cache
 
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, label
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,8 @@ class FaultSelectorConfig:
     min_lidar_loss_fraction: float = 0.95
     min_repair_box_cells: int = 5
     min_repair_fault_fraction: float = 0.95
+    max_secondary_repair_boxes: int = 0
+    min_secondary_repair_cells: int = 1
     min_halo_healthy_fraction: float = 0.90
     min_halo_healthy_cells: int = 64
     min_halo_context_ratio: float = 0.25
@@ -39,6 +41,10 @@ class FaultSelectorConfig:
             raise ValueError("min_halo_healthy_cells must be non-negative")
         if self.min_repair_box_cells < 1:
             raise ValueError("min_repair_box_cells must be positive")
+        if self.max_secondary_repair_boxes < 0:
+            raise ValueError("max_secondary_repair_boxes must be non-negative")
+        if self.min_secondary_repair_cells < 1:
+            raise ValueError("min_secondary_repair_cells must be positive")
         if (
             not np.isfinite(self.min_halo_context_ratio)
             or self.min_halo_context_ratio < 0.0
@@ -191,6 +197,47 @@ def _best_repair_box(
     )
 
 
+def _secondary_repair_boxes(
+    severe_loss: np.ndarray,
+    healthy_occupied: np.ndarray,
+    primary_box: tuple[int, int, int, int] | None,
+    *,
+    maximum_boxes: int,
+    minimum_fault_cells: int,
+    minimum_fault_fraction: float,
+) -> list[tuple[int, int, int, int]]:
+    """Return tight boxes for severe components missed by the primary band."""
+
+    if maximum_boxes == 0:
+        return []
+    remaining = severe_loss.copy()
+    if primary_box is not None:
+        top, left, bottom, right = primary_box
+        remaining[top:bottom, left:right] = False
+    component_labels, component_count = label(
+        remaining,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    candidates = []
+    for component_id in range(1, component_count + 1):
+        component = component_labels == component_id
+        fault_count = int(component.sum())
+        if fault_count < minimum_fault_cells:
+            continue
+        rectangle = _bbox(component)
+        top, left, bottom, right = rectangle
+        healthy_count = int(
+            healthy_occupied[top:bottom, left:right].sum()
+        )
+        fault_fraction = fault_count / (fault_count + healthy_count)
+        if fault_fraction < minimum_fault_fraction:
+            continue
+        area = (bottom - top) * (right - left)
+        candidates.append((area, -fault_count, rectangle))
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1], candidate[2]))
+    return [candidate[2] for candidate in candidates[:maximum_boxes]]
+
+
 def _adaptive_halo(
     reconstruction_mask: np.ndarray,
     repair_fault_cell_count: int,
@@ -325,12 +372,23 @@ class FaultSelector:
             self.config.min_repair_box_cells,
             self.config.min_repair_fault_fraction,
         )
+        secondary_rectangles = _secondary_repair_boxes(
+            severe_loss,
+            healthy_for_box,
+            rectangle,
+            maximum_boxes=self.config.max_secondary_repair_boxes,
+            minimum_fault_cells=self.config.min_secondary_repair_cells,
+            minimum_fault_fraction=self.config.min_repair_fault_fraction,
+        )
         reconstruction_mask = np.zeros(shape, dtype=bool)
-        rectangles = [] if rectangle is None else [rectangle]
-        if rectangle is not None:
-            top, left, bottom, right = rectangle
+        # Secondary boxes are listed first for diagnostic priority. The model
+        # reconstructs the union of every selected box in one forward pass.
+        rectangles = secondary_rectangles + (
+            [] if rectangle is None else [rectangle]
+        )
+        for top, left, bottom, right in rectangles:
             reconstruction_mask[top:bottom, left:right] = True
-            reconstruction_mask &= valid_support
+        reconstruction_mask &= valid_support
         trusted_occupied = occupied & ~reconstruction_mask
         original_fault = (missing > 0) & valid_support
         excluded_added_only = (

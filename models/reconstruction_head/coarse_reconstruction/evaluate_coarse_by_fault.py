@@ -137,6 +137,19 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def _target_occupied_cells(record: dict) -> int:
+    return int(
+        record.get(
+            "target_occupied_cells",
+            record.get("coarse_tp", 0) + record.get("coarse_fn", 0),
+        )
+    )
+
+
+def _passes_selector_for_metrics(record: dict) -> bool:
+    return int(record.get("repair_cells", 0)) > 0 and _target_occupied_cells(record) > 0
+
+
 def summarize_records(records: list[dict]) -> dict:
     """Return macro metric means and exact-cell micro occupancy metrics."""
 
@@ -149,6 +162,7 @@ def summarize_records(records: list[dict]) -> dict:
         "fault_group",
         "sequence_id",
         "frame_id",
+        "target_occupied_cells",
     }
     metric_keys = [
         key
@@ -159,17 +173,42 @@ def summarize_records(records: list[dict]) -> dict:
     ]
     summary = {
         "samples": len(records),
-        "repair_cells": sum(record["repair_cells"] for record in records),
+        "total_repair_cells": sum(record["repair_cells"] for record in records),
     }
+    evaluable_records = [
+        record for record in records if _passes_selector_for_metrics(record)
+    ]
+    selector_rejected = [
+        record for record in records if int(record.get("repair_cells", 0)) <= 0
+    ]
+    empty_target = [
+        record
+        for record in records
+        if int(record.get("repair_cells", 0)) > 0
+        and _target_occupied_cells(record) <= 0
+    ]
+    summary["metric_samples"] = len(evaluable_records)
+    summary["occupancy_metric_samples"] = len(evaluable_records)
+    summary["excluded_selector_rejected_samples"] = len(selector_rejected)
+    summary["excluded_empty_target_samples"] = len(empty_target)
+    summary["excluded_metric_samples"] = len(records) - len(evaluable_records)
+    summary["repair_cells"] = sum(
+        record["repair_cells"] for record in evaluable_records
+    )
     for key in metric_keys:
         if key == "repair_cells":
             continue
-        summary[f"macro/{key}"] = sum(record[key] for record in records) / len(records)
+        summary[f"macro/{key}"] = (
+            sum(record[key] for record in evaluable_records)
+            / len(evaluable_records)
+            if evaluable_records
+            else 0.0
+        )
     for prefix in ("coarse", "faulty"):
-        tp = sum(record[f"{prefix}_tp"] for record in records)
-        fp = sum(record[f"{prefix}_fp"] for record in records)
-        fn = sum(record[f"{prefix}_fn"] for record in records)
-        tn = sum(record[f"{prefix}_tn"] for record in records)
+        tp = sum(record[f"{prefix}_tp"] for record in evaluable_records)
+        fp = sum(record[f"{prefix}_fp"] for record in evaluable_records)
+        fn = sum(record[f"{prefix}_fn"] for record in evaluable_records)
+        tn = sum(record[f"{prefix}_tn"] for record in evaluable_records)
         precision = _safe_ratio(tp, tp + fp)
         recall = _safe_ratio(tp, tp + fn)
         f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
@@ -206,7 +245,7 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
 
 def _print_table(groups: dict[str, dict]) -> None:
     header = (
-        f"{'Fault':<28} {'N':>6} {'Faulty IoU':>11} {'Coarse IoU':>11} "
+        f"{'Fault':<28} {'N':>6} {'Used':>6} {'Faulty IoU':>11} {'Coarse IoU':>11} "
         f"{'Improvement':>12} {'F1@0.5m':>10} {'Halluc.':>9}"
     )
     print(header)
@@ -214,6 +253,7 @@ def _print_table(groups: dict[str, dict]) -> None:
     for name, summary in groups.items():
         print(
             f"{name:<28} {summary['samples']:6d} "
+            f"{summary.get('metric_samples', summary['samples']):6d} "
             f"{summary['micro/faulty_iou']:10.2%} "
             f"{summary['micro/coarse_iou']:10.2%} "
             f"{summary['micro/iou_improvement']:+11.2%} "
@@ -564,6 +604,9 @@ def main() -> None:
                 )
                 record.update(
                     {f"faulty_{key}": value for key, value in faulty_counts.items()}
+                )
+                record["target_occupied_cells"] = (
+                    coarse_counts["tp"] + coarse_counts["fn"]
                 )
                 record["exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]

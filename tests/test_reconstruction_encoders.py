@@ -288,6 +288,35 @@ class ReconstructionEncoderTests(unittest.TestCase):
             1.0,
         )
 
+    def test_fault_selector_can_add_tight_secondary_repair_boxes(self):
+        faulty = np.zeros((20, 12), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[0:5, 0:4] = 1
+        missing[12, 1:3] = 1
+        missing[16, 9] = 1
+        faulty[12, 3:8] = 1
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_repair_box_cells=5,
+            max_secondary_repair_boxes=4,
+            min_secondary_repair_cells=1,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertTrue(selection.reconstruction_mask[0:5, 0:4].all())
+        self.assertTrue(selection.reconstruction_mask[12, 1:3].all())
+        self.assertTrue(selection.reconstruction_mask[16, 9])
+        self.assertFalse(selection.reconstruction_mask[12, 3:8].any())
+        self.assertEqual(len(selection.selected_blobs), 3)
+        self.assertEqual(selection.selected_blobs[0].bbox, (16, 9, 17, 10))
+        self.assertEqual(selection.selected_blobs[1].bbox, (12, 1, 13, 3))
+
     def test_fault_selector_ignores_added_points_as_surviving_lidar(self):
         shape = (8, 8)
         faulty = np.zeros(shape, dtype=np.float32)

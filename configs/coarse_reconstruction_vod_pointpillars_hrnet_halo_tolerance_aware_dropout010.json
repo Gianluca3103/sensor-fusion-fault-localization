@@ -59,6 +59,8 @@
     "min_lidar_loss_fraction": 0.95,
     "min_repair_box_cells": 5,
     "min_repair_fault_fraction": 0.95,
+    "max_secondary_repair_boxes": 8,
+    "min_secondary_repair_cells": 1,
     "min_halo_healthy_fraction": 0.9,
     "min_halo_healthy_cells": 64,
     "min_halo_context_ratio": 0.25,

@@ -40,7 +40,14 @@ def selector_cache_path(sample_path: str | Path, data_root: str | Path) -> Path:
 
 
 def _config_json(config: FaultSelectorConfig) -> str:
-    return json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    payload = asdict(config)
+    # Preserve compatibility with version-8 caches created before optional
+    # secondary boxes existed. Explicitly enabled multi-box selectors retain
+    # both fields in their cache identity.
+    if config.max_secondary_repair_boxes == 0:
+        payload.pop("max_secondary_repair_boxes")
+        payload.pop("min_secondary_repair_cells")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:

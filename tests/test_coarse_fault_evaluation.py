@@ -94,6 +94,49 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["micro/faulty_iou"], 6 / 18)
         self.assertAlmostEqual(summary["micro/iou_improvement"], 9 / 15 - 6 / 18)
 
+    def test_summary_excludes_selector_rejected_samples_from_metrics(self):
+        records = []
+        for name, repair_cells, target_cells, tolerant_iou in (
+            ("rejected", 0, 4, 1.0),
+            ("empty", 10, 0, 1.0),
+            ("failure", 10, 4, 0.0),
+            ("success", 10, 4, 0.8),
+        ):
+            records.append(
+                {
+                    "sample_path": f"{name}.npz",
+                    "fault": "fog_sim",
+                    "severity": 4,
+                    "fault_group": "fog_sim_s4",
+                    "sequence_id": "1",
+                    "frame_id": name,
+                    "repair_cells": repair_cells,
+                    "target_occupied_cells": target_cells,
+                    "coarse_occupancy_tolerant_0_5m_iou": tolerant_iou,
+                    "coarse_tp": 0,
+                    "coarse_fp": 0,
+                    "coarse_fn": target_cells,
+                    "coarse_tn": 10 - target_cells,
+                    "faulty_tp": 0,
+                    "faulty_fp": 0,
+                    "faulty_fn": target_cells,
+                    "faulty_tn": 10 - target_cells,
+                }
+            )
+
+        summary = summarize_records(records)
+
+        self.assertEqual(summary["samples"], 4)
+        self.assertEqual(summary["metric_samples"], 2)
+        self.assertEqual(summary["occupancy_metric_samples"], 2)
+        self.assertEqual(summary["excluded_empty_target_samples"], 1)
+        self.assertEqual(summary["excluded_selector_rejected_samples"], 1)
+        self.assertEqual(summary["excluded_metric_samples"], 2)
+        self.assertAlmostEqual(
+            summary["macro/coarse_occupancy_tolerant_0_5m_iou"],
+            0.4,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
