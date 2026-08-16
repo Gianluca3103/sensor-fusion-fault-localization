@@ -46,11 +46,11 @@ class HRNetBackboneTests(unittest.TestCase):
         self.assertEqual(config.hrnet.dropout, 0.1)
         self.assertEqual(config.local_input_channels, 130)
 
-    def test_rejects_removed_backbones(self):
+    def test_rejects_unsupported_backbone(self):
         with self.assertRaisesRegex(ValueError, "Only the HRNet"):
             build_configs(
                 {
-                    "model": {"backbone": "sst"},
+                    "model": {"backbone": "unsupported"},
                     "coarse_reconstruction": {},
                 }
             )
