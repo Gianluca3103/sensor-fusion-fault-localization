@@ -630,7 +630,7 @@ def build_warmup_cosine_scheduler(optimizer, epochs, warmup_epochs, min_lr, base
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a PFS-style model for Hercules BEV fault reliability maps.")
+    parser = argparse.ArgumentParser(description="Train the reliability-map model on generated VoD BEV samples.")
     parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument(
         "--train-root",

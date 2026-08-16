@@ -26,11 +26,9 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="Fallback test dataset when a run's saved data root is unavailable.",
     )
-    parser.add_argument("--engineered-data-root", type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--radar3-root", type=Path)
     parser.add_argument("--radar5-root", type=Path)
-    parser.add_argument("--radar5-engineered-root", type=Path)
     parser.add_argument("--radar10-root", type=Path)
     parser.add_argument("--radar20-root", type=Path)
     parser.add_argument("--pattern", default="coarse_*")
@@ -81,9 +79,6 @@ def _choose_radar_root(
     resolved: dict[str, Any],
     args: argparse.Namespace,
 ) -> tuple[Path | None, str]:
-    model = resolved.get("model", {})
-    pointpillars = bool(model.get("pointpillars", {}).get("enabled", False))
-    radar_channels = int(model.get("radar_channels", 4))
     stack = _run_stack(run, resolved)
 
     saved = resolved.get("args", {}).get("radar_root")
@@ -91,10 +86,6 @@ def _choose_radar_root(
     candidates: list[Path | None] = []
     if stack == 3:
         candidates = [args.radar3_root, saved_root]
-    elif stack == 5 and pointpillars:
-        candidates = [args.radar5_root, saved_root]
-    elif stack == 5 and radar_channels > 4:
-        candidates = [args.radar5_engineered_root, saved_root]
     elif stack == 5:
         candidates = [args.radar5_root, saved_root]
     elif stack == 10:
@@ -114,10 +105,7 @@ def _choose_radar_root(
         seen.add(candidate)
         if _has_test_files(candidate):
             return candidate, f"radar{stack or '?'}"
-    requirement = (
-        f"radar stack={stack or 'unknown'}, pointpillars={pointpillars}, "
-        f"radar_channels={radar_channels}"
-    )
+    requirement = f"radar stack={stack or 'unknown'}"
     return None, requirement
 
 
@@ -128,7 +116,6 @@ def _choose_data_root(
     saved = resolved.get("args", {}).get("data_root")
     candidates = [
         Path(saved) if saved else None,
-        args.engineered_data_root,
         args.data_root,
     ]
     seen: set[Path] = set()
@@ -173,7 +160,6 @@ def _run_metadata(
     observability = loss.get("observability_weighting", {})
     return {
         "run": run.name,
-        "backbone": model.get("backbone", ""),
         "radar_stack": _run_stack(run, resolved) or "",
         "radar_root": str(radar_root or ""),
         "data_root": str(data_root or ""),
@@ -388,8 +374,6 @@ def main() -> None:
         row.update(
             status="complete",
             checkpoint_epoch=summary.get("checkpoint_epoch", ""),
-            radar_mode=summary.get("radar_mode", ""),
-            global_map_enabled=summary.get("global_map_enabled", ""),
         )
         overall = summary.get("overall", {})
         row.update(_flatten_scalars("", overall))

@@ -29,7 +29,6 @@ from PFS.training_utils import (
     require_checkpoint_args_match,
     require_checkpoint_semantics,
 )
-from PFS_Radar.pfs_radar_model import PFSRadarReliabilityModel
 
 
 def write_sample(path, source_relative_path):
@@ -189,31 +188,6 @@ class RobustnessTests(unittest.TestCase):
         before = int(pfs_batch_norm.num_batches_tracked)
         pfs(faulty, clean_bev=clean, return_features=True)
         self.assertEqual(int(pfs_batch_norm.num_batches_tracked) - before, 1)
-
-        radar_model = PFSRadarReliabilityModel(base_channels=2)
-        radar_model.train()
-        radar_batch_norm = radar_model.lidar_encoder.enc1.block[1]
-        fusion_batch_norm = radar_model.fusion[1]
-        radar_before = int(radar_batch_norm.num_batches_tracked)
-        fusion_before = int(fusion_batch_norm.num_batches_tracked)
-        outputs = radar_model(
-            faulty,
-            torch.rand(2, 4, 32, 32),
-            clean_lidar_bev=clean,
-            return_features=True,
-        )
-        self.assertEqual(
-            int(radar_batch_norm.num_batches_tracked) - radar_before,
-            1,
-        )
-        self.assertEqual(
-            int(fusion_batch_norm.num_batches_tracked) - fusion_before,
-            1,
-        )
-        self.assertEqual(
-            outputs["clean_features"].shape,
-            outputs["stabilized_features"].shape,
-        )
 
     def test_resume_rejects_changed_behavioral_arguments(self):
         current = SimpleNamespace(learning_rate=1e-4, exclude_faults=["snow", "rain"])

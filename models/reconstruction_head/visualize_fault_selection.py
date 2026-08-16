@@ -63,6 +63,18 @@ def _draw_repair_boxes(axis, selection):
         )
 
 
+def _draw_halo_outline(axis, selection):
+    if not selection.halo_mask.any():
+        return
+    axis.contour(
+        selection.halo_mask.astype(np.float32),
+        levels=[0.5],
+        colors=["#00ff66"],
+        linewidths=1.2,
+        linestyles="dashed",
+    )
+
+
 def render_fault_selection(sample_path, output_path, selector):
     clean, faulty, reliability, heatmap, evidence = load_fault_selection_sample(
         sample_path
@@ -111,27 +123,31 @@ def render_fault_selection(sample_path, output_path, selector):
         alpha=0.2,
         interpolation="nearest",
     )
+    selector_title = (
+        f"Primary >={100.0 * selector.config.min_lidar_loss_fraction:.0f}% loss"
+    )
+    if selector.config.max_secondary_repair_boxes:
+        selector_title += (
+            f"; up to {selector.config.max_secondary_repair_boxes} secondary "
+            f">={100.0 * selector.config.min_secondary_lidar_loss_fraction:.0f}% "
+            f"loss/{100.0 * selector.config.min_secondary_repair_fault_fraction:.0f}% "
+            "box purity"
+        )
     axes[1].set_title(
-        "Conservative >=95% loss boxes (magenta/cyan) + halo (green)\n"
+        f"{selector_title} (magenta/cyan) + halo (green)\n"
         f"Excluded added-only cells: {selection.excluded_added_only_cell_count}"
     )
     _draw_repair_boxes(axes[1], selection)
+    _draw_halo_outline(axes[1], selection)
 
     axes[2].imshow(clean, interpolation="nearest")
     axes[2].set_title("Clean LiDAR BEV")
 
     axes[3].imshow(faulty, interpolation="nearest")
-    axes[3].imshow(
-        healthy_overlay,
-        cmap=ListedColormap(["#00ff66"]),
-        vmin=0.0,
-        vmax=1.0,
-        alpha=0.65,
-        interpolation="nearest",
-    )
     _draw_repair_boxes(axes[3], selection)
+    _draw_halo_outline(axes[3], selection)
     axes[3].set_title(
-        "Faulty LiDAR with Repair Box Outline and Context\n"
+        "Faulty LiDAR with Repair Boxes (cyan) and Halo (green dashed)\n"
         f"Repair area: {selection.selected_cell_count}; halo area: {selection.halo_cell_count}; "
         f"fault evidence: {selection.selected_fault_cell_count}; "
         f"healthy context: {selection.healthy_context_cell_count}"

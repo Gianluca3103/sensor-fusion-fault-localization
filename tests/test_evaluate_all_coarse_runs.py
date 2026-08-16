@@ -13,16 +13,16 @@ class EvaluateAllCoarseRunsTests(unittest.TestCase):
         (cache / "test" / "sample.npz").touch()
         return cache
 
-    def test_selects_radar_cache_by_stack_and_representation(self) -> None:
+    def test_selects_pointpillar_radar_cache_by_stack(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             radar3 = self._cache(root, "radar3")
             radar5 = self._cache(root, "radar5")
-            engineered = self._cache(root, "radar5_engineered")
             args = Namespace(
                 radar3_root=radar3,
                 radar5_root=radar5,
-                radar5_engineered_root=engineered,
+                radar10_root=None,
+                radar20_root=None,
             )
 
             selected, _ = _choose_radar_root(
@@ -50,18 +50,6 @@ class EvaluateAllCoarseRunsTests(unittest.TestCase):
             self.assertEqual(selected, radar5.resolve())
 
             selected, _ = _choose_radar_root(
-                root / "coarse_vod_radar5_engineered_hrnet",
-                {
-                    "model": {
-                        "radar_channels": 7,
-                        "pointpillars": {"enabled": False},
-                    }
-                },
-                args,
-            )
-            self.assertEqual(selected, engineered.resolve())
-
-            selected, _ = _choose_radar_root(
                 root / "coarse_vod_radar5_pointpillars_hrnet",
                 {
                     "model": {
@@ -71,7 +59,7 @@ class EvaluateAllCoarseRunsTests(unittest.TestCase):
                 },
                 args,
             )
-            self.assertEqual(selected, engineered.resolve())
+            self.assertEqual(selected, radar5.resolve())
 
 
 if __name__ == "__main__":

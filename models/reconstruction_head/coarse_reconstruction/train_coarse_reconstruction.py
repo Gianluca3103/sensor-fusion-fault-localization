@@ -45,7 +45,7 @@ def _parse_args():
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--config",
-        default=str(REPO_ROOT / "configs" / "coarse_reconstruction.json"),
+        default=str(REPO_ROOT / "configs" / "coarse_reconstruction_vod.json"),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int)
@@ -59,24 +59,6 @@ def _parse_args():
         help=(
             "Run a radar-input ablation by replacing radar BEVs with zeros "
             "during both training and validation."
-        ),
-    )
-    parser.add_argument(
-        "--radar-mode",
-        choices=("full", "global-only", "none"),
-        default="full",
-        help=(
-            "Radar conditioning mode: full uses local and global radar, "
-            "global-only removes radar from the local U-Net, and none removes "
-            "radar measurements from both branches."
-        ),
-    )
-    parser.add_argument(
-        "--disable-global-map",
-        action="store_true",
-        help=(
-            "Use only the local U-Net by skipping both global encoders, "
-            "global fusion, cross-attention, and bottleneck fusion."
         ),
     )
     parser.add_argument(
@@ -134,10 +116,6 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
-    if "lidar_input_bev" in batch:
-        moved["lidar_input_bev"] = batch["lidar_input_bev"].to(
-            device, non_blocking=True
-        )
     for key in ("faulty_lidar_points", "radar_points"):
         if key in batch:
             moved[key] = tuple(
@@ -171,29 +149,8 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "healthy_context_mask",
         "halo_mask",
         "local_input",
-        "global_lidar_input",
-        "local_bottleneck",
-        "query_tokens",
-        "context_tokens",
-        "attention_context",
-        "fused_bottleneck",
-        "global_context_map",
         "lidar_pillar_bev",
         "radar_pillar_bev",
-        "sst_token_projection",
-        "sst_token_coordinates",
-        "sst_coordinates_before",
-        "sst_coordinates_after",
-        "sst_block_1",
-        "sst_block_final",
-        "sst_dense_features",
-        "sst_reconstruction_features",
-        "repair_query_features",
-        "repair_query_coordinates",
-        "repair_context_features",
-        "repair_context_coordinates",
-        "trusted_lidar_coordinates",
-        "radar_context_coordinates",
         "hrnet_stage_1_branch_0",
         "hrnet_stage_2_branch_0",
         "hrnet_stage_2_branch_1",
@@ -225,43 +182,6 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
                 key: value.detach().cpu().tolist()
                 for key, value in statistics.items()
             }
-    pillar_attention = outputs.get("radar_pillar_attention_debug")
-    if pillar_attention:
-        result["radar_pillar_attention_debug"] = {
-            key: value.detach().cpu().tolist()
-            for key, value in pillar_attention.items()
-            if isinstance(value, torch.Tensor)
-        }
-    sst_statistics = outputs.get("sst_token_statistics")
-    if sst_statistics:
-        result["sst_token_statistics"] = {
-            key: (
-                float(value.detach().cpu())
-                if value.numel() == 1
-                else value.detach().cpu().tolist()
-            )
-            for key, value in sst_statistics.items()
-        }
-    if "sst_timing_ms" in outputs:
-        result["sst_timing_ms"] = dict(outputs["sst_timing_ms"])
-    repair_statistics = outputs.get("repair_query_statistics")
-    if repair_statistics:
-        result["repair_query_statistics"] = {
-            key: (
-                float(value.detach().cpu())
-                if value.numel() == 1
-                else value.detach().cpu().tolist()
-            )
-            for key, value in repair_statistics.items()
-        }
-    if "repair_query_timing_ms" in outputs:
-        result["repair_query_timing_ms"] = dict(
-            outputs["repair_query_timing_ms"]
-        )
-    if "repair_query_peak_memory_bytes" in outputs:
-        result["repair_query_peak_memory_bytes"] = int(
-            outputs["repair_query_peak_memory_bytes"]
-        )
     return result
 
 
@@ -278,15 +198,15 @@ def _summarize_active_fractions(values: list[float]) -> dict[str, float]:
 
 def _active_fraction_recommendation(summary: dict[str, float]) -> str:
     if summary["median"] >= 0.25:
-        return "Keep the dense U-Net: typical active coverage is at least 25%."
+        return "Keep dense HRNet: typical active coverage is at least 25%."
     if summary["p90"] <= 0.15:
         return (
             "Test cropped dense processing first: at least 90% of samples use "
-            "no more than 15% of the BEV. Consider a sparse U-Net only if "
+            "no more than 15% of the BEV. Consider cropping only if "
             "cropping remains too expensive."
         )
     return (
-        "Keep the dense U-Net for now and profile cropped dense processing: "
+        "Keep dense HRNet processing and profile cropping only if needed: "
         "active coverage is neither consistently sparse nor typically above 25%."
     )
 
@@ -311,10 +231,6 @@ def _save_conditioning(
     count = min(max_samples, outputs["coarse_lidar_bev"].shape[0])
     for index in range(count):
         payload = {key: outputs[key][index].detach().cpu() for key in keys}
-        if "attention_weights" in outputs:
-            payload["attention_weights"] = outputs["attention_weights"][
-                index
-            ].detach().cpu()
         payload["sample_path"] = batch["sample_path"][index]
         atomic_torch_save(payload, destination / f"sample_{index:03d}.pt")
 
@@ -329,17 +245,17 @@ def _run_epoch(
     scaler=None,
     grad_clip=0.0,
     use_amp=False,
-    return_attention=False,
     conditioning_callback=None,
     active_fraction_samples=None,
-    radar_mode="full",
-    use_global_map=True,
+    radar_enabled=True,
     profile_first_batch=False,
 ):
     training = optimizer is not None
     model.train(training)
-    sums = {}
+    loss_sums = {}
+    metric_sums = {}
     samples = 0
+    metric_samples = 0
     logged_shapes = None
     for batch_index, batch in enumerate(loader):
         if active_fraction_samples is not None:
@@ -349,9 +265,6 @@ def _run_epoch(
             fractions = active_mask.flatten(1).float().mean(dim=1)
             active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
-        local_radar_bev = None
-        radar_enabled = radar_mode != "none"
-        local_radar_enabled = radar_mode == "full"
         pointpillars_enabled = bool(
             getattr(
                 getattr(getattr(model, "config", None), "pointpillars", None),
@@ -359,14 +272,8 @@ def _run_epoch(
                 False,
             )
         )
-        sparse_backbone_enabled = getattr(
-            getattr(model, "config", None), "backbone", None
-        ) in {"sst", "repair_query"}
-        if radar_mode == "none":
+        if not radar_enabled:
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
-        elif radar_mode == "global-only":
-            if not pointpillars_enabled:
-                local_radar_bev = torch.zeros_like(inputs["radar_bev"])
         if training:
             optimizer.zero_grad(set_to_none=True)
         capture_debug = logged_shapes is None
@@ -382,19 +289,7 @@ def _run_epoch(
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
                 enabled=use_amp,
             ):
-                model_options = {
-                    "local_radar_bev": local_radar_bev,
-                    "use_global_map": use_global_map,
-                    "return_attention_weights": (
-                        return_attention and batch_index == 0
-                    ),
-                }
-                if sparse_backbone_enabled:
-                    model_options["profile_sst"] = measure_runtime
-                if "lidar_input_bev" in inputs:
-                    model_options["lidar_input_bev"] = inputs[
-                        "lidar_input_bev"
-                    ]
+                model_options = {"radar_enabled": radar_enabled}
                 if pointpillars_enabled:
                     model_options.update(
                         {
@@ -402,8 +297,6 @@ def _run_epoch(
                                 "faulty_lidar_points"
                             ),
                             "radar_points": inputs.get("radar_points"),
-                            "radar_enabled": radar_enabled,
-                            "local_radar_enabled": local_radar_enabled,
                         }
                     )
                 outputs = model(
@@ -452,9 +345,23 @@ def _run_epoch(
             )
         batch_size = inputs["faulty_bev"].shape[0]
         samples += batch_size
-        values = {**losses, **metrics}
-        for key, value in values.items():
-            sums[key] = sums.get(key, 0.0) + float(value.detach()) * batch_size
+        valid_metric_samples = int(
+            (inputs["reconstruction_mask"].flatten(1) > 0)
+            .any(dim=1)
+            .sum()
+            .item()
+        )
+        metric_samples += valid_metric_samples
+        for key, value in losses.items():
+            loss_sums[key] = (
+                loss_sums.get(key, 0.0)
+                + float(value.detach()) * batch_size
+            )
+        for key, value in metrics.items():
+            metric_sums[key] = (
+                metric_sums.get(key, 0.0)
+                + float(value.detach()) * valid_metric_samples
+            )
         if logged_shapes is None:
             logged_shapes = _shape_log(inputs, outputs)
             if measure_runtime:
@@ -481,20 +388,26 @@ def _run_epoch(
                     )
         if conditioning_callback is not None and batch_index == 0:
             conditioning_callback(batch, outputs)
-    return {key: value / max(samples, 1) for key, value in sums.items()}, logged_shapes
+    statistics = {
+        key: value / max(samples, 1) for key, value in loss_sums.items()
+    }
+    statistics.update(
+        {
+            key: value / max(metric_samples, 1)
+            for key, value in metric_sums.items()
+        }
+    )
+    statistics["metric_samples"] = metric_samples
+    statistics["excluded_empty_mask_samples"] = samples - metric_samples
+    return statistics, logged_shapes
 
 
 def main():
     args = _parse_args()
-    if args.disable_radar and args.radar_mode != "full":
-        raise ValueError("Use either --disable-radar or --radar-mode, not both")
-    radar_mode = "none" if args.disable_radar else args.radar_mode
+    radar_enabled = not args.disable_radar
     payload = load_config(args.config)
     model_config, loss_config, selector_config = build_configs(payload)
     augmentation_config = build_augmentation_config(payload)
-    use_global_map = not args.disable_global_map
-    if model_config.backbone == "hrnet":
-        use_global_map = False
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 8))
@@ -587,11 +500,6 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     grad_clip = float(training.get("grad_clip", 1.0))
     save_conditioning_samples = int(training.get("save_conditioning_samples", 4))
-    return_attention = bool(
-        payload.get("coarse_reconstruction", {}).get("global_context", {}).get(
-            "return_attention_during_validation", True
-        )
-    )
     atomic_write_json(
         output_root / "resolved_config.json",
         {
@@ -606,14 +514,13 @@ def main():
     )
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
-    print(f"Radar mode: {radar_mode}")
-    print(f"Global map enabled: {use_global_map}")
+    print(f"Radar enabled: {radar_enabled}")
     print(f"Training augmentation enabled: {augmentation_config.enabled}")
     print(
         "Sensor representation: "
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
-    print(f"Reconstruction backbone: {model_config.backbone}")
+    print("Reconstruction backbone: HRNet")
     print(f"Occupancy loss: {loss_config.occupancy.type}")
     if loss_config.occupancy.type == "tolerance_aware":
         print(
@@ -645,19 +552,6 @@ def main():
             f"pillar={geometry.pillar_size_x:.3f}m x "
             f"{geometry.pillar_size_y:.3f}m"
         )
-        if model_config.backbone == "sst":
-            print(
-                "SST regional layouts: normal and shifted assignments "
-                "reused across all blocks"
-            )
-            print(
-                "SST regions: "
-                f"{model_config.sst.region_size_cells}x"
-                f"{model_config.sst.region_size_cells} cells; "
-                f"{model_config.sst.region_size_cells * geometry.pillar_size_x:.3f}m x "
-                f"{model_config.sst.region_size_cells * geometry.pillar_size_y:.3f}m; "
-                f"shift={model_config.sst.shift_size_cells} cells"
-            )
     history = []
     best_validation = float("inf")
     best_tolerant_iou = float("-inf")
@@ -677,8 +571,7 @@ def main():
             grad_clip=grad_clip,
             use_amp=use_amp,
             active_fraction_samples=train_active_fractions,
-            radar_mode=radar_mode,
-            use_global_map=use_global_map,
+            radar_enabled=radar_enabled,
             profile_first_batch=epoch == 1,
         )
         _synchronize_device(device)
@@ -691,7 +584,6 @@ def main():
                 loss_fn,
                 device,
                 use_amp=use_amp,
-                return_attention=return_attention,
                 conditioning_callback=lambda batch, outputs: _save_conditioning(
                     output_root,
                     epoch,
@@ -700,8 +592,7 @@ def main():
                     save_conditioning_samples,
                 ),
                 active_fraction_samples=val_active_fractions,
-                radar_mode=radar_mode,
-                use_global_map=use_global_map,
+                radar_enabled=radar_enabled,
                 profile_first_batch=epoch == 1,
             )
         _synchronize_device(device)
@@ -849,9 +740,7 @@ def main():
             "loss_config": asdict(loss_config),
             "augmentation_config": augmentation_config.to_dict(),
             "active_fraction_profile": active_fraction_profile,
-            "radar_mode": radar_mode,
-            "radar_disabled": radar_mode == "none",
-            "global_map_enabled": use_global_map,
+            "radar_enabled": radar_enabled,
             "grid_geometry": train_dataset.grid_geometry.to_dict(),
             "history": history,
         }

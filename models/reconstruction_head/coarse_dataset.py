@@ -11,7 +11,6 @@ from torch.utils.data._utils.collate import default_collate
 from torch.utils.data import Dataset
 
 from Fault_Localization_Model.sample_utils import InvalidSampleError
-from PFS_Radar.radar_data import radar_cache_path
 
 from .fault_selector import FaultSelectorConfig
 from .pointpillars import BEVGridGeometry
@@ -19,6 +18,21 @@ from .geometric_augmentation import (
     GeometricAugmentationConfig,
     ReconstructionGeometricAugmentation,
 )
+
+
+def radar_cache_path(radar_root: str | Path, metadata: dict) -> Path:
+    """Resolve the aligned View-of-Delft radar cache for one sample."""
+
+    dataset = str(metadata.get("dataset", "")).strip().lower()
+    if dataset not in {"view-of-delft", "view of delft", "vod"}:
+        raise ValueError(f"Unsupported dataset {metadata.get('dataset')!r}; expected VoD")
+    split = str(metadata.get("split", "")).strip()
+    frame_id = str(metadata.get("frame_id", metadata.get("radar_index", ""))).strip()
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Invalid VoD split {split!r}")
+    if not frame_id.isdigit():
+        raise ValueError(f"VoD frame_id must be numeric, got {frame_id!r}")
+    return Path(radar_root) / split / f"{int(frame_id):05d}.npz"
 from .fault_selector_cache import (
     load_selector_cache,
     selector_cache_path,

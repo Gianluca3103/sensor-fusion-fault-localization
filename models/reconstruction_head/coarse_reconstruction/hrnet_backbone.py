@@ -21,8 +21,6 @@ class HRNetConfig:
     blocks_per_stage: int = 2
     residual_blocks_per_branch: int = 2
     dropout: float = 0.0
-    radar_context_layers: int = 0
-    radar_context_channels: int = 16
 
     def validate(self) -> None:
         if self.base_channels < 1:
@@ -37,10 +35,6 @@ class HRNetConfig:
             )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("hrnet.dropout must be in [0,1)")
-        if self.radar_context_layers < 0:
-            raise ValueError("hrnet.radar_context_layers must be non-negative")
-        if self.radar_context_channels < 1:
-            raise ValueError("hrnet.radar_context_channels must be positive")
 
     @property
     def branch_channels(self) -> tuple[int, ...]:

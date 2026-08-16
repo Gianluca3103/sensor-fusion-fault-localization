@@ -8,6 +8,7 @@ from models.reconstruction_head import (
     BEVGridGeometry,
     CoarseReconstructionConfig,
     CoarseReconstructionModel,
+    HRNetConfig,
     Pillarizer,
     PointPillarsConfig,
     PointPillarsEncoder,
@@ -157,21 +158,19 @@ class PointPillarsTests(unittest.TestCase):
             lidar_channels=64,
             radar_channels=64,
             target_lidar_channels=3,
-            unet_base_channels=2,
-            unet_depth=4,
-            global_base_channels=2,
-            global_channel_multipliers=(1, 2, 4, 8, 16),
-            attention_dim=16,
-            num_heads=2,
             pointpillars=pointpillars,
+            hrnet=HRNetConfig(
+                base_channels=2,
+                blocks_per_stage=1,
+                residual_blocks_per_branch=1,
+            ),
         )
         model = CoarseReconstructionModel(config, grid_geometry=_geometry()).train()
         faulty_bev = torch.rand(1, 3, 320, 320)
         radar_bev = torch.zeros(1, 4, 320, 320)
         reconstruction = torch.zeros(1, 1, 320, 320)
         reconstruction[:, :, 260:300, 120:180] = 1.0
-        healthy = torch.zeros_like(reconstruction)
-        healthy[:, :, 250:310, 110:190] = 1.0 - reconstruction[:, :, 250:310, 110:190]
+        healthy = 1.0 - reconstruction
         halo = healthy.clone()
         lidar_points = (
             torch.tensor(

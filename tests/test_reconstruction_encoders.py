@@ -11,7 +11,6 @@ from models.reconstruction_head import (
     FaultSelectorConfig,
     load_bev_triplet,
 )
-from models.reconstruction_head.encoders import BEVEncoder
 from models.reconstruction_head.fault_selector import (
     _adaptive_halo,
     _best_repair_box,
@@ -134,28 +133,17 @@ class ReconstructionEncoderTests(unittest.TestCase):
                 reference(severe, healthy, min_cells, min_fraction),
             )
 
-    def test_bev_encoder_produces_expected_bottleneck(self):
-        encoder = BEVEncoder(
-            in_channels=3,
-            base_channels=4,
-            channel_multipliers=(1, 2, 4),
-        ).eval()
-        with torch.no_grad():
-            bottleneck = encoder(torch.zeros(2, 3, 65, 63))
-
-        self.assertEqual(tuple(bottleneck.shape), (2, 16, 17, 16))
-
     def test_dataset_loads_and_normalizes_existing_artifact_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sample_path = root / "sample.npz"
             radar_root = root / "radar"
-            radar_path = radar_root / "Scene01" / "01_Day" / "123.npz"
+            radar_path = radar_root / "train" / "00123.npz"
             radar_path.parent.mkdir(parents=True)
             metadata = {
-                "scene": "Scene01",
-                "session": "01_Day",
-                "timestamp": "123",
+                "dataset": "view-of-delft",
+                "split": "train",
+                "frame_id": "123",
             }
             np.savez_compressed(
                 sample_path,
@@ -288,20 +276,27 @@ class ReconstructionEncoderTests(unittest.TestCase):
             1.0,
         )
 
-    def test_fault_selector_can_add_tight_secondary_repair_boxes(self):
-        faulty = np.zeros((20, 12), dtype=np.float32)
+    def test_fault_selector_adds_two_coherent_secondary_repair_boxes(self):
+        faulty = np.zeros((32, 12), dtype=np.float32)
         missing = np.zeros_like(faulty)
-        missing[0:5, 0:4] = 1
-        missing[12, 1:3] = 1
-        missing[16, 9] = 1
-        faulty[12, 3:8] = 1
+        missing[8:13, 4:8] = 10
+        missing[2:5, 4:7] = 7
+        faulty[2:5, 4:7] = 3
+        missing[17:20, 5:8] = 7
+        faulty[17:20, 5:8] = 3
+        missing[31, 11] = 7
+        faulty[31, 11] = 3
+        faulty[5:8, 0] = 1
+        faulty[13:17, 0] = 1
 
         selection = self._select_loss(
             faulty,
             missing,
+            min_lidar_loss_fraction=0.8,
             min_repair_box_cells=5,
-            max_secondary_repair_boxes=4,
-            min_secondary_repair_cells=1,
+            max_secondary_repair_boxes=2,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_cells=5,
             min_halo_healthy_fraction=0.0,
             min_halo_healthy_cells=0,
             min_halo_context_ratio=0.0,
@@ -309,13 +304,173 @@ class ReconstructionEncoderTests(unittest.TestCase):
             max_halo_dilation_cells=1,
         )
 
-        self.assertTrue(selection.reconstruction_mask[0:5, 0:4].all())
-        self.assertTrue(selection.reconstruction_mask[12, 1:3].all())
-        self.assertTrue(selection.reconstruction_mask[16, 9])
-        self.assertFalse(selection.reconstruction_mask[12, 3:8].any())
+        self.assertTrue(selection.reconstruction_mask[8:13, 4:8].all())
+        self.assertTrue(selection.reconstruction_mask[2:5, 4:7].all())
+        self.assertTrue(selection.reconstruction_mask[17:20, 5:8].all())
+        self.assertFalse(selection.reconstruction_mask[31, 11])
         self.assertEqual(len(selection.selected_blobs), 3)
-        self.assertEqual(selection.selected_blobs[0].bbox, (16, 9, 17, 10))
-        self.assertEqual(selection.selected_blobs[1].bbox, (12, 1, 13, 3))
+        self.assertEqual(selection.selected_blobs[0].bbox, (2, 4, 5, 7))
+        self.assertEqual(selection.selected_blobs[1].bbox, (17, 5, 20, 8))
+        self.assertEqual(selection.selected_blobs[2].bbox, (8, 4, 13, 8))
+
+    def test_secondary_box_can_merge_related_faults_at_lower_purity(self):
+        faulty = np.zeros((30, 20), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[0:5, 0:5] = 10
+        missing[10:13, 2:5] = 7
+        faulty[10:13, 2:5] = 3
+        missing[10:13, 10:13] = 7
+        faulty[10:13, 10:13] = 3
+        faulty[6:8, 6:9] = 1
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_lidar_loss_fraction=0.8,
+            min_repair_box_cells=5,
+            min_repair_fault_fraction=0.95,
+            max_secondary_repair_boxes=2,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_fault_fraction=0.7,
+            min_secondary_repair_cells=5,
+            secondary_merge_gap_cells=8,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertEqual(len(selection.selected_blobs), 2)
+        self.assertEqual(selection.selected_blobs[0].bbox, (10, 2, 13, 13))
+        self.assertTrue(selection.reconstruction_mask[10:13, 2:5].all())
+        self.assertTrue(selection.reconstruction_mask[10:13, 10:13].all())
+        self.assertGreaterEqual(
+            selection.selected_blobs[0].repair_fault_fraction,
+            0.7,
+        )
+
+    def test_secondary_box_expands_to_configured_minimum_side_length(self):
+        faulty = np.zeros((40, 40), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[0:5, 0:5] = 10
+        missing[20:22, 25:28] = 7
+        faulty[20:22, 25:28] = 3
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_lidar_loss_fraction=0.8,
+            min_repair_box_cells=5,
+            max_secondary_repair_boxes=4,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_fault_fraction=0.7,
+            min_secondary_repair_cells=5,
+            min_secondary_box_side_cells=10,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        secondary = selection.selected_blobs[0].bbox
+        self.assertEqual(secondary, (16, 22, 26, 32))
+        self.assertEqual(secondary[2] - secondary[0], 10)
+        self.assertEqual(secondary[3] - secondary[1], 10)
+        self.assertTrue(selection.reconstruction_mask[20:22, 25:28].all())
+
+    def test_expanded_secondary_boxes_are_merged_when_they_overlap(self):
+        faulty = np.zeros((40, 40), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[0:5, 0:5] = 10
+        missing[12:14, 20:22] = 7
+        faulty[12:14, 20:22] = 3
+        missing[20:22, 20:22] = 7
+        faulty[20:22, 20:22] = 3
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_lidar_loss_fraction=0.8,
+            min_repair_box_cells=5,
+            max_secondary_repair_boxes=4,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_fault_fraction=0.7,
+            min_secondary_repair_cells=4,
+            secondary_merge_gap_cells=0,
+            min_secondary_box_side_cells=10,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertEqual(len(selection.selected_blobs), 2)
+        self.assertEqual(selection.selected_blobs[0].bbox, (8, 16, 26, 26))
+        self.assertTrue(selection.reconstruction_mask[12:14, 20:22].all())
+        self.assertTrue(selection.reconstruction_mask[20:22, 20:22].all())
+
+    def test_primary_box_may_span_sparse_corner_faults(self):
+        faulty = np.zeros((100, 100), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[5:8, 5:8] = 10
+        missing[90:93, 90:93] = 10
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_lidar_loss_fraction=0.8,
+            min_repair_box_cells=5,
+            min_repair_fault_fraction=0.95,
+            primary_expansion_gap_cells=12,
+            max_secondary_repair_boxes=2,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_fault_fraction=0.7,
+            min_secondary_repair_cells=5,
+            secondary_merge_gap_cells=8,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertEqual(
+            [blob.bbox for blob in selection.selected_blobs],
+            [(5, 5, 93, 93)],
+        )
+        self.assertTrue(selection.reconstruction_mask[50, 50])
+
+    def test_primary_box_absorbs_nearby_lower_threshold_faults(self):
+        faulty = np.zeros((40, 40), dtype=np.float32)
+        missing = np.zeros_like(faulty)
+        missing[10:15, 10:15] = 10
+        missing[18:21, 12:16] = 7
+        faulty[18:21, 12:16] = 3
+
+        selection = self._select_loss(
+            faulty,
+            missing,
+            min_lidar_loss_fraction=0.8,
+            min_repair_box_cells=5,
+            min_repair_fault_fraction=0.95,
+            primary_expansion_gap_cells=12,
+            max_secondary_repair_boxes=2,
+            min_secondary_lidar_loss_fraction=0.7,
+            min_secondary_repair_fault_fraction=0.7,
+            min_secondary_repair_cells=5,
+            min_halo_healthy_fraction=0.0,
+            min_halo_healthy_cells=0,
+            min_halo_context_ratio=0.0,
+            min_halo_width_cells=1,
+            max_halo_dilation_cells=1,
+        )
+
+        self.assertEqual(len(selection.selected_blobs), 1)
+        self.assertEqual(selection.selected_blobs[0].bbox, (10, 10, 21, 16))
+        self.assertTrue(selection.reconstruction_mask[18:21, 12:16].all())
 
     def test_fault_selector_ignores_added_points_as_surviving_lidar(self):
         shape = (8, 8)

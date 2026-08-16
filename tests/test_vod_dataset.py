@@ -11,7 +11,7 @@ from Fault_Localization_Model.vod_dataset import (
     load_vod_radar,
     load_vod_radar_to_lidar,
 )
-from PFS_Radar.radar_data import radar_cache_path
+from models.reconstruction_head.coarse_dataset import radar_cache_path
 
 
 def _write_calibration(path: Path, translation=(0.0, 0.0, 0.0)) -> None:

@@ -1,346 +1,32 @@
-"""Direct deterministic BEV replacement with full-scene cross-attention."""
+"""VoD PointPillars + HRNet coarse LiDAR reconstruction model."""
 
 from __future__ import annotations
 
-from typing import Sequence
-import time
+from collections.abc import Sequence
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
-from ..encoders import BEVEncoder, _group_count
-from ..pointpillars import (
-    BEVGridGeometry,
-    PointPillarsEncoder,
-    PointPillarsOutput,
-)
 from .coarse_config import CoarseReconstructionConfig
-from .repair_query import RepairQueryDecoder
 from .hrnet_backbone import HRNetBackbone
-from .range_aware_radar import RangeAwareRadarAggregation
-from .radar_pillar_attention import RadarPillarAttention
-from .sst_backbone import (
-    SSTBackbone,
-    SSTReconstructionHead,
-    SparseToDenseScatter,
-    SparseTokenBuilder,
-    region_statistics,
-)
-
-
-def _profile_start(tensor: torch.Tensor, enabled: bool) -> float | None:
-    if not enabled:
-        return None
-    if tensor.is_cuda:
-        torch.cuda.synchronize(tensor.device)
-    return time.perf_counter()
-
-
-def _profile_elapsed_ms(
-    tensor: torch.Tensor,
-    started: float | None,
-) -> float:
-    if started is None:
-        return 0.0
-    if tensor.is_cuda:
-        torch.cuda.synchronize(tensor.device)
-    return 1000.0 * (time.perf_counter() - started)
-
-
-class ResidualCoarseBlock(nn.Module):
-    """Two-convolution GroupNorm/SiLU residual block."""
-
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
-        super().__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
-            nn.SiLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout else nn.Identity(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
-        )
-        self.shortcut = (
-            nn.Identity()
-            if in_channels == out_channels
-            else nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        )
-        self.activation = nn.SiLU(inplace=True)
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.activation(self.main(tensor) + self.shortcut(tensor))
-
-
-class RadarSpatialContextEncoder(nn.Module):
-    """Aggregate neighboring radar cells without changing the BEV grid."""
-
-    def __init__(self, channels: int, hidden_channels: int, layer_count: int):
-        super().__init__()
-        if layer_count < 1:
-            raise ValueError("layer_count must be positive")
-        layers: list[nn.Module] = []
-        for index in range(layer_count):
-            in_channels = channels if index == 0 else hidden_channels
-            out_channels = channels if index == layer_count - 1 else hidden_channels
-            layers.extend(
-                (
-                    nn.Conv2d(
-                        in_channels,
-                        out_channels,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                        dilation=1,
-                        bias=False,
-                    ),
-                    nn.SiLU(inplace=True),
-                )
-            )
-        self.network = nn.Sequential(*layers)
-        self.effective_receptive_field_cells = 1 + 2 * layer_count
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.network(tensor)
-
-
-class LocalUNetEncoder(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, depth: int, dropout: float):
-        super().__init__()
-        self.channels = tuple(base_channels * (2**index) for index in range(depth))
-        self.blocks = nn.ModuleList(
-            ResidualCoarseBlock(
-                in_channels if index == 0 else channels,
-                channels,
-                dropout,
-            )
-            for index, channels in enumerate(self.channels)
-        )
-        self.downsamplers = nn.ModuleList(
-            nn.Conv2d(
-                self.channels[index],
-                self.channels[index + 1],
-                kernel_size=3,
-                stride=2,
-                padding=1,
-            )
-            for index in range(depth - 1)
-        )
-
-    def forward(self, tensor: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        skips = []
-        for index, block in enumerate(self.blocks):
-            tensor = block(tensor)
-            if index < len(self.blocks) - 1:
-                skips.append(tensor)
-                tensor = self.downsamplers[index](tensor)
-        return tuple(skips), tensor
-
-
-class GlobalLidarEncoder(nn.Module):
-    def __init__(self, config: CoarseReconstructionConfig):
-        super().__init__()
-        self.encoder = BEVEncoder(
-            config.lidar_channels + 1,
-            base_channels=config.global_base_channels,
-            channel_multipliers=config.global_channel_multipliers,
-        )
-
-    @property
-    def out_channels(self) -> int:
-        return self.encoder.out_channels[-1]
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.encoder(tensor)
-
-
-class GlobalRadarEncoder(nn.Module):
-    def __init__(self, config: CoarseReconstructionConfig):
-        super().__init__()
-        self.encoder = BEVEncoder(
-            config.radar_channels,
-            base_channels=config.global_base_channels,
-            channel_multipliers=config.global_channel_multipliers,
-        )
-
-    @property
-    def out_channels(self) -> int:
-        return self.encoder.out_channels[-1]
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.encoder(tensor)
-
-
-class GlobalFusionBlock(nn.Module):
-    def __init__(self, in_channels: int, attention_dim: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, attention_dim, 1, bias=False),
-            nn.GroupNorm(_group_count(attention_dim), attention_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(attention_dim, attention_dim, 3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(attention_dim), attention_dim),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.block(tensor)
-
-
-class AbsolutePositionEncoder(nn.Module):
-    def __init__(self, attention_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, attention_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(attention_dim, attention_dim),
-        )
-
-    def forward(self, coordinates: torch.Tensor) -> torch.Tensor:
-        if coordinates.ndim != 3 or coordinates.shape[-1] != 2:
-            raise ValueError("coordinates must have shape [B,N,2]")
-        return self.net(coordinates)
-
-
-def _normalized_grid(
-    batch_size: int,
-    height: int,
-    width: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
-    x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
-    yy, xx = torch.meshgrid(y, x, indexing="ij")
-    return torch.stack((xx, yy), dim=-1).reshape(1, height * width, 2).expand(
-        batch_size, -1, -1
-    )
-
-
-class LocalToGlobalCrossAttention(nn.Module):
-    def __init__(self, local_channels: int, config: CoarseReconstructionConfig):
-        super().__init__()
-        self.local_projection = (
-            nn.Identity()
-            if local_channels == config.attention_dim
-            else nn.Conv2d(local_channels, config.attention_dim, 1)
-        )
-        self.position_encoder = AbsolutePositionEncoder(config.attention_dim)
-        self.query_norm = nn.LayerNorm(config.attention_dim)
-        self.context_norm = nn.LayerNorm(config.attention_dim)
-        self.attention = nn.MultiheadAttention(
-            config.attention_dim,
-            config.num_heads,
-            dropout=config.attention_dropout,
-            batch_first=True,
-        )
-
-    def forward(
-        self,
-        local_bottleneck: torch.Tensor,
-        global_context_map: torch.Tensor,
-        *,
-        return_attention_weights: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-        projected = self.local_projection(local_bottleneck)
-        batch, channels, local_h, local_w = projected.shape
-        global_batch, global_channels, global_h, global_w = global_context_map.shape
-        if batch != global_batch or channels != global_channels:
-            raise ValueError("Local projection and global context batch/channels must match")
-        local_tokens = projected.flatten(2).transpose(1, 2)
-        global_tokens = global_context_map.flatten(2).transpose(1, 2)
-        local_xy = _normalized_grid(
-            batch, local_h, local_w, device=projected.device, dtype=projected.dtype
-        )
-        global_xy = _normalized_grid(
-            batch,
-            global_h,
-            global_w,
-            device=global_context_map.device,
-            dtype=global_context_map.dtype,
-        )
-        query_tokens = self.query_norm(
-            local_tokens + self.position_encoder(local_xy)
-        )
-        context_tokens = self.context_norm(
-            global_tokens + self.position_encoder(global_xy)
-        )
-        attention_tokens, weights = self.attention(
-            query_tokens,
-            context_tokens,
-            context_tokens,
-            need_weights=return_attention_weights,
-            average_attn_weights=False,
-        )
-        attention_context = attention_tokens.transpose(1, 2).reshape(
-            batch, channels, local_h, local_w
-        )
-        return attention_context, weights, query_tokens, context_tokens
-
-
-class BottleneckFusionBlock(nn.Module):
-    def __init__(self, local_channels: int, attention_dim: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(local_channels + attention_dim, local_channels, 1, bias=False),
-            nn.GroupNorm(_group_count(local_channels), local_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(local_channels, local_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(local_channels), local_channels),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(
-        self, local_bottleneck: torch.Tensor, attention_context: torch.Tensor) -> torch.Tensor:
-        if local_bottleneck.shape[-2:] != attention_context.shape[-2:]:
-            raise ValueError("Attention context must match the local bottleneck grid")
-        update = self.block(torch.cat((local_bottleneck, attention_context), dim=1))
-        return local_bottleneck + update
-
-
-class LocalUNetDecoder(nn.Module):
-    def __init__(self, channels: Sequence[int], dropout: float):
-        super().__init__()
-        current = channels[-1]
-        blocks = []
-        for skip_channels in reversed(channels[:-1]):
-            blocks.append(
-                ResidualCoarseBlock(current + skip_channels, skip_channels, dropout)
-            )
-            current = skip_channels
-        self.blocks = nn.ModuleList(blocks)
-        self.out_channels = current
-
-    def forward(
-        self, bottleneck: torch.Tensor, skips: tuple[torch.Tensor, ...]
-    ) -> torch.Tensor:
-        if len(skips) != len(self.blocks):
-            raise ValueError("Decoder received the wrong number of skip features")
-        tensor = bottleneck
-        for block, skip in zip(self.blocks, reversed(skips)):
-            tensor = F.interpolate(
-                tensor,
-                size=skip.shape[-2:],
-                mode="nearest",
-            )
-            if tensor.shape[0] != skip.shape[0] or tensor.shape[-2:] != skip.shape[-2:]:
-                raise ValueError("Decoder and skip features are not aligned")
-            tensor = block(torch.cat((tensor, skip), dim=1))
-        return tensor
+from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
 
 
 class CoarseReplacementHead(nn.Module):
-    def __init__(self, in_channels: int, lidar_channels: int):
+    """Predict occupancy logits, density, and height at full BEV resolution."""
+
+    def __init__(self, in_channels: int, lidar_channels: int = 3):
         super().__init__()
-        self.head = nn.Conv2d(in_channels, lidar_channels, 1)
+        # Keep the historical attribute name so existing HRNet checkpoints
+        # remain loadable after the architecture cleanup.
+        self.head = nn.Conv2d(in_channels, lidar_channels, kernel_size=1)
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         return self.head(tensor)
 
 
 class CoarseReconstructionModel(nn.Module):
-    """Reconstruct every LiDAR cell inside the selected editable region."""
+    """Reconstruct selected VoD LiDAR cells from LiDAR and Radar context."""
 
     def __init__(
         self,
@@ -352,11 +38,9 @@ class CoarseReconstructionModel(nn.Module):
         self.config = config or CoarseReconstructionConfig()
         self.config.validate()
         self.grid_geometry = grid_geometry
+
         self.lidar_pillar_encoder = None
         self.radar_pillar_encoder = None
-        self.radar_context_encoder: nn.Module = nn.Identity()
-        self.range_aware_radar = None
-        self.radar_pillar_attention = None
         if self.config.pointpillars.enabled:
             if grid_geometry is None:
                 raise ValueError(
@@ -364,10 +48,7 @@ class CoarseReconstructionModel(nn.Module):
                 )
             grid_geometry.validate()
             if (grid_geometry.height, grid_geometry.width) != (320, 320):
-                raise ValueError(
-                    "Experiment 1 requires a PointPillars pseudo-image aligned "
-                    "to the existing 320x320 reconstruction grid"
-                )
+                raise ValueError("VoD reconstruction requires a 320x320 BEV grid")
             pointpillars = self.config.pointpillars
             self.lidar_pillar_encoder = PointPillarsEncoder(
                 grid_geometry,
@@ -383,103 +64,36 @@ class CoarseReconstructionModel(nn.Module):
                 max_points_per_pillar=pointpillars.max_points_per_pillar,
                 max_pillars=pointpillars.max_pillars,
             )
-            if self.config.radar_pillar_attention.enabled:
-                self.radar_pillar_attention = RadarPillarAttention(
-                    pointpillars.output_channels,
-                    self.config.radar_pillar_attention,
-                )
-        if self.config.backbone == "unet":
-            self.local_unet_encoder = LocalUNetEncoder(
-                self.config.local_input_channels,
-                self.config.unet_base_channels,
-                self.config.unet_depth,
-                self.config.dropout,
-            )
-            self.global_lidar_encoder = GlobalLidarEncoder(self.config)
-            self.global_radar_encoder = GlobalRadarEncoder(self.config)
-            self.global_fusion = GlobalFusionBlock(
-                self.global_lidar_encoder.out_channels
-                + self.global_radar_encoder.out_channels,
-                self.config.attention_dim,
-            )
-            local_channels = self.local_unet_encoder.channels[-1]
-            self.cross_attention = LocalToGlobalCrossAttention(
-                local_channels, self.config
-            )
-            self.bottleneck_fusion = BottleneckFusionBlock(
-                local_channels, self.config.attention_dim
-            )
-            self.local_unet_decoder = LocalUNetDecoder(
-                self.local_unet_encoder.channels, self.config.dropout
-            )
-            replacement_channels = self.local_unet_decoder.out_channels
-        elif self.config.backbone == "sst":
-            self.sst_token_builder = SparseTokenBuilder(
-                self.config.lidar_channels,
-                self.config.radar_channels,
-                self.config.sst.token_dim,
-            )
-            self.sst_backbone = SSTBackbone(self.config.sst)
-            self.sst_scatter = SparseToDenseScatter(self.config.sst.token_dim)
-            self.sst_reconstruction_head = SSTReconstructionHead(
-                self.config.sst.token_dim
-            )
-            replacement_channels = self.sst_reconstruction_head.out_channels
-        elif self.config.backbone == "hrnet":
-            if self.config.range_aware_radar.enabled:
-                self.range_aware_radar = RangeAwareRadarAggregation(
-                    self.config.radar_channels,
-                    self.config.range_aware_radar,
-                )
-            elif self.config.hrnet.radar_context_layers:
-                self.radar_context_encoder = RadarSpatialContextEncoder(
-                    self.config.radar_channels,
-                    self.config.hrnet.radar_context_channels,
-                    self.config.hrnet.radar_context_layers,
-                )
-            self.hrnet_backbone = HRNetBackbone(
-                self.config.local_input_channels,
-                self.config.hrnet,
-            )
-            replacement_channels = self.hrnet_backbone.out_channels
-        else:
-            self.repair_query_decoder = RepairQueryDecoder(
-                self.config.lidar_channels,
-                self.config.radar_channels,
-                self.config.repair_query,
-            )
-            replacement_channels = None
-        self.replacement_head = (
-            CoarseReplacementHead(
-                replacement_channels, self.config.target_lidar_channels
-            )
-            if replacement_channels is not None
-            else None
+
+        self.hrnet_backbone = HRNetBackbone(
+            self.config.local_input_channels,
+            self.config.hrnet,
+        )
+        self.replacement_head = CoarseReplacementHead(
+            self.hrnet_backbone.out_channels,
+            self.config.target_lidar_channels,
         )
 
-    def _select_lidar_point_fields(
+    def _select_lidar_fields(
         self, point_clouds: Sequence[torch.Tensor]
     ) -> tuple[torch.Tensor, ...]:
-        expected = 4
         for points in point_clouds:
-            if points.ndim != 2 or points.shape[1] != expected:
+            if points.ndim != 2 or points.shape[1] != 4:
                 raise ValueError(
-                    "faulty_lidar_points must contain aligned "
-                    "[x,y,z,reflectivity] rows"
+                    "faulty_lidar_points must contain aligned [x,y,z,reflectivity] rows"
                 )
         if self.config.pointpillars.lidar_use_reflectivity:
             return tuple(point_clouds)
         return tuple(points[:, :3] for points in point_clouds)
 
-    def _select_radar_point_fields(
+    def _select_radar_fields(
         self, point_clouds: Sequence[torch.Tensor]
     ) -> tuple[torch.Tensor, ...]:
         selected = []
         for points in point_clouds:
             if points.ndim != 2 or points.shape[1] != 5:
                 raise ValueError(
-                    "radar_points must contain aligned "
-                    "[x,y,z,power,doppler] rows"
+                    "radar_points must contain aligned [x,y,z,power,doppler] rows"
                 )
             columns = [points[:, :3]]
             if self.config.pointpillars.radar_use_power:
@@ -502,56 +116,24 @@ class CoarseReconstructionModel(nn.Module):
         torch.Tensor,
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
-        dict[str, object],
     ]:
         if not self.config.pointpillars.enabled:
-            return faulty_lidar_bev, radar_bev, {}, {}, {}
+            radar_features = radar_bev if radar_enabled else torch.zeros_like(radar_bev)
+            return faulty_lidar_bev, radar_features, {}, {}
+
         if faulty_lidar_points is None:
-            raise ValueError(
-                "faulty_lidar_points are required when PointPillars is enabled"
-            )
+            raise ValueError("faulty_lidar_points are required by PointPillars")
         assert self.lidar_pillar_encoder is not None
         assert self.radar_pillar_encoder is not None
         lidar_features, lidar_statistics = self.lidar_pillar_encoder(
-            self._select_lidar_point_fields(faulty_lidar_points)
+            self._select_lidar_fields(faulty_lidar_points)
         )
         if radar_enabled:
             if radar_points is None:
-                raise ValueError(
-                    "radar_points are required when PointPillars is enabled"
-                )
-            selected_radar_points = self._select_radar_point_fields(
-                radar_points
+                raise ValueError("radar_points are required by PointPillars")
+            radar_features, radar_statistics = self.radar_pillar_encoder(
+                self._select_radar_fields(radar_points)
             )
-            if self.radar_pillar_attention is not None:
-                radar_output = self.radar_pillar_encoder(
-                    selected_radar_points,
-                    return_sparse=True,
-                )
-                assert isinstance(radar_output, PointPillarsOutput)
-                attended, radar_attention_debug = (
-                    self.radar_pillar_attention(
-                        radar_output.sparse_features,
-                        radar_output.sparse_coordinates,
-                        lidar_features.shape[0],
-                    )
-                )
-                coordinates = radar_output.sparse_coordinates
-                radar_features = (
-                    self.radar_pillar_encoder.scatter.forward_batch(
-                        attended,
-                        coordinates[:, 0],
-                        coordinates[:, 1],
-                        coordinates[:, 2],
-                        lidar_features.shape[0],
-                    )
-                )
-                radar_statistics = radar_output.statistics
-            else:
-                radar_features, radar_statistics = self.radar_pillar_encoder(
-                    selected_radar_points
-                )
-                radar_attention_debug = {}
         else:
             radar_features = lidar_features.new_zeros(
                 (
@@ -562,16 +144,9 @@ class CoarseReconstructionModel(nn.Module):
                 )
             )
             radar_statistics = {}
-            radar_attention_debug = {}
-        return (
-            lidar_features,
-            radar_features,
-            lidar_statistics,
-            radar_statistics,
-            radar_attention_debug,
-        )
+        return lidar_features, radar_features, lidar_statistics, radar_statistics
 
-    def _forward_hrnet(
+    def forward(
         self,
         faulty_lidar_bev: torch.Tensor,
         radar_bev: torch.Tensor,
@@ -579,30 +154,23 @@ class CoarseReconstructionModel(nn.Module):
         healthy_context_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         *,
-        lidar_input_bev: torch.Tensor | None,
-        local_radar_bev: torch.Tensor | None,
-        faulty_lidar_points: Sequence[torch.Tensor] | None,
-        radar_points: Sequence[torch.Tensor] | None,
-        radar_enabled: bool,
-        local_radar_enabled: bool,
+        faulty_lidar_points: Sequence[torch.Tensor] | None = None,
+        radar_points: Sequence[torch.Tensor] | None = None,
+        radar_enabled: bool = True,
     ) -> dict[str, torch.Tensor]:
         (
             lidar_sensor_bev,
             radar_sensor_bev,
             lidar_pillar_statistics,
             radar_pillar_statistics,
-            radar_pillar_attention_debug,
         ) = self._sensor_features(
-            (
-                lidar_input_bev
-                if lidar_input_bev is not None
-                else faulty_lidar_bev
-            ),
+            faulty_lidar_bev,
             radar_bev,
             faulty_lidar_points,
             radar_points,
             radar_enabled=radar_enabled,
         )
+
         halo_mask = halo_mask * (1.0 - reconstruction_mask)
         if not self.config.use_halo_context:
             halo_mask = torch.zeros_like(halo_mask)
@@ -615,36 +183,18 @@ class CoarseReconstructionModel(nn.Module):
                 if self.config.use_halo_context
                 else torch.zeros_like(healthy_context_mask)
             )
-            local_mask_channels = (reconstruction_mask, local_context_mask)
+            mask_channels = (reconstruction_mask, local_context_mask)
         else:
             local_context_mask = 1.0 - reconstruction_mask
-            local_mask_channels = (reconstruction_mask,)
-        local_lidar_context = local_context_mask * lidar_sensor_bev
+            mask_channels = (reconstruction_mask,)
 
-        if local_radar_bev is None:
-            local_radar_bev = radar_sensor_bev
-        if not local_radar_enabled:
-            local_radar_bev = torch.zeros_like(radar_sensor_bev)
-        local_radar_active = active_mask * local_radar_bev
-        radar_context_debug = {}
-        if self.range_aware_radar is not None:
-            local_radar_context, radar_context_debug = (
-                self.range_aware_radar(local_radar_active, active_mask)
-            )
-        else:
-            local_radar_context = active_mask * self.radar_context_encoder(
-                local_radar_active
-            )
+        local_lidar_context = local_context_mask * lidar_sensor_bev
+        local_radar_context = active_mask * radar_sensor_bev
         local_input = torch.cat(
-            (
-                local_lidar_context,
-                local_radar_context,
-                *local_mask_channels,
-            ),
+            (local_lidar_context, local_radar_context, *mask_channels),
             dim=1,
         )
         hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
-        assert self.replacement_head is not None
         replacement_raw = self.replacement_head(hrnet_features)
         occupancy_logits = replacement_raw[:, 0:1]
         predicted_density = replacement_raw[:, 1:2]
@@ -661,6 +211,7 @@ class CoarseReconstructionModel(nn.Module):
             (1.0 - reconstruction_mask) * faulty_lidar_bev
             + reconstruction_mask * replacement_bev
         )
+
         outputs = {
             "erased_lidar_bev": erased_lidar_bev,
             "erased_lidar_features": erased_lidar_bev,
@@ -678,7 +229,7 @@ class CoarseReconstructionModel(nn.Module):
             "active_mask": active_mask,
             "local_context_mask": local_context_mask,
             "local_lidar_context": local_lidar_context,
-            "local_radar_active": local_radar_active,
+            "local_radar_active": local_radar_context,
             "local_radar_context": local_radar_context,
             "local_input": local_input,
             "hrnet_features": hrnet_features,
@@ -686,504 +237,6 @@ class CoarseReconstructionModel(nn.Module):
             "radar_pillar_bev": radar_sensor_bev,
             "lidar_pillar_statistics": lidar_pillar_statistics,
             "radar_pillar_statistics": radar_pillar_statistics,
-            "radar_pillar_attention_debug": radar_pillar_attention_debug,
         }
         outputs.update(hrnet_debug)
-        outputs.update(
-            {
-                f"range_aware_radar_{name}": value
-                for name, value in radar_context_debug.items()
-            }
-        )
-        return outputs
-
-    def _empty_radar_pillar_output(
-        self,
-        lidar: PointPillarsOutput,
-    ) -> PointPillarsOutput:
-        batch, _, height, width = lidar.dense_features.shape
-        channels = self.config.radar_channels
-        return PointPillarsOutput(
-            dense_features=lidar.dense_features.new_zeros(
-                (batch, channels, height, width)
-            ),
-            sparse_features=lidar.sparse_features.new_empty((0, channels)),
-            sparse_coordinates=lidar.sparse_coordinates.new_empty((0, 3)),
-            statistics={
-                "nonempty_pillars": torch.zeros(
-                    batch,
-                    dtype=torch.long,
-                    device=lidar.dense_features.device,
-                )
-            },
-        )
-
-    def _trusted_lidar_points(
-        self,
-        point_clouds: Sequence[torch.Tensor],
-        reconstruction_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
-        """Remove raw points whose XY pillar belongs to the repair mask."""
-        assert self.lidar_pillar_encoder is not None
-        trusted = []
-        for batch_index, points in enumerate(point_clouds):
-            rows, cols, valid = self.lidar_pillar_encoder.pillarizer.grid_indices(
-                points[:, :3]
-            )
-            untrusted = torch.zeros(
-                len(points), dtype=torch.bool, device=points.device
-            )
-            untrusted[valid] = reconstruction_mask[
-                batch_index, 0, rows[valid], cols[valid]
-            ] > 0.5
-            trusted.append(points[~untrusted])
-        return tuple(trusted)
-
-    def _forward_repair_query(
-        self,
-        faulty_lidar_bev: torch.Tensor,
-        radar_bev: torch.Tensor,
-        reconstruction_mask: torch.Tensor,
-        healthy_context_mask: torch.Tensor,
-        halo_mask: torch.Tensor,
-        *,
-        faulty_lidar_points: Sequence[torch.Tensor] | None,
-        radar_points: Sequence[torch.Tensor] | None,
-        radar_enabled: bool,
-        profile: bool,
-    ) -> dict[str, torch.Tensor]:
-        if faulty_lidar_points is None:
-            raise ValueError(
-                "faulty_lidar_points are required by the repair_query backbone"
-            )
-        assert self.lidar_pillar_encoder is not None
-        assert self.radar_pillar_encoder is not None
-        complete_started = _profile_start(faulty_lidar_bev, profile)
-        if profile and faulty_lidar_bev.is_cuda:
-            torch.cuda.reset_peak_memory_stats(faulty_lidar_bev.device)
-        pointpillars_started = _profile_start(faulty_lidar_bev, profile)
-        selected_lidar = self._select_lidar_point_fields(faulty_lidar_points)
-        trusted_points = self._trusted_lidar_points(
-            selected_lidar, reconstruction_mask
-        )
-        lidar = self.lidar_pillar_encoder(trusted_points, return_sparse=True)
-        assert isinstance(lidar, PointPillarsOutput)
-        if radar_enabled:
-            if radar_points is None:
-                raise ValueError(
-                    "radar_points are required by the repair_query backbone"
-                )
-            radar = self.radar_pillar_encoder(
-                self._select_radar_point_fields(radar_points),
-                return_sparse=True,
-            )
-            assert isinstance(radar, PointPillarsOutput)
-        else:
-            radar = self._empty_radar_pillar_output(lidar)
-        pointpillars_ms = _profile_elapsed_ms(
-            faulty_lidar_bev, pointpillars_started
-        )
-        decoder_outputs = self.repair_query_decoder(
-            lidar,
-            radar,
-            reconstruction_mask,
-            radar_enabled=radar_enabled,
-            profile=profile,
-        )
-        replacement_raw = decoder_outputs["replacement_raw"]
-        occupancy_logits = replacement_raw[:, 0:1]
-        predicted_density = replacement_raw[:, 1:2]
-        predicted_height = replacement_raw[:, 2:3]
-        replacement_bev = torch.cat(
-            (
-                torch.sigmoid(occupancy_logits),
-                predicted_density,
-                predicted_height,
-            ),
-            dim=1,
-        )
-        coarse_lidar_bev = (
-            (1.0 - reconstruction_mask) * faulty_lidar_bev
-            + reconstruction_mask * replacement_bev
-        )
-        complete_ms = _profile_elapsed_ms(coarse_lidar_bev, complete_started)
-        timing = {
-            "pointpillars_ms": pointpillars_ms,
-            **decoder_outputs["timing_ms"],
-            "complete_forward_ms": complete_ms,
-        }
-        peak_memory = (
-            torch.cuda.max_memory_allocated(faulty_lidar_bev.device)
-            if faulty_lidar_bev.is_cuda and profile
-            else 0
-        )
-        erased_lidar = lidar.dense_features * (1.0 - reconstruction_mask)
-        halo_mask = halo_mask * (1.0 - reconstruction_mask)
-        return {
-            "erased_lidar_bev": erased_lidar,
-            "erased_lidar_features": erased_lidar,
-            "lidar_sensor_bev": lidar.dense_features,
-            "radar_sensor_bev": radar.dense_features,
-            "lidar_pillar_bev": lidar.dense_features,
-            "radar_pillar_bev": radar.dense_features,
-            "lidar_pillar_statistics": lidar.statistics,
-            "radar_pillar_statistics": radar.statistics,
-            "repair_query_features": decoder_outputs["query_features"],
-            "repair_query_coordinates": decoder_outputs["query_coordinates"],
-            "repair_context_features": decoder_outputs["context_features"],
-            "repair_context_coordinates": decoder_outputs["context_coordinates"],
-            "trusted_lidar_coordinates": decoder_outputs[
-                "trusted_lidar_coordinates"
-            ],
-            "radar_context_coordinates": decoder_outputs[
-                "radar_context_coordinates"
-            ],
-            "repair_query_statistics": decoder_outputs["statistics"],
-            "repair_query_timing_ms": timing,
-            "repair_query_peak_memory_bytes": peak_memory,
-            "replacement_raw": replacement_raw,
-            "replacement_bev": replacement_bev,
-            "occupancy_logits": occupancy_logits,
-            "predicted_density": predicted_density,
-            "predicted_height": predicted_height,
-            "coarse_lidar_bev": coarse_lidar_bev,
-            "reconstruction_mask": reconstruction_mask,
-            "healthy_context_mask": healthy_context_mask,
-            "halo_mask": halo_mask,
-            "active_mask": torch.maximum(reconstruction_mask, halo_mask),
-        }
-
-    def _forward_sst(
-        self,
-        faulty_lidar_bev: torch.Tensor,
-        radar_bev: torch.Tensor,
-        reconstruction_mask: torch.Tensor,
-        healthy_context_mask: torch.Tensor,
-        halo_mask: torch.Tensor,
-        *,
-        faulty_lidar_points: Sequence[torch.Tensor] | None,
-        radar_points: Sequence[torch.Tensor] | None,
-        radar_enabled: bool,
-        profile_sst: bool,
-    ) -> dict[str, torch.Tensor]:
-        if faulty_lidar_points is None:
-            raise ValueError("faulty_lidar_points are required by the SST backbone")
-        assert self.lidar_pillar_encoder is not None
-        assert self.radar_pillar_encoder is not None
-        pointpillars_started = _profile_start(
-            faulty_lidar_bev, profile_sst
-        )
-        lidar = self.lidar_pillar_encoder(
-            self._select_lidar_point_fields(faulty_lidar_points),
-            return_sparse=True,
-        )
-        assert isinstance(lidar, PointPillarsOutput)
-        if radar_enabled:
-            if radar_points is None:
-                raise ValueError("radar_points are required by the SST backbone")
-            radar = self.radar_pillar_encoder(
-                self._select_radar_point_fields(radar_points),
-                return_sparse=True,
-            )
-            assert isinstance(radar, PointPillarsOutput)
-        else:
-            radar = self._empty_radar_pillar_output(lidar)
-        pointpillars_ms = _profile_elapsed_ms(
-            faulty_lidar_bev, pointpillars_started
-        )
-
-        halo_mask = halo_mask * (1.0 - reconstruction_mask)
-        active_mask = torch.maximum(reconstruction_mask, halo_mask)
-        erased_lidar_bev = (
-            1.0 - reconstruction_mask
-        ) * lidar.dense_features
-        tokens = self.sst_token_builder(
-            lidar,
-            radar,
-            reconstruction_mask,
-            healthy_context_mask,
-            include_repair_tokens=self.config.sst.include_repair_tokens,
-            radar_enabled=radar_enabled,
-        )
-        grid_shape = faulty_lidar_bev.shape[-2:]
-        final_tokens, sst_debug = self.sst_backbone(
-            tokens.features,
-            tokens.coordinates,
-            grid_shape,
-            profile=profile_sst,
-        )
-        reconstruction_started = _profile_start(
-            final_tokens, profile_sst
-        )
-        dense_sst_features = self.sst_scatter(
-            final_tokens,
-            tokens.coordinates,
-            faulty_lidar_bev.shape[0],
-            grid_shape,
-        )
-        reconstruction_features = self.sst_reconstruction_head(
-            dense_sst_features
-        )
-        replacement_raw = self.replacement_head(reconstruction_features)
-        occupancy_logits = replacement_raw[:, 0:1]
-        predicted_density = replacement_raw[:, 1:2]
-        predicted_height = replacement_raw[:, 2:3]
-        replacement_bev = torch.cat(
-            (
-                torch.sigmoid(occupancy_logits),
-                predicted_density,
-                predicted_height,
-            ),
-            dim=1,
-        )
-        coarse_lidar_bev = (
-            (1.0 - reconstruction_mask) * faulty_lidar_bev
-            + reconstruction_mask * replacement_bev
-        )
-        reconstruction_head_ms = _profile_elapsed_ms(
-            coarse_lidar_bev, reconstruction_started
-        )
-        token_statistics = dict(tokens.statistics)
-        token_statistics.update(
-            region_statistics(
-                sst_debug["tokens_per_region"],
-                batch_size=faulty_lidar_bev.shape[0],
-                grid_shape=grid_shape,
-                region_size_cells=self.config.sst.region_size_cells,
-            )
-        )
-        sst_timing_ms = {
-            "pointpillars_ms": pointpillars_ms,
-            **sst_debug["timing_ms"],
-            "reconstruction_head_ms": reconstruction_head_ms,
-        }
-        return {
-            "erased_lidar_bev": erased_lidar_bev,
-            "erased_lidar_features": erased_lidar_bev,
-            "lidar_sensor_bev": lidar.dense_features,
-            "radar_sensor_bev": radar.dense_features,
-            "lidar_pillar_bev": lidar.dense_features,
-            "radar_pillar_bev": radar.dense_features,
-            "lidar_pillar_statistics": lidar.statistics,
-            "radar_pillar_statistics": radar.statistics,
-            "trusted_lidar_coordinates": tokens.trusted_lidar_coordinates,
-            "sst_token_coordinates": tokens.coordinates,
-            "sst_token_projection": tokens.features,
-            "sst_block_1": sst_debug["sst_block_1"],
-            "sst_block_final": sst_debug["sst_block_final"],
-            "sst_coordinates_before": sst_debug["coordinates_before"],
-            "sst_coordinates_after": sst_debug["coordinates_after"],
-            "sst_dense_features": dense_sst_features,
-            "sst_reconstruction_features": reconstruction_features,
-            "sst_token_statistics": token_statistics,
-            "sst_timing_ms": sst_timing_ms,
-            "replacement_raw": replacement_raw,
-            "replacement_bev": replacement_bev,
-            "occupancy_logits": occupancy_logits,
-            "predicted_density": predicted_density,
-            "predicted_height": predicted_height,
-            "coarse_lidar_bev": coarse_lidar_bev,
-            "reconstruction_mask": reconstruction_mask,
-            "healthy_context_mask": healthy_context_mask,
-            "halo_mask": halo_mask,
-            "active_mask": active_mask,
-        }
-
-    def forward(
-        self,
-        faulty_lidar_bev: torch.Tensor,
-        radar_bev: torch.Tensor,
-        reconstruction_mask: torch.Tensor,
-        healthy_context_mask: torch.Tensor,
-        halo_mask: torch.Tensor,
-        *,
-        lidar_input_bev: torch.Tensor | None = None,
-        local_radar_bev: torch.Tensor | None = None,
-        faulty_lidar_points: Sequence[torch.Tensor] | None = None,
-        radar_points: Sequence[torch.Tensor] | None = None,
-        radar_enabled: bool = True,
-        local_radar_enabled: bool = True,
-        use_global_map: bool = True,
-        return_attention_weights: bool = False,
-        profile_sst: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        if self.config.backbone == "repair_query":
-            return self._forward_repair_query(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
-                radar_enabled=radar_enabled,
-                profile=profile_sst,
-            )
-        if self.config.backbone == "sst":
-            return self._forward_sst(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
-                radar_enabled=radar_enabled,
-                profile_sst=profile_sst,
-            )
-        if self.config.backbone == "hrnet":
-            return self._forward_hrnet(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                lidar_input_bev=lidar_input_bev,
-                local_radar_bev=local_radar_bev,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
-                radar_enabled=radar_enabled,
-                local_radar_enabled=local_radar_enabled,
-            )
-        (
-            lidar_sensor_bev,
-            radar_sensor_bev,
-            lidar_pillar_statistics,
-            radar_pillar_statistics,
-            radar_pillar_attention_debug,
-        ) = self._sensor_features(
-            (
-                lidar_input_bev
-                if lidar_input_bev is not None
-                else faulty_lidar_bev
-            ),
-            radar_bev,
-            faulty_lidar_points,
-            radar_points,
-            radar_enabled=radar_enabled,
-        )
-        halo_mask = halo_mask * (1.0 - reconstruction_mask)
-        active_mask = (
-            torch.maximum(reconstruction_mask, halo_mask)
-            if self.config.use_halo_context
-            else reconstruction_mask
-        )
-
-        erased_lidar_bev = (1.0 - reconstruction_mask) * lidar_sensor_bev
-        if self.config.use_healthy_context_mask:
-            local_context_mask = (
-                healthy_context_mask
-                if self.config.use_halo_context
-                else torch.zeros_like(healthy_context_mask)
-            )
-            local_mask_channels = (reconstruction_mask, local_context_mask)
-        else:
-            local_context_mask = 1.0 - reconstruction_mask
-            local_mask_channels = (reconstruction_mask,)
-        local_lidar_context = local_context_mask * lidar_sensor_bev
-        if local_radar_bev is None:
-            local_radar_bev = radar_sensor_bev
-        if not local_radar_enabled:
-            local_radar_bev = torch.zeros_like(radar_sensor_bev)
-        local_radar_active = active_mask * local_radar_bev
-        local_input = torch.cat(
-            (
-                local_lidar_context,
-                local_radar_active,
-                *local_mask_channels,
-            ),
-            dim=1,
-        )
-        skip_features, local_bottleneck = self.local_unet_encoder(local_input)
-
-        global_outputs = {}
-        attention_weights = None
-        if use_global_map:
-            global_lidar_input = torch.cat(
-                (erased_lidar_bev, reconstruction_mask), dim=1
-            )
-            h_lidar_global = self.global_lidar_encoder(global_lidar_input)
-            h_radar_global = self.global_radar_encoder(radar_sensor_bev)
-            global_context_map = self.global_fusion(
-                torch.cat((h_lidar_global, h_radar_global), dim=1)
-            )
-            attention_context, attention_weights, query_tokens, context_tokens = (
-                self.cross_attention(
-                    local_bottleneck,
-                    global_context_map,
-                    return_attention_weights=return_attention_weights,
-                )
-            )
-            fused_bottleneck = self.bottleneck_fusion(
-                local_bottleneck, attention_context
-            )
-            global_outputs = {
-                "global_lidar_input": global_lidar_input,
-                "attention_context": attention_context,
-                "global_context_map": global_context_map,
-                "query_tokens": query_tokens,
-                "context_tokens": context_tokens,
-            }
-        else:
-            fused_bottleneck = local_bottleneck
-        decoder_feature = self.local_unet_decoder(fused_bottleneck, skip_features)
-        if decoder_feature.shape[-2:] != faulty_lidar_bev.shape[-2:]:
-            decoder_feature = F.interpolate(
-                decoder_feature,
-                size=faulty_lidar_bev.shape[-2:],
-                mode="nearest",
-            )
-        replacement_raw = self.replacement_head(decoder_feature)
-        occupancy_logits = replacement_raw[:, 0:1]
-        predicted_density = replacement_raw[:, 1:2]
-        predicted_height = replacement_raw[:, 2:3]
-        replacement_bev = torch.cat(
-            (
-                torch.sigmoid(occupancy_logits),
-                predicted_density,
-                predicted_height,
-            ),
-            dim=1,
-        )
-        coarse_lidar_bev = (
-            (1.0 - reconstruction_mask) * faulty_lidar_bev
-            + reconstruction_mask * replacement_bev
-        )
-        outputs = {
-            "erased_lidar_bev": erased_lidar_bev,
-            "erased_lidar_features": erased_lidar_bev,
-            "lidar_sensor_bev": lidar_sensor_bev,
-            "radar_sensor_bev": radar_sensor_bev,
-            "replacement_raw": replacement_raw,
-            "replacement_bev": replacement_bev,
-            "occupancy_logits": occupancy_logits,
-            "predicted_density": predicted_density,
-            "predicted_height": predicted_height,
-            "coarse_lidar_bev": coarse_lidar_bev,
-            "reconstruction_mask": reconstruction_mask,
-            "healthy_context_mask": healthy_context_mask,
-            "halo_mask": halo_mask,
-            "active_mask": active_mask,
-            "local_context_mask": local_context_mask,
-            "local_lidar_context": local_lidar_context,
-            "local_input": local_input,
-            "local_bottleneck": local_bottleneck,
-            "fused_bottleneck": fused_bottleneck,
-        }
-        if self.config.pointpillars.enabled:
-            outputs.update(
-                {
-                    "lidar_pillar_bev": lidar_sensor_bev,
-                    "radar_pillar_bev": radar_sensor_bev,
-                    "lidar_pillar_statistics": lidar_pillar_statistics,
-                    "radar_pillar_statistics": radar_pillar_statistics,
-                    "radar_pillar_attention_debug": (
-                        radar_pillar_attention_debug
-                    ),
-                }
-            )
-        outputs.update(global_outputs)
-        if return_attention_weights and use_global_map:
-            assert attention_weights is not None
-            outputs["attention_weights"] = attention_weights
         return outputs

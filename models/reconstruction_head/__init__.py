@@ -1,43 +1,19 @@
-"""Building blocks for the second-stage BEV reconstruction pipeline."""
+"""VoD coarse reconstruction and residual-diffusion components."""
 
-from .fault_selector import (
-    FaultBlob,
-    FaultSelection,
-    FaultSelector,
-    FaultSelectorConfig,
-)
-from .fault_selector_simplified import (
-    FaultSelectorSimplified,
-    SimplifiedFaultComponent,
-    SimplifiedFaultSelection,
-    SimplifiedFaultSelectorConfig,
-)
+from .fault_selector import FaultBlob, FaultSelection, FaultSelector, FaultSelectorConfig
 from .fault_selector_cache import (
     InvalidSelectorCacheError,
     build_selector_cache_entry,
-    load_selector_inputs,
     load_selector_cache,
+    load_selector_inputs,
     selector_cache_path,
     selector_cache_root,
 )
-from .coarse_reconstruction.coarse_model import (
-    AbsolutePositionEncoder,
-    BottleneckFusionBlock,
-    CoarseReplacementHead,
-    CoarseReconstructionModel,
-    GlobalFusionBlock,
-    GlobalLidarEncoder,
-    GlobalRadarEncoder,
-    LocalToGlobalCrossAttention,
-    LocalUNetDecoder,
-    LocalUNetEncoder,
-)
-from .coarse_reconstruction.coarse_config import (
-    CoarseReconstructionConfig,
-    build_augmentation_config,
-    build_configs,
-    build_selector_config,
-    load_config,
+from .coarse_dataset import (
+    CoarseReconstructionDataset,
+    coarse_reconstruction_collate,
+    load_bev_grid_geometry,
+    load_bev_triplet,
 )
 from .geometric_augmentation import (
     GeometricAugmentationConfig,
@@ -47,6 +23,22 @@ from .geometric_augmentation import (
     ScaleAugmentationConfig,
     TranslationAugmentationConfig,
     YawAugmentationConfig,
+)
+from .pointpillars import (
+    BEVGridGeometry,
+    PillarFeatureNet,
+    PillarScatter,
+    Pillarizer,
+    PointPillarsConfig,
+    PointPillarsEncoder,
+    PointPillarsOutput,
+)
+from .coarse_reconstruction.coarse_config import (
+    CoarseReconstructionConfig,
+    build_augmentation_config,
+    build_configs,
+    build_selector_config,
+    load_config,
 )
 from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
@@ -58,41 +50,9 @@ from .coarse_reconstruction.coarse_loss import (
     occupancy_bce_weights,
     tolerance_radius_cells,
 )
-from .coarse_dataset import (
-    CoarseReconstructionDataset,
-    coarse_reconstruction_collate,
-    load_bev_grid_geometry,
-    load_bev_triplet,
-)
-from .pointpillars import (
-    BEVGridGeometry,
-    PillarFeatureNet,
-    PillarScatter,
-    Pillarizer,
-    PointPillarsConfig,
-    PointPillarsEncoder,
-    PointPillarsOutput,
-)
-from .coarse_reconstruction.sst_backbone import (
-    SSTBackbone,
-    SSTBlock,
-    SSTConfig,
-    SSTReconstructionHead,
-    SparseMultimodalTokens,
-    SparseRegionLayout,
-    SparseRegionalAttention,
-    SparseToDenseScatter,
-    SparseTokenBuilder,
-    build_sparse_region_layout,
-    regional_group_indices,
-)
-from .coarse_reconstruction.repair_query import (
-    RepairQueryConfig,
-    RepairQueryDecoder,
-    RepairQueryDecoderBlock,
-    RepairQueryTokenBuilder,
-    XYPositionEncoder,
-    normalized_xy,
+from .coarse_reconstruction.coarse_model import (
+    CoarseReplacementHead,
+    CoarseReconstructionModel,
 )
 from .coarse_reconstruction.hrnet_backbone import (
     HRNetBackbone,
@@ -101,15 +61,6 @@ from .coarse_reconstruction.hrnet_backbone import (
     HRNetModule,
     HRNetResidualBlock,
     HRNetTransition,
-)
-from .coarse_reconstruction.range_aware_radar import (
-    RangeAwareRadarAggregation,
-    RangeAwareRadarConfig,
-)
-from .coarse_reconstruction.radar_pillar_attention import (
-    RadarPillarAttention,
-    RadarPillarAttentionBlock,
-    RadarPillarAttentionConfig,
 )
 from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
@@ -140,108 +91,4 @@ from .diffusion_process.diffusion_metrics import (
     reconstruction_stage_metrics,
 )
 
-__all__ = [
-    "BEVChannelNormalization",
-    "BEVGridGeometry",
-    "AbsolutePositionEncoder",
-    "BottleneckFusionBlock",
-    "CoarseReplacementHead",
-    "CoarseReconstructionDataset",
-    "CoarseLossConfig",
-    "CoarseReconstructionConfig",
-    "CoarseReconstructionModel",
-    "GeometricAugmentationConfig",
-    "GeometricTransform",
-    "HorizontalFlipConfig",
-    "ReconstructionGeometricAugmentation",
-    "ScaleAugmentationConfig",
-    "TranslationAugmentationConfig",
-    "YawAugmentationConfig",
-    "coarse_reconstruction_range_metrics",
-    "DiffusionDownBlock",
-    "DiffusionProcessConfig",
-    "DiffusionUpBlock",
-    "GlobalFusionBlock",
-    "GlobalLidarEncoder",
-    "GlobalRadarEncoder",
-    "HRNetBackbone",
-    "HRNetConfig",
-    "HRNetFusion",
-    "HRNetModule",
-    "HRNetResidualBlock",
-    "HRNetTransition",
-    "RangeAwareRadarAggregation",
-    "RangeAwareRadarConfig",
-    "RadarPillarAttention",
-    "RadarPillarAttentionBlock",
-    "RadarPillarAttentionConfig",
-    "GaussianNoiseSchedule",
-    "LocalToGlobalCrossAttention",
-    "LocalUNetDecoder",
-    "LocalUNetEncoder",
-    "MaskedBEVReconstructionLoss",
-    "ObservabilityWeightingConfig",
-    "OccupancyLossConfig",
-    "MaskedEpsilonMSELoss",
-    "MaskedResidualDiffusion",
-    "PillarFeatureNet",
-    "PillarScatter",
-    "Pillarizer",
-    "PointPillarsConfig",
-    "PointPillarsEncoder",
-    "PointPillarsOutput",
-    "RepairQueryConfig",
-    "RepairQueryDecoder",
-    "RepairQueryDecoderBlock",
-    "RepairQueryTokenBuilder",
-    "SSTBackbone",
-    "SSTBlock",
-    "SSTConfig",
-    "SSTReconstructionHead",
-    "SparseMultimodalTokens",
-    "SparseRegionLayout",
-    "SparseRegionalAttention",
-    "SparseToDenseScatter",
-    "SparseTokenBuilder",
-    "build_sparse_region_layout",
-    "regional_group_indices",
-    "XYPositionEncoder",
-    "normalized_xy",
-    "FaultBlob",
-    "FaultSelection",
-    "FaultSelector",
-    "FaultSelectorConfig",
-    "FaultSelectorSimplified",
-    "SimplifiedFaultComponent",
-    "SimplifiedFaultSelection",
-    "SimplifiedFaultSelectorConfig",
-    "InvalidSelectorCacheError",
-    "ResidualDiffusionSampler",
-    "ResidualDiffusionUNet",
-    "ResidualDiffusionUNetConfig",
-    "SinusoidalTimeEmbedding",
-    "TimeConditionedResidualBlock",
-    "FrozenCoarseDiffusionPipeline",
-    "load_bev_triplet",
-    "coarse_reconstruction_metrics",
-    "coarse_reconstruction_collate",
-    "build_configs",
-    "build_augmentation_config",
-    "build_selector_config",
-    "build_selector_cache_entry",
-    "load_config",
-    "load_bev_grid_geometry",
-    "occupancy_bce_weights",
-    "tolerance_radius_cells",
-    "bev_occupancy",
-    "load_frozen_coarse_model",
-    "load_selector_cache",
-    "load_selector_inputs",
-    "validate_diffusion_checkpoint_compatibility",
-    "occupancy_metrics",
-    "per_channel_continuous_metrics",
-    "reconstruction_stage_metrics",
-    "residual_target",
-    "selector_cache_path",
-    "selector_cache_root",
-]
+__all__ = [name for name in globals() if not name.startswith("_")]

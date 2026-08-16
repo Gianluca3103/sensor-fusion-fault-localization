@@ -1,4 +1,4 @@
-"""Configuration loading and validation for direct-BEV coarse reconstruction."""
+"""Configuration for the VoD PointPillars + HRNet coarse reconstructor."""
 
 from __future__ import annotations
 
@@ -11,181 +11,84 @@ from .coarse_loss import (
     ObservabilityWeightingConfig,
     OccupancyLossConfig,
 )
-from ..fault_selector import FaultSelectorConfig
-from ..pointpillars import PointPillarsConfig
-from ..geometric_augmentation import GeometricAugmentationConfig
-from .sst_backbone import SSTConfig
-from .repair_query import RepairQueryConfig
 from .hrnet_backbone import HRNetConfig
-from .range_aware_radar import RangeAwareRadarConfig
-from .radar_pillar_attention import RadarPillarAttentionConfig
+from ..fault_selector import FaultSelectorConfig
+from ..geometric_augmentation import GeometricAugmentationConfig
+from ..pointpillars import PointPillarsConfig
 
 
 @dataclass(frozen=True)
 class CoarseReconstructionConfig:
-    backbone: str = "unet"
+    """The single supported coarse architecture.
+
+    PointPillars may be disabled only to load a direct-BEV HRNet checkpoint used
+    by the untouched diffusion pipeline. New coarse experiments should enable it.
+    """
+
     lidar_channels: int = 3
     radar_channels: int = 4
     target_lidar_channels: int = 3
-    unet_base_channels: int = 16
-    unet_depth: int = 4
-    dropout: float = 0.025
     use_healthy_context_mask: bool = True
     use_halo_context: bool = True
-    global_base_channels: int = 16
-    global_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8, 16)
-    attention_dim: int = 128
-    num_heads: int = 4
-    attention_dropout: float = 0.025
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
-    sst: SSTConfig = field(default_factory=SSTConfig)
-    repair_query: RepairQueryConfig = field(default_factory=RepairQueryConfig)
     hrnet: HRNetConfig = field(default_factory=HRNetConfig)
-    range_aware_radar: RangeAwareRadarConfig = field(
-        default_factory=RangeAwareRadarConfig
-    )
-    radar_pillar_attention: RadarPillarAttentionConfig = field(
-        default_factory=RadarPillarAttentionConfig
-    )
 
     @property
     def local_input_channels(self) -> int:
         mask_channels = 2 if self.use_healthy_context_mask else 1
-        radar_channels = (
-            self.range_aware_radar.output_channels
-            if self.range_aware_radar.enabled
-            else self.radar_channels
-        )
-        return self.lidar_channels + radar_channels + mask_channels
+        return self.lidar_channels + self.radar_channels + mask_channels
 
     def validate(self) -> None:
-        if self.backbone not in {"unet", "sst", "repair_query", "hrnet"}:
-            raise ValueError(
-                "model.backbone must be 'unet', 'sst', 'repair_query', or 'hrnet'"
-            )
-        integer_values = {
-            "lidar_channels": self.lidar_channels,
-            "radar_channels": self.radar_channels,
-            "target_lidar_channels": self.target_lidar_channels,
-            "unet_base_channels": self.unet_base_channels,
-            "unet_depth": self.unet_depth,
-            "global_base_channels": self.global_base_channels,
-            "attention_dim": self.attention_dim,
-            "num_heads": self.num_heads,
-        }
-        for name, value in integer_values.items():
-            if value < 1:
+        for name in ("lidar_channels", "radar_channels", "target_lidar_channels"):
+            if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.target_lidar_channels != 3:
             raise ValueError(
-                "The coarse reconstruction target remains the existing "
-                "three-channel LiDAR BEV"
+                "The coarse target must contain occupancy, density, and height"
             )
-        if not self.global_channel_multipliers or any(
-            value < 1 for value in self.global_channel_multipliers
-        ):
-            raise ValueError("global_channel_multipliers must contain positive values")
-        if self.attention_dim % self.num_heads:
-            raise ValueError("attention_dim must be divisible by num_heads")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must be in [0,1)")
         if not isinstance(self.use_healthy_context_mask, bool):
             raise ValueError("use_healthy_context_mask must be boolean")
         if not isinstance(self.use_halo_context, bool):
             raise ValueError("use_halo_context must be boolean")
-        if not 0.0 <= self.attention_dropout < 1.0:
-            raise ValueError("attention_dropout must be in [0,1)")
         self.pointpillars.validate()
-        self.sst.validate()
-        self.repair_query.validate()
         self.hrnet.validate()
-        self.range_aware_radar.validate()
-        self.radar_pillar_attention.validate()
-        if self.range_aware_radar.enabled and self.backbone != "hrnet":
-            raise ValueError(
-                "range-aware Radar aggregation is isolated to the HRNet backbone"
-            )
-        if self.range_aware_radar.enabled and self.pointpillars.enabled:
-            raise ValueError(
-                "range-aware Radar aggregation requires handcrafted Radar BEVs"
-            )
-        if (
-            self.range_aware_radar.enabled
-            and self.hrnet.radar_context_layers
-        ):
-            raise ValueError(
-                "Use either fixed RF Radar context or range-aware Radar, not both"
-            )
-        if self.radar_pillar_attention.enabled:
-            if self.backbone != "hrnet":
+        if self.pointpillars.enabled:
+            expected = self.pointpillars.output_channels
+            if self.lidar_channels != expected or self.radar_channels != expected:
                 raise ValueError(
-                    "Radar PillarAttention is isolated to the HRNet backbone"
+                    "PointPillars output_channels must match both sensor channel counts"
                 )
-            if not self.pointpillars.enabled:
-                raise ValueError(
-                    "Radar PillarAttention requires PointPillars inputs"
-                )
-            if self.range_aware_radar.enabled:
-                raise ValueError(
-                    "Radar PillarAttention cannot be combined with range-aware Radar"
-                )
-            if self.hrnet.radar_context_layers:
-                raise ValueError(
-                    "Radar PillarAttention cannot be combined with fixed RF Radar context"
-                )
-        if (
-            self.backbone in {"sst", "repair_query"}
-            and not self.pointpillars.enabled
-        ):
-            raise ValueError(
-                f"The {self.backbone} backbone requires PointPillars inputs"
-            )
-        expected_lidar = self.pointpillars.output_channels
-        expected_radar = self.pointpillars.output_channels
-        if self.pointpillars.enabled and self.lidar_channels != expected_lidar:
-            raise ValueError(
-                "lidar_channels does not match the selected sensor representation: "
-                f"expected {expected_lidar}, got {self.lidar_channels}"
-            )
-        if self.pointpillars.enabled and self.radar_channels != expected_radar:
-            raise ValueError(
-                "radar_channels does not match the selected sensor representation: "
-                f"expected {expected_radar}, got {self.radar_channels}"
-            )
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CoarseReconstructionConfig":
+        """Load current configs and historical HRNet checkpoint metadata.
+
+        Old checkpoints contain fields for deleted experimental backbones. They
+        are deliberately ignored only when the checkpoint selected HRNet.
+        """
+
         values = dict(payload)
-        if "global_channel_multipliers" in values:
-            values["global_channel_multipliers"] = tuple(
-                values["global_channel_multipliers"]
+        backbone = values.pop("backbone", "hrnet")
+        if backbone != "hrnet":
+            raise ValueError(
+                f"Unsupported legacy coarse backbone {backbone!r}; only HRNet remains"
             )
         pointpillars = values.get("pointpillars", {})
         if isinstance(pointpillars, dict):
             values["pointpillars"] = PointPillarsConfig(**pointpillars)
-        sst = values.get("sst", {})
-        if isinstance(sst, dict):
-            values["sst"] = SSTConfig(**sst)
-        repair_query = values.get("repair_query", {})
-        if isinstance(repair_query, dict):
-            values["repair_query"] = RepairQueryConfig(**repair_query)
         hrnet = values.get("hrnet", {})
         if isinstance(hrnet, dict):
-            values["hrnet"] = HRNetConfig(**hrnet)
-        range_aware_radar = values.get("range_aware_radar", {})
-        if isinstance(range_aware_radar, dict):
-            values["range_aware_radar"] = RangeAwareRadarConfig(
-                **range_aware_radar
+            hrnet_fields = {item.name for item in fields(HRNetConfig)}
+            values["hrnet"] = HRNetConfig(
+                **{key: value for key, value in hrnet.items() if key in hrnet_fields}
             )
-        radar_pillar_attention = values.get("radar_pillar_attention", {})
-        if isinstance(radar_pillar_attention, dict):
-            values["radar_pillar_attention"] = RadarPillarAttentionConfig(
-                **radar_pillar_attention
-            )
-        return cls(**values)
+        supported = {item.name for item in fields(cls)}
+        config = cls(**{key: value for key, value in values.items() if key in supported})
+        config.validate()
+        return config
 
 
 def load_config(path: str | Path) -> dict:
@@ -195,17 +98,26 @@ def load_config(path: str | Path) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
-        raise ValueError("Coarse configuration must decode to a mapping")
+        raise ValueError("Coarse configuration must decode to an object")
     return payload
 
 
-def build_selector_config(payload: dict) -> FaultSelectorConfig:
-    selector_payload = payload.get("fault_selector", {})
-    valid_fields = {field.name for field in fields(FaultSelectorConfig)}
-    unknown = set(selector_payload) - valid_fields
+def _checked_dataclass(section: str, payload: object, cls):
+    if not isinstance(payload, dict):
+        raise ValueError(f"{section} must be an object")
+    valid = {item.name for item in fields(cls)}
+    unknown = set(payload) - valid
     if unknown:
-        raise ValueError("Unknown fault_selector settings: " + ", ".join(sorted(unknown)))
-    config = FaultSelectorConfig(**selector_payload)
+        raise ValueError(
+            f"Unknown {section} settings: " + ", ".join(sorted(unknown))
+        )
+    return cls(**payload)
+
+
+def build_selector_config(payload: dict) -> FaultSelectorConfig:
+    config = _checked_dataclass(
+        "fault_selector", payload.get("fault_selector", {}), FaultSelectorConfig
+    )
     config.validate()
     return config
 
@@ -215,113 +127,54 @@ def build_augmentation_config(payload: dict) -> GeometricAugmentationConfig:
 
 
 def build_configs(payload: dict):
+    """Build the only supported VoD coarse model, its loss, and selector."""
+
     coarse = payload.get("coarse_reconstruction", {})
-    unet = coarse.get("unet", {})
-    global_context = coarse.get("global_context", {})
+    if not isinstance(coarse, dict):
+        raise ValueError("coarse_reconstruction must be an object")
     if not coarse.get("enabled", True):
-        raise ValueError("coarse_reconstruction.enabled must be true for this trainer")
-    if unet.get("normalization", "group_norm") != "group_norm":
-        raise ValueError("The coarse U-Net currently supports group_norm only")
-    if unet.get("activation", "silu") != "silu":
-        raise ValueError("The coarse U-Net currently supports silu activation only")
-    defaults = CoarseReconstructionConfig()
+        raise ValueError("coarse_reconstruction.enabled must be true")
+
     model_payload = payload.get("model", {})
     if not isinstance(model_payload, dict):
         raise ValueError("model must be an object")
-    unknown_model_fields = set(model_payload) - {
-        "backbone",
-        "lidar_channels",
-        "radar_channels",
-    }
-    if unknown_model_fields:
-        raise ValueError(
-            "Unknown model settings: " + ", ".join(sorted(unknown_model_fields))
-        )
-    backbone = model_payload.get("backbone", defaults.backbone)
-    sst_payload = payload.get("sst", {})
-    if not isinstance(sst_payload, dict):
-        raise ValueError("sst must be an object")
-    valid_sst_fields = {field.name for field in fields(SSTConfig)}
-    unknown_sst_fields = set(sst_payload) - valid_sst_fields
-    if unknown_sst_fields:
-        raise ValueError(
-            "Unknown sst settings: " + ", ".join(sorted(unknown_sst_fields))
-        )
-    sst = SSTConfig(**sst_payload)
-    repair_query_payload = payload.get("repair_query", {})
-    if not isinstance(repair_query_payload, dict):
-        raise ValueError("repair_query must be an object")
-    valid_repair_query_fields = {
-        field.name for field in fields(RepairQueryConfig)
-    }
-    unknown_repair_query_fields = (
-        set(repair_query_payload) - valid_repair_query_fields
+    unknown_model = set(model_payload) - {"backbone", "lidar_channels", "radar_channels"}
+    if unknown_model:
+        raise ValueError("Unknown model settings: " + ", ".join(sorted(unknown_model)))
+    if model_payload.get("backbone", "hrnet") != "hrnet":
+        raise ValueError("Only the HRNet coarse backbone is supported")
+
+    pointpillars = _checked_dataclass(
+        "pointpillars", payload.get("pointpillars", {}), PointPillarsConfig
     )
-    if unknown_repair_query_fields:
-        raise ValueError(
-            "Unknown repair_query settings: "
-            + ", ".join(sorted(unknown_repair_query_fields))
-        )
-    repair_query = RepairQueryConfig(**repair_query_payload)
-    hrnet_payload = payload.get("hrnet", {})
-    if not isinstance(hrnet_payload, dict):
-        raise ValueError("hrnet must be an object")
-    valid_hrnet_fields = {field.name for field in fields(HRNetConfig)}
-    unknown_hrnet_fields = set(hrnet_payload) - valid_hrnet_fields
-    if unknown_hrnet_fields:
-        raise ValueError(
-            "Unknown hrnet settings: "
-            + ", ".join(sorted(unknown_hrnet_fields))
-        )
-    hrnet = HRNetConfig(**hrnet_payload)
-    range_aware_payload = payload.get("range_aware_radar", {})
-    if not isinstance(range_aware_payload, dict):
-        raise ValueError("range_aware_radar must be an object")
-    valid_range_aware_fields = {
-        field.name for field in fields(RangeAwareRadarConfig)
+    hrnet = _checked_dataclass("hrnet", payload.get("hrnet", {}), HRNetConfig)
+
+    # Current configs use `masks`; historical HRNet configs stored the same two
+    # switches under `coarse_reconstruction.unet`.
+    mask_payload = payload.get("masks")
+    if mask_payload is None:
+        legacy_unet = coarse.get("unet", {})
+        mask_payload = {
+            key: legacy_unet[key]
+            for key in ("use_healthy_context_mask", "use_halo_context")
+            if key in legacy_unet
+        }
+    if not isinstance(mask_payload, dict):
+        raise ValueError("masks must be an object")
+    unknown_masks = set(mask_payload) - {
+        "use_healthy_context_mask",
+        "use_halo_context",
     }
-    unknown_range_aware_fields = (
-        set(range_aware_payload) - valid_range_aware_fields
-    )
-    if unknown_range_aware_fields:
-        raise ValueError(
-            "Unknown range_aware_radar settings: "
-            + ", ".join(sorted(unknown_range_aware_fields))
-        )
-    range_aware_radar = RangeAwareRadarConfig(**range_aware_payload)
-    pillar_attention_payload = payload.get("radar_pillar_attention", {})
-    if not isinstance(pillar_attention_payload, dict):
-        raise ValueError("radar_pillar_attention must be an object")
-    valid_pillar_attention_fields = {
-        field.name for field in fields(RadarPillarAttentionConfig)
-    }
-    unknown_pillar_attention_fields = (
-        set(pillar_attention_payload) - valid_pillar_attention_fields
-    )
-    if unknown_pillar_attention_fields:
-        raise ValueError(
-            "Unknown radar_pillar_attention settings: "
-            + ", ".join(sorted(unknown_pillar_attention_fields))
-        )
-    radar_pillar_attention = RadarPillarAttentionConfig(
-        **pillar_attention_payload
-    )
-    pointpillars_payload = payload.get("pointpillars", {})
-    if not isinstance(pointpillars_payload, dict):
-        raise ValueError("pointpillars must be an object")
-    valid_pointpillars_fields = {
-        field.name for field in fields(PointPillarsConfig)
-    }
-    unknown_pointpillars_fields = (
-        set(pointpillars_payload) - valid_pointpillars_fields
-    )
-    if unknown_pointpillars_fields:
-        raise ValueError(
-            "Unknown pointpillars settings: "
-            + ", ".join(sorted(unknown_pointpillars_fields))
-        )
-    pointpillars = PointPillarsConfig(**pointpillars_payload)
-    pointpillars.validate()
+    if unknown_masks:
+        raise ValueError("Unknown masks settings: " + ", ".join(sorted(unknown_masks)))
+
+    # Fail if an obsolete experimental module is still requested, while
+    # accepting historical files that record those modules as disabled.
+    for section in ("range_aware_radar", "radar_pillar_attention"):
+        obsolete = payload.get(section, {})
+        if isinstance(obsolete, dict) and obsolete.get("enabled", False):
+            raise ValueError(f"{section} was removed from the HRNet-only pipeline")
+
     lidar_channels = (
         pointpillars.output_channels
         if pointpillars.enabled
@@ -333,44 +186,18 @@ def build_configs(payload: dict):
         else int(model_payload.get("radar_channels", 4))
     )
     model_config = CoarseReconstructionConfig(
-        backbone=backbone,
         lidar_channels=lidar_channels,
         radar_channels=radar_channels,
-        unet_base_channels=unet.get(
-            "base_channels", defaults.unet_base_channels
-        ),
-        unet_depth=unet.get("depth", defaults.unet_depth),
-        dropout=unet.get("dropout", defaults.dropout),
-        use_healthy_context_mask=unet.get(
-            "use_healthy_context_mask", defaults.use_healthy_context_mask
-        ),
-        use_halo_context=unet.get(
-            "use_halo_context", defaults.use_halo_context
-        ),
-        global_base_channels=global_context.get(
-            "base_channels", defaults.global_base_channels
-        ),
-        global_channel_multipliers=tuple(
-            global_context.get(
-                "channel_multipliers", defaults.global_channel_multipliers
-            )
-        ),
-        attention_dim=global_context.get(
-            "attention_dim", defaults.attention_dim
-        ),
-        num_heads=global_context.get("num_heads", defaults.num_heads),
-        attention_dropout=global_context.get(
-            "attention_dropout", defaults.attention_dropout
-        ),
+        use_healthy_context_mask=mask_payload.get("use_healthy_context_mask", True),
+        use_halo_context=mask_payload.get("use_halo_context", True),
         pointpillars=pointpillars,
-        sst=sst,
-        repair_query=repair_query,
         hrnet=hrnet,
-        range_aware_radar=range_aware_radar,
-        radar_pillar_attention=radar_pillar_attention,
     )
+
     loss_payload = coarse.get("loss", {})
-    allowed_loss_fields = {
+    if not isinstance(loss_payload, dict):
+        raise ValueError("coarse_reconstruction.loss must be an object")
+    allowed_loss = {
         "lambda_occupancy",
         "lambda_density",
         "lambda_height",
@@ -378,62 +205,27 @@ def build_configs(payload: dict):
         "observability_weighting",
         "occupancy",
     }
-    unknown_loss_fields = set(loss_payload) - allowed_loss_fields
-    if unknown_loss_fields:
+    unknown_loss = set(loss_payload) - allowed_loss
+    if unknown_loss:
         raise ValueError(
             "Unknown or obsolete coarse loss settings: "
-            + ", ".join(sorted(unknown_loss_fields))
+            + ", ".join(sorted(unknown_loss))
         )
-    observability_payload = loss_payload.get("observability_weighting", {})
-    if not isinstance(observability_payload, dict):
-        raise ValueError("coarse loss observability_weighting must be an object")
-    unknown_observability_fields = set(observability_payload) - {
-        "enabled",
-        "min_empty_weight",
-    }
-    if unknown_observability_fields:
-        raise ValueError(
-            "Unknown observability_weighting settings: "
-            + ", ".join(sorted(unknown_observability_fields))
-        )
-    occupancy_payload = loss_payload.get("occupancy", {})
-    if not isinstance(occupancy_payload, dict):
-        raise ValueError("coarse loss occupancy must be an object")
-    allowed_occupancy_fields = {
-        "type",
-        "exact_weight",
-        "tolerant_recall_weight",
-        "far_fp_weight",
-        "tolerance_radius_m",
-    }
-    unknown_occupancy_fields = set(occupancy_payload) - allowed_occupancy_fields
-    if unknown_occupancy_fields:
-        raise ValueError(
-            "Unknown occupancy loss settings: "
-            + ", ".join(sorted(unknown_occupancy_fields))
-        )
+    observability = _checked_dataclass(
+        "observability_weighting",
+        loss_payload.get("observability_weighting", {}),
+        ObservabilityWeightingConfig,
+    )
+    occupancy = _checked_dataclass(
+        "occupancy", loss_payload.get("occupancy", {}), OccupancyLossConfig
+    )
     loss_config = CoarseLossConfig(
         lambda_occupancy=loss_payload.get("lambda_occupancy", 1.0),
         lambda_density=loss_payload.get("lambda_density", 1.0),
         lambda_height=loss_payload.get("lambda_height", 1.0),
         epsilon=loss_payload.get("epsilon", 1.0e-8),
-        observability_weighting=ObservabilityWeightingConfig(
-            enabled=observability_payload.get("enabled", False),
-            min_empty_weight=observability_payload.get(
-                "min_empty_weight", 0.1
-            ),
-        ),
-        occupancy=OccupancyLossConfig(
-            type=occupancy_payload.get("type", "existing"),
-            exact_weight=occupancy_payload.get("exact_weight", 0.25),
-            tolerant_recall_weight=occupancy_payload.get(
-                "tolerant_recall_weight", 1.0
-            ),
-            far_fp_weight=occupancy_payload.get("far_fp_weight", 0.5),
-            tolerance_radius_m=occupancy_payload.get(
-                "tolerance_radius_m", 0.5
-            ),
-        ),
+        observability_weighting=observability,
+        occupancy=occupancy,
     )
     selector_config = build_selector_config(payload)
     model_config.validate()

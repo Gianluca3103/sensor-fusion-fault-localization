@@ -45,22 +45,6 @@ def _load_selector_config(path: Path) -> FaultSelectorConfig:
     return config
 
 
-def _model_lidar_input(
-    inputs: dict[str, torch.Tensor],
-    model_config: CoarseReconstructionConfig,
-) -> torch.Tensor | None:
-    """Return engineered BEV input only for models configured to consume it."""
-
-    engineered = inputs.get("lidar_input_bev")
-    if engineered is None or model_config.pointpillars.enabled:
-        return None
-    if engineered.shape[1] != model_config.lidar_channels:
-        return None
-    if engineered.shape[1] == inputs["faulty_bev"].shape[1]:
-        return None
-    return engineered
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -70,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/coarse_reconstruction.json"),
+        default=Path("configs/coarse_reconstruction_vod.json"),
         help="Configuration used to validate the cached Fault Selector masks.",
     )
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
@@ -99,10 +83,6 @@ def _move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
         "clean_bev",
     )
     moved = {key: batch[key].to(device, non_blocking=True) for key in keys}
-    if "lidar_input_bev" in batch:
-        moved["lidar_input_bev"] = batch["lidar_input_bev"].to(
-            device, non_blocking=True
-        )
     for key in ("faulty_lidar_points", "radar_points"):
         if key in batch:
             moved[key] = tuple(
@@ -459,10 +439,6 @@ def main() -> None:
     if "model_config" not in checkpoint or "model_state_dict" not in checkpoint:
         raise ValueError("Checkpoint does not contain a coarse reconstruction model")
     model_payload = dict(checkpoint["model_config"])
-    if "global_channel_multipliers" in model_payload:
-        model_payload["global_channel_multipliers"] = tuple(
-            model_payload["global_channel_multipliers"]
-        )
     model_config = CoarseReconstructionConfig.from_dict(model_payload)
 
     selector_config = _load_selector_config(args.config)
@@ -501,8 +477,12 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
         collate_fn=coarse_reconstruction_collate,
     )
-    radar_mode = str(checkpoint.get("radar_mode", "full"))
-    use_global_map = bool(checkpoint.get("global_map_enabled", True))
+    radar_enabled = bool(
+        checkpoint.get(
+            "radar_enabled",
+            not checkpoint.get("radar_disabled", False),
+        )
+    )
     epsilon = float(checkpoint.get("loss_config", {}).get("epsilon", 1.0e-8))
     use_amp = device.type == "cuda" and not args.no_amp
     records = []
@@ -513,14 +493,8 @@ def main() -> None:
     with torch.inference_mode():
         for batch in loader:
             inputs = _move_batch(batch, device)
-            local_radar_bev = None
-            radar_enabled = radar_mode != "none"
-            local_radar_enabled = radar_mode == "full"
-            if radar_mode == "none":
+            if not radar_enabled:
                 inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
-            elif radar_mode == "global-only":
-                if not model_config.pointpillars.enabled:
-                    local_radar_bev = torch.zeros_like(inputs["radar_bev"])
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
@@ -532,13 +506,9 @@ def main() -> None:
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
-                    lidar_input_bev=_model_lidar_input(inputs, model_config),
-                    local_radar_bev=local_radar_bev,
                     faulty_lidar_points=inputs.get("faulty_lidar_points"),
                     radar_points=inputs.get("radar_points"),
                     radar_enabled=radar_enabled,
-                    local_radar_enabled=local_radar_enabled,
-                    use_global_map=use_global_map,
                 )
             batch_size = inputs["faulty_bev"].shape[0]
             for index in range(batch_size):
@@ -613,7 +583,7 @@ def main() -> None:
                     - record["faulty_occupancy_exact_iou"]
                 )
                 records.append(record)
-                if model_config.backbone == "hrnet" and not hrnet_debug_saved:
+                if not hrnet_debug_saved:
                     _save_hrnet_debug(
                         args.output_root / "visualizations" / "hrnet_debug",
                         inputs["clean_bev"][index],
@@ -662,8 +632,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
-        "radar_mode": radar_mode,
-        "global_map_enabled": use_global_map,
+        "radar_enabled": radar_enabled,
         "overall": summarize_records(records),
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,

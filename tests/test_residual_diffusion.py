@@ -11,6 +11,7 @@ from models.reconstruction_head import (
     DiffusionProcessConfig,
     FrozenCoarseDiffusionPipeline,
     GaussianNoiseSchedule,
+    HRNetConfig,
     MaskedEpsilonMSELoss,
     MaskedResidualDiffusion,
     ResidualDiffusionSampler,
@@ -277,12 +278,11 @@ class ResidualDiffusionTests(unittest.TestCase):
 
     def test_coarse_checkpoint_loader(self):
         config = CoarseReconstructionConfig(
-            unet_base_channels=2,
-            unet_depth=2,
-            global_base_channels=2,
-            global_channel_multipliers=(1, 2),
-            attention_dim=4,
-            num_heads=1,
+            hrnet=HRNetConfig(
+                base_channels=2,
+                blocks_per_stage=1,
+                residual_blocks_per_branch=1,
+            )
         )
         model = CoarseReconstructionModel(config)
         with tempfile.TemporaryDirectory() as directory:

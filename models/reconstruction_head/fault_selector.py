@@ -17,8 +17,14 @@ class FaultSelectorConfig:
     min_lidar_loss_fraction: float = 0.95
     min_repair_box_cells: int = 5
     min_repair_fault_fraction: float = 0.95
+    primary_expansion_gap_cells: int = 0
     max_secondary_repair_boxes: int = 0
+    min_secondary_lidar_loss_fraction: float = 0.70
+    min_secondary_repair_fault_fraction: float = 0.70
     min_secondary_repair_cells: int = 1
+    secondary_merge_gap_cells: int = 4
+    min_secondary_box_spatial_density: float = 0.01
+    min_secondary_box_side_cells: int = 1
     min_halo_healthy_fraction: float = 0.90
     min_halo_healthy_cells: int = 64
     min_halo_context_ratio: float = 0.25
@@ -31,8 +37,11 @@ class FaultSelectorConfig:
     def validate(self) -> None:
         for name in (
             "min_lidar_loss_fraction",
+            "min_secondary_lidar_loss_fraction",
             "min_repair_fault_fraction",
+            "min_secondary_repair_fault_fraction",
             "min_halo_healthy_fraction",
+            "min_secondary_box_spatial_density",
         ):
             value = getattr(self, name)
             if not np.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -41,10 +50,16 @@ class FaultSelectorConfig:
             raise ValueError("min_halo_healthy_cells must be non-negative")
         if self.min_repair_box_cells < 1:
             raise ValueError("min_repair_box_cells must be positive")
+        if self.primary_expansion_gap_cells < 0:
+            raise ValueError("primary_expansion_gap_cells must be non-negative")
         if self.max_secondary_repair_boxes < 0:
             raise ValueError("max_secondary_repair_boxes must be non-negative")
         if self.min_secondary_repair_cells < 1:
             raise ValueError("min_secondary_repair_cells must be positive")
+        if self.secondary_merge_gap_cells < 0:
+            raise ValueError("secondary_merge_gap_cells must be non-negative")
+        if self.min_secondary_box_side_cells < 1:
+            raise ValueError("min_secondary_box_side_cells must be positive")
         if (
             not np.isfinite(self.min_halo_context_ratio)
             or self.min_halo_context_ratio < 0.0
@@ -136,6 +151,111 @@ def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
     )
 
 
+def _box_spatial_density(
+    rectangle: tuple[int, int, int, int],
+    fault_mask: np.ndarray,
+) -> float:
+    """Return fault-evidence cells divided by complete rectangle area."""
+
+    top, left, bottom, right = rectangle
+    area = (bottom - top) * (right - left)
+    if area <= 0:
+        return 0.0
+    return float(fault_mask[top:bottom, left:right].sum()) / area
+
+
+def _rectangle_union(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
+    )
+
+
+def _rectangle_gap(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> int:
+    row_gap = max(first[0] - second[2], second[0] - first[2], 0)
+    col_gap = max(first[1] - second[3], second[1] - first[3], 0)
+    return max(row_gap, col_gap)
+
+
+def _merge_touching_rectangles(
+    rectangles: list[tuple[int, int, int, int]],
+    candidate: tuple[int, int, int, int],
+) -> list[tuple[int, int, int, int]]:
+    """Insert a rectangle while unioning every overlap or shared boundary."""
+
+    remaining = list(rectangles)
+    while True:
+        separated = []
+        merged = False
+        for rectangle in remaining:
+            if _rectangle_gap(rectangle, candidate) == 0:
+                candidate = _rectangle_union(rectangle, candidate)
+                merged = True
+            else:
+                separated.append(rectangle)
+        if not merged:
+            return separated + [candidate]
+        remaining = separated
+
+
+def _expand_primary_box(
+    rectangle: tuple[int, int, int, int],
+    secondary_loss: np.ndarray,
+    healthy_occupied: np.ndarray,
+    *,
+    maximum_gap_cells: int,
+    minimum_component_cells: int,
+    minimum_fault_fraction: float,
+) -> tuple[int, int, int, int]:
+    """Absorb nearby unreliable components without sacrificing box purity."""
+
+    labels, count = label(
+        secondary_loss,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    components = []
+    for component_id in range(1, count + 1):
+        component = labels == component_id
+        cell_count = int(component.sum())
+        if cell_count >= minimum_component_cells:
+            components.append((cell_count, _bbox(component)))
+
+    expanded = rectangle
+    remaining = components
+    while remaining:
+        eligible = [
+            item
+            for item in remaining
+            if _rectangle_gap(expanded, item[1]) <= maximum_gap_cells
+        ]
+        if not eligible:
+            break
+        eligible.sort(key=lambda item: (_rectangle_gap(expanded, item[1]), -item[0]))
+        accepted = False
+        for _cell_count, component_box in eligible:
+            proposal = _rectangle_union(expanded, component_box)
+            top, left, bottom, right = proposal
+            fault_count = int(secondary_loss[top:bottom, left:right].sum())
+            healthy_count = int(healthy_occupied[top:bottom, left:right].sum())
+            if fault_count / (fault_count + healthy_count) < minimum_fault_fraction:
+                continue
+            expanded = proposal
+            remaining.remove((_cell_count, component_box))
+            accepted = True
+            break
+        if not accepted:
+            break
+    return expanded
+
+
 @lru_cache(maxsize=None)
 def _row_intervals(height: int) -> tuple[np.ndarray, np.ndarray]:
     """Return every non-empty ``[top, bottom)`` row interval."""
@@ -197,45 +317,108 @@ def _best_repair_box(
     )
 
 
-def _secondary_repair_boxes(
+def _expand_rectangle_to_minimum_size(
+    rectangle: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    minimum_side_cells: int,
+) -> tuple[int, int, int, int]:
+    """Expand a rectangle around its center to the requested minimum size."""
+
+    top, left, bottom, right = rectangle
+    height, width = shape
+
+    def expand_axis(start: int, stop: int, limit: int) -> tuple[int, int]:
+        target = min(minimum_side_cells, limit)
+        missing = max(target - (stop - start), 0)
+        start -= missing // 2
+        stop += missing - missing // 2
+        if start < 0:
+            stop = min(stop - start, limit)
+            start = 0
+        if stop > limit:
+            start = max(start - (stop - limit), 0)
+            stop = limit
+        return start, stop
+
+    top, bottom = expand_axis(top, bottom, height)
+    left, right = expand_axis(left, right, width)
+    return top, left, bottom, right
+
+
+def _next_secondary_repair_box(
     severe_loss: np.ndarray,
     healthy_occupied: np.ndarray,
     primary_box: tuple[int, int, int, int] | None,
     *,
-    maximum_boxes: int,
     minimum_fault_cells: int,
     minimum_fault_fraction: float,
-) -> list[tuple[int, int, int, int]]:
-    """Return tight boxes for severe components missed by the primary band."""
+    minimum_spatial_density: float,
+    minimum_box_side_cells: int,
+    merge_gap_cells: int,
+) -> tuple[int, int, int, int] | None:
+    """Select the strongest coherent remaining secondary repair region.
 
-    if maximum_boxes == 0:
-        return []
+    Nearby residual cells are grouped before choosing the strongest eligible
+    group. A secondary region is independent from the primary region: it is
+    never stretched across the healthy/empty gap merely to touch the primary
+    box. Its bounds cover the complete merged unreliable cluster.
+    """
+
     remaining = severe_loss.copy()
     if primary_box is not None:
         top, left, bottom, right = primary_box
         remaining[top:bottom, left:right] = False
-    component_labels, component_count = label(
-        remaining,
-        structure=np.ones((3, 3), dtype=np.uint8),
-    )
-    candidates = []
-    for component_id in range(1, component_count + 1):
-        component = component_labels == component_id
-        fault_count = int(component.sum())
-        if fault_count < minimum_fault_cells:
-            continue
-        rectangle = _bbox(component)
-        top, left, bottom, right = rectangle
-        healthy_count = int(
-            healthy_occupied[top:bottom, left:right].sum()
+    grouping_mask = (
+        binary_dilation(
+            remaining,
+            structure=np.ones((3, 3), dtype=bool),
+            iterations=merge_gap_cells,
         )
+        if merge_gap_cells > 0
+        else remaining
+    )
+    connectivity = np.ones((3, 3), dtype=np.uint8)
+    group_labels, group_count = label(grouping_mask, structure=connectivity)
+    candidates = []
+
+    def add_candidate(grouped_fault: np.ndarray) -> bool:
+        fault_count = int(grouped_fault.sum())
+        if fault_count < minimum_fault_cells:
+            return False
+        rectangle = _bbox(grouped_fault)
+        top, left, bottom, right = rectangle
+        healthy_count = int(healthy_occupied[top:bottom, left:right].sum())
         fault_fraction = fault_count / (fault_count + healthy_count)
         if fault_fraction < minimum_fault_fraction:
-            continue
+            return False
         area = (bottom - top) * (right - left)
-        candidates.append((area, -fault_count, rectangle))
-    candidates.sort(key=lambda candidate: (candidate[0], candidate[1], candidate[2]))
-    return [candidate[2] for candidate in candidates[:maximum_boxes]]
+        if fault_count / area < minimum_spatial_density:
+            return False
+        rectangle = _expand_rectangle_to_minimum_size(
+            rectangle,
+            severe_loss.shape,
+            minimum_box_side_cells,
+        )
+        candidates.append((-fault_count, healthy_count, area, rectangle))
+        return True
+
+    for group_id in range(1, group_count + 1):
+        grouped_fault = remaining & (group_labels == group_id)
+        if add_candidate(grouped_fault):
+            continue
+        # A gap-merged group can still span too much empty area. In that case,
+        # fall back to its tight original components instead of accepting one
+        # hallucination-prone rectangle or discarding every local fault.
+        component_labels, component_count = label(
+            grouped_fault,
+            structure=connectivity,
+        )
+        for component_id in range(1, component_count + 1):
+            add_candidate(component_labels == component_id)
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][3]
 
 
 def _adaptive_halo(
@@ -364,6 +547,14 @@ class FaultSelector:
             & observed_original
             & valid_support
         )
+        secondary_severe_loss = (
+            (
+                loss_fraction
+                >= self.config.min_secondary_lidar_loss_fraction
+            )
+            & observed_original
+            & valid_support
+        )
         occupied = (surviving > 0) & valid_support
         healthy_for_box = occupied & ~severe_loss
         rectangle = _best_repair_box(
@@ -372,23 +563,67 @@ class FaultSelector:
             self.config.min_repair_box_cells,
             self.config.min_repair_fault_fraction,
         )
-        secondary_rectangles = _secondary_repair_boxes(
-            severe_loss,
-            healthy_for_box,
-            rectangle,
-            maximum_boxes=self.config.max_secondary_repair_boxes,
-            minimum_fault_cells=self.config.min_secondary_repair_cells,
-            minimum_fault_fraction=self.config.min_repair_fault_fraction,
-        )
+        secondary_healthy_for_box = occupied & ~secondary_severe_loss
+        if rectangle is not None and self.config.primary_expansion_gap_cells > 0:
+            rectangle = _expand_primary_box(
+                rectangle,
+                secondary_severe_loss,
+                secondary_healthy_for_box,
+                maximum_gap_cells=self.config.primary_expansion_gap_cells,
+                minimum_component_cells=self.config.min_secondary_repair_cells,
+                minimum_fault_fraction=self.config.min_repair_fault_fraction,
+            )
+        remaining_secondary_loss = secondary_severe_loss.copy()
+        if rectangle is not None:
+            top, left, bottom, right = rectangle
+            remaining_secondary_loss[top:bottom, left:right] = False
+        secondary_rectangles = []
+        while len(secondary_rectangles) < self.config.max_secondary_repair_boxes:
+            secondary_rectangle = _next_secondary_repair_box(
+                remaining_secondary_loss,
+                secondary_healthy_for_box,
+                rectangle,
+                minimum_fault_cells=self.config.min_secondary_repair_cells,
+                minimum_fault_fraction=(
+                    self.config.min_secondary_repair_fault_fraction
+                ),
+                minimum_spatial_density=(
+                    self.config.min_secondary_box_spatial_density
+                ),
+                minimum_box_side_cells=(
+                    self.config.min_secondary_box_side_cells
+                ),
+                merge_gap_cells=self.config.secondary_merge_gap_cells,
+            )
+            if secondary_rectangle is None:
+                break
+            secondary_rectangles = _merge_touching_rectangles(
+                secondary_rectangles,
+                secondary_rectangle,
+            )
+            for top, left, bottom, right in secondary_rectangles:
+                remaining_secondary_loss[top:bottom, left:right] = False
         reconstruction_mask = np.zeros(shape, dtype=bool)
-        # Secondary boxes are listed first for diagnostic priority. The model
-        # reconstructs the union of every selected box in one forward pass.
-        rectangles = secondary_rectangles + (
-            [] if rectangle is None else [rectangle]
-        )
+        # Smaller boxes are listed first for diagnostics. The model
+        # reconstructs the union of all selected boxes in one forward pass.
+        rectangle_entries = [
+            (secondary_rectangle, secondary_severe_loss)
+            for secondary_rectangle in secondary_rectangles
+        ]
+        if rectangle is not None:
+            rectangle_entries.append((rectangle, severe_loss))
+        rectangles = [entry[0] for entry in rectangle_entries]
         for top, left, bottom, right in rectangles:
             reconstruction_mask[top:bottom, left:right] = True
         reconstruction_mask &= valid_support
+        selector_threshold_mask = (
+            secondary_severe_loss
+            if self.config.max_secondary_repair_boxes > 0
+            else severe_loss
+        )
+        selected_fault_evidence = (
+            reconstruction_mask & selector_threshold_mask
+        )
         trusted_occupied = occupied & ~reconstruction_mask
         original_fault = (missing > 0) & valid_support
         excluded_added_only = (
@@ -405,7 +640,7 @@ class FaultSelector:
                 qualifying_blobs=(),
                 rejected_small_blobs=(),
                 original_fault_cell_count=int(original_fault.sum()),
-                thresholded_cell_count=int(severe_loss.sum()),
+                thresholded_cell_count=int(selector_threshold_mask.sum()),
                 excluded_added_only_cell_count=int(excluded_added_only.sum()),
                 selected_fault_cell_count=0,
             )
@@ -413,7 +648,7 @@ class FaultSelector:
         halo_mask, dilation, healthy_count, healthy_fraction, target_met = (
             _adaptive_halo(
                 reconstruction_mask,
-                int(np.logical_and(reconstruction_mask, severe_loss).sum()),
+                int(selected_fault_evidence.sum()),
                 trusted_occupied,
                 occupied,
                 valid_support,
@@ -425,13 +660,16 @@ class FaultSelector:
         required_healthy = max(
             self.config.min_halo_healthy_cells,
             math.ceil(
-                int(np.logical_and(reconstruction_mask, severe_loss).sum())
+                int(selected_fault_evidence.sum())
                 * self.config.min_halo_context_ratio
             ),
         )
         halo_bbox = _bbox(reconstruction_mask | halo_mask)
         blobs = []
-        for component_id, rectangle in enumerate(rectangles, start=1):
+        for component_id, (rectangle, evidence_mask) in enumerate(
+            rectangle_entries,
+            start=1,
+        ):
             top, left, bottom, right = rectangle
             rows = np.arange(top, bottom)
             nearest_distance = self.config.x_min_m + (
@@ -441,8 +679,10 @@ class FaultSelector:
                 height - 1 - float(rows.mean()) + 0.5
             ) * self.config.x_cell_size_m
             rectangle_loss = loss_fraction[top:bottom, left:right]
-            rectangle_fault = severe_loss[top:bottom, left:right]
-            rectangle_healthy = healthy_for_box[top:bottom, left:right]
+            rectangle_fault = evidence_mask[top:bottom, left:right]
+            rectangle_healthy = (
+                occupied & ~evidence_mask
+            )[top:bottom, left:right]
             fault_count = int(rectangle_fault.sum())
             healthy_in_box = int(rectangle_healthy.sum())
             blobs.append(
@@ -476,9 +716,9 @@ class FaultSelector:
             qualifying_blobs=tuple(blobs),
             rejected_small_blobs=(),
             original_fault_cell_count=int(original_fault.sum()),
-            thresholded_cell_count=int(severe_loss.sum()),
+            thresholded_cell_count=int(selector_threshold_mask.sum()),
             excluded_added_only_cell_count=int(excluded_added_only.sum()),
             selected_fault_cell_count=int(
-                np.logical_and(reconstruction_mask, severe_loss).sum()
+                selected_fault_evidence.sum()
             ),
         )
