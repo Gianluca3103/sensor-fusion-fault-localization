@@ -33,7 +33,7 @@ Fault_Localization_Model/**/*.csv
 
 # Training outputs and checkpoints
 Fault_Localization_Model/runs/
-PFS/runs/
+models/Fault_Localization/runs/
 **/checkpoints/
 *.pt
 *.pth

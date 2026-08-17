@@ -19,14 +19,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from Fault_Localization_Model.io_utils import atomic_torch_save, atomic_write_json, write_csv_rows
-from PFS.training_utils import (
+from models.Fault_Localization.training_utils import (
     _split_paths,
     capture_rng_state,
     resolve_device,
     restore_rng_state,
     seed_everything,
 )
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     BEVChannelNormalization,
     CoarseReconstructionDataset,
     DiffusionProcessConfig,

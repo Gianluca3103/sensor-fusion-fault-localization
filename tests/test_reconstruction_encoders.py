@@ -6,12 +6,12 @@ import unittest
 import numpy as np
 import torch
 
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     FaultSelector,
     FaultSelectorConfig,
     load_bev_triplet,
 )
-from models.reconstruction_head.fault_selector import (
+from models.two_stage_reconstruction_head.fault_selector import (
     _adaptive_halo,
     _best_repair_box,
 )

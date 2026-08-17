@@ -5,7 +5,7 @@ import unittest
 import torch
 from torch import nn
 
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     CoarseReconstructionConfig,
     CoarseReconstructionModel,
     DiffusionProcessConfig,

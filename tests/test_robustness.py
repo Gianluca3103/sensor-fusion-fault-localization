@@ -24,8 +24,8 @@ from Fault_Localization_Model.sample_utils import (
     validate_rgb_array,
 )
 from Fault_Localization_Model.visualization_utils import draw_cell_boundaries
-from PFS.pfs_model import PFSReliabilityModel
-from PFS.training_utils import (
+from models.Fault_Localization.pfs_model import PFSReliabilityModel
+from models.Fault_Localization.training_utils import (
     require_checkpoint_args_match,
     require_checkpoint_semantics,
 )

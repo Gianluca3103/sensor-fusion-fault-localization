@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from Fault_Localization_Model.bev_utils import metric_to_grid
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     BEVGridGeometry,
     CoarseReconstructionConfig,
     CoarseReconstructionModel,

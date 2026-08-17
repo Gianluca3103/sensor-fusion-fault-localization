@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
     ObservabilityWeightingConfig,

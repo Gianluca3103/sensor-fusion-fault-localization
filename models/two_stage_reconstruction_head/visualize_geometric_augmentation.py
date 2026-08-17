@@ -12,8 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from PFS.training_utils import _split_paths
-from models.reconstruction_head import (
+from models.Fault_Localization.training_utils import _split_paths
+from models.two_stage_reconstruction_head import (
     CoarseReconstructionDataset,
     GeometricTransform,
     ReconstructionGeometricAugmentation,

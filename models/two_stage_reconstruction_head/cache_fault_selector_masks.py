@@ -16,8 +16,8 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from models.reconstruction_head import build_selector_config, load_config
-from models.reconstruction_head.fault_selector_cache import (
+from models.two_stage_reconstruction_head import build_selector_config, load_config
+from models.two_stage_reconstruction_head.fault_selector_cache import (
     build_selector_cache_entry,
     selector_cache_root,
 )
