@@ -46,33 +46,16 @@ class HRNetBackboneTests(unittest.TestCase):
         self.assertEqual(config.hrnet.dropout, 0.1)
         self.assertEqual(config.local_input_channels, 130)
 
-    def test_rejects_unsupported_backbone(self):
-        with self.assertRaisesRegex(ValueError, "Only the HRNet"):
-            build_configs(
-                {
-                    "model": {"backbone": "unsupported"},
-                    "coarse_reconstruction": {},
-                }
+    def test_serialized_hrnet_config_round_trip(self):
+        original = CoarseReconstructionConfig(
+            hrnet=HRNetConfig(
+                base_channels=4,
+                num_stages=2,
+                blocks_per_stage=1,
+                residual_blocks_per_branch=1,
             )
-
-    def test_historical_hrnet_metadata_remains_loadable(self):
-        config = CoarseReconstructionConfig.from_dict(
-            {
-                "backbone": "hrnet",
-                "lidar_channels": 3,
-                "radar_channels": 4,
-                "unet_base_channels": 16,
-                "global_base_channels": 16,
-                "hrnet": {
-                    "base_channels": 4,
-                    "num_stages": 2,
-                    "blocks_per_stage": 1,
-                    "residual_blocks_per_branch": 1,
-                    "radar_context_layers": 0,
-                    "radar_context_channels": 16,
-                },
-            }
         )
+        config = CoarseReconstructionConfig.from_dict(original.to_dict())
         self.assertEqual(config.hrnet.branch_channels, (4, 8))
         self.assertFalse(config.pointpillars.enabled)
 

@@ -33,7 +33,7 @@
       "occupancy": {
         "type": "tolerance_aware",
         "exact_weight": 0.35,
-        "tolerant_recall_weight": 0.5,
+        "tolerant_recall_weight": 0.6,
         "far_fp_weight": 1.0,
         "tolerance_radius_m": 0.5
       }

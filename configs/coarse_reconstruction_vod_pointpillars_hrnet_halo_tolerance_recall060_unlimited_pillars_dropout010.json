@@ -3,7 +3,7 @@
     "enabled": true,
     "output_channels": 64,
     "max_points_per_pillar": 100,
-    "max_pillars": 12000,
+    "max_pillars": null,
     "lidar_use_reflectivity": true,
     "radar_use_power": true,
     "radar_use_radial_velocity": true
@@ -33,7 +33,7 @@
       "occupancy": {
         "type": "tolerance_aware",
         "exact_weight": 0.35,
-        "tolerant_recall_weight": 0.5,
+        "tolerant_recall_weight": 0.6,
         "far_fp_weight": 1.0,
         "tolerance_radius_m": 0.5
       }

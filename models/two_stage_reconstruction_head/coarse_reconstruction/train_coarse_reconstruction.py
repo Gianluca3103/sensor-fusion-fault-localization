@@ -520,7 +520,7 @@ def main():
         "Sensor representation: "
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
-    print("Reconstruction backbone: HRNet")
+    print("Coarse model: HRNet")
     print(f"Occupancy loss: {loss_config.occupancy.type}")
     if loss_config.occupancy.type == "tolerance_aware":
         print(

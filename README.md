@@ -17,8 +17,8 @@ unchanged.
   repair boxes and their healthy halo context.
 - `models/two_stage_reconstruction_head/pointpillars.py`: encode aligned LiDAR and Radar
   point clouds into 320x320 pseudo-images.
-- `models/two_stage_reconstruction_head/coarse_reconstruction/hrnet_backbone.py`: the only
-  supported deterministic reconstruction backbone.
+- `models/two_stage_reconstruction_head/coarse_reconstruction/hrnet_backbone.py`: the
+  deterministic HRNet reconstruction network.
 - `models/two_stage_reconstruction_head/coarse_reconstruction/train_coarse_reconstruction.py`:
   train the coarse model.
 - `models/two_stage_reconstruction_head/coarse_reconstruction/evaluate_coarse_by_fault.py`:
