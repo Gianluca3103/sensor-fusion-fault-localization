@@ -9,6 +9,7 @@ from torch import nn
 
 from .coarse_config import CoarseReconstructionConfig
 from .hrnet_backbone import HRNetBackbone
+from ..PointPillarV2 import PointPillarsEncoderV2, PointPillarsV2Config
 from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
 
 
@@ -41,7 +42,7 @@ class CoarseReconstructionModel(nn.Module):
 
         self.lidar_pillar_encoder = None
         self.radar_pillar_encoder = None
-        if self.config.pointpillars.enabled:
+        if self.config.pointpillars_enabled:
             if grid_geometry is None:
                 raise ValueError(
                     "grid_geometry is required when PointPillars is enabled"
@@ -49,20 +50,35 @@ class CoarseReconstructionModel(nn.Module):
             grid_geometry.validate()
             if (grid_geometry.height, grid_geometry.width) != (320, 320):
                 raise ValueError("VoD reconstruction requires a 320x320 BEV grid")
-            pointpillars = self.config.pointpillars
-            self.lidar_pillar_encoder = PointPillarsEncoder(
+            pointpillars = self.config.pillar_encoder_config
+            encoder_class = (
+                PointPillarsEncoderV2
+                if isinstance(pointpillars, PointPillarsV2Config)
+                else PointPillarsEncoder
+            )
+            common_arguments = {
+                "output_channels": pointpillars.output_channels,
+                "max_points_per_pillar": pointpillars.max_points_per_pillar,
+                "max_pillars": pointpillars.max_pillars,
+            }
+            if isinstance(pointpillars, PointPillarsV2Config):
+                common_arguments.update(
+                    {
+                        "neighbor_enabled": pointpillars.neighbor_enabled,
+                        "neighbor_radius_m": pointpillars.neighbor_radius_m,
+                        "neighbor_max_neighbors": pointpillars.neighbor_max_neighbors,
+                        "neighbor_initial_scale": pointpillars.neighbor_initial_scale,
+                    }
+                )
+            self.lidar_pillar_encoder = encoder_class(
                 grid_geometry,
                 raw_channels=pointpillars.lidar_raw_channels,
-                output_channels=pointpillars.output_channels,
-                max_points_per_pillar=pointpillars.max_points_per_pillar,
-                max_pillars=pointpillars.max_pillars,
+                **common_arguments,
             )
-            self.radar_pillar_encoder = PointPillarsEncoder(
+            self.radar_pillar_encoder = encoder_class(
                 grid_geometry,
                 raw_channels=pointpillars.radar_raw_channels,
-                output_channels=pointpillars.output_channels,
-                max_points_per_pillar=pointpillars.max_points_per_pillar,
-                max_pillars=pointpillars.max_pillars,
+                **common_arguments,
             )
 
         self.hrnet_backbone = HRNetBackbone(
@@ -82,7 +98,7 @@ class CoarseReconstructionModel(nn.Module):
                 raise ValueError(
                     "faulty_lidar_points must contain aligned [x,y,z,reflectivity] rows"
                 )
-        if self.config.pointpillars.lidar_use_reflectivity:
+        if self.config.pillar_encoder_config.lidar_use_reflectivity:
             return tuple(point_clouds)
         return tuple(points[:, :3] for points in point_clouds)
 
@@ -96,9 +112,9 @@ class CoarseReconstructionModel(nn.Module):
                     "radar_points must contain aligned [x,y,z,power,doppler] rows"
                 )
             columns = [points[:, :3]]
-            if self.config.pointpillars.radar_use_power:
+            if self.config.pillar_encoder_config.radar_use_power:
                 columns.append(points[:, 3:4])
-            if self.config.pointpillars.radar_use_radial_velocity:
+            if self.config.pillar_encoder_config.radar_use_radial_velocity:
                 columns.append(points[:, 4:5])
             selected.append(torch.cat(columns, dim=1))
         return tuple(selected)
@@ -117,7 +133,7 @@ class CoarseReconstructionModel(nn.Module):
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
     ]:
-        if not self.config.pointpillars.enabled:
+        if not self.config.pointpillars_enabled:
             radar_features = radar_bev if radar_enabled else torch.zeros_like(radar_bev)
             return faulty_lidar_bev, radar_features, {}, {}
 

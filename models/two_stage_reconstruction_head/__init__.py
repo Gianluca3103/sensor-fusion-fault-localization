@@ -33,6 +33,11 @@ from .pointpillars import (
     PointPillarsEncoder,
     PointPillarsOutput,
 )
+from .PointPillarV2 import (
+    NeighborAwarePillarEnhancer,
+    PointPillarsEncoderV2,
+    PointPillarsV2Config,
+)
 from .coarse_reconstruction.coarse_config import (
     CoarseReconstructionConfig,
     build_augmentation_config,

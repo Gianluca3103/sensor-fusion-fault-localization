@@ -11,6 +11,7 @@ from .coarse_loss import (
     ObservabilityWeightingConfig,
 )
 from .hrnet_backbone import HRNetConfig
+from ..PointPillarV2 import PointPillarsV2Config
 from ..fault_selector import FaultSelectorConfig
 from ..geometric_augmentation import GeometricAugmentationConfig
 from ..pointpillars import PointPillarsConfig
@@ -30,7 +31,18 @@ class CoarseReconstructionConfig:
     use_healthy_context_mask: bool = True
     use_halo_context: bool = True
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
+    pointpillars_v2: PointPillarsV2Config = field(
+        default_factory=PointPillarsV2Config
+    )
     hrnet: HRNetConfig = field(default_factory=HRNetConfig)
+
+    @property
+    def pointpillars_enabled(self) -> bool:
+        return self.pointpillars.enabled or self.pointpillars_v2.enabled
+
+    @property
+    def pillar_encoder_config(self) -> PointPillarsConfig | PointPillarsV2Config:
+        return self.pointpillars_v2 if self.pointpillars_v2.enabled else self.pointpillars
 
     @property
     def local_input_channels(self) -> int:
@@ -50,9 +62,14 @@ class CoarseReconstructionConfig:
         if not isinstance(self.use_halo_context, bool):
             raise ValueError("use_halo_context must be boolean")
         self.pointpillars.validate()
+        self.pointpillars_v2.validate()
+        if self.pointpillars.enabled and self.pointpillars_v2.enabled:
+            raise ValueError(
+                "Enable either pointpillars or pointpillars_v2, not both"
+            )
         self.hrnet.validate()
-        if self.pointpillars.enabled:
-            expected = self.pointpillars.output_channels
+        if self.pointpillars_enabled:
+            expected = self.pillar_encoder_config.output_channels
             if self.lidar_channels != expected or self.radar_channels != expected:
                 raise ValueError(
                     "PointPillars output_channels must match both sensor channel counts"
@@ -69,6 +86,9 @@ class CoarseReconstructionConfig:
         pointpillars = values.get("pointpillars", {})
         if isinstance(pointpillars, dict):
             values["pointpillars"] = PointPillarsConfig(**pointpillars)
+        pointpillars_v2 = values.get("pointpillars_v2", {})
+        if isinstance(pointpillars_v2, dict):
+            values["pointpillars_v2"] = PointPillarsV2Config(**pointpillars_v2)
         hrnet = values.get("hrnet", {})
         if isinstance(hrnet, dict):
             hrnet_fields = {item.name for item in fields(HRNetConfig)}
@@ -128,7 +148,18 @@ def build_configs(payload: dict):
     pointpillars = _checked_dataclass(
         "pointpillars", payload.get("pointpillars", {}), PointPillarsConfig
     )
+    pointpillars_v2 = _checked_dataclass(
+        "pointpillars_v2",
+        payload.get("pointpillars_v2", {}),
+        PointPillarsV2Config,
+    )
     hrnet = _checked_dataclass("hrnet", payload.get("hrnet", {}), HRNetConfig)
+
+    if pointpillars.enabled and pointpillars_v2.enabled:
+        raise ValueError("Enable either pointpillars or pointpillars_v2, not both")
+    active_pointpillars = (
+        pointpillars_v2 if pointpillars_v2.enabled else pointpillars
+    )
 
     mask_payload = payload.get("masks", {})
     if not isinstance(mask_payload, dict):
@@ -141,13 +172,13 @@ def build_configs(payload: dict):
         raise ValueError("Unknown masks settings: " + ", ".join(sorted(unknown_masks)))
 
     lidar_channels = (
-        pointpillars.output_channels
-        if pointpillars.enabled
+        active_pointpillars.output_channels
+        if active_pointpillars.enabled
         else 3
     )
     radar_channels = (
-        pointpillars.output_channels
-        if pointpillars.enabled
+        active_pointpillars.output_channels
+        if active_pointpillars.enabled
         else 4
     )
     model_config = CoarseReconstructionConfig(
@@ -156,6 +187,7 @@ def build_configs(payload: dict):
         use_healthy_context_mask=mask_payload.get("use_healthy_context_mask", True),
         use_halo_context=mask_payload.get("use_halo_context", True),
         pointpillars=pointpillars,
+        pointpillars_v2=pointpillars_v2,
         hrnet=hrnet,
     )
 

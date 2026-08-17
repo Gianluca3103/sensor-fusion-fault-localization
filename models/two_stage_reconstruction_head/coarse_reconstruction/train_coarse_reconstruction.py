@@ -265,11 +265,7 @@ def _run_epoch(
             active_fraction_samples.extend(fractions.tolist())
         inputs = _move_batch(batch, device)
         pointpillars_enabled = bool(
-            getattr(
-                getattr(getattr(model, "config", None), "pointpillars", None),
-                "enabled",
-                False,
-            )
+            getattr(getattr(model, "config", None), "pointpillars_enabled", False)
         )
         if not radar_enabled:
             inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
@@ -445,7 +441,7 @@ def main():
         "radar_root": radar_root,
         "data_root": data_root,
         "selector_config": selector_config,
-        "use_pointpillars": model_config.pointpillars.enabled,
+        "use_pointpillars": model_config.pointpillars_enabled,
     }
     train_dataset = CoarseReconstructionDataset(
         train_paths,
@@ -468,7 +464,7 @@ def main():
         model_config,
         grid_geometry=(
             train_dataset.grid_geometry
-            if model_config.pointpillars.enabled
+            if model_config.pointpillars_enabled
             else None
         ),
     ).to(device)
@@ -500,7 +496,13 @@ def main():
     print(f"Training augmentation enabled: {augmentation_config.enabled}")
     print(
         "Sensor representation: "
-        + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
+        + (
+            "PointPillarV2"
+            if model_config.pointpillars_v2.enabled
+            else "PointPillars"
+            if model_config.pointpillars.enabled
+            else "handcrafted BEV"
+        )
     )
     print("Coarse model: HRNet")
     print("Occupancy loss: weighted BCE + Dice")
@@ -514,7 +516,7 @@ def main():
         if parameter.requires_grad
     )
     print(f"Trainable parameters: {trainable_parameters:,}")
-    if model_config.pointpillars.enabled:
+    if model_config.pointpillars_enabled:
         geometry = train_dataset.grid_geometry
         print(
             "PointPillars voxelization: batched native PyTorch "
@@ -526,6 +528,14 @@ def main():
             f"pillar={geometry.pillar_size_x:.3f}m x "
             f"{geometry.pillar_size_y:.3f}m"
         )
+        if model_config.pointpillars_v2.enabled:
+            v2 = model_config.pointpillars_v2
+            print(
+                "PointPillarV2 neighbors: "
+                f"radius={v2.neighbor_radius_m:.2f}m, "
+                f"max={v2.neighbor_max_neighbors}, "
+                f"initial_scale={v2.neighbor_initial_scale:g}"
+            )
     history = []
     best_validation = float("inf")
     best_tolerant_iou = float("-inf")
@@ -601,6 +611,55 @@ def main():
                 {"train": train_shapes, "validation": val_shapes},
             )
             print("Debug tensor shapes:", json.dumps(val_shapes, indent=2))
+            if model_config.pointpillars_v2.enabled:
+                for sensor in ("lidar", "radar"):
+                    pillar_statistics = val_shapes.get(
+                        f"{sensor}_pillar_statistics",
+                        {},
+                    )
+                    occupied = sum(
+                        pillar_statistics.get("nonempty_pillars", [])
+                    )
+                    neighborless = sum(
+                        pillar_statistics.get(
+                            "pillars_with_no_neighbors",
+                            [],
+                        )
+                    )
+                    averages = pillar_statistics.get(
+                        "average_neighbors_per_pillar",
+                        [],
+                    )
+                    occupied_per_sample = pillar_statistics.get(
+                        "nonempty_pillars",
+                        [],
+                    )
+                    average_neighbors = (
+                        sum(
+                            average * count
+                            for average, count in zip(
+                                averages,
+                                occupied_per_sample,
+                            )
+                        )
+                        / max(occupied, 1)
+                    )
+                    maximum_neighbors = max(
+                        pillar_statistics.get(
+                            "maximum_neighbors_per_pillar",
+                            [0],
+                        )
+                    )
+                    print(
+                        f"PointPillarV2 {sensor}: "
+                        f"occupied={occupied:,}, "
+                        f"avg_neighbors={average_neighbors:.2f}, "
+                        f"max_neighbors={maximum_neighbors}, "
+                        f"neighborless={neighborless:,}, "
+                        f"neighborless_fraction="
+                        f"{neighborless / max(occupied, 1):.3f}, "
+                        f"radius={model_config.pointpillars_v2.neighbor_radius_m:.2f}m"
+                    )
             print(
                 "Active-mask coverage: "
                 f"median={combined_active_summary['median']:.2%}, "

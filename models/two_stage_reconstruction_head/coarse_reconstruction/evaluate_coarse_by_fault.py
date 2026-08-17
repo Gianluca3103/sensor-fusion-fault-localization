@@ -454,7 +454,7 @@ def main() -> None:
         args.radar_root,
         data_root=args.data_root,
         selector_config=selector_config,
-        use_pointpillars=model_config.pointpillars.enabled,
+        use_pointpillars=model_config.pointpillars_enabled,
     )
     geometry_payload = checkpoint.get("grid_geometry")
     grid_geometry = (
@@ -464,7 +464,7 @@ def main() -> None:
     )
     model = CoarseReconstructionModel(
         model_config,
-        grid_geometry=(grid_geometry if model_config.pointpillars.enabled else None),
+        grid_geometry=(grid_geometry if model_config.pointpillars_enabled else None),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()

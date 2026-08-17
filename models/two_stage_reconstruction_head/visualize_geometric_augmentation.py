@@ -97,7 +97,7 @@ def main():
         args.radar_root,
         data_root=args.data_root,
         selector_config=selector_config,
-        use_pointpillars=model_config.pointpillars.enabled,
+        use_pointpillars=model_config.pointpillars_enabled,
     )
     original = dataset[0]
     augment = ReconstructionGeometricAugmentation(
