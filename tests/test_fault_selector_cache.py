@@ -13,6 +13,7 @@ from models.reconstruction_head.cache_fault_selector_masks import (
 from models.reconstruction_head import (
     CoarseReconstructionDataset,
     FaultSelectorConfig,
+    GeometricAugmentationConfig,
     InvalidSelectorCacheError,
     build_selector_cache_entry,
     load_selector_cache,
@@ -27,7 +28,7 @@ class FaultSelectorCacheTests(unittest.TestCase):
         sample_path = data_root / "train" / "sample.npz"
         sample_path.parent.mkdir(parents=True)
         radar_root = root / "radar"
-        radar_path = radar_root / "Scene01" / "01_Day" / "123.npz"
+        radar_path = radar_root / "train" / "00123.npz"
         radar_path.parent.mkdir(parents=True)
 
         heatmap = np.zeros((8, 6), dtype=np.float32)
@@ -35,15 +36,15 @@ class FaultSelectorCacheTests(unittest.TestCase):
         reliability = np.ones_like(heatmap)
         reliability[heatmap > 0] = 0.0
         missing = (heatmap > 0).astype(np.float32)
+        faulty_counts = np.zeros_like(heatmap)
+        faulty_counts[1, :] = 1.0
+        faulty_counts[6, :] = 1.0
         metadata = {
-            "scene": "Scene01",
-            "session": "01_Day",
-            "timestamp": "123",
+            "dataset": "View-of-Delft",
+            "split": "train",
+            "frame_id": "00123",
             "x_range": [0.0, 8.0],
             "y_range": [-3.0, 3.0],
-            "radar_from_lidar": np.eye(4).tolist(),
-            "radar_azimuth_range_rad": [-np.pi, np.pi],
-            "radar_range_m": [0.0, 100.0],
         }
         faulty_density = np.zeros((320, 320), dtype=np.float32)
         faulty_density[::2, ::2] = 1.0
@@ -54,10 +55,11 @@ class FaultSelectorCacheTests(unittest.TestCase):
             faulty_density=faulty_density,
             fault_heatmap=heatmap,
             reliability_map=reliability,
-            faulty_counts=np.ones_like(heatmap),
+            faulty_counts=faulty_counts,
             added_faulty_counts=np.zeros_like(heatmap),
             missing_faulty_counts=missing,
             moved_faulty_counts=np.zeros_like(heatmap),
+            valid_support_mask=np.ones_like(heatmap, dtype=np.uint8),
             faulty_lidar_points=np.asarray(
                 [[1.0, 0.0, 0.0, 12.0]], dtype=np.float32
             ),
@@ -148,6 +150,18 @@ class FaultSelectorCacheTests(unittest.TestCase):
             self.assertEqual(point_item["faulty_lidar_points"].shape, (1, 4))
             self.assertEqual(point_item["radar_points"].shape, (1, 5))
 
+            augmented_dataset = CoarseReconstructionDataset(
+                [sample_path],
+                radar_root,
+                data_root=data_root,
+                selector_config=config,
+                augmentation_config=GeometricAugmentationConfig.from_dict(
+                    {"enabled": True}
+                ),
+            )
+            self.assertIsNotNone(augmented_dataset.augmentation)
+            self.assertIsNone(dataset.augmentation)
+
     def test_changed_selector_configuration_rejects_stale_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -158,7 +172,10 @@ class FaultSelectorCacheTests(unittest.TestCase):
                 data_root,
                 config,
             )
-            changed = replace(config, min_blob_cells=config.min_blob_cells + 1)
+            changed = replace(
+                config,
+                min_lidar_loss_fraction=config.min_lidar_loss_fraction - 0.05,
+            )
 
             with self.assertRaisesRegex(
                 InvalidSelectorCacheError,

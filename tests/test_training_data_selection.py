@@ -1,4 +1,5 @@
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
@@ -21,6 +22,61 @@ from models.reconstruction_head import MaskedBEVReconstructionLoss
 
 
 class TrainingDataSelectionTests(unittest.TestCase):
+    def test_epoch_metrics_exclude_samples_without_repair_boxes(self):
+        class IdentityModel(torch.nn.Module):
+            def forward(
+                self,
+                faulty_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                **_options,
+            ):
+                occupancy = faulty_bev[:, 0:1]
+                return {
+                    "replacement_raw": faulty_bev,
+                    "replacement_bev": faulty_bev,
+                    "occupancy_logits": torch.where(
+                        occupancy > 0,
+                        torch.full_like(occupancy, 20.0),
+                        torch.full_like(occupancy, -20.0),
+                    ),
+                    "predicted_density": faulty_bev[:, 1:2],
+                    "predicted_height": faulty_bev[:, 2:3],
+                    "coarse_lidar_bev": faulty_bev,
+                    "reconstruction_mask": reconstruction_mask,
+                    "healthy_context_mask": healthy_context_mask,
+                    "halo_mask": halo_mask,
+                }
+
+        def batch(mask_value):
+            lidar = torch.zeros(1, 3, 2, 2)
+            lidar[:, 0, 0, 0] = 1.0
+            return {
+                "clean_bev": lidar.clone(),
+                "faulty_bev": lidar,
+                "radar_bev": torch.zeros(1, 4, 2, 2),
+                "reconstruction_mask": torch.full(
+                    (1, 1, 2, 2), mask_value
+                ),
+                "healthy_context_mask": torch.zeros(1, 1, 2, 2),
+                "halo_mask": torch.zeros(1, 1, 2, 2),
+            }
+
+        statistics, _ = run_coarse_epoch(
+            IdentityModel(),
+            [batch(1.0), batch(0.0)],
+            MaskedBEVReconstructionLoss(),
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(statistics["metric_samples"], 1)
+        self.assertEqual(statistics["excluded_empty_mask_samples"], 1)
+        self.assertAlmostEqual(
+            statistics["coarse_occupancy_exact_iou"], 1.0
+        )
+
     def test_tensorboard_tracker_writes_numeric_epoch_metrics_and_learning_rate(self):
         class RecordingWriter:
             def __init__(self):
@@ -62,14 +118,11 @@ class TrainingDataSelectionTests(unittest.TestCase):
         )
         self.assertEqual(writer.flushes, 1)
 
-    def test_validation_attention_is_requested_only_for_saved_batch(self):
+    def test_epoch_supports_radar_ablation_without_mutating_batch(self):
         class RecordingModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.attention_requests = []
                 self.radar_sums = []
-                self.local_radar_sums = []
-                self.global_map_requests = []
 
             def forward(
                 self,
@@ -79,16 +132,9 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 healthy_context_mask,
                 halo_mask,
                 *,
-                local_radar_bev=None,
-                use_global_map=True,
-                return_attention_weights=False,
+                radar_enabled=True,
             ):
-                self.attention_requests.append(return_attention_weights)
-                self.global_map_requests.append(use_global_map)
                 self.radar_sums.append(float(radar_bev.sum()))
-                if local_radar_bev is None:
-                    local_radar_bev = radar_bev
-                self.local_radar_sums.append(float(local_radar_bev.sum()))
                 erased = faulty_bev * (1.0 - reconstruction_mask)
                 outputs = {
                     "erased_lidar_bev": erased,
@@ -102,19 +148,7 @@ class TrainingDataSelectionTests(unittest.TestCase):
                     "healthy_context_mask": healthy_context_mask,
                     "halo_mask": halo_mask,
                 }
-                for name in (
-                    "local_input",
-                    "global_lidar_input",
-                    "local_bottleneck",
-                    "query_tokens",
-                    "context_tokens",
-                    "attention_context",
-                    "fused_bottleneck",
-                    "global_context_map",
-                ):
-                    outputs[name] = faulty_bev
-                if return_attention_weights:
-                    outputs["attention_weights"] = torch.zeros(1, 1, 1, 1)
+                outputs["local_input"] = faulty_bev
                 return outputs
 
         batch = {
@@ -134,17 +168,13 @@ class TrainingDataSelectionTests(unittest.TestCase):
             [batch, batch],
             MaskedBEVReconstructionLoss(),
             torch.device("cpu"),
-            return_attention=True,
             conditioning_callback=lambda raw_batch, outputs: saved_batches.append(
-                "attention_weights" in outputs
+                "coarse_lidar_bev" in outputs
             ),
             active_fraction_samples=active_fractions,
         )
 
-        self.assertEqual(model.attention_requests, [True, False])
-        self.assertEqual(model.global_map_requests, [True, True])
         self.assertEqual(model.radar_sums, [64.0, 64.0])
-        self.assertEqual(model.local_radar_sums, [64.0, 64.0])
         self.assertEqual(saved_batches, [True])
         self.assertEqual(active_fractions, [1.0, 1.0])
 
@@ -154,39 +184,17 @@ class TrainingDataSelectionTests(unittest.TestCase):
             [batch],
             MaskedBEVReconstructionLoss(),
             torch.device("cpu"),
-            radar_mode="none",
+            radar_enabled=False,
         )
         self.assertEqual(ablated_model.radar_sums, [0.0])
-        self.assertEqual(ablated_model.local_radar_sums, [0.0])
         self.assertEqual(float(batch["radar_bev"].sum()), 64.0)
-
-        global_only_model = RecordingModel()
-        run_coarse_epoch(
-            global_only_model,
-            [batch],
-            MaskedBEVReconstructionLoss(),
-            torch.device("cpu"),
-            radar_mode="global-only",
-        )
-        self.assertEqual(global_only_model.radar_sums, [64.0])
-        self.assertEqual(global_only_model.local_radar_sums, [0.0])
-
-        local_only_model = RecordingModel()
-        run_coarse_epoch(
-            local_only_model,
-            [batch],
-            MaskedBEVReconstructionLoss(),
-            torch.device("cpu"),
-            use_global_map=False,
-        )
-        self.assertEqual(local_only_model.global_map_requests, [False])
 
     def test_active_fraction_summary_and_recommendation(self):
         summary = _summarize_active_fractions([0.0, 0.25, 0.5, 0.75, 1.0])
         self.assertAlmostEqual(summary["median"], 0.5)
         self.assertAlmostEqual(summary["p90"], 0.9)
         self.assertAlmostEqual(summary["maximum"], 1.0)
-        self.assertIn("dense U-Net", _active_fraction_recommendation(summary))
+        self.assertIn("dense HRNet", _active_fraction_recommendation(summary))
 
         sparse_summary = _summarize_active_fractions([0.01, 0.05, 0.1])
         self.assertIn(
@@ -208,11 +216,22 @@ class TrainingDataSelectionTests(unittest.TestCase):
                 )
 
             all_paths = coarse_split_paths(data_root, "train", None, 17)
+            exact_limit = coarse_split_paths(data_root, "train", 6, 17)
+            oversized_limit = coarse_split_paths(data_root, "train", 10, 17)
             coarse_first = coarse_split_paths(data_root, "train", 3, 17)
             coarse_second = coarse_split_paths(data_root, "train", 3, 17)
             diffusion = diffusion_split_paths(data_root, "train", 3, 17)
 
             self.assertEqual(len(all_paths), 6)
+            expected_full_order = random.Random(17).sample(
+                all_paths,
+                k=len(all_paths),
+            )
+            self.assertEqual(
+                exact_limit,
+                expected_full_order,
+            )
+            self.assertEqual(oversized_limit, expected_full_order)
             self.assertEqual(coarse_first, coarse_second)
             self.assertEqual(coarse_first, diffusion)
             self.assertEqual(len(coarse_first), 3)

@@ -1,6 +1,6 @@
 # PFS Reliability Map Model
 
-This folder adapts the Post Fusion Stabilizer idea to the Hercules BEV fault-localization problem.
+This folder contains the dataset-agnostic reliability-map model and training helpers used with generated View-of-Delft BEV samples.
 
 The original PFS paper places a lightweight feature stabilizer between a fused BEV representation and a frozen detector head. In this project there is no frozen 3D detector head, so the adapted setup is:
 

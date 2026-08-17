@@ -22,11 +22,27 @@ from models.reconstruction_head import (
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
     BEVGridGeometry,
+    FaultSelectorConfig,
     build_selector_config,
     coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
+    coarse_reconstruction_range_metrics,
     load_config,
 )
+
+
+def _load_selector_config(path: Path) -> FaultSelectorConfig:
+    """Load either a source training config or a run's resolved config."""
+
+    payload = load_config(path)
+    if "selector" not in payload:
+        return build_selector_config(payload)
+    selector_payload = payload["selector"]
+    if not isinstance(selector_payload, dict):
+        raise ValueError("resolved selector configuration must be an object")
+    config = FaultSelectorConfig(**selector_payload)
+    config.validate()
+    return config
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/coarse_reconstruction.json"),
+        default=Path("configs/coarse_reconstruction_vod.json"),
         help="Configuration used to validate the cached Fault Selector masks.",
     )
     parser.add_argument("--split", choices=("train", "val", "test"), default="val")
@@ -101,6 +117,19 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def _target_occupied_cells(record: dict) -> int:
+    return int(
+        record.get(
+            "target_occupied_cells",
+            record.get("coarse_tp", 0) + record.get("coarse_fn", 0),
+        )
+    )
+
+
+def _passes_selector_for_metrics(record: dict) -> bool:
+    return int(record.get("repair_cells", 0)) > 0 and _target_occupied_cells(record) > 0
+
+
 def summarize_records(records: list[dict]) -> dict:
     """Return macro metric means and exact-cell micro occupancy metrics."""
 
@@ -113,6 +142,7 @@ def summarize_records(records: list[dict]) -> dict:
         "fault_group",
         "sequence_id",
         "frame_id",
+        "target_occupied_cells",
     }
     metric_keys = [
         key
@@ -123,17 +153,42 @@ def summarize_records(records: list[dict]) -> dict:
     ]
     summary = {
         "samples": len(records),
-        "repair_cells": sum(record["repair_cells"] for record in records),
+        "total_repair_cells": sum(record["repair_cells"] for record in records),
     }
+    evaluable_records = [
+        record for record in records if _passes_selector_for_metrics(record)
+    ]
+    selector_rejected = [
+        record for record in records if int(record.get("repair_cells", 0)) <= 0
+    ]
+    empty_target = [
+        record
+        for record in records
+        if int(record.get("repair_cells", 0)) > 0
+        and _target_occupied_cells(record) <= 0
+    ]
+    summary["metric_samples"] = len(evaluable_records)
+    summary["occupancy_metric_samples"] = len(evaluable_records)
+    summary["excluded_selector_rejected_samples"] = len(selector_rejected)
+    summary["excluded_empty_target_samples"] = len(empty_target)
+    summary["excluded_metric_samples"] = len(records) - len(evaluable_records)
+    summary["repair_cells"] = sum(
+        record["repair_cells"] for record in evaluable_records
+    )
     for key in metric_keys:
         if key == "repair_cells":
             continue
-        summary[f"macro/{key}"] = sum(record[key] for record in records) / len(records)
+        summary[f"macro/{key}"] = (
+            sum(record[key] for record in evaluable_records)
+            / len(evaluable_records)
+            if evaluable_records
+            else 0.0
+        )
     for prefix in ("coarse", "faulty"):
-        tp = sum(record[f"{prefix}_tp"] for record in records)
-        fp = sum(record[f"{prefix}_fp"] for record in records)
-        fn = sum(record[f"{prefix}_fn"] for record in records)
-        tn = sum(record[f"{prefix}_tn"] for record in records)
+        tp = sum(record[f"{prefix}_tp"] for record in evaluable_records)
+        fp = sum(record[f"{prefix}_fp"] for record in evaluable_records)
+        fn = sum(record[f"{prefix}_fn"] for record in evaluable_records)
+        tn = sum(record[f"{prefix}_tn"] for record in evaluable_records)
         precision = _safe_ratio(tp, tp + fp)
         recall = _safe_ratio(tp, tp + fn)
         f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
@@ -170,7 +225,7 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
 
 def _print_table(groups: dict[str, dict]) -> None:
     header = (
-        f"{'Fault':<28} {'N':>6} {'Faulty IoU':>11} {'Coarse IoU':>11} "
+        f"{'Fault':<28} {'N':>6} {'Used':>6} {'Faulty IoU':>11} {'Coarse IoU':>11} "
         f"{'Improvement':>12} {'F1@0.5m':>10} {'Halluc.':>9}"
     )
     print(header)
@@ -178,6 +233,7 @@ def _print_table(groups: dict[str, dict]) -> None:
     for name, summary in groups.items():
         print(
             f"{name:<28} {summary['samples']:6d} "
+            f"{summary.get('metric_samples', summary['samples']):6d} "
             f"{summary['micro/faulty_iou']:10.2%} "
             f"{summary['micro/coarse_iou']:10.2%} "
             f"{summary['micro/iou_improvement']:+11.2%} "
@@ -208,6 +264,25 @@ def _save_comparison(
 ) -> None:
     clean = _bev_rgb(clean_bev)
     coarse = _bev_rgb(coarse_bev)
+    radar = (
+        radar_bev.detach()
+        .to(dtype=torch.float32)
+        .clamp(0.0, 1.0)
+        .cpu()
+        .numpy()
+    )
+    if radar.shape[0] != 4:
+        raise ValueError(
+            f"Expected four radar BEV channels for visualization, got {radar.shape}"
+        )
+    radar_composite = np.stack(
+        (
+            radar[2],
+            radar[3],
+            np.maximum(radar[1], 0.15 * radar[0]),
+        ),
+        axis=-1,
+    ).clip(0.0, 1.0)
     faulty_support = faulty_bev[0].detach().cpu().numpy() >= 0.5
     radar_support = (
         radar_bev.detach()
@@ -227,7 +302,7 @@ def _save_comparison(
         axis=-1,
     ).astype(np.float32)
     mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    figure, axes = plt.subplots(1, 3, figsize=(16, 5), facecolor="black")
+    figure, axes = plt.subplots(2, 4, figsize=(20, 10), facecolor="black")
     panels = (
         (clean, "Clean LiDAR BEV", None),
         (coarse, "Coarse reconstructed LiDAR BEV", None),
@@ -236,8 +311,17 @@ def _save_comparison(
             "Faulty LiDAR + trusted radar\nCyan: LiDAR | Magenta: radar | White: overlap",
             None,
         ),
+        (
+            radar_composite,
+            "Radar composite\nR: speed | G: height | B: power/occupancy",
+            None,
+        ),
+        (radar[0], "Radar 0: Static occupancy", "gray"),
+        (radar[1], "Radar 1: Normalized power", "inferno"),
+        (radar[2], "Radar 2: Dynamic speed", "turbo"),
+        (radar[3], "Radar 3: Robust upper height", "viridis"),
     )
-    for axis, (image, title, cmap) in zip(axes, panels):
+    for axis, (image, title, cmap) in zip(axes.flat, panels):
         axis.imshow(
             image,
             cmap=cmap,
@@ -265,6 +349,84 @@ def _save_comparison(
     plt.close(figure)
 
 
+def _save_hrnet_debug(
+    destination: Path,
+    clean_bev: torch.Tensor,
+    faulty_bev: torch.Tensor,
+    coarse_bev: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    occupancy_logits: torch.Tensor,
+    activations: dict[str, torch.Tensor],
+) -> None:
+    """Save the required output and multiresolution HRNet diagnostics."""
+
+    clean = _bev_rgb(clean_bev)
+    faulty = _bev_rgb(faulty_bev)
+    coarse = _bev_rgb(coarse_bev)
+    mask = reconstruction_mask.detach().float().squeeze().cpu().numpy()
+    occupancy = (
+        torch.sigmoid(occupancy_logits)
+        .detach()
+        .float()
+        .squeeze()
+        .cpu()
+        .numpy()
+    )
+    thresholded = occupancy >= 0.5
+    absolute_error = np.abs(coarse - clean).mean(axis=-1)
+    output_panels = (
+        (clean, "Clean LiDAR BEV", None),
+        (faulty, "Faulty LiDAR BEV", None),
+        (mask, "Reconstruction mask", "gray"),
+        (coarse, "HRNet coarse reconstruction", None),
+        (occupancy, "Occupancy probability", "viridis"),
+        (thresholded, "Occupancy thresholded", "gray"),
+        (absolute_error, "Absolute reconstruction error", "magma"),
+    )
+    figure, axes = plt.subplots(2, 4, figsize=(20, 10), facecolor="black")
+    for axis, (image, title, cmap) in zip(axes.flat, output_panels):
+        axis.imshow(image, cmap=cmap, interpolation="nearest")
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    axes.flat[-1].axis("off")
+    destination.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        destination / "hrnet_reconstruction_debug.png",
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)
+
+    feature_names = (
+        ("hrnet_stage_4_branch_0", "320x320 branch"),
+        ("hrnet_stage_4_branch_1", "160x160 branch"),
+        ("hrnet_stage_4_branch_2", "80x80 branch"),
+        ("hrnet_stage_4_branch_3", "40x40 branch"),
+    )
+    figure, axes = plt.subplots(1, 4, figsize=(18, 5), facecolor="black")
+    for axis, (key, title) in zip(axes, feature_names):
+        feature = (
+            activations[key]
+            .detach()
+            .float()
+            .abs()
+            .mean(dim=0)
+            .cpu()
+            .numpy()
+        )
+        axis.imshow(feature, cmap="viridis", interpolation="nearest")
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    figure.savefig(
+        destination / "hrnet_branch_activations.png",
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)
+
+
 def main() -> None:
     args = _parse_args()
     if args.batch_size < 1 or args.num_workers < 0:
@@ -277,13 +439,9 @@ def main() -> None:
     if "model_config" not in checkpoint or "model_state_dict" not in checkpoint:
         raise ValueError("Checkpoint does not contain a coarse reconstruction model")
     model_payload = dict(checkpoint["model_config"])
-    if "global_channel_multipliers" in model_payload:
-        model_payload["global_channel_multipliers"] = tuple(
-            model_payload["global_channel_multipliers"]
-        )
     model_config = CoarseReconstructionConfig.from_dict(model_payload)
 
-    selector_config = build_selector_config(load_config(args.config))
+    selector_config = _load_selector_config(args.config)
     sample_paths = _split_paths(
         args.data_root, args.split, args.limit_samples, args.seed
     )
@@ -319,25 +477,24 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
         collate_fn=coarse_reconstruction_collate,
     )
-    radar_mode = str(checkpoint.get("radar_mode", "full"))
-    use_global_map = bool(checkpoint.get("global_map_enabled", True))
+    radar_enabled = bool(
+        checkpoint.get(
+            "radar_enabled",
+            not checkpoint.get("radar_disabled", False),
+        )
+    )
     epsilon = float(checkpoint.get("loss_config", {}).get("epsilon", 1.0e-8))
     use_amp = device.type == "cuda" and not args.no_amp
     records = []
     visualized = defaultdict(int)
+    hrnet_debug_saved = False
     completed = 0
 
     with torch.inference_mode():
         for batch in loader:
             inputs = _move_batch(batch, device)
-            local_radar_bev = None
-            radar_enabled = radar_mode != "none"
-            local_radar_enabled = radar_mode == "full"
-            if radar_mode == "none":
+            if not radar_enabled:
                 inputs["radar_bev"] = torch.zeros_like(inputs["radar_bev"])
-            elif radar_mode == "global-only":
-                if not model_config.pointpillars.enabled:
-                    local_radar_bev = torch.zeros_like(inputs["radar_bev"])
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
@@ -349,12 +506,9 @@ def main() -> None:
                     inputs["reconstruction_mask"],
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
-                    local_radar_bev=local_radar_bev,
                     faulty_lidar_points=inputs.get("faulty_lidar_points"),
                     radar_points=inputs.get("radar_points"),
                     radar_enabled=radar_enabled,
-                    local_radar_enabled=local_radar_enabled,
-                    use_global_map=use_global_map,
                 )
             batch_size = inputs["faulty_bev"].shape[0]
             for index in range(batch_size):
@@ -378,6 +532,16 @@ def main() -> None:
                     epsilon,
                     observability,
                     include_tolerant=True,
+                )
+                metrics.update(
+                    coarse_reconstruction_range_metrics(
+                        sample_outputs,
+                        inputs["clean_bev"][index : index + 1],
+                        x_range=(grid_geometry.x_min, grid_geometry.x_max),
+                        y_range=(grid_geometry.y_min, grid_geometry.y_max),
+                        epsilon=epsilon,
+                        include_tolerant=True,
+                    )
                 )
                 sample_path = str(batch["sample_path"][index])
                 sample_metadata = metadata[sample_path]
@@ -411,11 +575,33 @@ def main() -> None:
                 record.update(
                     {f"faulty_{key}": value for key, value in faulty_counts.items()}
                 )
+                record["target_occupied_cells"] = (
+                    coarse_counts["tp"] + coarse_counts["fn"]
+                )
                 record["exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]
                     - record["faulty_occupancy_exact_iou"]
                 )
                 records.append(record)
+                if not hrnet_debug_saved:
+                    _save_hrnet_debug(
+                        args.output_root / "visualizations" / "hrnet_debug",
+                        inputs["clean_bev"][index],
+                        inputs["faulty_bev"][index],
+                        outputs["coarse_lidar_bev"][index],
+                        inputs["reconstruction_mask"][index],
+                        outputs["occupancy_logits"][index],
+                        {
+                            key: outputs[key][index]
+                            for key in (
+                                "hrnet_stage_4_branch_0",
+                                "hrnet_stage_4_branch_1",
+                                "hrnet_stage_4_branch_2",
+                                "hrnet_stage_4_branch_3",
+                            )
+                        },
+                    )
+                    hrnet_debug_saved = True
                 if (
                     visualized[record["fault_group"]]
                     < args.visualize_samples_per_fault
@@ -446,8 +632,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
-        "radar_mode": radar_mode,
-        "global_map_enabled": use_global_map,
+        "radar_enabled": radar_enabled,
         "overall": summarize_records(records),
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,
@@ -466,7 +651,7 @@ def main() -> None:
     write_csv_rows(args.output_root / "by_fault_metrics.csv", summary_rows)
     atomic_write_json(args.output_root / "summary.json", summary)
     print()
-    print("PER-FAULT VALIDATION RESULTS")
+    print(f"PER-FAULT {args.split.upper()} RESULTS")
     _print_table(by_fault_severity)
     print(f"\nSaved evaluation to {args.output_root}")
 

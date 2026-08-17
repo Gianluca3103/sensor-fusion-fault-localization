@@ -11,10 +11,28 @@ from torch.utils.data._utils.collate import default_collate
 from torch.utils.data import Dataset
 
 from Fault_Localization_Model.sample_utils import InvalidSampleError
-from PFS_Radar.radar_data import radar_cache_path
 
 from .fault_selector import FaultSelectorConfig
 from .pointpillars import BEVGridGeometry
+from .geometric_augmentation import (
+    GeometricAugmentationConfig,
+    ReconstructionGeometricAugmentation,
+)
+
+
+def radar_cache_path(radar_root: str | Path, metadata: dict) -> Path:
+    """Resolve the aligned View-of-Delft radar cache for one sample."""
+
+    dataset = str(metadata.get("dataset", "")).strip().lower()
+    if dataset not in {"view-of-delft", "view of delft", "vod"}:
+        raise ValueError(f"Unsupported dataset {metadata.get('dataset')!r}; expected VoD")
+    split = str(metadata.get("split", "")).strip()
+    frame_id = str(metadata.get("frame_id", metadata.get("radar_index", ""))).strip()
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Invalid VoD split {split!r}")
+    if not frame_id.isdigit():
+        raise ValueError(f"VoD frame_id must be numeric, got {frame_id!r}")
+    return Path(radar_root) / split / f"{int(frame_id):05d}.npz"
 from .fault_selector_cache import (
     load_selector_cache,
     selector_cache_path,
@@ -51,12 +69,17 @@ def load_bev_triplet(
                 if "observability_confidence" in sample.files
                 else None
             )
+            lidar_input_bev = (
+                np.asarray(sample["faulty_lidar_input_bev"], dtype=np.float32)
+                if "faulty_lidar_input_bev" in sample.files
+                else None
+            )
         radar_path = radar_cache_path(radar_root, metadata)
         with np.load(radar_path, allow_pickle=False) as radar_cache:
             if include_pointpillars_inputs and "radar_points" not in radar_cache.files:
                 raise InvalidSampleError(
                     f"{radar_path} has no aligned raw radar points; rebuild the "
-                    "K-Radar RadarV2 cache with cache format version 9 or newer"
+                    "View-of-Delft radar cache"
                 )
             radar = np.asarray(radar_cache["radar_bev"], dtype=np.float32)
             radar_points = (
@@ -81,6 +104,13 @@ def load_bev_triplet(
         ),
         "sample_path": str(sample_path),
     }
+    if lidar_input_bev is not None:
+        if lidar_input_bev.ndim != 3 or lidar_input_bev.shape[1:] != clean.shape[:2]:
+            raise InvalidSampleError(
+                "faulty_lidar_input_bev must have shape [C,H,W] aligned with "
+                f"the target BEV; got {lidar_input_bev.shape}"
+            )
+        item["lidar_input_bev"] = torch.from_numpy(lidar_input_bev)
     if observability is not None:
         if observability.shape != clean.shape[:2]:
             raise InvalidSampleError(
@@ -98,8 +128,8 @@ def load_bev_triplet(
         if radar_points is None or radar_points.ndim != 2 or radar_points.shape[1] != 5:
             raise InvalidSampleError(
                 f"{radar_path} requires radar_points with shape [N,5] "
-                "([x,y,z,power,doppler]); rebuild the RadarV2 cache for the "
-                "PointPillars experiment"
+                "([x,y,z,power,doppler]); rebuild the View-of-Delft radar "
+                "cache for the PointPillars experiment"
             )
         item["faulty_lidar_points"] = torch.from_numpy(faulty_lidar_points)
         item["radar_points"] = torch.from_numpy(radar_points)
@@ -165,6 +195,7 @@ class CoarseReconstructionDataset(Dataset):
         data_root: str | Path,
         selector_config: FaultSelectorConfig | None = None,
         use_pointpillars: bool = False,
+        augmentation_config: GeometricAugmentationConfig | None = None,
     ):
         self.sample_paths = tuple(Path(path) for path in sample_paths)
         if not self.sample_paths:
@@ -174,6 +205,14 @@ class CoarseReconstructionDataset(Dataset):
         self.selector_config = selector_config or FaultSelectorConfig()
         self.use_pointpillars = bool(use_pointpillars)
         self.grid_geometry = load_bev_grid_geometry(self.sample_paths[0])
+        self.augmentation = (
+            ReconstructionGeometricAugmentation(
+                augmentation_config,
+                self.grid_geometry,
+            )
+            if augmentation_config is not None and augmentation_config.enabled
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -205,4 +244,6 @@ class CoarseReconstructionDataset(Dataset):
                 )[None],
             }
         )
+        if self.augmentation is not None:
+            item = self.augmentation.apply(item)
         return item

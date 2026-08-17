@@ -9,12 +9,11 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
-from Fault_Localization_Model.kradar_dataset import radar_bev_support_mask
 from .fault_selector import FaultSelector, FaultSelectorConfig
 
 
 MASK_SIZE = (320, 320)
-CACHE_VERSION = 3
+CACHE_VERSION = 15
 MASK_NAMES = (
     "reconstruction_mask",
     "halo_mask",
@@ -41,7 +40,19 @@ def selector_cache_path(sample_path: str | Path, data_root: str | Path) -> Path:
 
 
 def _config_json(config: FaultSelectorConfig) -> str:
-    return json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    payload = asdict(config)
+    # Preserve compatibility between configurations that do not enable the
+    # optional secondary box. Explicitly enabled selectors retain
+    # both fields in their cache identity.
+    if config.max_secondary_repair_boxes == 0:
+        payload.pop("max_secondary_repair_boxes")
+        payload.pop("min_secondary_lidar_loss_fraction")
+        payload.pop("min_secondary_repair_fault_fraction")
+        payload.pop("min_secondary_repair_cells")
+        payload.pop("secondary_merge_gap_cells")
+        payload.pop("min_secondary_box_spatial_density")
+        payload.pop("min_secondary_box_side_cells")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:
@@ -59,20 +70,22 @@ def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:
             name: np.asarray(sample[name], dtype=np.float32)
             for name in names
         }
-        metadata = json.loads(str(sample["metadata_json"].item()))
-    try:
-        arrays["valid_support_mask"] = radar_bev_support_mask(
-            arrays["fault_heatmap"].shape,
-            tuple(metadata["x_range"]),
-            tuple(metadata["y_range"]),
-            np.asarray(metadata["radar_from_lidar"], dtype=np.float64),
-            azimuth_range_rad=tuple(metadata["radar_azimuth_range_rad"]),
-            radar_range_m=tuple(metadata["radar_range_m"]),
-        ).astype(np.float32)
-    except (KeyError, TypeError, ValueError) as exc:
+        stored_support = (
+            np.asarray(sample["valid_support_mask"], dtype=np.float32)
+            if "valid_support_mask" in sample.files
+            else None
+        )
+    if stored_support is None:
         raise ValueError(
-            f"Cannot derive nominal radar support for {sample_path}: {exc}"
-        ) from exc
+            f"{sample_path} does not contain valid_support_mask; regenerate the "
+            "View-of-Delft sample before building selector caches"
+        )
+    if stored_support.shape != arrays["fault_heatmap"].shape:
+        raise ValueError(
+            "valid_support_mask must align with fault_heatmap; got "
+            f"{stored_support.shape} and {arrays['fault_heatmap'].shape}"
+        )
+    arrays["valid_support_mask"] = stored_support
     return arrays
 
 
