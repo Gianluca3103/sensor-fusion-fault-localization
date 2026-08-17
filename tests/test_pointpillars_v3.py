@@ -220,6 +220,22 @@ class PointPillarsEncoderV3Tests(unittest.TestCase):
         self.assertTrue(torch.isfinite(dense).all())
         self.assertIsNotNone(encoder.feature_net.point_score.weight.grad)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_amp_forward_backward_with_statistics(self):
+        encoder = _encoder(channels=8).cuda()
+        points = torch.tensor(
+            [[1.0, 1.0, 0.2, 0.5], [1.05, 1.02, 0.3, 0.7]],
+            device="cuda",
+        )
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            dense, statistics = encoder((points,))
+            loss = dense.float().square().sum()
+        loss.backward()
+        self.assertTrue(torch.isfinite(dense).all())
+        for value in statistics.values():
+            self.assertTrue(torch.isfinite(value).all())
+        self.assertIsNotNone(encoder.feature_net.point_score.weight.grad)
+
 
 class PointPillarsV3IntegrationTests(unittest.TestCase):
     def test_config_selects_v3_and_rejects_multiple_encoders(self):

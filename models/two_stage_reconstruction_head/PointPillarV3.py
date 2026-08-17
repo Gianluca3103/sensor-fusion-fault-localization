@@ -380,18 +380,23 @@ class PointPillarsEncoderV3(PointPillarsEncoder):
         attention = diagnostics["attention_weights"]
         point_counts = diagnostics["point_counts"]
         if use_point_residual and len(attention):
-            entropy_terms = -attention.squeeze(1) * torch.log(
-                attention.squeeze(1).clamp_min(1.0e-8)
+            # Autocast can produce FP16 attention while log/exp operations
+            # promote intermediate values to FP32.  Diagnostics do not need
+            # gradients, so calculate and aggregate them consistently in
+            # FP32 instead of mixing source and destination dtypes.
+            attention_values = attention.detach().float().squeeze(1)
+            entropy_terms = -attention_values * torch.log(
+                attention_values.clamp_min(1.0e-8)
             )
             entropy = torch.zeros(
-                len(point_counts), device=device, dtype=attention.dtype
+                len(point_counts), device=device, dtype=torch.float32
             )
             entropy.index_add_(0, point_to_pillar, entropy_terms)
             maximum_attention = torch.zeros_like(entropy)
             maximum_attention.scatter_reduce_(
                 0,
                 point_to_pillar,
-                attention.squeeze(1),
+                attention_values,
                 reduce="amax",
                 include_self=True,
             )
