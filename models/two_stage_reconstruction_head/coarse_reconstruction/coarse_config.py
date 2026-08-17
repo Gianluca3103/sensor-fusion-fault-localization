@@ -13,6 +13,7 @@ from .coarse_loss import (
 )
 from .hrnet_backbone import HRNetConfig
 from ..PointPillarV2 import PointPillarsV2Config
+from ..PointPillarV3 import PointPillarsV3Config
 from ..fault_selector import FaultSelectorConfig
 from ..geometric_augmentation import GeometricAugmentationConfig
 from ..pointpillars import PointPillarsConfig
@@ -35,15 +36,28 @@ class CoarseReconstructionConfig:
     pointpillars_v2: PointPillarsV2Config = field(
         default_factory=PointPillarsV2Config
     )
+    pointpillars_v3: PointPillarsV3Config = field(
+        default_factory=PointPillarsV3Config
+    )
     hrnet: HRNetConfig = field(default_factory=HRNetConfig)
 
     @property
     def pointpillars_enabled(self) -> bool:
-        return self.pointpillars.enabled or self.pointpillars_v2.enabled
+        return (
+            self.pointpillars.enabled
+            or self.pointpillars_v2.enabled
+            or self.pointpillars_v3.enabled
+        )
 
     @property
-    def pillar_encoder_config(self) -> PointPillarsConfig | PointPillarsV2Config:
-        return self.pointpillars_v2 if self.pointpillars_v2.enabled else self.pointpillars
+    def pillar_encoder_config(
+        self,
+    ) -> PointPillarsConfig | PointPillarsV2Config | PointPillarsV3Config:
+        if self.pointpillars_v3.enabled:
+            return self.pointpillars_v3
+        if self.pointpillars_v2.enabled:
+            return self.pointpillars_v2
+        return self.pointpillars
 
     @property
     def local_input_channels(self) -> int:
@@ -64,9 +78,19 @@ class CoarseReconstructionConfig:
             raise ValueError("use_halo_context must be boolean")
         self.pointpillars.validate()
         self.pointpillars_v2.validate()
-        if self.pointpillars.enabled and self.pointpillars_v2.enabled:
+        self.pointpillars_v3.validate()
+        enabled_encoders = sum(
+            int(config.enabled)
+            for config in (
+                self.pointpillars,
+                self.pointpillars_v2,
+                self.pointpillars_v3,
+            )
+        )
+        if enabled_encoders > 1:
             raise ValueError(
-                "Enable either pointpillars or pointpillars_v2, not both"
+                "Enable only one of pointpillars, pointpillars_v2, or "
+                "pointpillars_v3"
             )
         self.hrnet.validate()
         if self.pointpillars_enabled:
@@ -90,6 +114,9 @@ class CoarseReconstructionConfig:
         pointpillars_v2 = values.get("pointpillars_v2", {})
         if isinstance(pointpillars_v2, dict):
             values["pointpillars_v2"] = PointPillarsV2Config(**pointpillars_v2)
+        pointpillars_v3 = values.get("pointpillars_v3", {})
+        if isinstance(pointpillars_v3, dict):
+            values["pointpillars_v3"] = PointPillarsV3Config(**pointpillars_v3)
         hrnet = values.get("hrnet", {})
         if isinstance(hrnet, dict):
             hrnet_fields = {item.name for item in fields(HRNetConfig)}
@@ -154,13 +181,27 @@ def build_configs(payload: dict):
         payload.get("pointpillars_v2", {}),
         PointPillarsV2Config,
     )
+    pointpillars_v3 = _checked_dataclass(
+        "pointpillars_v3",
+        payload.get("pointpillars_v3", {}),
+        PointPillarsV3Config,
+    )
     hrnet = _checked_dataclass("hrnet", payload.get("hrnet", {}), HRNetConfig)
 
-    if pointpillars.enabled and pointpillars_v2.enabled:
-        raise ValueError("Enable either pointpillars or pointpillars_v2, not both")
-    active_pointpillars = (
-        pointpillars_v2 if pointpillars_v2.enabled else pointpillars
+    enabled_encoders = sum(
+        int(config.enabled)
+        for config in (pointpillars, pointpillars_v2, pointpillars_v3)
     )
+    if enabled_encoders > 1:
+        raise ValueError(
+            "Enable only one of pointpillars, pointpillars_v2, or pointpillars_v3"
+        )
+    if pointpillars_v3.enabled:
+        active_pointpillars = pointpillars_v3
+    elif pointpillars_v2.enabled:
+        active_pointpillars = pointpillars_v2
+    else:
+        active_pointpillars = pointpillars
 
     mask_payload = payload.get("masks", {})
     if not isinstance(mask_payload, dict):
@@ -189,6 +230,7 @@ def build_configs(payload: dict):
         use_halo_context=mask_payload.get("use_halo_context", True),
         pointpillars=pointpillars,
         pointpillars_v2=pointpillars_v2,
+        pointpillars_v3=pointpillars_v3,
         hrnet=hrnet,
     )
 

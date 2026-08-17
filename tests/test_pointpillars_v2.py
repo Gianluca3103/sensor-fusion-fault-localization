@@ -289,7 +289,7 @@ class PointPillarsEncoderV2Tests(unittest.TestCase):
         )
 
     def test_configuration_rejects_two_enabled_encoders(self):
-        with self.assertRaisesRegex(ValueError, "either pointpillars or pointpillars_v2"):
+        with self.assertRaisesRegex(ValueError, "Enable only one"):
             build_configs(
                 {
                     "pointpillars": {"enabled": True},

@@ -195,6 +195,16 @@ def _summarize_active_fractions(values: list[float]) -> dict[str, float]:
     }
 
 
+def _mean_stat(statistics: dict, name: str) -> float:
+    values = statistics.get(name, [])
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def _max_stat(statistics: dict, name: str) -> float:
+    values = statistics.get(name, [])
+    return float(max(values)) if values else 0.0
+
+
 def _active_fraction_recommendation(summary: dict[str, float]) -> str:
     if summary["median"] >= 0.25:
         return "Keep dense HRNet: typical active coverage is at least 25%."
@@ -497,7 +507,9 @@ def main():
     print(
         "Sensor representation: "
         + (
-            "PointPillarV2"
+            "PointPillarV3"
+            if model_config.pointpillars_v3.enabled
+            else "PointPillarV2"
             if model_config.pointpillars_v2.enabled
             else "PointPillars"
             if model_config.pointpillars.enabled
@@ -545,6 +557,15 @@ def main():
                 f"radius={v2.neighbor_radius_m:.2f}m, "
                 f"max={v2.neighbor_max_neighbors}, "
                 f"initial_scale={v2.neighbor_initial_scale:g}"
+            )
+        elif model_config.pointpillars_v3.enabled:
+            v3 = model_config.pointpillars_v3
+            print(
+                "PointPillarV3 branches: "
+                f"mean={v3.use_mean_pool}, "
+                f"point_residual={v3.use_point_residual}, "
+                f"hidden={v3.point_residual_hidden_channels}, "
+                f"initial_scale={v3.initial_residual_scale:g}"
             )
     history = []
     best_validation = float("inf")
@@ -669,6 +690,36 @@ def main():
                         f"neighborless_fraction="
                         f"{neighborless / max(occupied, 1):.3f}, "
                         f"radius={model_config.pointpillars_v2.neighbor_radius_m:.2f}m"
+                    )
+            elif model_config.pointpillars_v3.enabled:
+                for sensor in ("lidar", "radar"):
+                    pillar_statistics = val_shapes.get(
+                        f"{sensor}_pillar_statistics", {}
+                    )
+                    entropy = _mean_stat(
+                        pillar_statistics, "average_attention_entropy"
+                    )
+                    maximum_attention = _max_stat(
+                        pillar_statistics, "maximum_attention_weight"
+                    )
+                    effective_points = _mean_stat(
+                        pillar_statistics,
+                        "average_points_receiving_attention",
+                    )
+                    max_mean_difference = _mean_stat(
+                        pillar_statistics,
+                        "average_max_mean_feature_difference",
+                    )
+                    residual_scale = _mean_stat(
+                        pillar_statistics, "residual_scale"
+                    )
+                    print(
+                        f"PointPillarV3 {sensor}: "
+                        f"attention_entropy={entropy:.3f}, "
+                        f"max_attention={maximum_attention:.3f}, "
+                        f"effective_points={effective_points:.2f}, "
+                        f"max_mean_difference={max_mean_difference:.3f}, "
+                        f"residual_scale={residual_scale:.3f}"
                     )
             print(
                 "Active-mask coverage: "

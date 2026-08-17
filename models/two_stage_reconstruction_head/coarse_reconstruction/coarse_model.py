@@ -10,6 +10,7 @@ from torch import nn
 from .coarse_config import CoarseReconstructionConfig
 from .hrnet_backbone import HRNetBackbone
 from ..PointPillarV2 import PointPillarsEncoderV2, PointPillarsV2Config
+from ..PointPillarV3 import PointPillarsEncoderV3, PointPillarsV3Config
 from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
 
 
@@ -51,11 +52,12 @@ class CoarseReconstructionModel(nn.Module):
             if (grid_geometry.height, grid_geometry.width) != (320, 320):
                 raise ValueError("VoD reconstruction requires a 320x320 BEV grid")
             pointpillars = self.config.pillar_encoder_config
-            encoder_class = (
-                PointPillarsEncoderV2
-                if isinstance(pointpillars, PointPillarsV2Config)
-                else PointPillarsEncoder
-            )
+            if isinstance(pointpillars, PointPillarsV3Config):
+                encoder_class = PointPillarsEncoderV3
+            elif isinstance(pointpillars, PointPillarsV2Config):
+                encoder_class = PointPillarsEncoderV2
+            else:
+                encoder_class = PointPillarsEncoder
             common_arguments = {
                 "output_channels": pointpillars.output_channels,
                 "max_points_per_pillar": pointpillars.max_points_per_pillar,
@@ -68,6 +70,19 @@ class CoarseReconstructionModel(nn.Module):
                         "neighbor_radius_m": pointpillars.neighbor_radius_m,
                         "neighbor_max_neighbors": pointpillars.neighbor_max_neighbors,
                         "neighbor_initial_scale": pointpillars.neighbor_initial_scale,
+                    }
+                )
+            elif isinstance(pointpillars, PointPillarsV3Config):
+                common_arguments.update(
+                    {
+                        "use_mean_pool": pointpillars.use_mean_pool,
+                        "use_point_residual": pointpillars.use_point_residual,
+                        "point_residual_hidden_channels": (
+                            pointpillars.point_residual_hidden_channels
+                        ),
+                        "initial_residual_scale": (
+                            pointpillars.initial_residual_scale
+                        ),
                     }
                 )
             self.lidar_pillar_encoder = encoder_class(

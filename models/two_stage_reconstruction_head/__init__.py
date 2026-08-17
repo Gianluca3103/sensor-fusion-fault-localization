@@ -38,6 +38,11 @@ from .PointPillarV2 import (
     PointPillarsEncoderV2,
     PointPillarsV2Config,
 )
+from .PointPillarV3 import (
+    PillarFeatureNetV3,
+    PointPillarsEncoderV3,
+    PointPillarsV3Config,
+)
 from .coarse_reconstruction.coarse_config import (
     CoarseReconstructionConfig,
     build_augmentation_config,
