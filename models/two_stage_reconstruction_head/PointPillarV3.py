@@ -210,18 +210,28 @@ class PillarFeatureNetV3(nn.Module):
         point_to_pillar: torch.Tensor,
         pillar_count: int,
     ) -> torch.Tensor:
-        maxima = scores.new_full((pillar_count, 1), -torch.inf)
+        # AMP may leave ``scores`` in FP16 while ``torch.exp`` promotes its
+        # result to FP32.  Accumulate the softmax in FP32 explicitly, then
+        # return weights in the input dtype so the following weighted pooling
+        # has matching source and destination dtypes.
+        accumulation_scores = scores.float()
+        maxima = accumulation_scores.new_full((pillar_count, 1), -torch.inf)
         maxima.scatter_reduce_(
             0,
             point_to_pillar[:, None],
-            scores,
+            accumulation_scores,
             reduce="amax",
             include_self=True,
         )
-        exponentials = torch.exp(scores - maxima[point_to_pillar])
-        denominators = scores.new_zeros((pillar_count, 1))
+        exponentials = torch.exp(
+            accumulation_scores - maxima[point_to_pillar]
+        )
+        denominators = accumulation_scores.new_zeros((pillar_count, 1))
         denominators.index_add_(0, point_to_pillar, exponentials)
-        return exponentials / denominators[point_to_pillar].clamp_min(self.epsilon)
+        weights = exponentials / denominators[point_to_pillar].clamp_min(
+            self.epsilon
+        )
+        return weights.to(scores.dtype)
 
     def _attention_pool(
         self,

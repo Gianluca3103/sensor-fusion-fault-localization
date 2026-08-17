@@ -75,6 +75,20 @@ class PillarFeatureNetV3Tests(unittest.TestCase):
         self.assertTrue(torch.allclose(sums, torch.ones_like(sums)))
         self.assertTrue(torch.isfinite(weights).all())
 
+    def test_attention_supports_half_precision_scores(self):
+        network = PillarFeatureNetV3(3, 4)
+        scores = torch.tensor(
+            [[1.0], [3.0], [-2.0], [0.5], [4.0]], dtype=torch.float16
+        )
+        membership = torch.tensor([0, 0, 1, 1, 1])
+        weights = network._segment_softmax(scores, membership, 2)
+        sums = torch.zeros(2, 1, dtype=weights.dtype).index_add_(
+            0, membership, weights
+        )
+        self.assertEqual(weights.dtype, torch.float16)
+        self.assertTrue(torch.allclose(sums.float(), torch.ones_like(sums).float()))
+        self.assertTrue(torch.isfinite(weights).all())
+
     def test_pillars_are_isolated(self):
         torch.manual_seed(4)
         network = PillarFeatureNetV3(3, 8).eval()
