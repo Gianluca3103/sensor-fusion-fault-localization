@@ -9,7 +9,6 @@ from pathlib import Path
 from .coarse_loss import (
     CoarseLossConfig,
     ObservabilityWeightingConfig,
-    OccupancyLossConfig,
 )
 from .hrnet_backbone import HRNetConfig
 from ..fault_selector import FaultSelectorConfig
@@ -168,8 +167,8 @@ def build_configs(payload: dict):
         "lambda_density",
         "lambda_height",
         "epsilon",
+        "positive_occupancy_weight",
         "observability_weighting",
-        "occupancy",
     }
     unknown_loss = set(loss_payload) - allowed_loss
     if unknown_loss:
@@ -182,16 +181,15 @@ def build_configs(payload: dict):
         loss_payload.get("observability_weighting", {}),
         ObservabilityWeightingConfig,
     )
-    occupancy = _checked_dataclass(
-        "occupancy", loss_payload.get("occupancy", {}), OccupancyLossConfig
-    )
     loss_config = CoarseLossConfig(
         lambda_occupancy=loss_payload.get("lambda_occupancy", 1.0),
         lambda_density=loss_payload.get("lambda_density", 1.0),
         lambda_height=loss_payload.get("lambda_height", 1.0),
         epsilon=loss_payload.get("epsilon", 1.0e-8),
+        positive_occupancy_weight=loss_payload.get(
+            "positive_occupancy_weight", 1.0
+        ),
         observability_weighting=observability,
-        occupancy=occupancy,
     )
     selector_config = build_selector_config(payload)
     model_config.validate()

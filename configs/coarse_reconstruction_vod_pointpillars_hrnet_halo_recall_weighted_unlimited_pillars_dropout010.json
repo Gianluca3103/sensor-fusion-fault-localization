@@ -26,16 +26,10 @@
       "lambda_density": 1.0,
       "lambda_height": 1.0,
       "epsilon": 1e-8,
+      "positive_occupancy_weight": 1.1,
       "observability_weighting": {
         "enabled": true,
         "min_empty_weight": 0.1
-      },
-      "occupancy": {
-        "type": "tolerance_aware",
-        "exact_weight": 0.35,
-        "tolerant_recall_weight": 0.6,
-        "far_fp_weight": 1.0,
-        "tolerance_radius_m": 0.5
       }
     }
   },

@@ -37,54 +37,15 @@ class ObservabilityWeightingConfig:
 
 
 @dataclass(frozen=True)
-class OccupancyLossConfig:
-    """Optional Stage-I occupancy objective; ``existing`` is the baseline."""
-
-    type: str = "existing"
-    exact_weight: float = 0.25
-    tolerant_recall_weight: float = 1.0
-    far_fp_weight: float = 0.5
-    tolerance_radius_m: float = 0.5
-
-    def validate(self) -> None:
-        if self.type not in {"existing", "tolerance_aware"}:
-            raise ValueError(
-                "occupancy.type must be 'existing' or 'tolerance_aware'"
-            )
-        for name in (
-            "exact_weight",
-            "tolerant_recall_weight",
-            "far_fp_weight",
-        ):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or value < 0
-            ):
-                raise ValueError(f"occupancy.{name} must be finite and non-negative")
-        if (
-            isinstance(self.tolerance_radius_m, bool)
-            or not isinstance(self.tolerance_radius_m, (int, float))
-            or not math.isfinite(float(self.tolerance_radius_m))
-            or self.tolerance_radius_m < 0
-        ):
-            raise ValueError(
-                "occupancy.tolerance_radius_m must be finite and non-negative"
-            )
-
-
-@dataclass(frozen=True)
 class CoarseLossConfig:
     lambda_occupancy: float = 1.0
     lambda_density: float = 1.0
     lambda_height: float = 1.0
     epsilon: float = 1.0e-8
+    positive_occupancy_weight: float = 1.0
     observability_weighting: ObservabilityWeightingConfig = field(
         default_factory=ObservabilityWeightingConfig
     )
-    occupancy: OccupancyLossConfig = field(default_factory=OccupancyLossConfig)
 
     def validate(self) -> None:
         for name in ("lambda_occupancy", "lambda_density", "lambda_height"):
@@ -92,18 +53,16 @@ class CoarseLossConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.epsilon <= 0:
             raise ValueError("epsilon must be positive")
+        if (
+            isinstance(self.positive_occupancy_weight, bool)
+            or not isinstance(self.positive_occupancy_weight, (int, float))
+            or not math.isfinite(float(self.positive_occupancy_weight))
+            or self.positive_occupancy_weight < 1.0
+        ):
+            raise ValueError(
+                "positive_occupancy_weight must be finite and at least 1.0"
+            )
         self.observability_weighting.validate()
-        self.occupancy.validate()
-
-
-def tolerance_radius_cells(tolerance_radius_m: float, resolution_m: float) -> int:
-    """Convert metric tolerance to a conservative symmetric cell radius."""
-
-    if not math.isfinite(resolution_m) or resolution_m <= 0:
-        raise ValueError("BEV resolution must be finite and positive")
-    if not math.isfinite(tolerance_radius_m) or tolerance_radius_m < 0:
-        raise ValueError("Tolerance radius must be finite and non-negative")
-    return int(math.floor(tolerance_radius_m / resolution_m + 1.0e-9))
 
 
 def _validate_observability(
@@ -145,13 +104,17 @@ def occupancy_bce_weights(
     clean_occupancy: torch.Tensor,
     observability_confidence: torch.Tensor,
     min_empty_weight: float,
+    positive_occupancy_weight: float = 1.0,
 ) -> torch.Tensor:
-    """Return unit occupied weights and confidence-scaled empty weights."""
+    """Return recall-biased occupied and confidence-scaled empty weights."""
 
     empty_weight = min_empty_weight + (
         1.0 - min_empty_weight
     ) * observability_confidence
-    return clean_occupancy + (1.0 - clean_occupancy) * empty_weight
+    return (
+        positive_occupancy_weight * clean_occupancy
+        + (1.0 - clean_occupancy) * empty_weight
+    )
 
 
 def _masked_mean(
@@ -186,20 +149,10 @@ def _soft_dice_loss_per_sample(
 class MaskedBEVReconstructionLoss(nn.Module):
     """Masked occupancy, density, and P90-height reconstruction objective."""
 
-    def __init__(
-        self,
-        config: CoarseLossConfig | None = None,
-        *,
-        bev_resolution_m: float = BEV_RESOLUTION_M,
-    ):
+    def __init__(self, config: CoarseLossConfig | None = None):
         super().__init__()
         self.config = config or CoarseLossConfig()
         self.config.validate()
-        self.bev_resolution_m = float(bev_resolution_m)
-        self.tolerance_radius_cells = tolerance_radius_cells(
-            self.config.occupancy.tolerance_radius_m,
-            self.bev_resolution_m,
-        )
 
     def forward(
         self,
@@ -238,50 +191,26 @@ class MaskedBEVReconstructionLoss(nn.Module):
                 clean_occupancy,
                 observability_confidence,
                 weighting.min_empty_weight,
-            )
-            valid_weight = mask * occupancy_weight
-            occupancy_bce = _masked_mean(
-                occupancy_bce_per_cell,
-                valid_weight,
-                self.config.epsilon,
+                self.config.positive_occupancy_weight,
             )
         else:
-            occupancy_weight = None
-            occupancy_bce = _masked_mean(
-                occupancy_bce_per_cell,
-                mask,
-                self.config.epsilon,
+            occupancy_weight = (
+                self.config.positive_occupancy_weight * clean_occupancy
+                + (1.0 - clean_occupancy)
             )
+        valid_weight = mask * occupancy_weight
+        occupancy_bce = _masked_mean(
+            occupancy_bce_per_cell,
+            valid_weight,
+            self.config.epsilon,
+        )
         occupancy_dice = _soft_dice_loss_per_sample(
             occupancy_logits,
             clean_occupancy,
             mask,
             self.config.epsilon,
         )
-        occupancy_exact = occupancy_bce + occupancy_dice
-        zero = occupancy_logits.sum() * 0.0
-        occupancy_tolerant_recall = zero
-        occupancy_far_fp = zero
-        occupancy_config = self.config.occupancy
-        if occupancy_config.type == "tolerance_aware":
-            (
-                occupancy_tolerant_recall,
-                occupancy_far_fp,
-            ) = _tolerance_aware_occupancy_terms(
-                occupancy_logits,
-                clean_occupancy,
-                mask,
-                radius_cells=self.tolerance_radius_cells,
-                epsilon=self.config.epsilon,
-            )
-            occupancy_loss = (
-                occupancy_config.exact_weight * occupancy_exact
-                + occupancy_config.tolerant_recall_weight
-                * occupancy_tolerant_recall
-                + occupancy_config.far_fp_weight * occupancy_far_fp
-            )
-        else:
-            occupancy_loss = occupancy_exact
+        occupancy_loss = occupancy_bce + occupancy_dice
 
         continuous_mask = mask * clean_occupancy
         density_loss = _masked_mean(
@@ -310,9 +239,6 @@ class MaskedBEVReconstructionLoss(nn.Module):
             "loss": total,
             "loss_total": total,
             "loss_occupancy": occupancy_loss,
-            "loss_occupancy_exact": occupancy_exact,
-            "loss_occupancy_tolerant_recall": occupancy_tolerant_recall,
-            "loss_occupancy_far_fp": occupancy_far_fp,
             "loss_occupancy_bce": occupancy_bce,
             "loss_occupancy_dice": occupancy_dice,
             "loss_density": density_loss,
@@ -330,57 +256,6 @@ class MaskedBEVReconstructionLoss(nn.Module):
                 )
             )
         return result
-
-
-def _tolerance_aware_occupancy_terms(
-    occupancy_logits: torch.Tensor,
-    clean_occupancy: torch.Tensor,
-    reconstruction_mask: torch.Tensor,
-    *,
-    radius_cells: int,
-    epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return differentiable tolerant-recall and distant-FP penalties."""
-
-    valid = reconstruction_mask > 0
-    target_positive = (clean_occupancy >= 0.5) & valid
-    kernel_size = 2 * radius_cells + 1
-
-    # max(sigmoid(x)) == sigmoid(max(x)); pooling logits keeps BCE stable.
-    minimum = torch.finfo(occupancy_logits.dtype).min
-    valid_logits = occupancy_logits.masked_fill(~valid, minimum)
-    nearby_logits = F.max_pool2d(
-        valid_logits,
-        kernel_size=kernel_size,
-        stride=1,
-        padding=radius_cells,
-    )
-    tolerant_recall_per_cell = torch.where(
-        target_positive,
-        F.softplus(-nearby_logits),
-        torch.zeros_like(nearby_logits),
-    )
-    tolerant_recall = _masked_mean(
-        tolerant_recall_per_cell,
-        target_positive.to(dtype=occupancy_logits.dtype),
-        epsilon,
-    )
-
-    target_tolerance_region = F.max_pool2d(
-        target_positive.to(dtype=occupancy_logits.dtype),
-        kernel_size=kernel_size,
-        stride=1,
-        padding=radius_cells,
-    ) > 0
-    far_region = valid & ~target_tolerance_region
-    far_fp = _masked_mean(
-        F.softplus(occupancy_logits),
-        far_region.to(dtype=occupancy_logits.dtype),
-        epsilon,
-    )
-    return tolerant_recall, far_fp
-
-
 def _observability_loss_diagnostics(
     confidence: torch.Tensor,
     occupancy_weight: torch.Tensor,

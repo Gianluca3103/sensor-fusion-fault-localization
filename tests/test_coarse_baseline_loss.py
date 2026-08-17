@@ -215,6 +215,8 @@ class CoarseBaselineLossTests(unittest.TestCase):
             CoarseLossConfig(lambda_density=-1.0).validate()
         with self.assertRaisesRegex(ValueError, "positive"):
             CoarseLossConfig(epsilon=0.0).validate()
+        with self.assertRaisesRegex(ValueError, "at least 1.0"):
+            CoarseLossConfig(positive_occupancy_weight=0.9).validate()
         with self.assertRaisesRegex(ValueError, "obsolete"):
             build_configs(
                 {

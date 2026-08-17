@@ -6,7 +6,6 @@ import argparse
 import atexit
 from dataclasses import asdict
 import json
-import math
 from pathlib import Path
 import sys
 import time
@@ -340,8 +339,6 @@ def _run_epoch(
                 loss_fn.config.epsilon,
                 inputs.get("observability_confidence"),
                 include_tolerant=True,
-                resolution_m=loss_fn.bev_resolution_m,
-                tolerance_m=loss_fn.config.occupancy.tolerance_radius_m,
             )
         batch_size = inputs["faulty_bev"].shape[0]
         samples += batch_size
@@ -475,22 +472,7 @@ def main():
             else None
         ),
     ).to(device)
-    geometry = train_dataset.grid_geometry
-    if not math.isclose(
-        geometry.pillar_size_x,
-        geometry.pillar_size_y,
-        rel_tol=1.0e-6,
-        abs_tol=1.0e-9,
-    ):
-        raise ValueError(
-            "Tolerance-aware occupancy requires square BEV cells; got "
-            f"{geometry.pillar_size_x:.6f}m x "
-            f"{geometry.pillar_size_y:.6f}m"
-        )
-    loss_fn = MaskedBEVReconstructionLoss(
-        loss_config,
-        bev_resolution_m=geometry.pillar_size_x,
-    )
+    loss_fn = MaskedBEVReconstructionLoss(loss_config)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=float(training.get("learning_rate", 2.0e-4)),
@@ -521,19 +503,11 @@ def main():
         + ("PointPillars" if model_config.pointpillars.enabled else "handcrafted BEV")
     )
     print("Coarse model: HRNet")
-    print(f"Occupancy loss: {loss_config.occupancy.type}")
-    if loss_config.occupancy.type == "tolerance_aware":
-        print(
-            "Tolerance-aware occupancy: "
-            f"exact={loss_config.occupancy.exact_weight:g}, "
-            "tolerant_recall="
-            f"{loss_config.occupancy.tolerant_recall_weight:g}, "
-            f"far_fp={loss_config.occupancy.far_fp_weight:g}, "
-            f"requested_radius={loss_config.occupancy.tolerance_radius_m:.3f}m, "
-            f"cell_radius={loss_fn.tolerance_radius_cells}, "
-            "effective_axis_radius="
-            f"{loss_fn.tolerance_radius_cells * loss_fn.bev_resolution_m:.3f}m"
-        )
+    print("Occupancy loss: weighted BCE + Dice")
+    print(
+        "Positive occupancy weight: "
+        f"{loss_config.positive_occupancy_weight:g}"
+    )
     trainable_parameters = sum(
         parameter.numel()
         for parameter in model.parameters()
@@ -684,18 +658,6 @@ def main():
                 f"{val_stats['loss_height']:10.6f}"
             ),
         ]
-        if loss_config.occupancy.type == "tolerance_aware":
-            summary_lines.extend(
-                [
-                    "  Occupancy terms         exact   tolerant-recall      far-FP",
-                    (
-                        "                      "
-                        f"{val_stats['loss_occupancy_exact']:10.6f}  "
-                        f"{val_stats['loss_occupancy_tolerant_recall']:16.6f}  "
-                        f"{val_stats['loss_occupancy_far_fp']:10.6f}"
-                    ),
-                ]
-            )
         summary_lines.extend(
             [
                 "  Exact occupancy           precision     recall         F1        IoU",

@@ -64,6 +64,20 @@ class ObservabilityWeightedLossTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(weights, torch.ones_like(weights)))
 
+    def test_positive_occupancy_weight_biases_only_occupied_cells(self):
+        target = torch.tensor([[[[1.0, 0.0]]]])
+        confidence = torch.ones_like(target)
+        weights = occupancy_bce_weights(
+            target,
+            confidence,
+            0.1,
+            positive_occupancy_weight=1.1,
+        )
+
+        self.assertTrue(
+            torch.allclose(weights, torch.tensor([[[[1.1, 1.0]]]]))
+        )
+
     def test_fully_observable_empty_cell_matches_ordinary_bce(self):
         raw = torch.tensor([[[[0.7]], [[0.0]], [[0.0]]]], requires_grad=True)
         clean = torch.zeros_like(raw)
@@ -234,6 +248,14 @@ class ObservabilityWeightedLossTests(unittest.TestCase):
         )
         self.assertTrue(loss_config.observability_weighting.enabled)
         self.assertEqual(loss_config.observability_weighting.min_empty_weight, 0.2)
+        _model, recall_biased, _selector = build_configs(
+            {
+                "coarse_reconstruction": {
+                    "loss": {"positive_occupancy_weight": 1.1}
+                }
+            }
+        )
+        self.assertEqual(recall_biased.positive_occupancy_weight, 1.1)
         with self.assertRaisesRegex(ValueError, "must be a bool"):
             build_configs(
                 {
