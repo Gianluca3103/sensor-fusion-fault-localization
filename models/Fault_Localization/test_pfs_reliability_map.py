@@ -15,9 +15,9 @@ FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch
-from PFS.pfs_model import MODEL_VARIANTS, load_model_checkpoint
-from PFS.training_utils import resolve_device, save_predictions, split_paths
+from models.Fault_Localization.datasets import PFSReliabilityDataset, collate_reliability_batch
+from models.Fault_Localization.pfs_model import MODEL_VARIANTS, load_model_checkpoint
+from models.Fault_Localization.training_utils import resolve_device, save_predictions, split_paths
 
 
 DEFAULT_DATASET_ROOT = FAULT_MODEL_DIR / "grid_reliability_7500_fog_s3_x64_y32"

@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import torch
 
-from models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction import (
+from models.two_stage_reconstruction_head.coarse_reconstruction.train_coarse_reconstruction import (
     _active_fraction_recommendation,
     _move_batch as move_coarse_batch,
     _run_epoch as run_coarse_epoch,
@@ -14,11 +14,11 @@ from models.reconstruction_head.coarse_reconstruction.train_coarse_reconstructio
     _summarize_active_fractions,
     _write_tensorboard_epoch,
 )
-from models.reconstruction_head.diffusion_process.train_residual_diffusion import (
+from models.two_stage_reconstruction_head.diffusion_process.train_residual_diffusion import (
     _move_batch as move_diffusion_batch,
     _split_paths as diffusion_split_paths,
 )
-from models.reconstruction_head import MaskedBEVReconstructionLoss
+from models.two_stage_reconstruction_head import MaskedBEVReconstructionLoss
 
 
 class TrainingDataSelectionTests(unittest.TestCase):

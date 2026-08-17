@@ -117,7 +117,7 @@ def load_selector_cache(
     if not path.is_file():
         raise InvalidSelectorCacheError(
             f"Fault Selector cache is missing: {path}. Run "
-            "python -m models.reconstruction_head.cache_fault_selector_masks first."
+            "python -m models.two_stage_reconstruction_head.cache_fault_selector_masks first."
         )
     try:
         with np.load(path, allow_pickle=False) as cache:

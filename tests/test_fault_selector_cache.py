@@ -7,10 +7,10 @@ import unittest
 import numpy as np
 import torch
 
-from models.reconstruction_head.cache_fault_selector_masks import (
+from models.two_stage_reconstruction_head.cache_fault_selector_masks import (
     _discover_sample_paths,
 )
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     CoarseReconstructionDataset,
     FaultSelectorConfig,
     GeometricAugmentationConfig,

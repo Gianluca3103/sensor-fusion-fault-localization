@@ -19,8 +19,8 @@ FAULT_MODEL_DIR = REPO_ROOT / "Fault_Localization_Model"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch
-from PFS.pfs_model import MODEL_VARIANTS, build_reliability_model
+from models.Fault_Localization.datasets import PFSReliabilityDataset, collate_reliability_batch
+from models.Fault_Localization.pfs_model import MODEL_VARIANTS, build_reliability_model
 from Fault_Localization_Model.heatmap_metrics import (
     HeatmapMetricAccumulator,
     save_group_metrics,
@@ -33,7 +33,7 @@ from Fault_Localization_Model.io_utils import (
     write_csv_rows,
 )
 from Fault_Localization_Model.sample_utils import require_disjoint_splits
-from PFS.training_utils import (
+from models.Fault_Localization.training_utils import (
     capture_rng_state,
     original_reliability_loss,
     require_checkpoint_args_match,

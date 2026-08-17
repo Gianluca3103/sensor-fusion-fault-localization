@@ -15,16 +15,16 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PFS.datasets import PFSReliabilityDataset, collate_reliability_batch  # noqa: E402
+from models.Fault_Localization.datasets import PFSReliabilityDataset, collate_reliability_batch  # noqa: E402
 from Fault_Localization_Model.heatmap_metrics import (  # noqa: E402
     HeatmapMetricAccumulator,
     prepare_probability_target,
     save_group_metrics,
 )
 from Fault_Localization_Model.io_utils import atomic_write_json, write_csv_rows  # noqa: E402
-from PFS.pfs_model import MODEL_VARIANTS, load_model_checkpoint  # noqa: E402
+from models.Fault_Localization.pfs_model import MODEL_VARIANTS, load_model_checkpoint  # noqa: E402
 from Fault_Localization_Model.sample_utils import filter_paths_by_fault, require_disjoint_splits  # noqa: E402
-from PFS.training_utils import resolve_device  # noqa: E402
+from models.Fault_Localization.training_utils import resolve_device  # noqa: E402
 
 
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "runs" / "threshold_calibration_test_eval"

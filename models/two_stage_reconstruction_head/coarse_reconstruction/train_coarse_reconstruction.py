@@ -25,8 +25,8 @@ from Fault_Localization_Model.io_utils import (
     atomic_write_json,
     write_csv_rows,
 )
-from PFS.training_utils import _split_paths, resolve_device, seed_everything
-from models.reconstruction_head import (
+from models.Fault_Localization.training_utils import _split_paths, resolve_device, seed_everything
+from models.two_stage_reconstruction_head import (
     CoarseReconstructionDataset,
     CoarseReconstructionModel,
     MaskedBEVReconstructionLoss,

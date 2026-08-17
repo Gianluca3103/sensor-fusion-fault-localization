@@ -13,17 +13,17 @@ unchanged.
 
 - `Fault_Localization_Model/create_vod_reconstruction_dataset.py`: generate
   aligned clean/faulty LiDAR samples and accumulated VoD Radar caches.
-- `models/reconstruction_head/fault_selector.py`: select primary and secondary
+- `models/two_stage_reconstruction_head/fault_selector.py`: select primary and secondary
   repair boxes and their healthy halo context.
-- `models/reconstruction_head/pointpillars.py`: encode aligned LiDAR and Radar
+- `models/two_stage_reconstruction_head/pointpillars.py`: encode aligned LiDAR and Radar
   point clouds into 320x320 pseudo-images.
-- `models/reconstruction_head/coarse_reconstruction/hrnet_backbone.py`: the only
+- `models/two_stage_reconstruction_head/coarse_reconstruction/hrnet_backbone.py`: the only
   supported deterministic reconstruction backbone.
-- `models/reconstruction_head/coarse_reconstruction/train_coarse_reconstruction.py`:
+- `models/two_stage_reconstruction_head/coarse_reconstruction/train_coarse_reconstruction.py`:
   train the coarse model.
-- `models/reconstruction_head/coarse_reconstruction/evaluate_coarse_by_fault.py`:
+- `models/two_stage_reconstruction_head/coarse_reconstruction/evaluate_coarse_by_fault.py`:
   evaluate exact and tolerant reconstruction metrics by fault.
-- `models/reconstruction_head/diffusion_process/`: unchanged Stage-II code.
+- `models/two_stage_reconstruction_head/diffusion_process/`: unchanged Stage-II code.
 
 ## Canonical configuration
 
@@ -55,7 +55,7 @@ generator options. Fault-selector masks are cached
 separately with:
 
 ```powershell
-python -m models.reconstruction_head.cache_fault_selector_masks `
+python -m models.two_stage_reconstruction_head.cache_fault_selector_masks `
   --data-root "C:\path\to\reconstruction_vod" `
   --config configs\coarse_reconstruction_vod.json `
   --num-workers 8
@@ -64,7 +64,7 @@ python -m models.reconstruction_head.cache_fault_selector_masks `
 ## Training
 
 ```bash
-python -u -m models.reconstruction_head.coarse_reconstruction.train_coarse_reconstruction \
+python -u -m models.two_stage_reconstruction_head.coarse_reconstruction.train_coarse_reconstruction \
   --data-root /workspace/reconstruction_vod \
   --radar-root /workspace/radar20_pointpillars_cache \
   --output-root /workspace/coarse_vod_hrnet \
@@ -81,7 +81,7 @@ controlled radar ablation.
 ## Evaluation
 
 ```bash
-python -u -m models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault \
+python -u -m models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault \
   --checkpoint /workspace/coarse_vod_hrnet/best_model.pt \
   --data-root /workspace/reconstruction_vod \
   --radar-root /workspace/radar20_pointpillars_cache \

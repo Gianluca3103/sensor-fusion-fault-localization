@@ -13,7 +13,7 @@ from typing import Any
 
 
 EVALUATOR_MODULE = (
-    "models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault"
+    "models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault"
 )
 
 

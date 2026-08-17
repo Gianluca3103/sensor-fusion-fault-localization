@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from models.reconstruction_head import (
+from models.two_stage_reconstruction_head import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
     build_configs,

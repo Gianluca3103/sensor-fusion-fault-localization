@@ -49,9 +49,9 @@ From the repo root:
 
 ```powershell
 cd "C:\Users\gianl\Desktop\Thesis\Sensor-Fusion_Final_Model_Repo"
-& "C:\Users\gianl\miniconda3\python.exe" PFS\train_pfs_reliability_map.py `
+& "C:\Users\gianl\miniconda3\python.exe" models\Fault_Localization\train_pfs_reliability_map.py `
   --dataset-root "C:\Users\gianl\Desktop\Thesis\Sensor-Fusion_Final_Model_Repo\Fault_Localization_Model\grid_reliability_7500_fog_s3_x64_y32" `
-  --output-root "C:\Users\gianl\Desktop\Thesis\Sensor-Fusion_Final_Model_Repo\PFS\runs\pfs_7500_fog_s3_x64_y32" `
+  --output-root "C:\Users\gianl\Desktop\Thesis\Sensor-Fusion_Final_Model_Repo\models\Fault_Localization\runs\pfs_7500_fog_s3_x64_y32" `
   --epochs 100 `
   --batch-size 24 `
   --base-channels 16 `

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from models.reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
+from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
     _save_comparison,
     summarize_records,
 )
