@@ -45,7 +45,7 @@ class PointPillarsConfig:
     enabled: bool = False
     output_channels: int = 64
     max_points_per_pillar: int = 100
-    max_pillars: int = 12000
+    max_pillars: int | None = 12000
     lidar_use_reflectivity: bool = True
     radar_use_power: bool = True
     radar_use_radial_velocity: bool = True
@@ -77,8 +77,10 @@ class PointPillarsConfig:
             raise ValueError("pointpillars.output_channels must be positive")
         if self.max_points_per_pillar < 1:
             raise ValueError("pointpillars.max_points_per_pillar must be positive")
-        if self.max_pillars < 1:
-            raise ValueError("pointpillars.max_pillars must be positive")
+        if self.max_pillars is not None and self.max_pillars < 1:
+            raise ValueError(
+                "pointpillars.max_pillars must be positive or null"
+            )
         for name in (
             "lidar_use_reflectivity",
             "radar_use_power",
@@ -121,7 +123,7 @@ class Pillarizer(nn.Module):
         *,
         raw_channels: int,
         max_points_per_pillar: int,
-        max_pillars: int,
+        max_pillars: int | None,
     ):
         super().__init__()
         geometry.validate()
@@ -130,7 +132,9 @@ class Pillarizer(nn.Module):
         self.geometry = geometry
         self.raw_channels = int(raw_channels)
         self.max_points_per_pillar = int(max_points_per_pillar)
-        self.max_pillars = int(max_pillars)
+        self.max_pillars = (
+            None if max_pillars is None else int(max_pillars)
+        )
 
     def grid_indices(
         self, xyz: torch.Tensor
@@ -165,7 +169,7 @@ class Pillarizer(nn.Module):
         inverse: torch.Tensor,
         pillar_count: int,
     ) -> torch.Tensor:
-        if pillar_count <= self.max_pillars:
+        if self.max_pillars is None or pillar_count <= self.max_pillars:
             return torch.ones(pillar_count, dtype=torch.bool, device=inverse.device)
         selected = torch.zeros(pillar_count, dtype=torch.bool, device=inverse.device)
         if self.training:
@@ -389,7 +393,7 @@ class PointPillarsEncoder(nn.Module):
         raw_channels: int,
         output_channels: int,
         max_points_per_pillar: int,
-        max_pillars: int,
+        max_pillars: int | None,
     ):
         super().__init__()
         self.pillarizer = Pillarizer(
@@ -412,6 +416,10 @@ class PointPillarsEncoder(nn.Module):
         if pillar_count == 0:
             return torch.empty(
                 0, dtype=torch.bool, device=pillar_batches.device
+            )
+        if self.pillarizer.max_pillars is None:
+            return torch.ones(
+                pillar_count, dtype=torch.bool, device=pillar_batches.device
             )
         if self.training:
             randomized = torch.argsort(

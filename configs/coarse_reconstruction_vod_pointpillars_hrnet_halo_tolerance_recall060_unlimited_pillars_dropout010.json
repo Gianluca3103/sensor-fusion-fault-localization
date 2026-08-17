@@ -1,0 +1,78 @@
+{
+  "pointpillars": {
+    "enabled": true,
+    "output_channels": 64,
+    "max_points_per_pillar": 100,
+    "max_pillars": null,
+    "lidar_use_reflectivity": true,
+    "radar_use_power": true,
+    "radar_use_radial_velocity": true
+  },
+  "hrnet": {
+    "base_channels": 16,
+    "num_stages": 4,
+    "blocks_per_stage": 2,
+    "residual_blocks_per_branch": 2,
+    "dropout": 0.1
+  },
+  "masks": {
+    "use_healthy_context_mask": true,
+    "use_halo_context": true
+  },
+  "coarse_reconstruction": {
+    "enabled": true,
+    "loss": {
+      "lambda_occupancy": 1.0,
+      "lambda_density": 1.0,
+      "lambda_height": 1.0,
+      "epsilon": 1e-8,
+      "observability_weighting": {
+        "enabled": true,
+        "min_empty_weight": 0.1
+      },
+      "occupancy": {
+        "type": "tolerance_aware",
+        "exact_weight": 0.35,
+        "tolerant_recall_weight": 0.6,
+        "far_fp_weight": 1.0,
+        "tolerance_radius_m": 0.5
+      }
+    }
+  },
+  "fault_selector": {
+    "min_lidar_loss_fraction": 0.8,
+    "min_repair_box_cells": 5,
+    "min_repair_fault_fraction": 0.95,
+    "primary_expansion_gap_cells": 12,
+    "max_secondary_repair_boxes": 7,
+    "min_secondary_repair_cells": 5,
+    "min_secondary_lidar_loss_fraction": 0.7,
+    "min_secondary_repair_fault_fraction": 0.7,
+    "secondary_merge_gap_cells": 24,
+    "min_secondary_box_spatial_density": 0.0001,
+    "min_secondary_box_side_cells": 10,
+    "min_halo_healthy_fraction": 0.9,
+    "min_halo_healthy_cells": 64,
+    "min_halo_context_ratio": 0.25,
+    "min_halo_width_cells": 4,
+    "max_halo_dilation_cells": 64
+  },
+  "augmentation": {
+    "enabled": true,
+    "horizontal_flip": {"enabled": true, "probability": 0.5},
+    "translation": {"enabled": true, "max_x_m": 0.5, "max_y_m": 0.5},
+    "yaw": {"enabled": true, "max_degrees": 5.0},
+    "scale": {"enabled": true, "min": 0.95, "max": 1.05}
+  },
+  "training": {
+    "epochs": 150,
+    "batch_size": 12,
+    "num_workers": 8,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.005,
+    "grad_clip": 1.0,
+    "mixed_precision": true,
+    "save_conditioning_samples": 4,
+    "seed": 42
+  }
+}

@@ -94,6 +94,32 @@ class PointPillarsTests(unittest.TestCase):
             3,
         )
 
+    def test_null_max_pillars_retains_every_pillar(self):
+        config = PointPillarsConfig(max_pillars=None)
+        config.validate()
+        encoder = PointPillarsEncoder(
+            _geometry(),
+            raw_channels=3,
+            output_channels=4,
+            max_points_per_pillar=100,
+            max_pillars=None,
+        ).eval()
+        points = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ]
+        )
+        with torch.no_grad():
+            output, statistics = encoder((points,))
+        self.assertEqual(tuple(output.shape), (1, 4, 320, 320))
+        self.assertEqual(int(statistics["nonempty_pillars"][0]), 3)
+        self.assertEqual(
+            int(statistics["available_nonempty_pillars"][0]),
+            3,
+        )
+
     def test_batched_encoder_matches_per_sample_reference(self):
         encoder = PointPillarsEncoder(
             _geometry(),
