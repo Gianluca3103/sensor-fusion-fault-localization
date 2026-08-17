@@ -505,7 +505,17 @@ def main():
         )
     )
     print("Coarse model: HRNet")
-    print("Occupancy loss: weighted BCE + Dice")
+    occupancy_config = loss_config.occupancy
+    if occupancy_config.type == "tolerance_aware":
+        print(
+            "Occupancy loss: tolerance-aware "
+            f"(exact={occupancy_config.exact_weight:g}, "
+            f"tolerant_recall={occupancy_config.tolerant_recall_weight:g}, "
+            f"far_fp={occupancy_config.far_fp_weight:g}, "
+            f"radius={occupancy_config.tolerance_radius_m:g}m)"
+        )
+    else:
+        print("Occupancy loss: weighted BCE + Dice")
     print(
         "Positive occupancy weight: "
         f"{loss_config.positive_occupancy_weight:g}"

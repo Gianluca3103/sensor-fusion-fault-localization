@@ -49,9 +49,11 @@ from .coarse_reconstruction.coarse_loss import (
     CoarseLossConfig,
     MaskedBEVReconstructionLoss,
     ObservabilityWeightingConfig,
+    OccupancyLossConfig,
     coarse_reconstruction_metrics,
     coarse_reconstruction_range_metrics,
     occupancy_bce_weights,
+    tolerance_radius_cells,
 )
 from .coarse_reconstruction.coarse_model import (
     CoarseReplacementHead,
