@@ -19,7 +19,7 @@ from ..pointpillars import PointPillarsConfig
 
 @dataclass(frozen=True)
 class CoarseReconstructionConfig:
-    """The single supported coarse architecture.
+    """Configuration for the coarse HRNet reconstruction model.
 
     PointPillars may be disabled only to load a direct-BEV HRNet checkpoint used
     by the untouched diffusion pipeline. New coarse experiments should enable it.
@@ -64,18 +64,9 @@ class CoarseReconstructionConfig:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CoarseReconstructionConfig":
-        """Load current configs and historical HRNet checkpoint metadata.
-
-        Old checkpoints contain fields for deleted experimental backbones. They
-        are deliberately ignored only when the checkpoint selected HRNet.
-        """
+        """Load serialized HRNet settings used by saved checkpoints."""
 
         values = dict(payload)
-        backbone = values.pop("backbone", "hrnet")
-        if backbone != "hrnet":
-            raise ValueError(
-                f"Unsupported legacy coarse backbone {backbone!r}; only HRNet remains"
-            )
         pointpillars = values.get("pointpillars", {})
         if isinstance(pointpillars, dict):
             values["pointpillars"] = PointPillarsConfig(**pointpillars)
@@ -127,7 +118,7 @@ def build_augmentation_config(payload: dict) -> GeometricAugmentationConfig:
 
 
 def build_configs(payload: dict):
-    """Build the only supported VoD coarse model, its loss, and selector."""
+    """Build the VoD coarse HRNet model, its loss, and selector."""
 
     coarse = payload.get("coarse_reconstruction", {})
     if not isinstance(coarse, dict):
@@ -135,30 +126,12 @@ def build_configs(payload: dict):
     if not coarse.get("enabled", True):
         raise ValueError("coarse_reconstruction.enabled must be true")
 
-    model_payload = payload.get("model", {})
-    if not isinstance(model_payload, dict):
-        raise ValueError("model must be an object")
-    unknown_model = set(model_payload) - {"backbone", "lidar_channels", "radar_channels"}
-    if unknown_model:
-        raise ValueError("Unknown model settings: " + ", ".join(sorted(unknown_model)))
-    if model_payload.get("backbone", "hrnet") != "hrnet":
-        raise ValueError("Only the HRNet coarse backbone is supported")
-
     pointpillars = _checked_dataclass(
         "pointpillars", payload.get("pointpillars", {}), PointPillarsConfig
     )
     hrnet = _checked_dataclass("hrnet", payload.get("hrnet", {}), HRNetConfig)
 
-    # Current configs use `masks`; historical HRNet configs stored the same two
-    # switches under `coarse_reconstruction.unet`.
-    mask_payload = payload.get("masks")
-    if mask_payload is None:
-        legacy_unet = coarse.get("unet", {})
-        mask_payload = {
-            key: legacy_unet[key]
-            for key in ("use_healthy_context_mask", "use_halo_context")
-            if key in legacy_unet
-        }
+    mask_payload = payload.get("masks", {})
     if not isinstance(mask_payload, dict):
         raise ValueError("masks must be an object")
     unknown_masks = set(mask_payload) - {
@@ -168,22 +141,15 @@ def build_configs(payload: dict):
     if unknown_masks:
         raise ValueError("Unknown masks settings: " + ", ".join(sorted(unknown_masks)))
 
-    # Fail if an obsolete experimental module is still requested, while
-    # accepting historical files that record those modules as disabled.
-    for section in ("range_aware_radar", "radar_pillar_attention"):
-        obsolete = payload.get(section, {})
-        if isinstance(obsolete, dict) and obsolete.get("enabled", False):
-            raise ValueError(f"{section} was removed from the HRNet-only pipeline")
-
     lidar_channels = (
         pointpillars.output_channels
         if pointpillars.enabled
-        else int(model_payload.get("lidar_channels", 3))
+        else 3
     )
     radar_channels = (
         pointpillars.output_channels
         if pointpillars.enabled
-        else int(model_payload.get("radar_channels", 4))
+        else 4
     )
     model_config = CoarseReconstructionConfig(
         lidar_channels=lidar_channels,

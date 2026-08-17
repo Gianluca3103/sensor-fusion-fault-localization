@@ -2,8 +2,8 @@
 
 ## Deterministic Stage I
 
-The coarse stage has one supported architecture: VoD PointPillars followed by
-HRNet. LiDAR points use `[x, y, z, reflectivity]`; Radar points use
+The coarse stage uses VoD PointPillars followed by HRNet. LiDAR points use
+`[x, y, z, reflectivity]`; Radar points use
 `[x, y, z, power, Doppler]`. Each encoder produces a 64-channel 320x320
 pseudo-image.
 

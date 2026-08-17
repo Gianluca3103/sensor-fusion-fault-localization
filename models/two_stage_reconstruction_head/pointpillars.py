@@ -168,10 +168,7 @@ class Pillarizer(nn.Module):
         if pillar_count <= self.max_pillars:
             return torch.ones(pillar_count, dtype=torch.bool, device=inverse.device)
         selected = torch.zeros(pillar_count, dtype=torch.bool, device=inverse.device)
-        over_capacity = torch.any(
-            available_per_sample > self.pillarizer.max_pillars
-        )
-        if self.training and bool(over_capacity.item()):
+        if self.training:
             indices = torch.randperm(pillar_count, device=inverse.device)[
                 : self.max_pillars
             ]

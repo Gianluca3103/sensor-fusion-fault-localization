@@ -72,6 +72,28 @@ class PointPillarsTests(unittest.TestCase):
         self.assertEqual(int(statistics["maximum_points_per_pillar"][0]), 3)
         self.assertGreater(float(statistics["empty_pillar_fraction"][0]), 0.99)
 
+    def test_single_cloud_pillarizer_enforces_max_pillars(self):
+        pillarizer = Pillarizer(
+            _geometry(),
+            raw_channels=3,
+            max_points_per_pillar=100,
+            max_pillars=2,
+        ).eval()
+        points = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ]
+        )
+        output = pillarizer(points)
+        self.assertEqual(len(output.pillar_rows), 2)
+        self.assertEqual(int(output.statistics["nonempty_pillars"]), 2)
+        self.assertEqual(
+            int(output.statistics["available_nonempty_pillars"]),
+            3,
+        )
+
     def test_batched_encoder_matches_per_sample_reference(self):
         encoder = PointPillarsEncoder(
             _geometry(),
