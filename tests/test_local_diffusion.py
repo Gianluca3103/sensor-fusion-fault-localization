@@ -7,6 +7,7 @@ from models.two_stage_reconstruction_head.diffusion_process.local_diffusion impo
     FineDiffusionConfig,
     FineDiffusionRefiner,
     ReconstructionCropExtractor,
+    WindowAttention2d,
 )
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,
@@ -94,6 +95,23 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_window_attention_tolerates_amp_output_dtype(self):
+        attention = WindowAttention2d(
+            hidden_dim=4, num_heads=2, window_size=2, dropout=0.0
+        )
+        query = torch.rand(1, 4, 4, 4)
+        valid = torch.ones(1, 1, 4, 4)
+
+        class HalfAttention(torch.nn.Module):
+            def forward(self, query, key, value, **_kwargs):
+                return query.half(), None
+
+        attention.attention = HalfAttention()
+        output = attention(query, query, valid)
+
+        self.assertEqual(output.dtype, query.dtype)
+        self.assertEqual(output.shape, query.shape)
+
     def test_training_residual_masking_leakage_and_final_preservation(self):
         clean, coarse, faulty, radar, repair, halo = _inputs()
         distinctive = faulty.clone()

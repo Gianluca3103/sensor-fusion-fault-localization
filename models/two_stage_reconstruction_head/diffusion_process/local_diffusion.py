@@ -419,7 +419,9 @@ class WindowAttention2d(nn.Module):
                 key_padding_mask=~key_valid[active],
                 need_weights=False,
             )
-            output[active] = attended * valid_windows[active, :, None]
+            output[active] = attended.to(output.dtype) * valid_windows[
+                active, :, None
+            ]
         return _reverse_windows(output, metadata) * valid
 
 
