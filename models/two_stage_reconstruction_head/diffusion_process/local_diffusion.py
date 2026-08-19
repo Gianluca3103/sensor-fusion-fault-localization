@@ -604,20 +604,24 @@ class MaskedExactReconstructionLoss(nn.Module):
         clean: torch.Tensor,
         reconstruction_mask: torch.Tensor,
     ) -> torch.Tensor:
-        occupied = clean[:, 0:1].clamp(0.0, 1.0)
-        occupancy = F.binary_cross_entropy(
-            refined[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
-            occupied,
-            reduction="none",
-        )
-        occupancy_loss = (occupancy * reconstruction_mask).sum() / (
-            reconstruction_mask.sum() + self.epsilon
-        )
+        with torch.autocast(device_type=refined.device.type, enabled=False):
+            refined_float = refined.float()
+            clean_float = clean.float()
+            mask_float = reconstruction_mask.float()
+            occupied = clean_float[:, 0:1].clamp(0.0, 1.0)
+            occupancy = F.binary_cross_entropy(
+                refined_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
+                occupied,
+                reduction="none",
+            )
+            occupancy_loss = (occupancy * mask_float).sum() / (
+                mask_float.sum() + self.epsilon
+            )
         if refined.shape[1] == 1:
             return occupancy_loss
-        continuous_mask = reconstruction_mask * occupied
+        continuous_mask = mask_float * occupied
         continuous = F.smooth_l1_loss(
-            refined[:, 1:], clean[:, 1:], reduction="none"
+            refined_float[:, 1:], clean_float[:, 1:], reduction="none"
         )
         denominator = (
             continuous_mask.sum() * (refined.shape[1] - 1) + self.epsilon
