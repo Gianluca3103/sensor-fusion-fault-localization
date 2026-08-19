@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -9,7 +10,9 @@ from models.two_stage_reconstruction_head.diffusion_process.local_diffusion impo
 )
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,
+    load_frozen_coarse_model,
 )
+from models.two_stage_reconstruction_head.pointpillars import BEVGridGeometry
 
 
 def _config(*, global_context=True, sampling_steps=3):
@@ -259,6 +262,52 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(
             any(parameter.grad is not None for parameter in pipeline.diffusion.parameters())
         )
+
+    def test_pointpillars_checkpoint_restores_grid_geometry(self):
+        checkpoint = {
+            "model_config": {
+                "lidar_channels": 64,
+                "radar_channels": 64,
+                "target_lidar_channels": 3,
+                "pointpillars": {
+                    "enabled": True,
+                    "output_channels": 64,
+                    "max_points_per_pillar": 100,
+                    "max_pillars": None,
+                },
+            },
+            "grid_geometry": {
+                "x_min": 0.0,
+                "x_max": 64.0,
+                "y_min": -32.0,
+                "y_max": 32.0,
+                "height": 320,
+                "width": 320,
+            },
+            "model_state_dict": {},
+        }
+
+        class DummyCoarse(torch.nn.Module):
+            def load_state_dict(self, *_args, **_kwargs):
+                return None
+
+            def to(self, *_args, **_kwargs):
+                return self
+
+        with mock.patch("torch.load", return_value=checkpoint):
+            with mock.patch(
+                "models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline.CoarseReconstructionModel",
+                return_value=DummyCoarse(),
+            ) as constructor:
+                _model, loaded = load_frozen_coarse_model(
+                    "checkpoint.pt", allow_pointpillars=True
+                )
+
+        self.assertIs(loaded, checkpoint)
+        geometry = constructor.call_args.kwargs["grid_geometry"]
+        self.assertIsInstance(geometry, BEVGridGeometry)
+        self.assertEqual((geometry.height, geometry.width), (320, 320))
+        self.assertEqual((geometry.x_min, geometry.x_max), (0.0, 64.0))
 
 
 if __name__ == "__main__":

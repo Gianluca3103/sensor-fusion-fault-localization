@@ -9,6 +9,7 @@ from torch import nn
 
 from ..coarse_reconstruction.coarse_config import CoarseReconstructionConfig
 from ..coarse_reconstruction.coarse_model import CoarseReconstructionModel
+from ..pointpillars import BEVGridGeometry
 from .residual_diffusion import MaskedResidualDiffusion
 from .local_diffusion import FineDiffusionRefiner
 
@@ -31,7 +32,14 @@ def load_frozen_coarse_model(
             "PointPillars coarse checkpoints require the local fine-diffusion "
             "pipeline with raw point-cloud inputs"
         )
-    model = CoarseReconstructionModel(config)
+    grid_geometry = None
+    if config.pointpillars_enabled:
+        if "grid_geometry" not in checkpoint:
+            raise KeyError(
+                "PointPillars coarse checkpoint requires saved grid_geometry"
+            )
+        grid_geometry = BEVGridGeometry(**checkpoint["grid_geometry"])
+    model = CoarseReconstructionModel(config, grid_geometry=grid_geometry)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval().requires_grad_(False)
     return model, checkpoint
