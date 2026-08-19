@@ -183,6 +183,67 @@ class GaussianNoiseSchedule(nn.Module):
         ) * noise
         return reconstruction_mask * previous
 
+    def predict_x0(
+        self,
+        residual_t: torch.Tensor,
+        epsilon_prediction: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Recover the clean residual estimate from an epsilon prediction."""
+
+        return (
+            self.extract(self.sqrt_recip_alpha_bars, timestep, residual_t)
+            * residual_t
+            - self.extract(self.sqrt_recipm1_alpha_bars, timestep, residual_t)
+            * epsilon_prediction
+        )
+
+    def ddim_step(
+        self,
+        residual_t: torch.Tensor,
+        epsilon_prediction: torch.Tensor,
+        timestep: torch.Tensor,
+        previous_timestep: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        *,
+        eta: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Perform one mask-restricted DDIM step and return `(x_prev, x0)`."""
+
+        if eta < 0:
+            raise ValueError("DDIM eta must be non-negative")
+        if previous_timestep.shape != timestep.shape:
+            raise ValueError("previous_timestep must have the same shape as timestep")
+        alpha_t = self.extract(self.alpha_bars, timestep, residual_t)
+        previous_index = previous_timestep.clamp_min(0)
+        alpha_previous = self.extract(
+            self.alpha_bars, previous_index, residual_t
+        )
+        alpha_previous = torch.where(
+            (previous_timestep < 0).reshape(-1, 1, 1, 1),
+            torch.ones_like(alpha_previous),
+            alpha_previous,
+        )
+        x0 = self.predict_x0(residual_t, epsilon_prediction, timestep)
+        sigma = eta * torch.sqrt(
+            ((1.0 - alpha_previous) / (1.0 - alpha_t).clamp_min(1.0e-12))
+            * (1.0 - alpha_t / alpha_previous.clamp_min(1.0e-12))
+        ).clamp_min(0.0)
+        direction = torch.sqrt(
+            (1.0 - alpha_previous - sigma.square()).clamp_min(0.0)
+        ) * epsilon_prediction
+        previous = alpha_previous.sqrt() * x0 + direction
+        if eta > 0:
+            noise = torch.randn(
+                residual_t.shape,
+                device=residual_t.device,
+                dtype=residual_t.dtype,
+                generator=generator,
+            )
+            previous = previous + sigma * noise
+        return reconstruction_mask * previous, reconstruction_mask * x0
+
 
 def residual_target(clean_lidar_bev, coarse_lidar_bev, reconstruction_mask):
     if clean_lidar_bev.shape != coarse_lidar_bev.shape:

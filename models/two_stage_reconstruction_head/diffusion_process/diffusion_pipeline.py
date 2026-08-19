@@ -10,9 +10,12 @@ from torch import nn
 from ..coarse_reconstruction.coarse_config import CoarseReconstructionConfig
 from ..coarse_reconstruction.coarse_model import CoarseReconstructionModel
 from .residual_diffusion import MaskedResidualDiffusion
+from .local_diffusion import FineDiffusionRefiner
 
 
-def load_frozen_coarse_model(checkpoint_path, device="cpu"):
+def load_frozen_coarse_model(
+    checkpoint_path, device="cpu", *, allow_pointpillars: bool = False
+):
     checkpoint_path = Path(checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if "model_config" not in checkpoint or "model_state_dict" not in checkpoint:
@@ -23,15 +26,126 @@ def load_frozen_coarse_model(checkpoint_path, device="cpu"):
             config_payload["global_channel_multipliers"]
         )
     config = CoarseReconstructionConfig.from_dict(config_payload)
-    if config.pointpillars_enabled:
+    if config.pointpillars_enabled and not allow_pointpillars:
         raise ValueError(
-            "PointPillars coarse checkpoints require raw point-cloud inputs and "
-            "are not compatible with the current diffusion-stage dataset"
+            "PointPillars coarse checkpoints require the local fine-diffusion "
+            "pipeline with raw point-cloud inputs"
         )
     model = CoarseReconstructionModel(config)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval().requires_grad_(False)
     return model, checkpoint
+
+
+class FrozenCoarseFineDiffusionPipeline(nn.Module):
+    """Online frozen coarse reconstruction followed by local fine diffusion."""
+
+    def __init__(self, coarse_model: nn.Module, diffusion: FineDiffusionRefiner):
+        super().__init__()
+        self.coarse_model = coarse_model.eval().requires_grad_(False)
+        self.diffusion = diffusion
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.coarse_model.eval()
+        self.diffusion.train(mode)
+        return self
+
+    def coarse_forward(
+        self,
+        faulty_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        healthy_context_mask,
+        halo_mask,
+        *,
+        faulty_lidar_points=None,
+        radar_points=None,
+    ):
+        self.coarse_model.eval()
+        with torch.no_grad():
+            output = self.coarse_model(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+            )
+        return output["coarse_lidar_bev"].detach(), output
+
+    def forward(
+        self,
+        clean_lidar_bev,
+        faulty_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        healthy_context_mask,
+        halo_mask,
+        *,
+        coarse_lidar_bev=None,
+        faulty_lidar_points=None,
+        radar_points=None,
+        **diffusion_options,
+    ):
+        if coarse_lidar_bev is None:
+            coarse_lidar_bev, coarse_output = self.coarse_forward(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+            )
+        else:
+            coarse_lidar_bev = coarse_lidar_bev.detach()
+            coarse_output = None
+        output = self.diffusion(
+            clean_lidar_bev,
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+            **diffusion_options,
+        )
+        output["coarse_output"] = coarse_output
+        return output
+
+    @torch.no_grad()
+    def sample(
+        self,
+        faulty_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        healthy_context_mask,
+        halo_mask,
+        *,
+        coarse_lidar_bev=None,
+        faulty_lidar_points=None,
+        radar_points=None,
+        **sampling_options,
+    ):
+        if coarse_lidar_bev is None:
+            coarse_lidar_bev, _coarse_output = self.coarse_forward(
+                faulty_lidar_bev,
+                radar_bev,
+                reconstruction_mask,
+                healthy_context_mask,
+                halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+            )
+        return self.diffusion.sample(
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+            **sampling_options,
+        )
 
 
 def validate_diffusion_checkpoint_compatibility(checkpoint, diffusion):

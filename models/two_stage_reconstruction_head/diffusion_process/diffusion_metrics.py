@@ -7,10 +7,10 @@ import torch.nn.functional as F
 
 
 def bev_occupancy(bev: torch.Tensor) -> torch.Tensor:
-    """Occupancy is positive normalized log-density in LiDAR channel 2."""
-    if bev.ndim != 4 or bev.shape[1] < 3:
-        raise ValueError("LiDAR BEV must have shape [B,C>=3,H,W]")
-    return bev[:, 2:3] > 0
+    """Return occupancy from the canonical first LiDAR BEV channel."""
+    if bev.ndim != 4 or bev.shape[1] < 1:
+        raise ValueError("LiDAR BEV must have shape [B,C>=1,H,W]")
+    return bev[:, 0:1] >= 0.5
 
 
 def occupancy_metrics(prediction, target, reconstruction_mask, epsilon=1e-8):

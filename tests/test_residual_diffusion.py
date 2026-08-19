@@ -181,9 +181,9 @@ class ResidualDiffusionTests(unittest.TestCase):
         mask = torch.ones(1, 1, 2, 2)
         target = torch.zeros(1, 3, 2, 2)
         prediction = torch.zeros_like(target)
-        target[:, 2, 0, 0] = 1
-        prediction[:, 2, 0, 0] = 1
-        prediction[:, 2, 0, 1] = 1
+        target[:, 0, 0, 0] = 1
+        prediction[:, 0, 0, 0] = 1
+        prediction[:, 0, 0, 1] = 1
         values = occupancy_metrics(prediction, target, mask)
         self.assertEqual(values["tp"].item(), 1)
         self.assertEqual(values["fp"].item(), 1)
@@ -197,7 +197,7 @@ class ResidualDiffusionTests(unittest.TestCase):
         self.assertEqual(empty_mask["iou"].item(), 0.0)
         continuous = per_channel_continuous_metrics(prediction, target, mask)
         self.assertEqual(continuous["mae_per_channel"].shape, (3,))
-        self.assertAlmostEqual(continuous["mae_per_channel"][2].item(), 0.25)
+        self.assertAlmostEqual(continuous["mae_per_channel"][0].item(), 0.25)
 
         stages = reconstruction_stage_metrics(
             prediction,

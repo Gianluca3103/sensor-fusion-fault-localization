@@ -30,5 +30,29 @@ training/evaluation reconstruction metrics.
 
 ## Stage II
 
-`diffusion_process/` contains the masked residual-diffusion model. It was not
-redesigned as part of the HRNet/VoD cleanup.
+Stage II is a local cropped dense residual-diffusion Transformer. It models
+only `reconstruction_mask * (clean - coarse)` and never changes cells outside
+the reconstruction mask.
+
+For each sample, the tight repair bounds are expanded by the configured margin
+and by the explicit halo extent. Crops retain the original 0.20 m cell size and
+are zero-padded to the largest crop in a batch and to a multiple of the
+attention window. A valid-crop mask prevents padding from participating in
+attention or losses. No geometric resizing is used.
+
+The local condition contains the coarse crop, radar crop, faulty LiDAR with
+repair cells erased, reconstruction and halo masks, and continuous local/global
+coordinates. An optional small strided encoder summarizes the full faulty
+LiDAR after the repair region is erased. Its embedding and the diffusion
+timestep modulate alternating normal/shifted window Transformer blocks. The
+blocks use local self-attention, local cross-attention to the condition map,
+and a depthwise-convolutional FFN.
+
+Training combines masked epsilon MSE with exact cell-aligned reconstruction
+loss. Inference uses configurable 1/3/5/10-step DDIM and composes the result as
+trusted faulty LiDAR outside the mask and `coarse + residual` inside it.
+
+The canonical configuration is `configs/fine_diffusion.json`; training uses
+`python -m models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion`.
+The previous full-BEV residual U-Net remains loadable only for historical
+checkpoint compatibility.

@@ -88,7 +88,20 @@ from .diffusion_process.residual_diffusion import (
     SinusoidalTimeEmbedding,
     TimeConditionedResidualBlock,
 )
+from .diffusion_process.local_diffusion import (
+    DiffusionRefinementBlock,
+    FineDiffusionConfig,
+    FineDiffusionRefiner,
+    GlobalFaultyLidarEncoder,
+    LocalConditionEncoder,
+    LocalResidualDiffusionTransformer,
+    MaskedExactReconstructionLoss,
+    ReconstructionCropBatch,
+    ReconstructionCropExtractor,
+    WindowAttention2d,
+)
 from .diffusion_process.diffusion_pipeline import (
+    FrozenCoarseFineDiffusionPipeline,
     FrozenCoarseDiffusionPipeline,
     ResidualDiffusionSampler,
     load_frozen_coarse_model,

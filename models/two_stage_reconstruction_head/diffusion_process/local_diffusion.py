@@ -1,0 +1,1020 @@
+"""Local cropped dense Transformer for fine residual LiDAR diffusion."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import math
+from typing import Mapping
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from ..encoders import _group_count
+from .diffusion_process import (
+    BEVChannelNormalization,
+    DiffusionProcessConfig,
+    GaussianNoiseSchedule,
+    MaskedEpsilonMSELoss,
+    residual_target,
+)
+from .residual_diffusion import SinusoidalTimeEmbedding
+
+
+@dataclass(frozen=True)
+class FineDiffusionConfig:
+    """Configuration for the V1 local residual-diffusion refiner."""
+
+    enabled: bool = True
+    lidar_channels: int = 3
+    radar_channels: int = 4
+    hidden_dim: int = 64
+    num_heads: int = 4
+    num_transformer_blocks: int = 4
+    window_size: int = 8
+    use_shifted_windows: bool = True
+    crop_context_margin_cells: int = 8
+    use_global_faulty_context: bool = True
+    global_context_dim: int = 128
+    diffusion_prediction_type: str = "epsilon"
+    training_timesteps: int = 1000
+    sampling_steps: int = 3
+    noise_schedule: str = "cosine"
+    sampler: str = "ddim"
+    ddim_eta: float = 0.0
+    lambda_diffusion: float = 1.0
+    lambda_exact_reconstruction: float = 1.0
+    dropout: float = 0.0
+    denominator_epsilon: float = 1.0e-8
+
+    def validate(self) -> None:
+        if not self.enabled:
+            raise ValueError("Fine diffusion must be enabled")
+        for name in (
+            "lidar_channels",
+            "radar_channels",
+            "hidden_dim",
+            "num_heads",
+            "num_transformer_blocks",
+            "window_size",
+            "global_context_dim",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.hidden_dim % self.num_heads:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        if self.crop_context_margin_cells < 0:
+            raise ValueError("crop_context_margin_cells must be non-negative")
+        if self.diffusion_prediction_type != "epsilon":
+            raise ValueError("V1 supports only epsilon prediction")
+        if self.training_timesteps < 2:
+            raise ValueError("training_timesteps must be at least 2")
+        if self.sampling_steps not in {1, 3, 5, 10}:
+            raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
+        if self.sampling_steps > self.training_timesteps:
+            raise ValueError("sampling_steps cannot exceed training_timesteps")
+        if self.noise_schedule != "cosine" or self.sampler != "ddim":
+            raise ValueError("V1 requires cosine noise and DDIM sampling")
+        if self.ddim_eta < 0:
+            raise ValueError("ddim_eta must be non-negative")
+        for name in ("lambda_diffusion", "lambda_exact_reconstruction"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be in [0,1)")
+        if self.denominator_epsilon <= 0:
+            raise ValueError("denominator_epsilon must be positive")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ReconstructionCropBatch:
+    """Aligned, padded local crops and their full-BEV bounding boxes."""
+
+    tensors: dict[str, torch.Tensor]
+    boxes: torch.Tensor
+    valid_mask: torch.Tensor
+    active_samples: torch.Tensor
+    crop_heights: torch.Tensor
+    crop_widths: torch.Tensor
+    full_height: int
+    full_width: int
+
+    def paste(
+        self,
+        crop: torch.Tensor,
+        *,
+        channels: int | None = None,
+    ) -> torch.Tensor:
+        output_channels = channels or crop.shape[1]
+        output = crop.new_zeros(
+            (crop.shape[0], output_channels, self.full_height, self.full_width)
+        )
+        for index, box in enumerate(self.boxes.tolist()):
+            top, bottom, left, right = box
+            height, width = bottom - top, right - left
+            if bool(self.active_samples[index]):
+                output[index, :, top:bottom, left:right] = crop[
+                    index, :output_channels, :height, :width
+                ]
+        return output
+
+
+class ReconstructionCropExtractor:
+    """Extract metric-preserving crops and pad them for dense batching."""
+
+    def __init__(self, context_margin_cells: int = 8, pad_multiple: int = 8):
+        if context_margin_cells < 0 or pad_multiple < 1:
+            raise ValueError("Invalid crop margin or padding multiple")
+        self.context_margin_cells = int(context_margin_cells)
+        self.pad_multiple = int(pad_multiple)
+
+    @staticmethod
+    def _extent(mask: torch.Tensor) -> tuple[int, int, int, int] | None:
+        locations = torch.nonzero(mask, as_tuple=False)
+        if locations.numel() == 0:
+            return None
+        rows, columns = locations[:, -2], locations[:, -1]
+        return (
+            int(rows.min()),
+            int(rows.max()) + 1,
+            int(columns.min()),
+            int(columns.max()) + 1,
+        )
+
+    def _box(
+        self,
+        repair: torch.Tensor,
+        halo: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> tuple[tuple[int, int, int, int], bool]:
+        repair_extent = self._extent(repair > 0.5)
+        if repair_extent is None:
+            return (0, 1, 0, 1), False
+        top, bottom, left, right = repair_extent
+        top = max(0, top - self.context_margin_cells)
+        bottom = min(height, bottom + self.context_margin_cells)
+        left = max(0, left - self.context_margin_cells)
+        right = min(width, right + self.context_margin_cells)
+        halo_extent = self._extent(halo > 0.5)
+        if halo_extent is not None:
+            halo_top, halo_bottom, halo_left, halo_right = halo_extent
+            top, bottom = min(top, halo_top), max(bottom, halo_bottom)
+            left, right = min(left, halo_left), max(right, halo_right)
+        return (top, bottom, left, right), True
+
+    def extract(
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+    ) -> ReconstructionCropBatch:
+        if reconstruction_mask.ndim != 4 or reconstruction_mask.shape[1] != 1:
+            raise ValueError("reconstruction_mask must have shape [B,1,H,W]")
+        if halo_mask.shape != reconstruction_mask.shape:
+            raise ValueError("halo_mask must match reconstruction_mask")
+        batch, _one, height, width = reconstruction_mask.shape
+        for name, tensor in tensors.items():
+            if tensor.ndim != 4 or tensor.shape[0] != batch:
+                raise ValueError(f"{name} must have shape [B,C,H,W]")
+            if tensor.shape[-2:] != (height, width):
+                raise ValueError(f"{name} is not spatially aligned")
+        boxes_and_active = [
+            self._box(
+                reconstruction_mask[index, 0],
+                halo_mask[index, 0],
+                height,
+                width,
+            )
+            for index in range(batch)
+        ]
+        boxes = [item[0] for item in boxes_and_active]
+        active = reconstruction_mask.new_tensor(
+            [item[1] for item in boxes_and_active], dtype=torch.bool
+        )
+        crop_heights = [bottom - top for top, bottom, _left, _right in boxes]
+        crop_widths = [right - left for _top, _bottom, left, right in boxes]
+        padded_height = math.ceil(max(crop_heights) / self.pad_multiple) * self.pad_multiple
+        padded_width = math.ceil(max(crop_widths) / self.pad_multiple) * self.pad_multiple
+        cropped: dict[str, torch.Tensor] = {}
+        for name, tensor in tensors.items():
+            output = tensor.new_zeros(
+                (batch, tensor.shape[1], padded_height, padded_width)
+            )
+            for index, box in enumerate(boxes):
+                top, bottom, left, right = box
+                output[index, :, : bottom - top, : right - left] = tensor[
+                    index, :, top:bottom, left:right
+                ]
+            cropped[name] = output
+        valid = reconstruction_mask.new_zeros(
+            (batch, 1, padded_height, padded_width)
+        )
+        for index, (crop_height, crop_width) in enumerate(
+            zip(crop_heights, crop_widths)
+        ):
+            valid[index, :, :crop_height, :crop_width] = 1
+        return ReconstructionCropBatch(
+            tensors=cropped,
+            boxes=torch.tensor(boxes, device=reconstruction_mask.device),
+            valid_mask=valid,
+            active_samples=active,
+            crop_heights=torch.tensor(crop_heights, device=reconstruction_mask.device),
+            crop_widths=torch.tensor(crop_widths, device=reconstruction_mask.device),
+            full_height=height,
+            full_width=width,
+        )
+
+
+def _coordinate_channels(crops: ReconstructionCropBatch) -> torch.Tensor:
+    """Return global and local XY coordinates without learned size coupling."""
+
+    batch, _one, padded_height, padded_width = crops.valid_mask.shape
+    coordinates = crops.valid_mask.new_zeros((batch, 4, padded_height, padded_width))
+    for index, box in enumerate(crops.boxes.tolist()):
+        top, bottom, left, right = box
+        height, width = bottom - top, right - left
+        global_y = torch.linspace(
+            -1.0 + 2.0 * top / max(crops.full_height - 1, 1),
+            -1.0 + 2.0 * (bottom - 1) / max(crops.full_height - 1, 1),
+            height,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
+        )
+        global_x = torch.linspace(
+            -1.0 + 2.0 * left / max(crops.full_width - 1, 1),
+            -1.0 + 2.0 * (right - 1) / max(crops.full_width - 1, 1),
+            width,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
+        )
+        local_y = torch.linspace(
+            -1.0, 1.0, height, device=coordinates.device, dtype=coordinates.dtype
+        )
+        local_x = torch.linspace(
+            -1.0, 1.0, width, device=coordinates.device, dtype=coordinates.dtype
+        )
+        coordinates[index, 0, :height, :width] = global_x[None, :]
+        coordinates[index, 1, :height, :width] = global_y[:, None]
+        coordinates[index, 2, :height, :width] = local_x[None, :]
+        coordinates[index, 3, :height, :width] = local_y[:, None]
+    return coordinates * crops.valid_mask
+
+
+class GlobalFaultyLidarEncoder(nn.Module):
+    """Small strided convolutional encoder returning one scene vector."""
+
+    def __init__(self, input_channels: int, output_dim: int, hidden_dim: int):
+        super().__init__()
+        widths = (hidden_dim // 2, hidden_dim, hidden_dim)
+        layers: list[nn.Module] = []
+        current = input_channels
+        for width in widths:
+            layers.extend(
+                (
+                    nn.Conv2d(current, width, 3, stride=2, padding=1),
+                    nn.GroupNorm(_group_count(width), width),
+                    nn.SiLU(inplace=True),
+                )
+            )
+            current = width
+        self.encoder = nn.Sequential(*layers)
+        self.projection = nn.Linear(current, output_dim)
+
+    def forward(self, trusted_faulty_bev: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(trusted_faulty_bev)
+        return self.projection(F.adaptive_avg_pool2d(features, 1).flatten(1))
+
+
+class LocalConditionEncoder(nn.Module):
+    def __init__(self, input_channels: int, hidden_dim: int):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_dim, 3, padding=1),
+            nn.GroupNorm(_group_count(hidden_dim), hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+        )
+
+    def forward(self, condition: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        return self.encoder(condition) * valid
+
+
+class AdaptiveLayerNorm2d(nn.Module):
+    """Per-cell LayerNorm modulated by timestep/global conditioning."""
+
+    def __init__(self, channels: int, condition_dim: int):
+        super().__init__()
+        self.normalization = nn.LayerNorm(channels, elementwise_affine=False)
+        self.modulation = nn.Linear(condition_dim, 2 * channels)
+        nn.init.zeros_(self.modulation.weight)
+        nn.init.zeros_(self.modulation.bias)
+
+    def forward(self, tensor: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        normalized = self.normalization(tensor.permute(0, 2, 3, 1)).permute(
+            0, 3, 1, 2
+        )
+        scale, shift = self.modulation(condition).chunk(2, dim=1)
+        return normalized * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+
+
+def _partition_windows(
+    tensor: torch.Tensor,
+    valid: torch.Tensor,
+    window_size: int,
+    shift: int,
+):
+    batch, channels, height, width = tensor.shape
+    pad_top = pad_left = shift
+    padded_height = math.ceil((height + shift) / window_size) * window_size
+    padded_width = math.ceil((width + shift) / window_size) * window_size
+    pad_bottom = padded_height - height - pad_top
+    pad_right = padded_width - width - pad_left
+    tensor = F.pad(tensor, (pad_left, pad_right, pad_top, pad_bottom))
+    valid = F.pad(valid, (pad_left, pad_right, pad_top, pad_bottom))
+    rows, columns = padded_height // window_size, padded_width // window_size
+    windows = (
+        tensor.reshape(batch, channels, rows, window_size, columns, window_size)
+        .permute(0, 2, 4, 3, 5, 1)
+        .reshape(batch * rows * columns, window_size * window_size, channels)
+    )
+    valid_windows = (
+        valid.reshape(batch, 1, rows, window_size, columns, window_size)
+        .permute(0, 2, 4, 3, 5, 1)
+        .reshape(batch * rows * columns, window_size * window_size)
+        > 0.5
+    )
+    metadata = (
+        batch,
+        channels,
+        height,
+        width,
+        padded_height,
+        padded_width,
+        rows,
+        columns,
+        shift,
+    )
+    return windows, valid_windows, metadata
+
+
+def _reverse_windows(windows: torch.Tensor, metadata) -> torch.Tensor:
+    (
+        batch,
+        channels,
+        height,
+        width,
+        padded_height,
+        padded_width,
+        rows,
+        columns,
+        shift,
+    ) = metadata
+    window_size = int(math.sqrt(windows.shape[1]))
+    tensor = (
+        windows.reshape(batch, rows, columns, window_size, window_size, channels)
+        .permute(0, 5, 1, 3, 2, 4)
+        .reshape(batch, channels, padded_height, padded_width)
+    )
+    return tensor[:, :, shift : shift + height, shift : shift + width]
+
+
+class WindowAttention2d(nn.Module):
+    """Windowed attention supporting independent query and key/value maps."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, window_size: int, dropout: float):
+        super().__init__()
+        self.window_size = int(window_size)
+        self.attention = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        shift: int = 0,
+    ) -> torch.Tensor:
+        query_windows, valid_windows, metadata = _partition_windows(
+            query, valid, self.window_size, shift
+        )
+        key_windows, key_valid, _ = _partition_windows(
+            key_value, valid, self.window_size, shift
+        )
+        active = valid_windows.any(dim=1)
+        output = torch.zeros_like(query_windows)
+        if bool(active.any()):
+            attended, _weights = self.attention(
+                query_windows[active],
+                key_windows[active],
+                key_windows[active],
+                key_padding_mask=~key_valid[active],
+                need_weights=False,
+            )
+            output[active] = attended * valid_windows[active, :, None]
+        return _reverse_windows(output, metadata) * valid
+
+
+class ConvolutionalFFN(nn.Module):
+    def __init__(self, channels: int, dropout: float):
+        super().__init__()
+        expanded = 4 * channels
+        self.layers = nn.Sequential(
+            nn.Conv2d(channels, expanded, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(expanded, expanded, 3, padding=1, groups=expanded),
+            nn.SiLU(inplace=True),
+            nn.Dropout2d(dropout) if dropout else nn.Identity(),
+            nn.Conv2d(expanded, channels, 1),
+        )
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self.layers(tensor)
+
+
+class DiffusionRefinementBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        window_size: int,
+        condition_dim: int,
+        dropout: float,
+        shifted: bool,
+    ):
+        super().__init__()
+        self.shift = window_size // 2 if shifted else 0
+        self.self_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
+        self.cross_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
+        self.ffn_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
+        self.self_attention = WindowAttention2d(
+            hidden_dim, num_heads, window_size, dropout
+        )
+        self.cross_attention = WindowAttention2d(
+            hidden_dim, num_heads, window_size, dropout
+        )
+        self.ffn = ConvolutionalFFN(hidden_dim, dropout)
+
+    def forward(
+        self,
+        tensor: torch.Tensor,
+        local_condition: torch.Tensor,
+        condition_vector: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        tensor = tensor + self.self_attention(
+            self.self_norm(tensor, condition_vector),
+            self.self_norm(tensor, condition_vector),
+            valid,
+            shift=self.shift,
+        )
+        tensor = tensor + self.cross_attention(
+            self.cross_norm(tensor, condition_vector),
+            local_condition,
+            valid,
+            shift=self.shift,
+        )
+        tensor = tensor + self.ffn(self.ffn_norm(tensor, condition_vector)) * valid
+        return tensor * valid
+
+
+class LocalResidualDiffusionTransformer(nn.Module):
+    """Resolution-preserving local epsilon predictor."""
+
+    def __init__(self, config: FineDiffusionConfig):
+        super().__init__()
+        config.validate()
+        self.config = config
+        coordinates = 4
+        condition_channels = (
+            2 * config.lidar_channels + config.radar_channels + 2 + coordinates
+        )
+        self.residual_stem = nn.Conv2d(
+            config.lidar_channels + coordinates,
+            config.hidden_dim,
+            3,
+            padding=1,
+        )
+        self.local_condition_encoder = LocalConditionEncoder(
+            condition_channels, config.hidden_dim
+        )
+        condition_dim = config.global_context_dim
+        self.time_embedding = nn.Sequential(
+            SinusoidalTimeEmbedding(condition_dim),
+            nn.Linear(condition_dim, condition_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(condition_dim, condition_dim),
+        )
+        if config.use_global_faulty_context:
+            self.global_encoder = GlobalFaultyLidarEncoder(
+                config.lidar_channels,
+                config.global_context_dim,
+                config.hidden_dim,
+            )
+        else:
+            self.global_encoder = None
+        self.blocks = nn.ModuleList(
+            DiffusionRefinementBlock(
+                config.hidden_dim,
+                config.num_heads,
+                config.window_size,
+                condition_dim,
+                config.dropout,
+                config.use_shifted_windows and index % 2 == 1,
+            )
+            for index in range(config.num_transformer_blocks)
+        )
+        self.output_head = nn.Sequential(
+            nn.GroupNorm(_group_count(config.hidden_dim), config.hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(config.hidden_dim, config.lidar_channels, 3, padding=1),
+        )
+
+    def global_context(
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        trusted = faulty_lidar_bev * (1.0 - reconstruction_mask)
+        if self.global_encoder is None:
+            embedding = faulty_lidar_bev.new_zeros(
+                (faulty_lidar_bev.shape[0], self.config.global_context_dim)
+            )
+        else:
+            embedding = self.global_encoder(trusted)
+        return trusted, embedding
+
+    def forward(
+        self,
+        noisy_residual: torch.Tensor,
+        coarse: torch.Tensor,
+        trusted_faulty: torch.Tensor,
+        radar: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        valid: torch.Tensor,
+        coordinates: torch.Tensor,
+        timestep: torch.Tensor,
+        global_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_condition_input = torch.cat(
+            (
+                coarse,
+                radar,
+                trusted_faulty,
+                reconstruction_mask,
+                halo_mask,
+                coordinates,
+            ),
+            dim=1,
+        )
+        local_condition = self.local_condition_encoder(
+            local_condition_input, valid
+        )
+        tensor = self.residual_stem(
+            torch.cat((noisy_residual, coordinates), dim=1)
+        ) * valid
+        condition_vector = self.time_embedding(timestep) + global_embedding
+        for block in self.blocks:
+            tensor = block(tensor, local_condition, condition_vector, valid)
+        epsilon = self.output_head(tensor) * reconstruction_mask * valid
+        return epsilon, local_condition
+
+
+class MaskedExactReconstructionLoss(nn.Module):
+    """Exact cell-aligned channel-aware loss inside the repair mask."""
+
+    def __init__(self, epsilon: float = 1.0e-8):
+        super().__init__()
+        self.epsilon = float(epsilon)
+
+    def forward(
+        self,
+        refined: torch.Tensor,
+        clean: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        occupied = clean[:, 0:1].clamp(0.0, 1.0)
+        occupancy = F.binary_cross_entropy(
+            refined[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
+            occupied,
+            reduction="none",
+        )
+        occupancy_loss = (occupancy * reconstruction_mask).sum() / (
+            reconstruction_mask.sum() + self.epsilon
+        )
+        if refined.shape[1] == 1:
+            return occupancy_loss
+        continuous_mask = reconstruction_mask * occupied
+        continuous = F.smooth_l1_loss(
+            refined[:, 1:], clean[:, 1:], reduction="none"
+        )
+        denominator = (
+            continuous_mask.sum() * (refined.shape[1] - 1) + self.epsilon
+        )
+        continuous_loss = (continuous * continuous_mask).sum() / denominator
+        return occupancy_loss + continuous_loss
+
+
+class FineDiffusionRefiner(nn.Module):
+    """Train and sample masked local residual diffusion over aligned BEV crops."""
+
+    def __init__(
+        self,
+        config: FineDiffusionConfig | None = None,
+        normalization: BEVChannelNormalization | None = None,
+    ):
+        super().__init__()
+        self.config = config or FineDiffusionConfig()
+        self.config.validate()
+        self.crop_extractor = ReconstructionCropExtractor(
+            self.config.crop_context_margin_cells,
+            self.config.window_size,
+        )
+        process_config = DiffusionProcessConfig(
+            num_train_timesteps=self.config.training_timesteps,
+            noise_schedule=self.config.noise_schedule,
+            prediction_type=self.config.diffusion_prediction_type,
+            denominator_epsilon=self.config.denominator_epsilon,
+        )
+        self.schedule = GaussianNoiseSchedule(process_config)
+        self.normalization = normalization or BEVChannelNormalization(
+            means=(0.0,) * self.config.lidar_channels,
+            stds=(1.0,) * self.config.lidar_channels,
+        )
+        self.transformer = LocalResidualDiffusionTransformer(self.config)
+        self.diffusion_loss = MaskedEpsilonMSELoss(
+            self.config.denominator_epsilon
+        )
+        self.exact_loss = MaskedExactReconstructionLoss(
+            self.config.denominator_epsilon
+        )
+
+    def _validate_inputs(
+        self,
+        coarse_lidar_bev: torch.Tensor,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        clean_lidar_bev: torch.Tensor | None = None,
+    ) -> None:
+        if coarse_lidar_bev.ndim != 4:
+            raise ValueError("LiDAR BEVs must have shape [B,C,H,W]")
+        expected_lidar = (
+            coarse_lidar_bev.shape[0],
+            self.config.lidar_channels,
+            *coarse_lidar_bev.shape[-2:],
+        )
+        for name, tensor in (
+            ("coarse_lidar_bev", coarse_lidar_bev),
+            ("faulty_lidar_bev", faulty_lidar_bev),
+        ):
+            if tuple(tensor.shape) != expected_lidar:
+                raise ValueError(f"{name} must have shape {expected_lidar}")
+        if clean_lidar_bev is not None and tuple(clean_lidar_bev.shape) != expected_lidar:
+            raise ValueError(f"clean_lidar_bev must have shape {expected_lidar}")
+        expected_radar = (
+            coarse_lidar_bev.shape[0],
+            self.config.radar_channels,
+            *coarse_lidar_bev.shape[-2:],
+        )
+        if tuple(radar_bev.shape) != expected_radar:
+            raise ValueError(f"radar_bev must have shape {expected_radar}")
+        expected_mask = (
+            coarse_lidar_bev.shape[0],
+            1,
+            *coarse_lidar_bev.shape[-2:],
+        )
+        if reconstruction_mask.shape != expected_mask or halo_mask.shape != expected_mask:
+            raise ValueError(f"masks must have shape {expected_mask}")
+        tensors = (
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+        )
+        if clean_lidar_bev is not None:
+            tensors = (*tensors, clean_lidar_bev)
+        if any(tensor.device != coarse_lidar_bev.device for tensor in tensors):
+            raise ValueError("All fine-diffusion inputs must share a device")
+        if any(tensor.dtype != coarse_lidar_bev.dtype for tensor in tensors):
+            raise TypeError("All fine-diffusion inputs must share a floating dtype")
+        if not all(torch.isfinite(tensor).all() for tensor in tensors):
+            raise ValueError("Fine-diffusion input contains NaN or Inf")
+
+    def _extract(
+        self,
+        coarse_lidar_bev: torch.Tensor,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        clean_lidar_bev: torch.Tensor | None = None,
+    ) -> ReconstructionCropBatch:
+        trusted_faulty = faulty_lidar_bev * (1.0 - reconstruction_mask)
+        tensors = {
+            "coarse": coarse_lidar_bev,
+            "faulty": faulty_lidar_bev,
+            "trusted_faulty": trusted_faulty,
+            "radar": radar_bev,
+            "repair": reconstruction_mask,
+            "halo": halo_mask * (1.0 - reconstruction_mask),
+        }
+        if clean_lidar_bev is not None:
+            tensors["clean"] = clean_lidar_bev
+            tensors["residual_gt"] = residual_target(
+                clean_lidar_bev, coarse_lidar_bev, reconstruction_mask
+            )
+        return self.crop_extractor.extract(
+            tensors, reconstruction_mask, halo_mask
+        )
+
+    def _predict_epsilon(
+        self,
+        residual_t: torch.Tensor,
+        crops: ReconstructionCropBatch,
+        timestep: torch.Tensor,
+        global_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values = crops.tensors
+        return self.transformer(
+            residual_t,
+            self.normalization.normalize(values["coarse"]),
+            self.normalization.normalize(values["trusted_faulty"]),
+            values["radar"],
+            values["repair"],
+            values["halo"],
+            crops.valid_mask,
+            _coordinate_channels(crops),
+            timestep,
+            global_embedding,
+        )
+
+    @staticmethod
+    def _compose_full(
+        crops: ReconstructionCropBatch,
+        refined_crop: torch.Tensor,
+        faulty_lidar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        refined_full = crops.paste(refined_crop)
+        final = (
+            (1.0 - reconstruction_mask) * faulty_lidar_bev
+            + reconstruction_mask * refined_full
+        )
+        return refined_full, final
+
+    def forward(
+        self,
+        clean_lidar_bev: torch.Tensor,
+        coarse_lidar_bev: torch.Tensor,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        timestep: torch.Tensor | None = None,
+        epsilon: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        return_debug: bool = False,
+    ) -> dict[str, torch.Tensor | ReconstructionCropBatch | dict]:
+        self._validate_inputs(
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+            clean_lidar_bev,
+        )
+        crops = self._extract(
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+            clean_lidar_bev=clean_lidar_bev,
+        )
+        batch = coarse_lidar_bev.shape[0]
+        repair = crops.tensors["repair"] * crops.valid_mask
+        residual_gt_physical = crops.tensors["residual_gt"] * repair
+        residual_gt = self.normalization.normalize_residual(
+            residual_gt_physical
+        ) * repair
+        if timestep is None:
+            timestep = torch.randint(
+                self.config.training_timesteps,
+                (batch,),
+                device=coarse_lidar_bev.device,
+                generator=generator,
+            )
+        if timestep.shape != (batch,):
+            raise ValueError("timestep must have shape [B]")
+        if epsilon is None:
+            epsilon = torch.randn(
+                residual_gt.shape,
+                device=residual_gt.device,
+                dtype=residual_gt.dtype,
+                generator=generator,
+            )
+        if epsilon.shape != residual_gt.shape:
+            raise ValueError("epsilon must match the padded residual crop")
+        residual_t, epsilon_masked = self.schedule.add_masked_noise(
+            residual_gt, epsilon, timestep, repair
+        )
+        trusted_global, global_embedding = self.transformer.global_context(
+            faulty_lidar_bev, reconstruction_mask
+        )
+        epsilon_pred, local_condition = self._predict_epsilon(
+            residual_t, crops, timestep, global_embedding
+        )
+        residual_x0 = self.schedule.predict_x0(
+            residual_t, epsilon_pred, timestep
+        ) * repair
+        refined_crop = crops.tensors["coarse"] + self.normalization.denormalize_residual(
+            residual_x0
+        ) * repair
+        refined_crop = refined_crop.clamp(0.0, 1.0)
+        refined_full, final = self._compose_full(
+            crops, refined_crop, faulty_lidar_bev, reconstruction_mask
+        )
+        diffusion_loss = self.diffusion_loss(epsilon_pred, epsilon_masked, repair)
+        exact_loss = self.exact_loss(
+            refined_crop, crops.tensors["clean"], repair
+        )
+        total_loss = (
+            self.config.lambda_diffusion * diffusion_loss
+            + self.config.lambda_exact_reconstruction * exact_loss
+        )
+        repair_cells = repair.sum(dim=(1, 2, 3))
+        crop_cells = crops.valid_mask.sum(dim=(1, 2, 3)).clamp_min(1)
+        diagnostics = {
+            "average_reconstruction_mask_area": repair_cells.mean(),
+            "average_crop_area": crop_cells.mean(),
+            "average_crop_height": crops.crop_heights.float().mean(),
+            "average_crop_width": crops.crop_widths.float().mean(),
+            "repair_fraction_of_crop": (repair_cells / crop_cells).mean(),
+            "halo_fraction_of_crop": (
+                crops.tensors["halo"].sum(dim=(1, 2, 3)) / crop_cells
+            ).mean(),
+            "diffusion_timestep": timestep.float().mean(),
+            "residual_gt_abs_mean": (
+                residual_gt_physical.abs().sum()
+                / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
+            ),
+            "predicted_residual_abs_mean": (
+                residual_x0.abs().sum()
+                / (repair.sum() * residual_x0.shape[1]).clamp_min(1)
+            ),
+            "diffusion_loss": diffusion_loss.detach(),
+            "exact_reconstruction_loss": exact_loss.detach(),
+        }
+        output: dict = {
+            "loss": total_loss,
+            "diffusion_loss": diffusion_loss,
+            "exact_reconstruction_loss": exact_loss,
+            "coarse_lidar_bev": coarse_lidar_bev,
+            "final_lidar_bev": final,
+            "reconstruction_mask": reconstruction_mask,
+            "statistics": diagnostics,
+        }
+        if return_debug:
+            output["debug"] = {
+                "crops": crops,
+                "trusted_global_faulty_lidar": trusted_global,
+                "residual_gt": residual_gt_physical,
+                "normalized_residual_gt": residual_gt,
+                "noisy_residual": residual_t,
+                "epsilon": epsilon_masked,
+                "predicted_epsilon": epsilon_pred,
+                "predicted_residual_crop": self.normalization.denormalize_residual(
+                    residual_x0
+                ),
+                "local_condition": local_condition,
+                "refined_crop": refined_crop,
+                "refined_lidar_bev": refined_full,
+            }
+        return output
+
+    def _sampling_timesteps(
+        self, sampling_steps: int, device: torch.device
+    ) -> torch.Tensor:
+        if sampling_steps not in {1, 3, 5, 10}:
+            raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
+        return torch.linspace(
+            self.config.training_timesteps - 1,
+            0,
+            sampling_steps,
+            device=device,
+        ).round().long()
+
+    @torch.no_grad()
+    def sample(
+        self,
+        coarse_lidar_bev: torch.Tensor,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        sampling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+        return_debug: bool = False,
+    ) -> dict[str, torch.Tensor | ReconstructionCropBatch | list]:
+        """Refine a coarse BEV without requiring clean LiDAR supervision."""
+
+        self._validate_inputs(
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+        )
+        crops = self._extract(
+            coarse_lidar_bev,
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            halo_mask,
+        )
+        repair = crops.tensors["repair"] * crops.valid_mask
+        if int(repair.count_nonzero()) == 0:
+            zeros = torch.zeros_like(coarse_lidar_bev)
+            return {
+                "coarse_lidar_bev": coarse_lidar_bev,
+                "predicted_residual": zeros,
+                "final_lidar_bev": faulty_lidar_bev.clone(),
+                "reconstruction_mask": reconstruction_mask,
+            }
+        residual_t = repair * torch.randn(
+            (
+                coarse_lidar_bev.shape[0],
+                self.config.lidar_channels,
+                *repair.shape[-2:],
+            ),
+            device=coarse_lidar_bev.device,
+            dtype=coarse_lidar_bev.dtype,
+            generator=generator,
+        )
+        _trusted_global, global_embedding = self.transformer.global_context(
+            faulty_lidar_bev, reconstruction_mask
+        )
+        timesteps = self._sampling_timesteps(
+            sampling_steps or self.config.sampling_steps,
+            coarse_lidar_bev.device,
+        )
+        intermediates = []
+        residual_x0 = torch.zeros_like(residual_t)
+        for index, scalar_timestep in enumerate(timesteps):
+            timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
+            previous_scalar = (
+                timesteps[index + 1]
+                if index + 1 < len(timesteps)
+                else scalar_timestep.new_tensor(-1)
+            )
+            previous = previous_scalar.expand_as(timestep)
+            epsilon_pred, _local_condition = self._predict_epsilon(
+                residual_t, crops, timestep, global_embedding
+            )
+            residual_t, residual_x0 = self.schedule.ddim_step(
+                residual_t,
+                epsilon_pred,
+                timestep,
+                previous,
+                repair,
+                eta=self.config.ddim_eta,
+                generator=generator,
+            )
+            if return_debug:
+                intermediates.append(residual_t.detach().clone())
+        residual_crop = self.normalization.denormalize_residual(
+            residual_x0 * repair
+        )
+        refined_crop = (
+            crops.tensors["coarse"] + residual_crop
+        ).clamp(0.0, 1.0)
+        refined_full, final = self._compose_full(
+            crops, refined_crop, faulty_lidar_bev, reconstruction_mask
+        )
+        output: dict = {
+            "coarse_lidar_bev": coarse_lidar_bev,
+            "predicted_residual": crops.paste(residual_crop) * reconstruction_mask,
+            "refined_lidar_bev": refined_full,
+            "final_lidar_bev": final,
+            "reconstruction_mask": reconstruction_mask,
+            "crop_boxes": crops.boxes,
+        }
+        if return_debug:
+            output["crop_batch"] = crops
+            output["intermediate_residuals"] = intermediates
+        return output
