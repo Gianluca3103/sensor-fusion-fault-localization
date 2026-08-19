@@ -31,6 +31,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--radar5-root", type=Path)
     parser.add_argument("--radar10-root", type=Path)
     parser.add_argument("--radar20-root", type=Path)
+    parser.add_argument(
+        "--selector-config",
+        type=Path,
+        help=(
+            "Optional shared Fault Selector configuration used to validate "
+            "the evaluation mask cache. Model architecture is still loaded "
+            "from each checkpoint."
+        ),
+    )
     parser.add_argument("--pattern", default="coarse_*")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -257,6 +266,10 @@ def _print_leaderboard(rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.selector_config is not None and not args.selector_config.is_file():
+        raise FileNotFoundError(
+            f"Selector configuration is missing: {args.selector_config}"
+        )
     if not _has_test_files(args.data_root):
         raise FileNotFoundError(
             f"Test split is missing or empty: {args.data_root / 'test'}"
@@ -277,6 +290,8 @@ def main() -> None:
         data_root = _choose_data_root(resolved, args)
         checkpoint = _checkpoint_path(run)
         row = _run_metadata(run, resolved, radar_root, data_root, checkpoint)
+        selector_config = args.selector_config or resolved_path
+        row["selector_config"] = str(selector_config)
         destination = args.output_root / run.name
         summary_path = destination / "summary.json"
         print(f"\n[{index}/{len(runs)}] {run.name}", flush=True)
@@ -311,7 +326,7 @@ def main() -> None:
             "--output-root",
             str(destination),
             "--config",
-            str(resolved_path),
+            str(selector_config),
             "--split",
             "test",
             "--device",

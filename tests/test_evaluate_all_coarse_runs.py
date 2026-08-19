@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from scripts.evaluate_all_coarse_runs import _choose_radar_root
+from scripts.evaluate_all_coarse_runs import _choose_radar_root, _parse_args
 
 
 class EvaluateAllCoarseRunsTests(unittest.TestCase):
@@ -60,6 +60,25 @@ class EvaluateAllCoarseRunsTests(unittest.TestCase):
                 args,
             )
             self.assertEqual(selected, radar5.resolve())
+
+    def test_accepts_shared_selector_configuration(self) -> None:
+        from unittest.mock import patch
+
+        selector = Path("current_selector.json")
+        with patch(
+            "sys.argv",
+            [
+                "evaluate_all_coarse_runs.py",
+                "--data-root",
+                "data",
+                "--output-root",
+                "output",
+                "--selector-config",
+                str(selector),
+            ],
+        ):
+            args = _parse_args()
+        self.assertEqual(args.selector_config, selector)
 
 
 if __name__ == "__main__":
