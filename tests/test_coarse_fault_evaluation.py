@@ -53,6 +53,9 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
                 "repair_cells": 10,
                 "coarse_occupancy_exact_iou": 0.5,
                 "faulty_occupancy_exact_iou": 0.25,
+                "coarse_occupancy_tolerant_0_5m_iou": 0.8,
+                "faulty_occupancy_tolerant_0_5m_iou": 0.4,
+                "tolerant_0_5m_iou_improvement": 0.4,
                 "coarse_tp": 3,
                 "coarse_fp": 1,
                 "coarse_fn": 1,
@@ -72,6 +75,9 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
                 "repair_cells": 20,
                 "coarse_occupancy_exact_iou": 0.75,
                 "faulty_occupancy_exact_iou": 0.5,
+                "coarse_occupancy_tolerant_0_5m_iou": 0.6,
+                "faulty_occupancy_tolerant_0_5m_iou": 0.3,
+                "tolerant_0_5m_iou_improvement": 0.3,
                 "coarse_tp": 6,
                 "coarse_fp": 2,
                 "coarse_fn": 2,
@@ -93,6 +99,15 @@ class CoarseFaultEvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["micro/coarse_iou"], 9 / 15)
         self.assertAlmostEqual(summary["micro/faulty_iou"], 6 / 18)
         self.assertAlmostEqual(summary["micro/iou_improvement"], 9 / 15 - 6 / 18)
+        self.assertAlmostEqual(
+            summary["macro/faulty_occupancy_tolerant_0_5m_iou"], 0.35
+        )
+        self.assertAlmostEqual(
+            summary["macro/coarse_occupancy_tolerant_0_5m_iou"], 0.7
+        )
+        self.assertAlmostEqual(
+            summary["macro/tolerant_0_5m_iou_improvement"], 0.35
+        )
 
     def test_summary_excludes_selector_rejected_samples_from_metrics(self):
         records = []

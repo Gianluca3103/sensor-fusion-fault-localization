@@ -224,6 +224,8 @@ def _write_comparison(output_root: Path, rows: list[dict[str, Any]]) -> None:
         "exact_precision",
         "exact_recall",
         "tolerant_iou_0_5m",
+        "faulty_tolerant_iou_0_5m",
+        "tolerant_iou_0_5m_improvement",
         "tolerant_f1_0_5m",
         "tolerant_precision_0_5m",
         "tolerant_recall_0_5m",
@@ -258,6 +260,8 @@ def _print_leaderboard(rows: list[dict[str, Any]]) -> None:
         print(
             "    @0.5m:  "
             f"IoU={row['tolerant_iou_0_5m']:.3%}  "
+            f"Faulty IoU={row['faulty_tolerant_iou_0_5m']:.3%}  "
+            f"Improvement={row['tolerant_iou_0_5m_improvement']:+.3%}  "
             f"F1={row['tolerant_f1_0_5m']:.3%}  "
             f"P={row['tolerant_precision_0_5m']:.3%}  "
             f"R={row['tolerant_recall_0_5m']:.3%}"
@@ -400,6 +404,12 @@ def main() -> None:
             tolerant_iou_0_5m=overall.get(
                 "macro/coarse_occupancy_tolerant_0_5m_iou", 0.0
             ),
+            faulty_tolerant_iou_0_5m=overall.get(
+                "macro/faulty_occupancy_tolerant_0_5m_iou", 0.0
+            ),
+            tolerant_iou_0_5m_improvement=overall.get(
+                "macro/tolerant_0_5m_iou_improvement", 0.0
+            ),
             tolerant_f1_0_5m=overall.get(
                 "macro/coarse_occupancy_tolerant_0_5m_f1", 0.0
             ),
@@ -415,8 +425,10 @@ def main() -> None:
         print(
             "  DONE: exact IoU="
             f"{row.get('micro/coarse_iou', 0.0):.2%}, "
-            "F1@0.5m="
-            f"{row.get('macro/coarse_occupancy_tolerant_0_5m_f1', 0.0):.2%}",
+            "IoU@0.5m="
+            f"{row['tolerant_iou_0_5m']:.2%} "
+            f"({row['tolerant_iou_0_5m_improvement']:+.2%}), "
+            f"F1@0.5m={row['tolerant_f1_0_5m']:.2%}",
             flush=True,
         )
 

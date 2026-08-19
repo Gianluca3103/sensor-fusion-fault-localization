@@ -226,7 +226,8 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
 def _print_table(groups: dict[str, dict]) -> None:
     header = (
         f"{'Fault':<28} {'N':>6} {'Used':>6} {'Faulty IoU':>11} {'Coarse IoU':>11} "
-        f"{'Improvement':>12} {'F1@0.5m':>10} {'Halluc.':>9}"
+        f"{'Improvement':>12} {'Faulty@0.5m':>13} {'Coarse@0.5m':>13} "
+        f"{'Improvement@0.5m':>18} {'F1@0.5m':>10} {'Halluc.':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -237,6 +238,9 @@ def _print_table(groups: dict[str, dict]) -> None:
             f"{summary['micro/faulty_iou']:10.2%} "
             f"{summary['micro/coarse_iou']:10.2%} "
             f"{summary['micro/iou_improvement']:+11.2%} "
+            f"{summary['macro/faulty_occupancy_tolerant_0_5m_iou']:12.2%} "
+            f"{summary['macro/coarse_occupancy_tolerant_0_5m_iou']:12.2%} "
+            f"{summary['macro/tolerant_0_5m_iou_improvement']:+17.2%} "
             f"{summary['macro/coarse_occupancy_tolerant_0_5m_f1']:9.2%} "
             f"{summary['macro/coarse_occupancy_hallucination_rate']:8.2%}"
         )
@@ -581,6 +585,10 @@ def main() -> None:
                 record["exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]
                     - record["faulty_occupancy_exact_iou"]
+                )
+                record["tolerant_0_5m_iou_improvement"] = (
+                    record["coarse_occupancy_tolerant_0_5m_iou"]
+                    - record["faulty_occupancy_tolerant_0_5m_iou"]
                 )
                 records.append(record)
                 if not hrnet_debug_saved:
