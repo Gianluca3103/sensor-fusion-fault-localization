@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -15,8 +16,11 @@ from .local_diffusion import FineDiffusionRefiner
 
 
 def load_frozen_coarse_model(
-    checkpoint_path, device="cpu", *, allow_pointpillars: bool = False
-):
+    checkpoint_path: str | Path,
+    device: str | torch.device = "cpu",
+    *,
+    allow_pointpillars: bool = False,
+) -> tuple[CoarseReconstructionModel, dict]:
     checkpoint_path = Path(checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if "model_config" not in checkpoint or "model_state_dict" not in checkpoint:
@@ -32,7 +36,7 @@ def load_frozen_coarse_model(
             "PointPillars coarse checkpoints require the local fine-diffusion "
             "pipeline with raw point-cloud inputs"
         )
-    grid_geometry = None
+    grid_geometry: BEVGridGeometry | None = None
     if config.pointpillars_enabled:
         if "grid_geometry" not in checkpoint:
             raise KeyError(
@@ -48,7 +52,11 @@ def load_frozen_coarse_model(
 class FrozenCoarseFineDiffusionPipeline(nn.Module):
     """Online frozen coarse reconstruction followed by local fine diffusion."""
 
-    def __init__(self, coarse_model: nn.Module, diffusion: FineDiffusionRefiner):
+    def __init__(
+        self,
+        coarse_model: CoarseReconstructionModel,
+        diffusion: FineDiffusionRefiner,
+    ) -> None:
         super().__init__()
         self.coarse_model = coarse_model.eval().requires_grad_(False)
         self.diffusion = diffusion
@@ -178,7 +186,11 @@ def validate_diffusion_checkpoint_compatibility(checkpoint, diffusion):
 
 
 class FrozenCoarseDiffusionPipeline(nn.Module):
-    def __init__(self, coarse_model, diffusion: MaskedResidualDiffusion):
+    def __init__(
+        self,
+        coarse_model: CoarseReconstructionModel,
+        diffusion: MaskedResidualDiffusion,
+    ) -> None:
         super().__init__()
         self.coarse_model = coarse_model.eval().requires_grad_(False)
         self.diffusion = diffusion
@@ -190,9 +202,22 @@ class FrozenCoarseDiffusionPipeline(nn.Module):
         return self
 
     def coarse_forward(
-        self, faulty_lidar_bev, radar_bev, reconstruction_mask, healthy_context_mask, halo_mask
-    ):
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        radar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+        healthy_context_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        *,
+        faulty_lidar_points: Sequence[torch.Tensor] | None = None,
+        radar_points: Sequence[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         self.coarse_model.eval()
+        point_arguments = {}
+        if faulty_lidar_points is not None:
+            point_arguments["faulty_lidar_points"] = faulty_lidar_points
+        if radar_points is not None:
+            point_arguments["radar_points"] = radar_points
         with torch.no_grad():
             output = self.coarse_model(
                 faulty_lidar_bev,
@@ -200,6 +225,7 @@ class FrozenCoarseDiffusionPipeline(nn.Module):
                 reconstruction_mask,
                 healthy_context_mask,
                 halo_mask,
+                **point_arguments,
             )
         return output["coarse_lidar_bev"].detach(), output["erased_lidar_bev"].detach()
 
@@ -211,6 +237,8 @@ class FrozenCoarseDiffusionPipeline(nn.Module):
         reconstruction_mask,
         healthy_context_mask,
         halo_mask,
+        faulty_lidar_points: Sequence[torch.Tensor] | None = None,
+        radar_points: Sequence[torch.Tensor] | None = None,
         **diffusion_options,
     ):
         coarse, erased = self.coarse_forward(
@@ -219,6 +247,8 @@ class FrozenCoarseDiffusionPipeline(nn.Module):
             reconstruction_mask,
             healthy_context_mask,
             halo_mask,
+            faulty_lidar_points=faulty_lidar_points,
+            radar_points=radar_points,
         )
         output = self.diffusion(
             clean_lidar_bev,
