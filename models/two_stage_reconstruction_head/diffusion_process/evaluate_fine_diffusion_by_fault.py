@@ -12,7 +12,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -37,7 +36,6 @@ from models.two_stage_reconstruction_head import (
     load_frozen_coarse_model,
 )
 from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
-    _bev_rgb,
     _load_selector_config,
     _move_batch,
     _occupancy_counts,
@@ -321,39 +319,40 @@ def _save_comparison(
     destination: Path,
     clean_bev: torch.Tensor,
     faulty_bev: torch.Tensor,
-    radar_bev: torch.Tensor,
     coarse_bev: torch.Tensor,
     fine_bev: torch.Tensor,
     reconstruction_mask: torch.Tensor,
     record: dict,
 ) -> None:
-    clean = _bev_rgb(clean_bev)
-    faulty = _bev_rgb(faulty_bev)
-    coarse = _bev_rgb(coarse_bev)
-    fine = _bev_rgb(fine_bev)
-    radar = radar_bev.detach().float().cpu()
-    radar_occupancy = radar[0].clamp(0.0, 1.0).numpy()
-    radar_power = radar[1].clamp(0.0, 1.0).numpy() if radar.shape[0] > 1 else radar_occupancy
-    radar_speed = radar[2].clamp(0.0, 1.0).numpy() if radar.shape[0] > 2 else radar_occupancy
-    radar_height = radar[3].clamp(0.0, 1.0).numpy() if radar.shape[0] > 3 else radar_occupancy
-    radar_composite = np.stack(
-        (radar_speed, radar_height, np.maximum(radar_power, 0.15 * radar_occupancy)),
-        axis=-1,
-    ).clip(0.0, 1.0)
+    def occupancy(bev: torch.Tensor):
+        return bev.detach().float().cpu()[0].clamp(0.0, 1.0).numpy()
+
+    clean = occupancy(clean_bev)
+    faulty = occupancy(faulty_bev)
+    coarse = occupancy(coarse_bev)
+    fine = occupancy(fine_bev)
     mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    figure, axes = plt.subplots(2, 3, figsize=(18, 11), facecolor="black")
+    figure, axes = plt.subplots(1, 4, figsize=(20, 5.5), facecolor="black")
     panels = (
-        (clean, "Clean LiDAR BEV", None),
-        (faulty, "Faulty LiDAR BEV", None),
-        (coarse, "Frozen coarse output", None),
-        (fine, "Fine diffusion output", None),
-        (radar_composite, "Radar composite", None),
-        (mask, "Reconstruction mask", "gray"),
+        (clean, "Clean occupancy"),
+        (faulty, "Faulty occupancy"),
+        (coarse, "Coarse occupancy"),
+        (fine, "Fine diffusion occupancy"),
     )
-    for axis, (image, title, cmap) in zip(axes.flat, panels):
-        axis.imshow(image, cmap=cmap, interpolation="nearest")
-        if title != "Reconstruction mask":
-            axis.contour(mask.astype(np.uint8), levels=(0.5,), colors="cyan", linewidths=0.7)
+    for axis, (image, title) in zip(axes.flat, panels):
+        axis.imshow(
+            image,
+            cmap="gray",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        axis.contour(
+            mask.astype("uint8"),
+            levels=(0.5,),
+            colors="cyan",
+            linewidths=0.8,
+        )
         axis.set_title(title, color="white")
         axis.axis("off")
     figure.suptitle(
@@ -566,7 +565,6 @@ def main() -> None:
                         / f"{visual_index:03d}_{Path(sample_path).stem}.png",
                         clean[0],
                         faulty[0],
-                        inputs["radar_bev"][index],
                         coarse_sample[0],
                         fine_sample[0],
                         sample_mask[0],

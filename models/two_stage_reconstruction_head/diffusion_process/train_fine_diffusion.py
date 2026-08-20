@@ -130,8 +130,6 @@ def _run_epoch(
     training = optimizer is not None
     pipeline.train(training)
     totals: dict[str, float] = {}
-    occupancy_counts = {"tp": 0.0, "fp": 0.0, "fn": 0.0, "empty": 0.0}
-    coarse_occupancy_counts = {"tp": 0.0, "fp": 0.0, "fn": 0.0}
     samples = optimizer_steps = 0
     for raw_batch in loader:
         batch = _move_batch(raw_batch, device)
@@ -175,50 +173,110 @@ def _run_epoch(
         }
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
-        with torch.no_grad():
-            selected = batch["reconstruction_mask"] > 0.5
-            predicted = output["final_lidar_bev"][:, 0:1] >= 0.5
-            coarse_predicted = output["coarse_lidar_bev"][:, 0:1] >= 0.5
-            expected = batch["clean_lidar_bev"][:, 0:1] >= 0.5
-            occupancy_counts["tp"] += float((predicted & expected & selected).sum())
-            occupancy_counts["fp"] += float((predicted & ~expected & selected).sum())
-            occupancy_counts["fn"] += float((~predicted & expected & selected).sum())
-            occupancy_counts["empty"] += float((~expected & selected).sum())
-            coarse_occupancy_counts["tp"] += float(
-                (coarse_predicted & expected & selected).sum()
-            )
-            coarse_occupancy_counts["fp"] += float(
-                (coarse_predicted & ~expected & selected).sum()
-            )
-            coarse_occupancy_counts["fn"] += float(
-                (~coarse_predicted & expected & selected).sum()
-            )
         samples += count
         if any(parameter.grad is not None for parameter in pipeline.coarse_model.parameters()):
             raise RuntimeError("Frozen coarse model unexpectedly received gradients")
     result = {key: value / max(samples, 1) for key, value in totals.items()}
-    tp, fp, fn = (occupancy_counts[key] for key in ("tp", "fp", "fn"))
-    coarse_tp, coarse_fp, coarse_fn = (
-        coarse_occupancy_counts[key] for key in ("tp", "fp", "fn")
-    )
-    epsilon = 1.0e-8
-    exact_iou = tp / (tp + fp + fn + epsilon)
-    coarse_exact_iou = coarse_tp / (
-        coarse_tp + coarse_fp + coarse_fn + epsilon
-    )
-    result.update(
-        {
-            "exact_occupancy_precision": tp / (tp + fp + epsilon),
-            "exact_occupancy_recall": tp / (tp + fn + epsilon),
-            "exact_occupancy_iou": exact_iou,
-            "coarse_exact_occupancy_iou": coarse_exact_iou,
-            "exact_iou_improvement_vs_coarse": exact_iou - coarse_exact_iou,
-            "false_positive_occupancy_rate": fp
-            / (occupancy_counts["empty"] + epsilon),
-        }
-    )
     if training:
         result["optimizer_steps"] = optimizer_steps
+    return result
+
+
+@torch.inference_mode()
+def _run_sampled_validation(
+    pipeline,
+    loader,
+    device,
+    *,
+    sampling_steps,
+    use_amp=False,
+    seed=0,
+):
+    """Run the deployment sampler; clean LiDAR is used only after prediction."""
+
+    pipeline.eval()
+    counts = {
+        "fine_tp": 0.0,
+        "fine_fp": 0.0,
+        "fine_fn": 0.0,
+        "coarse_tp": 0.0,
+        "coarse_fp": 0.0,
+        "coarse_fn": 0.0,
+        "empty": 0.0,
+    }
+    crop_height = crop_width = samples = 0.0
+    generator = torch.Generator(device=device).manual_seed(seed)
+    for raw_batch in loader:
+        batch = _move_batch(raw_batch, device)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
+            enabled=use_amp,
+        ):
+            sampled = pipeline.sample(
+                batch["faulty_lidar_bev"],
+                batch["radar_bev"],
+                batch["reconstruction_mask"],
+                batch["healthy_context_mask"],
+                batch["halo_mask"],
+                faulty_lidar_points=batch.get("faulty_lidar_points"),
+                radar_points=batch.get("radar_points"),
+                sampling_steps=sampling_steps,
+                generator=generator,
+            )
+
+        selected = batch["reconstruction_mask"] > 0.5
+        expected = batch["clean_lidar_bev"][:, 0:1] >= 0.5
+        coarse = sampled["coarse_lidar_bev"][:, 0:1] >= 0.5
+        fine = sampled["final_lidar_bev"][:, 0:1] >= 0.5
+        for prefix, predicted in (("coarse", coarse), ("fine", fine)):
+            counts[f"{prefix}_tp"] += float(
+                (predicted & expected & selected).sum()
+            )
+            counts[f"{prefix}_fp"] += float(
+                (predicted & ~expected & selected).sum()
+            )
+            counts[f"{prefix}_fn"] += float(
+                (~predicted & expected & selected).sum()
+            )
+        counts["empty"] += float((~expected & selected).sum())
+
+        batch_size = batch["clean_lidar_bev"].shape[0]
+        boxes = sampled.get("crop_boxes")
+        if boxes is None:
+            crop_height += batch_size
+            crop_width += batch_size
+        else:
+            crop_height += float((boxes[:, 1] - boxes[:, 0]).sum())
+            crop_width += float((boxes[:, 3] - boxes[:, 2]).sum())
+        samples += batch_size
+
+    epsilon = 1.0e-8
+    result = {
+        "samples": samples,
+        "average_crop_height": crop_height / max(samples, 1.0),
+        "average_crop_width": crop_width / max(samples, 1.0),
+    }
+    for prefix in ("coarse", "fine"):
+        tp = counts[f"{prefix}_tp"]
+        fp = counts[f"{prefix}_fp"]
+        fn = counts[f"{prefix}_fn"]
+        result[f"{prefix}_exact_occupancy_iou"] = tp / (
+            tp + fp + fn + epsilon
+        )
+        result[f"{prefix}_exact_occupancy_precision"] = tp / (
+            tp + fp + epsilon
+        )
+        result[f"{prefix}_exact_occupancy_recall"] = tp / (
+            tp + fn + epsilon
+        )
+    result["fine_false_positive_occupancy_rate"] = counts["fine_fp"] / (
+        counts["empty"] + epsilon
+    )
+    result["fine_minus_coarse_exact_iou"] = (
+        result["fine_exact_occupancy_iou"]
+        - result["coarse_exact_occupancy_iou"]
+    )
     return result
 
 
@@ -334,7 +392,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    start_epoch, best, history = 1, float("inf"), []
+    start_epoch, best, history = 1, float("-inf"), []
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
@@ -343,7 +401,11 @@ def main():
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         restore_rng_state(checkpoint.get("rng_state"))
         start_epoch = int(checkpoint["epoch"]) + 1
-        best = float(checkpoint["best_validation_loss"])
+        best = float(
+            checkpoint.get(
+                "best_sampled_validation_iou_improvement", float("-inf")
+            )
+        )
         history = list(checkpoint.get("history", []))
     atomic_write_json(
         output_root / "resolved_config.json",
@@ -371,40 +433,51 @@ def main():
             grad_clip=float(training.get("grad_clip", 1.0)),
             use_amp=use_amp,
         )
-        with torch.no_grad():
-            val_stats = _run_epoch(
-                pipeline, val_loader, device, use_amp=use_amp
-            )
+        validation_started = time.perf_counter()
+        val_stats = _run_sampled_validation(
+            pipeline,
+            val_loader,
+            device,
+            sampling_steps=config.sampling_steps,
+            use_amp=use_amp,
+            seed=seed + 10_000,
+        )
+        validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
             scheduler.step()
         elapsed = time.perf_counter() - started
-        row = {"epoch": epoch, "runtime/epoch_seconds": elapsed}
+        row = {
+            "epoch": epoch,
+            "runtime/epoch_seconds": elapsed,
+            "runtime/sampled_validation_seconds": validation_seconds,
+        }
         row.update({f"train/{key}": value for key, value in train_stats.items()})
         row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
         print(
             f"\nepoch {epoch:03d}/{epochs:03d} | {elapsed:.1f}s | "
+            f"sampled validation {validation_seconds:.1f}s\n"
+            f"  train | loss {train_stats['loss']:.6f} | "
+            f"diffusion {train_stats['diffusion_loss']:.6f} | "
+            f"reconstruction {train_stats['exact_reconstruction_loss']:.6f} | "
+            f"degradation {train_stats['degradation_loss']:.6f} | "
+            f"residual {train_stats['residual_regularization_loss']:.6f}\n"
+            f"  sampled validation | {int(val_stats['samples'])} samples | "
             f"crop {val_stats['average_crop_height']:.1f}x"
             f"{val_stats['average_crop_width']:.1f}\n"
-            f"  train | loss {train_stats['loss']:.6f} | "
-            f"exact IoU {100.0 * train_stats['exact_occupancy_iou']:.2f}%\n"
-            f"  val   | loss {val_stats['loss']:.6f} | "
-            f"diffusion {val_stats['diffusion_loss']:.6f} | "
-            f"reconstruction {val_stats['exact_reconstruction_loss']:.6f} | "
-            f"degradation {val_stats['degradation_loss']:.6f} | "
-            f"residual {val_stats['residual_regularization_loss']:.6f}\n"
-            f"  exact reconstruction-mask occupancy\n"
-            f"        | coarse IoU {100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
-            f"-> fine IoU {100.0 * val_stats['exact_occupancy_iou']:.2f}% "
-            f"({100.0 * val_stats['exact_iou_improvement_vs_coarse']:+.2f} pp)\n"
-            f"        | precision {100.0 * val_stats['exact_occupancy_precision']:.2f}% | "
-            f"recall {100.0 * val_stats['exact_occupancy_recall']:.2f}% | "
+            f"    exact mask IoU   | coarse "
+            f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
+            f"-> fine {100.0 * val_stats['fine_exact_occupancy_iou']:.2f}% "
+            f"({100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp)\n"
+            f"    fine occupancy   | precision "
+            f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% | "
+            f"recall {100.0 * val_stats['fine_exact_occupancy_recall']:.2f}% | "
             f"false-positive rate "
-            f"{100.0 * val_stats['false_positive_occupancy_rate']:.2f}% | "
-            f"mean |residual| {val_stats['predicted_residual_abs_mean']:.6f}"
+            f"{100.0 * val_stats['fine_false_positive_occupancy_rate']:.2f}%"
         )
-        improved = val_stats["loss"] < best
-        best = min(best, val_stats["loss"])
+        score = val_stats["fine_minus_coarse_exact_iou"]
+        improved = score > best
+        best = max(best, score)
         checkpoint = {
             "epoch": epoch,
             "diffusion_state_dict": diffusion.state_dict(),
@@ -414,13 +487,15 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
-            "best_validation_loss": best,
+            "best_sampled_validation_iou_improvement": best,
             "history": history,
             "rng_state": capture_rng_state(),
         }
         atomic_torch_save(checkpoint, output_root / "latest_checkpoint.pt")
         if improved:
-            atomic_torch_save(checkpoint, output_root / "best_validation_loss.pt")
+            atomic_torch_save(
+                checkpoint, output_root / "best_sampled_validation_iou.pt"
+            )
         write_csv_rows(output_root / "history.csv", history)
     rows = _sampling_metrics(
         pipeline,
