@@ -10,6 +10,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
@@ -62,6 +63,7 @@ def _parse_args():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--validation-batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--limit-train-samples", type=int)
     parser.add_argument("--limit-val-samples", type=int)
@@ -214,13 +216,30 @@ def _run_sampled_validation(
         "fine_tp": 0.0,
         "fine_fp": 0.0,
         "fine_fn": 0.0,
+        "fine_tolerant_matched_predictions": 0.0,
+        "fine_tolerant_matched_targets": 0.0,
+        "fine_prediction_count": 0.0,
         "coarse_tp": 0.0,
         "coarse_fp": 0.0,
         "coarse_fn": 0.0,
-        "empty": 0.0,
+        "coarse_tolerant_matched_predictions": 0.0,
+        "coarse_tolerant_matched_targets": 0.0,
+        "coarse_prediction_count": 0.0,
+        "target_count": 0.0,
     }
-    crop_height = crop_width = samples = 0.0
+    samples = 0.0
     generator = torch.Generator(device=device).manual_seed(seed)
+    offsets = torch.arange(-2, 3, device=device, dtype=torch.float32)
+    rows, columns = torch.meshgrid(offsets, offsets, indexing="ij")
+    tolerance_kernel = (
+        torch.sqrt(rows.square() + columns.square()) * 0.2 <= 0.5 + 1.0e-6
+    ).to(dtype=torch.float32)[None, None]
+
+    def dilate(values):
+        return F.conv2d(
+            values.to(dtype=torch.float32), tolerance_kernel, padding=2
+        ) > 0
+
     for raw_batch in loader:
         batch = _move_batch(raw_batch, device)
         with torch.autocast(
@@ -244,7 +263,11 @@ def _run_sampled_validation(
         expected = batch["clean_lidar_bev"][:, 0:1] >= 0.5
         coarse = sampled["coarse_lidar_bev"][:, 0:1] >= 0.5
         fine = sampled["final_lidar_bev"][:, 0:1] >= 0.5
+        expected_selected = expected & selected
+        target_neighborhood = dilate(expected_selected)
+        counts["target_count"] += float(expected_selected.sum())
         for prefix, predicted in (("coarse", coarse), ("fine", fine)):
+            predicted_selected = predicted & selected
             counts[f"{prefix}_tp"] += float(
                 (predicted & expected & selected).sum()
             )
@@ -254,24 +277,20 @@ def _run_sampled_validation(
             counts[f"{prefix}_fn"] += float(
                 (~predicted & expected & selected).sum()
             )
-        counts["empty"] += float((~expected & selected).sum())
-
-        batch_size = batch["clean_lidar_bev"].shape[0]
-        boxes = sampled.get("crop_boxes")
-        if boxes is None:
-            crop_height += batch_size
-            crop_width += batch_size
-        else:
-            crop_height += float((boxes[:, 1] - boxes[:, 0]).sum())
-            crop_width += float((boxes[:, 3] - boxes[:, 2]).sum())
-        samples += batch_size
+            prediction_neighborhood = dilate(predicted_selected)
+            counts[f"{prefix}_tolerant_matched_predictions"] += float(
+                (predicted_selected & target_neighborhood).sum()
+            )
+            counts[f"{prefix}_tolerant_matched_targets"] += float(
+                (expected_selected & prediction_neighborhood).sum()
+            )
+            counts[f"{prefix}_prediction_count"] += float(
+                predicted_selected.sum()
+            )
+        samples += batch["clean_lidar_bev"].shape[0]
 
     epsilon = 1.0e-8
-    result = {
-        "samples": samples,
-        "average_crop_height": crop_height / max(samples, 1.0),
-        "average_crop_width": crop_width / max(samples, 1.0),
-    }
+    result = {"samples": samples}
     for prefix in ("coarse", "fine"):
         tp = counts[f"{prefix}_tp"]
         fp = counts[f"{prefix}_fp"]
@@ -279,18 +298,40 @@ def _run_sampled_validation(
         result[f"{prefix}_exact_occupancy_iou"] = tp / (
             tp + fp + fn + epsilon
         )
-        result[f"{prefix}_exact_occupancy_precision"] = tp / (
-            tp + fp + epsilon
+        result[f"{prefix}_exact_occupancy_f1"] = 2.0 * tp / (
+            2.0 * tp + fp + fn + epsilon
         )
-        result[f"{prefix}_exact_occupancy_recall"] = tp / (
-            tp + fn + epsilon
+        tolerant_precision = counts[
+            f"{prefix}_tolerant_matched_predictions"
+        ] / (counts[f"{prefix}_prediction_count"] + epsilon)
+        tolerant_recall = counts[f"{prefix}_tolerant_matched_targets"] / (
+            counts["target_count"] + epsilon
         )
-    result["fine_false_positive_occupancy_rate"] = counts["fine_fp"] / (
-        counts["empty"] + epsilon
-    )
+        tolerant_f1 = (
+            2.0
+            * tolerant_precision
+            * tolerant_recall
+            / (tolerant_precision + tolerant_recall + epsilon)
+        )
+        result[f"{prefix}_tolerant_0_5m_f1"] = tolerant_f1
+        result[f"{prefix}_tolerant_0_5m_iou"] = tolerant_f1 / (
+            2.0 - tolerant_f1 + epsilon
+        )
     result["fine_minus_coarse_exact_iou"] = (
         result["fine_exact_occupancy_iou"]
         - result["coarse_exact_occupancy_iou"]
+    )
+    result["fine_minus_coarse_exact_f1"] = (
+        result["fine_exact_occupancy_f1"]
+        - result["coarse_exact_occupancy_f1"]
+    )
+    result["fine_minus_coarse_tolerant_0_5m_iou"] = (
+        result["fine_tolerant_0_5m_iou"]
+        - result["coarse_tolerant_0_5m_iou"]
+    )
+    result["fine_minus_coarse_tolerant_0_5m_f1"] = (
+        result["fine_tolerant_0_5m_f1"]
+        - result["coarse_tolerant_0_5m_f1"]
     )
     return result
 
@@ -360,6 +401,9 @@ def main():
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 4))
+    validation_batch_size = args.validation_batch_size or int(
+        training.get("validation_batch_size", batch_size)
+    )
     workers = (
         args.num_workers
         if args.num_workers is not None
@@ -400,14 +444,20 @@ def main():
         **dataset_options,
     )
     loader_options = {
-        "batch_size": batch_size,
         "num_workers": workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": workers > 0,
         "collate_fn": coarse_reconstruction_collate,
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, **loader_options
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=validation_batch_size,
+        shuffle=False,
+        **loader_options,
+    )
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     resume_checkpoint = (
@@ -615,18 +665,23 @@ def main():
         if val_stats is not None:
             print(
                 f"  sampled validation | {validation_seconds:.1f}s | "
-                f"{int(val_stats['samples'])} samples | "
-                f"crop {val_stats['average_crop_height']:.1f}x"
-                f"{val_stats['average_crop_width']:.1f}\n"
-                f"    exact mask IoU   | {baseline_label} "
+                f"{int(val_stats['samples'])} samples\n"
+                f"    exact IoU/F1     | {baseline_label} "
                 f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
+                f"/ {100.0 * val_stats['coarse_exact_occupancy_f1']:.2f}% "
                 f"-> fine {100.0 * val_stats['fine_exact_occupancy_iou']:.2f}% "
-                f"({100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp)\n"
-                f"    fine occupancy   | precision "
-                f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% | "
-                f"recall {100.0 * val_stats['fine_exact_occupancy_recall']:.2f}% | "
-                f"false-positive rate "
-                f"{100.0 * val_stats['fine_false_positive_occupancy_rate']:.2f}%"
+                f"/ {100.0 * val_stats['fine_exact_occupancy_f1']:.2f}%\n"
+                f"    exact improvement| IoU "
+                f"{100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp | "
+                f"F1 {100.0 * val_stats['fine_minus_coarse_exact_f1']:+.2f} pp\n"
+                f"    0.5m IoU/F1      | {baseline_label} "
+                f"{100.0 * val_stats['coarse_tolerant_0_5m_iou']:.2f}% "
+                f"/ {100.0 * val_stats['coarse_tolerant_0_5m_f1']:.2f}% "
+                f"-> fine {100.0 * val_stats['fine_tolerant_0_5m_iou']:.2f}% "
+                f"/ {100.0 * val_stats['fine_tolerant_0_5m_f1']:.2f}%\n"
+                f"    0.5m improvement | IoU "
+                f"{100.0 * val_stats['fine_minus_coarse_tolerant_0_5m_iou']:+.2f} pp | "
+                f"F1 {100.0 * val_stats['fine_minus_coarse_tolerant_0_5m_f1']:+.2f} pp"
             )
             score = val_stats["fine_minus_coarse_exact_iou"]
             improved = score > best

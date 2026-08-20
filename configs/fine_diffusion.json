@@ -45,6 +45,7 @@
   "training": {
     "epochs": 50,
     "batch_size": 4,
+    "validation_batch_size": 16,
     "num_workers": 4,
     "learning_rate": 0.0002,
     "weight_decay": 0.001,
