@@ -119,6 +119,26 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(len(timesteps), 10)
         self.assertNotIn(999, timesteps.tolist())
 
+    def test_sampling_timesteps_support_full_50_step_schedule(self):
+        model = FineDiffusionRefiner(
+            FineDiffusionConfig(
+                hidden_dim=16,
+                num_heads=4,
+                num_transformer_blocks=1,
+                window_size=4,
+                training_timesteps=1000,
+                sampling_start_timestep=999,
+                sampling_steps=50,
+                global_context_dim=16,
+            )
+        )
+
+        timesteps = model._sampling_timesteps(50, torch.device("cpu"))
+
+        self.assertEqual(int(timesteps[0]), 999)
+        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(len(timesteps), 50)
+
     def test_initial_sampling_residual_uses_zero_residual_prior(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()

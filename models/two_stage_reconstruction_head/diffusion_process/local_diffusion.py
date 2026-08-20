@@ -20,6 +20,9 @@ from .diffusion_process import (
 )
 
 
+SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     """Standard sinusoidal timestep embedding used by the fine refiner."""
 
@@ -98,7 +101,7 @@ class FineDiffusionConfig:
                 "sampling_start_timestep must be in "
                 "[1, training_timesteps)"
             )
-        if self.sampling_steps not in {1, 3, 5, 10, 25, 50}:
+        if self.sampling_steps not in SUPPORTED_SAMPLING_STEPS:
             raise ValueError(
                 "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
             )
@@ -1053,8 +1056,10 @@ class FineDiffusionRefiner(nn.Module):
     def _sampling_timesteps(
         self, sampling_steps: int, device: torch.device
     ) -> torch.Tensor:
-        if sampling_steps not in {1, 3, 5, 10}:
-            raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
+        if sampling_steps not in SUPPORTED_SAMPLING_STEPS:
+            raise ValueError(
+                "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
+            )
         if sampling_steps > self.config.sampling_start_timestep + 1:
             raise ValueError(
                 "sampling_steps cannot exceed sampling_start_timestep + 1"
