@@ -76,7 +76,7 @@ from .diffusion_process.diffusion_process import (
     BEVChannelNormalization,
     DiffusionProcessConfig,
     GaussianNoiseSchedule,
-    MaskedEpsilonMSELoss,
+    MaskedFlowMSELoss,
     ResidualChannelNormalization,
     residual_target,
 )

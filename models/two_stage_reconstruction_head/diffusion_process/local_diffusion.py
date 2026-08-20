@@ -1,4 +1,4 @@
-"""Local cropped dense Transformer for fine residual LiDAR diffusion."""
+"""Local coarse-anchored residual-flow refiner for LiDAR reconstruction."""
 
 from __future__ import annotations
 
@@ -13,16 +13,14 @@ import torch.nn.functional as F
 from ..encoders import _group_count
 from .diffusion_process import (
     BEVChannelNormalization,
-    DiffusionProcessConfig,
-    GaussianNoiseSchedule,
-    MaskedEpsilonMSELoss,
+    MaskedFlowMSELoss,
     ResidualChannelNormalization,
     residual_target,
 )
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 4
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 5
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -48,7 +46,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 @dataclass(frozen=True)
 class FineDiffusionConfig:
-    """Configuration for the V1 local residual-diffusion refiner."""
+    """Configuration for the coarse-anchored local residual-flow refiner."""
 
     enabled: bool = True
     bypass_coarse_reconstruction: bool = False
@@ -62,13 +60,10 @@ class FineDiffusionConfig:
     crop_context_margin_cells: int = 8
     use_global_faulty_context: bool = True
     global_context_dim: int = 128
-    diffusion_prediction_type: str = "epsilon"
+    diffusion_prediction_type: str = "residual_flow"
     training_timesteps: int = 1000
-    sampling_start_timestep: int = 999
     sampling_steps: int = 10
-    noise_schedule: str = "cosine"
-    sampler: str = "ddim"
-    ddim_eta: float = 0.0
+    coarse_start_training_fraction: float = 0.25
     lambda_diffusion: float = 1.0
     lambda_exact_reconstruction: float = 1.0
     lambda_degradation: float = 1.0
@@ -95,27 +90,19 @@ class FineDiffusionConfig:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if self.crop_context_margin_cells < 0:
             raise ValueError("crop_context_margin_cells must be non-negative")
-        if self.diffusion_prediction_type != "epsilon":
-            raise ValueError("V1 supports only epsilon prediction")
+        if self.diffusion_prediction_type != "residual_flow":
+            raise ValueError(
+                "Fine refinement requires residual_flow prediction; Gaussian "
+                "epsilon prediction is intentionally unsupported"
+            )
         if self.training_timesteps < 2:
             raise ValueError("training_timesteps must be at least 2")
-        if not 1 <= self.sampling_start_timestep < self.training_timesteps:
-            raise ValueError(
-                "sampling_start_timestep must be in "
-                "[1, training_timesteps)"
-            )
         if self.sampling_steps not in SUPPORTED_SAMPLING_STEPS:
             raise ValueError(
                 "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
             )
-        if self.sampling_steps > self.sampling_start_timestep + 1:
-            raise ValueError(
-                "sampling_steps cannot exceed sampling_start_timestep + 1"
-            )
-        if self.noise_schedule != "cosine" or self.sampler != "ddim":
-            raise ValueError("V1 requires cosine noise and DDIM sampling")
-        if self.ddim_eta < 0:
-            raise ValueError("ddim_eta must be non-negative")
+        if not 0.0 <= self.coarse_start_training_fraction <= 1.0:
+            raise ValueError("coarse_start_training_fraction must be in [0,1]")
         for name in (
             "lambda_diffusion",
             "lambda_exact_reconstruction",
@@ -575,7 +562,7 @@ class DiffusionRefinementBlock(nn.Module):
 
 
 class LocalResidualDiffusionTransformer(nn.Module):
-    """Resolution-preserving local epsilon predictor."""
+    """Resolution-preserving local residual-flow velocity predictor."""
 
     def __init__(self, config: FineDiffusionConfig):
         super().__init__()
@@ -625,6 +612,10 @@ class LocalResidualDiffusionTransformer(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(config.hidden_dim, config.lidar_channels, 3, padding=1),
         )
+        # An untrained refiner is an identity mapping: zero velocity means the
+        # output remains exactly the frozen coarse reconstruction.
+        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.zeros_(self.output_head[-1].bias)
 
     def global_context(
         self,
@@ -642,7 +633,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
 
     def forward(
         self,
-        noisy_residual: torch.Tensor,
+        current_residual: torch.Tensor,
         coarse: torch.Tensor,
         trusted_faulty: torch.Tensor,
         radar: torch.Tensor,
@@ -666,7 +657,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
             auxiliary_condition_input, valid
         )
         residual_stem_input = torch.cat(
-            (noisy_residual, coordinates), dim=1
+            (current_residual, coordinates), dim=1
         )
         tensor = (
             self.residual_stem(residual_stem_input) + auxiliary_condition
@@ -684,8 +675,9 @@ class LocalResidualDiffusionTransformer(nn.Module):
                 coarse_valid,
                 radar_valid,
             )
-        epsilon = self.output_head(tensor) * reconstruction_mask * valid
-        return epsilon, auxiliary_condition, {
+        velocity = torch.tanh(self.output_head(tensor))
+        velocity = velocity * reconstruction_mask * valid
+        return velocity, auxiliary_condition, {
             "raw_coarse_cross_attention": coarse,
             "coarse_cross_attention_valid": coarse_valid,
             "raw_radar_cross_attention": radar,
@@ -699,6 +691,8 @@ def fine_diffusion_architecture_metadata(
 ) -> dict[str, int | str]:
     return {
         "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
+        "process": "coarse_anchored_residual_flow",
+        "initial_state": "frozen_coarse_reconstruction",
         "residual_stem_input_channels": config.lidar_channels + 4,
         "coarse_cross_attention": "raw_full_resolution_reconstruction_mask",
         "radar_cross_attention": "raw_full_resolution_reconstruction_mask",
@@ -724,8 +718,8 @@ def validate_fine_diffusion_checkpoint_compatibility(
         )
     if architecture_version != FINE_DIFFUSION_ARCHITECTURE_VERSION:
         raise ValueError(
-            "Fine Diffusion checkpoint predates raw full-resolution coarse/radar "
-            "cross-attention. Start a fresh Fine Diffusion run."
+            "Fine checkpoint is not the coarse-anchored residual-flow "
+            "architecture. Start a fresh Fine Diffusion run."
         )
     if actual != expected:
         raise ValueError(
@@ -836,7 +830,7 @@ class MaskedNoDegradationLoss(nn.Module):
 
 
 class FineDiffusionRefiner(nn.Module):
-    """Train and sample masked local residual diffusion over aligned BEV crops."""
+    """Train and integrate masked corrections from a frozen coarse BEV."""
 
     def __init__(
         self,
@@ -851,13 +845,6 @@ class FineDiffusionRefiner(nn.Module):
             self.config.crop_context_margin_cells,
             self.config.window_size,
         )
-        process_config = DiffusionProcessConfig(
-            num_train_timesteps=self.config.training_timesteps,
-            noise_schedule=self.config.noise_schedule,
-            prediction_type=self.config.diffusion_prediction_type,
-            denominator_epsilon=self.config.denominator_epsilon,
-        )
-        self.schedule = GaussianNoiseSchedule(process_config)
         self.normalization = normalization or BEVChannelNormalization(
             means=(0.0,) * self.config.lidar_channels,
             stds=(1.0,) * self.config.lidar_channels,
@@ -871,7 +858,7 @@ class FineDiffusionRefiner(nn.Module):
             )
         )
         self.transformer = LocalResidualDiffusionTransformer(self.config)
-        self.diffusion_loss = MaskedEpsilonMSELoss(
+        self.diffusion_loss = MaskedFlowMSELoss(
             self.config.denominator_epsilon
         )
         self.exact_loss = MaskedExactReconstructionLoss(
@@ -976,7 +963,7 @@ class FineDiffusionRefiner(nn.Module):
             tensors, reconstruction_mask, halo_mask
         )
 
-    def _predict_epsilon(
+    def _predict_velocity(
         self,
         residual_t: torch.Tensor,
         crops: ReconstructionCropBatch,
@@ -984,7 +971,7 @@ class FineDiffusionRefiner(nn.Module):
         global_embedding: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         values = crops.tensors
-        return self.transformer(
+        velocity_physical, condition, debug = self.transformer(
             residual_t,
             self.normalization.normalize(values["coarse"]),
             self.normalization.normalize(values["trusted_faulty"]),
@@ -996,6 +983,12 @@ class FineDiffusionRefiner(nn.Module):
             timestep,
             global_embedding,
         )
+        repair = values["repair"] * crops.valid_mask
+        velocity_normalized = self.residual_normalization.normalize(
+            velocity_physical
+        ) * repair
+        debug["predicted_velocity_physical"] = velocity_physical
+        return velocity_normalized, condition, debug
 
     @staticmethod
     def _compose_full(
@@ -1021,7 +1014,6 @@ class FineDiffusionRefiner(nn.Module):
         halo_mask: torch.Tensor,
         *,
         timestep: torch.Tensor | None = None,
-        epsilon: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
         return_debug: bool = False,
         return_diagnostics: bool = True,
@@ -1055,28 +1047,32 @@ class FineDiffusionRefiner(nn.Module):
                 device=coarse_lidar_bev.device,
                 generator=generator,
             )
+            # Deployment always starts at the frozen coarse output. Expose the
+            # model to that exact state frequently instead of only 1/T times.
+            start_samples = torch.rand(
+                (batch,),
+                device=coarse_lidar_bev.device,
+                generator=generator,
+            ) < self.config.coarse_start_training_fraction
+            timestep = timestep.masked_fill(start_samples, 0)
         if timestep.shape != (batch,):
             raise ValueError("timestep must have shape [B]")
-        if epsilon is None:
-            epsilon = torch.randn(
-                residual_gt_normalized.shape,
-                device=residual_gt_normalized.device,
-                dtype=residual_gt_normalized.dtype,
-                generator=generator,
-            )
-        if epsilon.shape != residual_gt_normalized.shape:
-            raise ValueError("epsilon must match the padded residual crop")
-        residual_t, epsilon_masked = self.schedule.add_masked_noise(
-            residual_gt_normalized, epsilon, timestep, repair
-        )
+        progress = (
+            timestep.to(residual_gt_normalized.dtype)
+            / float(self.config.training_timesteps - 1)
+        ).reshape(batch, 1, 1, 1)
+        # Linear flow path: progress zero is exactly coarse; progress one is
+        # clean. The target velocity is clean-minus-coarse everywhere.
+        residual_t = progress * residual_gt_normalized * repair
+        target_velocity = residual_gt_normalized * repair
         trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
         )
-        epsilon_pred, local_condition, transformer_debug = self._predict_epsilon(
+        velocity_pred, local_condition, transformer_debug = self._predict_velocity(
             residual_t, crops, timestep, global_embedding
         )
-        residual_x0_normalized = self.schedule.predict_x0(
-            residual_t, epsilon_pred, timestep
+        residual_x0_normalized = (
+            residual_t + (1.0 - progress) * velocity_pred
         ) * repair
         predicted_residual_physical = self.residual_normalization.denormalize(
             residual_x0_normalized
@@ -1087,7 +1083,9 @@ class FineDiffusionRefiner(nn.Module):
         refined_full, final = self._compose_full(
             crops, refined_crop, faulty_lidar_bev, reconstruction_mask
         )
-        diffusion_loss = self.diffusion_loss(epsilon_pred, epsilon_masked, repair)
+        diffusion_loss = self.diffusion_loss(
+            velocity_pred, target_velocity, repair
+        )
         exact_loss = self.exact_loss(
             refined_crop, crops.tensors["clean"], repair
         )
@@ -1183,9 +1181,10 @@ class FineDiffusionRefiner(nn.Module):
                 "trusted_global_faulty_lidar": trusted_global,
                 "residual_gt_physical": residual_gt_physical,
                 "residual_gt_normalized": residual_gt_normalized,
-                "noisy_residual": residual_t,
-                "epsilon": epsilon_masked,
-                "predicted_epsilon": epsilon_pred,
+                "flow_progress": progress,
+                "current_residual": residual_t,
+                "target_velocity": target_velocity,
+                "predicted_velocity": velocity_pred,
                 "residual_x0_normalized": residual_x0_normalized,
                 "predicted_residual_physical": predicted_residual_physical,
                 "local_condition": local_condition,
@@ -1202,16 +1201,12 @@ class FineDiffusionRefiner(nn.Module):
             raise ValueError(
                 "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
             )
-        if sampling_steps > self.config.sampling_start_timestep + 1:
-            raise ValueError(
-                "sampling_steps cannot exceed sampling_start_timestep + 1"
-            )
         return torch.linspace(
-            self.config.sampling_start_timestep,
             0,
-            sampling_steps,
+            self.config.training_timesteps,
+            sampling_steps + 1,
             device=device,
-        ).round().long()
+        )[:-1].round().long().clamp_max(self.config.training_timesteps - 1)
 
     @torch.no_grad()
     def sample(
@@ -1256,7 +1251,7 @@ class FineDiffusionRefiner(nn.Module):
             coarse_lidar_bev.device,
         )
         start_timestep = timesteps[0].expand(coarse_lidar_bev.shape[0])
-        initial_noise = torch.randn(
+        residual_t = torch.zeros(
             (
                 coarse_lidar_bev.shape[0],
                 self.config.lidar_channels,
@@ -1264,42 +1259,29 @@ class FineDiffusionRefiner(nn.Module):
             ),
             device=coarse_lidar_bev.device,
             dtype=coarse_lidar_bev.dtype,
-            generator=generator,
         )
-        start_sigma = self.schedule.extract(
-            self.schedule.sqrt_one_minus_alpha_bars,
-            start_timestep,
-            initial_noise,
-        )
-        residual_t = repair * start_sigma * initial_noise
         initial_residual = residual_t.detach().clone()
         _trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
         )
         intermediates = []
         residual_x0_normalized = torch.zeros_like(residual_t)
-        for index, scalar_timestep in enumerate(timesteps):
+        step_size = 1.0 / float(len(timesteps))
+        for scalar_timestep in timesteps:
             timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
-            previous_scalar = (
-                timesteps[index + 1]
-                if index + 1 < len(timesteps)
-                else scalar_timestep.new_tensor(-1)
-            )
-            previous = previous_scalar.expand_as(timestep)
-            epsilon_pred, _local_condition, transformer_debug = self._predict_epsilon(
+            velocity_pred, _local_condition, transformer_debug = self._predict_velocity(
                 residual_t, crops, timestep, global_embedding
             )
-            residual_t, residual_x0_normalized = self.schedule.ddim_step(
-                residual_t,
-                epsilon_pred,
-                timestep,
-                previous,
-                repair,
-                eta=self.config.ddim_eta,
-                generator=generator,
-            )
+            residual_t = (residual_t + step_size * velocity_pred) * repair
+            physical = self.residual_normalization.denormalize(residual_t)
+            physical = (
+                (crops.tensors["coarse"] + physical).clamp(0.0, 1.0)
+                - crops.tensors["coarse"]
+            ) * repair
+            residual_t = self.residual_normalization.normalize(physical) * repair
             if return_debug:
                 intermediates.append(residual_t.detach().clone())
+        residual_x0_normalized = residual_t
         predicted_residual_physical = self.residual_normalization.denormalize(
             residual_x0_normalized * repair
         ) * repair
@@ -1323,7 +1305,7 @@ class FineDiffusionRefiner(nn.Module):
             output["crop_batch"] = crops
             output["intermediate_residuals"] = intermediates
             output["sampling_timesteps"] = timesteps.detach().clone()
-            output["sampling_start_timestep"] = start_timestep.detach().clone()
+            output["sampling_start_progress"] = torch.zeros_like(start_timestep)
             output["initial_residual"] = initial_residual
             output["initial_lidar_bev"] = (
                 coarse_lidar_bev

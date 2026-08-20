@@ -36,7 +36,6 @@ def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
         use_global_faulty_context=global_context,
         global_context_dim=16,
         training_timesteps=12,
-        sampling_start_timestep=11,
         sampling_steps=sampling_steps,
     )
 
@@ -106,16 +105,16 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
-    def test_default_sampling_is_terminal_ten_step_ddim(self):
+    def test_default_sampling_is_forward_ten_step_residual_flow(self):
         config = FineDiffusionConfig()
         model = FineDiffusionRefiner(config)
         timesteps = model._sampling_timesteps(10, torch.device("cpu"))
         self.assertEqual(config.sampling_steps, 10)
-        self.assertEqual(int(timesteps[0]), 999)
-        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(int(timesteps[0]), 0)
+        self.assertEqual(int(timesteps[-1]), 900)
         self.assertEqual(len(timesteps), 10)
 
-    def test_sampling_timesteps_start_from_configured_low_strength_timestep(self):
+    def test_sampling_flow_always_starts_from_zero_progress(self):
         model = FineDiffusionRefiner(
             FineDiffusionConfig(
                 hidden_dim=16,
@@ -123,7 +122,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 num_transformer_blocks=1,
                 window_size=4,
                 training_timesteps=1000,
-                sampling_start_timestep=500,
                 sampling_steps=10,
                 global_context_dim=16,
             )
@@ -131,10 +129,9 @@ class FineDiffusionRefinerTests(unittest.TestCase):
 
         timesteps = model._sampling_timesteps(10, torch.device("cpu"))
 
-        self.assertEqual(int(timesteps[0]), 500)
-        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(int(timesteps[0]), 0)
+        self.assertEqual(int(timesteps[-1]), 900)
         self.assertEqual(len(timesteps), 10)
-        self.assertNotIn(999, timesteps.tolist())
 
     def test_sampling_timesteps_support_full_50_step_schedule(self):
         model = FineDiffusionRefiner(
@@ -144,7 +141,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 num_transformer_blocks=1,
                 window_size=4,
                 training_timesteps=1000,
-                sampling_start_timestep=999,
                 sampling_steps=50,
                 global_context_dim=16,
             )
@@ -152,11 +148,11 @@ class FineDiffusionRefinerTests(unittest.TestCase):
 
         timesteps = model._sampling_timesteps(50, torch.device("cpu"))
 
-        self.assertEqual(int(timesteps[0]), 999)
-        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(int(timesteps[0]), 0)
+        self.assertEqual(int(timesteps[-1]), 980)
         self.assertEqual(len(timesteps), 50)
 
-    def test_initial_sampling_residual_uses_masked_gaussian_prior(self):
+    def test_initial_sampling_state_is_exactly_coarse(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()
         generator = torch.Generator().manual_seed(17)
@@ -171,23 +167,29 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             return_debug=True,
         )
 
-        crops = output["crop_batch"]
-        self.assertGreater(int(output["initial_residual"].count_nonzero()), 0)
-        expected_initial_lidar = (
-            coarse
-            + crops.paste(output["initial_residual"]) * repair
+        self.assertEqual(int(output["initial_residual"].count_nonzero()), 0)
+        self.assertTrue(torch.equal(output["initial_lidar_bev"], coarse))
+
+    def test_zero_initialized_refiner_preserves_coarse_inside_repair_mask(self):
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()
+
+        output = model.sample(
+            coarse, faulty, radar, repair, halo, sampling_steps=3
+        )
+
+        self.assertEqual(int(output["predicted_residual"].count_nonzero()), 0)
+        self.assertTrue(
+            torch.equal(
+                output["final_lidar_bev"] * repair,
+                coarse * repair,
+            )
         )
         self.assertTrue(
-            torch.equal(output["initial_lidar_bev"], expected_initial_lidar)
-        )
-        self.assertEqual(
-            int(
-                (
-                    output["initial_residual"]
-                    * (1 - crops.tensors["repair"] * crops.valid_mask)
-                ).count_nonzero()
-            ),
-            0,
+            torch.equal(
+                output["final_lidar_bev"] * (1 - repair),
+                faulty * (1 - repair),
+            )
         )
 
     def test_no_degradation_loss_only_penalizes_worse_refinement(self):
@@ -285,7 +287,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             0,
         )
         self.assertEqual(
-            int((debug["noisy_residual"] * (1 - crop_batch.tensors["repair"])).count_nonzero()),
+            int((debug["current_residual"] * (1 - crop_batch.tensors["repair"])).count_nonzero()),
             0,
         )
         outside = 1 - repair
@@ -314,7 +316,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(torch.allclose(restored, physical, atol=1.0e-7))
         self.assertEqual(float(restored[0, 0, 0, 0]), 0.0)
 
-    def test_sampling_adds_denormalized_residual_in_physical_units(self):
+    def test_sampling_integrates_denormalized_velocity_in_physical_units(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         normalizer = ResidualChannelNormalization((0.1, 0.2, 0.4))
         model = FineDiffusionRefiner(
@@ -322,26 +324,26 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             residual_normalization=normalizer,
         ).eval()
 
-        def fixed_step(
-            residual_t,
-            _epsilon_prediction,
-            _timestep,
-            _previous_timestep,
-            reconstruction_mask,
-            **_kwargs,
-        ):
-            normalized = torch.ones_like(residual_t) * reconstruction_mask
-            return torch.zeros_like(residual_t), normalized
+        def fixed_velocity(residual_t, crops, timestep, global_embedding):
+            del timestep, global_embedding
+            normalized = torch.ones_like(residual_t) * crops.tensors["repair"]
+            return normalized, normalized, {}
 
-        with mock.patch.object(model.schedule, "ddim_step", side_effect=fixed_step):
+        with mock.patch.object(
+            model, "_predict_velocity", side_effect=fixed_velocity
+        ):
             output = model.sample(
                 coarse, faulty, radar, repair, halo, sampling_steps=1
             )
         predicted = output["predicted_residual"]
         for channel, expected in enumerate((0.1, 0.2, 0.4)):
             selected = predicted[:, channel : channel + 1][repair > 0.5]
+            expected_values = (
+                (coarse[:, channel : channel + 1] + expected).clamp(0.0, 1.0)
+                - coarse[:, channel : channel + 1]
+            )[repair > 0.5]
             self.assertTrue(
-                torch.allclose(selected, torch.full_like(selected, expected))
+                torch.allclose(selected, expected_values)
             )
 
     def test_residual_statistics_use_only_masked_training_values(self):
@@ -388,7 +390,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             repair,
             halo,
             timestep=torch.tensor([4]),
-            epsilon=torch.zeros(1, 3, 8, 8),
             return_debug=True,
         )
         debug = output["debug"]
@@ -446,7 +447,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             repair,
             halo,
             timestep=torch.tensor([4]),
-            epsilon=torch.zeros_like(debug["noisy_residual"]),
             return_debug=True,
         )["debug"]
         self.assertFalse(
@@ -458,7 +458,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 debug["residual_stem_input"][:, :3],
-                debug["noisy_residual"],
+                debug["current_residual"],
             )
         )
 
@@ -501,7 +501,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             )
         )
 
-    def test_inference_needs_no_clean_lidar_and_ddim_is_masked(self):
+    def test_inference_needs_no_clean_lidar_and_flow_is_masked(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config()).eval()
         output = model.sample(

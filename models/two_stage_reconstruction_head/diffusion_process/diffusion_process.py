@@ -298,16 +298,20 @@ def residual_target(clean_lidar_bev, coarse_lidar_bev, reconstruction_mask):
     return reconstruction_mask * (clean_lidar_bev - coarse_lidar_bev)
 
 
-class MaskedEpsilonMSELoss(nn.Module):
+class MaskedFlowMSELoss(nn.Module):
+    """Velocity MSE normalized by selected cell-channel count."""
+
     def __init__(self, denominator_epsilon: float = 1.0e-8):
         super().__init__()
         if denominator_epsilon <= 0:
             raise ValueError("denominator_epsilon must be positive")
         self.denominator_epsilon = float(denominator_epsilon)
 
-    def forward(self, epsilon_prediction, epsilon, reconstruction_mask):
-        if epsilon_prediction.shape != epsilon.shape:
-            raise ValueError("epsilon prediction and target must have identical shapes")
-        squared_error = reconstruction_mask * (epsilon_prediction - epsilon).square()
-        denominator = epsilon.shape[1] * reconstruction_mask.sum()
+    def forward(self, velocity_prediction, target_velocity, reconstruction_mask):
+        if velocity_prediction.shape != target_velocity.shape:
+            raise ValueError("velocity prediction and target must have identical shapes")
+        squared_error = reconstruction_mask * (
+            velocity_prediction - target_velocity
+        ).square()
+        denominator = target_velocity.shape[1] * reconstruction_mask.sum()
         return squared_error.sum() / (denominator + self.denominator_epsilon)
