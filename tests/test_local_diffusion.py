@@ -6,6 +6,7 @@ import torch
 from models.two_stage_reconstruction_head.diffusion_process.local_diffusion import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
+    MaskedNoDegradationLoss,
     ReconstructionCropExtractor,
     WindowAttention2d,
 )
@@ -26,6 +27,7 @@ def _config(*, global_context=True, sampling_steps=3):
         use_global_faulty_context=global_context,
         global_context_dim=16,
         training_timesteps=12,
+        sampling_start_timestep=11,
         sampling_steps=sampling_steps,
     )
 
@@ -95,6 +97,115 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_sampling_timesteps_start_from_configured_low_strength_timestep(self):
+        model = FineDiffusionRefiner(
+            FineDiffusionConfig(
+                hidden_dim=16,
+                num_heads=4,
+                num_transformer_blocks=1,
+                window_size=4,
+                training_timesteps=1000,
+                sampling_start_timestep=500,
+                sampling_steps=10,
+                global_context_dim=16,
+            )
+        )
+
+        timesteps = model._sampling_timesteps(10, torch.device("cpu"))
+
+        self.assertEqual(int(timesteps[0]), 500)
+        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(len(timesteps), 10)
+        self.assertNotIn(999, timesteps.tolist())
+
+    def test_initial_sampling_residual_uses_zero_residual_prior(self):
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()
+        generator = torch.Generator().manual_seed(123)
+
+        output = model.sample(
+            coarse,
+            faulty,
+            radar,
+            repair,
+            halo,
+            sampling_steps=3,
+            generator=generator,
+            return_debug=True,
+        )
+
+        crops = output["crop_batch"]
+        expected_generator = torch.Generator().manual_seed(123)
+        noise = torch.randn(
+            output["initial_residual"].shape,
+            dtype=output["initial_residual"].dtype,
+            generator=expected_generator,
+        )
+        start = torch.full((coarse.shape[0],), 11, dtype=torch.long)
+        sigma = model.schedule.extract(
+            model.schedule.sqrt_one_minus_alpha_bars,
+            start,
+            noise,
+        )
+        expected = crops.tensors["repair"] * crops.valid_mask * sigma * noise
+
+        self.assertTrue(torch.allclose(output["initial_residual"], expected))
+        self.assertEqual(
+            int(
+                (
+                    output["initial_residual"]
+                    * (1 - crops.tensors["repair"] * crops.valid_mask)
+                ).count_nonzero()
+            ),
+            0,
+        )
+
+    def test_no_degradation_loss_only_penalizes_worse_refinement(self):
+        loss = MaskedNoDegradationLoss()
+        clean = torch.zeros(1, 3, 2, 2)
+        clean[:, 0] = 1.0
+        clean[:, 1:] = 0.8
+        coarse = clean.clone()
+        coarse[:, 0] = 0.6
+        coarse[:, 1:] = 0.4
+        mask = torch.ones(1, 1, 2, 2)
+
+        self.assertAlmostEqual(float(loss(coarse, coarse, clean, mask)), 0.0)
+
+        better = clean.clone()
+        better[:, 0] = 0.9
+        better[:, 1:] = 0.7
+        self.assertAlmostEqual(float(loss(better, coarse, clean, mask)), 0.0)
+
+        worse = clean.clone()
+        worse[:, 0] = 0.2
+        worse[:, 1:] = 0.1
+        self.assertGreater(float(loss(worse, coarse, clean, mask)), 0.0)
+
+    def test_residual_regularizer_is_masked_and_magnitude_sensitive(self):
+        model = FineDiffusionRefiner(_config())
+        mask = torch.zeros(1, 1, 2, 2)
+        mask[:, :, 0, 0] = 1.0
+        zero = torch.zeros(1, 3, 2, 2)
+        small = zero.clone()
+        large = zero.clone()
+        outside_only = zero.clone()
+        small[:, :, 0, 0] = 0.1
+        large[:, :, 0, 0] = 0.5
+        outside_only[:, :, 1, 1] = 100.0
+
+        self.assertAlmostEqual(
+            float(model._residual_regularization_loss(zero, mask)), 0.0
+        )
+        self.assertGreater(
+            float(model._residual_regularization_loss(large, mask)),
+            float(model._residual_regularization_loss(small, mask)),
+        )
+        self.assertAlmostEqual(
+            float(model._residual_regularization_loss(outside_only, mask)),
+            0.0,
+        )
+
     def test_window_attention_tolerates_amp_output_dtype(self):
         attention = WindowAttention2d(
             hidden_dim=4, num_heads=2, window_size=2, dropout=0.0

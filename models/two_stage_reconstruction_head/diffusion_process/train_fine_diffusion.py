@@ -163,6 +163,13 @@ def _run_epoch(
             "exact_reconstruction_loss": float(
                 output["exact_reconstruction_loss"].detach()
             ),
+            "degradation_loss": float(output["degradation_loss"].detach()),
+            "residual_regularization_loss": float(
+                output["residual_regularization_loss"].detach()
+            ),
+            "coarse_exact_reconstruction_loss": float(
+                output["coarse_exact_reconstruction_loss"].detach()
+            ),
             **_mean_statistics(output["statistics"]),
         }
         for key, value in values.items():
@@ -350,9 +357,17 @@ def main():
         history.append(row)
         print(
             f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
+            f"train/diffusion={train_stats['diffusion_loss']:.6f} "
+            f"train/exact={train_stats['exact_reconstruction_loss']:.6f} "
+            f"train/degradation={train_stats['degradation_loss']:.6f} "
+            f"train/residual_reg={train_stats['residual_regularization_loss']:.6f} "
             f"val/loss={val_stats['loss']:.6f} "
             f"val/diffusion={val_stats['diffusion_loss']:.6f} "
             f"val/exact={val_stats['exact_reconstruction_loss']:.6f} "
+            f"val/degradation={val_stats['degradation_loss']:.6f} "
+            f"val/residual_reg={val_stats['residual_regularization_loss']:.6f} "
+            f"val/coarse_exact={val_stats['coarse_exact_reconstruction_loss']:.6f} "
+            f"val/residual_abs={val_stats['predicted_residual_abs_mean']:.6f} "
             f"val/IoU={100.0 * val_stats['exact_occupancy_iou']:.2f}% "
             f"val/P={100.0 * val_stats['exact_occupancy_precision']:.2f}% "
             f"val/R={100.0 * val_stats['exact_occupancy_recall']:.2f}% "

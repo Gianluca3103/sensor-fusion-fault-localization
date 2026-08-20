@@ -58,12 +58,15 @@ class FineDiffusionConfig:
     global_context_dim: int = 128
     diffusion_prediction_type: str = "epsilon"
     training_timesteps: int = 1000
-    sampling_steps: int = 3
+    sampling_start_timestep: int = 500
+    sampling_steps: int = 10
     noise_schedule: str = "cosine"
     sampler: str = "ddim"
     ddim_eta: float = 0.0
     lambda_diffusion: float = 1.0
     lambda_exact_reconstruction: float = 1.0
+    lambda_degradation: float = 1.0
+    lambda_residual_regularization: float = 0.05
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
 
@@ -89,15 +92,27 @@ class FineDiffusionConfig:
             raise ValueError("V1 supports only epsilon prediction")
         if self.training_timesteps < 2:
             raise ValueError("training_timesteps must be at least 2")
+        if not 1 <= self.sampling_start_timestep < self.training_timesteps:
+            raise ValueError(
+                "sampling_start_timestep must be in "
+                "[1, training_timesteps)"
+            )
         if self.sampling_steps not in {1, 3, 5, 10}:
             raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
-        if self.sampling_steps > self.training_timesteps:
-            raise ValueError("sampling_steps cannot exceed training_timesteps")
+        if self.sampling_steps > self.sampling_start_timestep + 1:
+            raise ValueError(
+                "sampling_steps cannot exceed sampling_start_timestep + 1"
+            )
         if self.noise_schedule != "cosine" or self.sampler != "ddim":
             raise ValueError("V1 requires cosine noise and DDIM sampling")
         if self.ddim_eta < 0:
             raise ValueError("ddim_eta must be non-negative")
-        for name in ("lambda_diffusion", "lambda_exact_reconstruction"):
+        for name in (
+            "lambda_diffusion",
+            "lambda_exact_reconstruction",
+            "lambda_degradation",
+            "lambda_residual_regularization",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
         if not 0 <= self.dropout < 1:
@@ -650,6 +665,66 @@ class MaskedExactReconstructionLoss(nn.Module):
         return occupancy_loss + continuous_loss
 
 
+class MaskedNoDegradationLoss(nn.Module):
+    """Penalize refined cells only when they are worse than coarse cells."""
+
+    def __init__(self, epsilon: float = 1.0e-8):
+        super().__init__()
+        self.epsilon = float(epsilon)
+
+    def forward(
+        self,
+        refined: torch.Tensor,
+        coarse: torch.Tensor,
+        clean: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.autocast(device_type=refined.device.type, enabled=False):
+            refined_float = refined.float()
+            coarse_float = coarse.detach().float()
+            clean_float = clean.float()
+            mask_float = reconstruction_mask.float()
+            occupied = clean_float[:, 0:1].clamp(0.0, 1.0)
+
+            refined_occupancy_error = F.binary_cross_entropy(
+                refined_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
+                occupied,
+                reduction="none",
+            )
+            coarse_occupancy_error = F.binary_cross_entropy(
+                coarse_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
+                occupied,
+                reduction="none",
+            )
+            occupancy_degradation = F.relu(
+                refined_occupancy_error - coarse_occupancy_error
+            )
+            occupancy_loss = (occupancy_degradation * mask_float).sum() / (
+                mask_float.sum() + self.epsilon
+            )
+
+            if refined.shape[1] == 1:
+                return occupancy_loss
+
+            continuous_mask = mask_float * occupied
+            refined_continuous_error = F.smooth_l1_loss(
+                refined_float[:, 1:], clean_float[:, 1:], reduction="none"
+            )
+            coarse_continuous_error = F.smooth_l1_loss(
+                coarse_float[:, 1:], clean_float[:, 1:], reduction="none"
+            )
+            continuous_degradation = F.relu(
+                refined_continuous_error - coarse_continuous_error
+            )
+            denominator = (
+                continuous_mask.sum() * (refined.shape[1] - 1) + self.epsilon
+            )
+            continuous_loss = (
+                continuous_degradation * continuous_mask
+            ).sum() / denominator
+            return occupancy_loss + continuous_loss
+
+
 class FineDiffusionRefiner(nn.Module):
     """Train and sample masked local residual diffusion over aligned BEV crops."""
 
@@ -683,6 +758,22 @@ class FineDiffusionRefiner(nn.Module):
         self.exact_loss = MaskedExactReconstructionLoss(
             self.config.denominator_epsilon
         )
+        self.degradation_loss = MaskedNoDegradationLoss(
+            self.config.denominator_epsilon
+        )
+
+    def _residual_regularization_loss(
+        self,
+        predicted_residual_physical: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        denominator = (
+            reconstruction_mask.sum() * predicted_residual_physical.shape[1]
+            + self.config.denominator_epsilon
+        )
+        return (
+            predicted_residual_physical.abs() * reconstruction_mask
+        ).sum() / denominator
 
     def _validate_inputs(
         self,
@@ -864,13 +955,15 @@ class FineDiffusionRefiner(nn.Module):
         epsilon_pred, local_condition = self._predict_epsilon(
             residual_t, crops, timestep, global_embedding
         )
-        residual_x0 = self.schedule.predict_x0(
+        residual_x0_normalized = self.schedule.predict_x0(
             residual_t, epsilon_pred, timestep
         ) * repair
-        refined_crop = crops.tensors["coarse"] + self.normalization.denormalize_residual(
-            residual_x0
+        predicted_residual_physical = self.normalization.denormalize_residual(
+            residual_x0_normalized
         ) * repair
-        refined_crop = refined_crop.clamp(0.0, 1.0)
+        refined_crop = (
+            crops.tensors["coarse"] + predicted_residual_physical
+        ).clamp(0.0, 1.0)
         refined_full, final = self._compose_full(
             crops, refined_crop, faulty_lidar_bev, reconstruction_mask
         )
@@ -878,9 +971,23 @@ class FineDiffusionRefiner(nn.Module):
         exact_loss = self.exact_loss(
             refined_crop, crops.tensors["clean"], repair
         )
+        coarse_exact_loss = self.exact_loss(
+            crops.tensors["coarse"].detach(), crops.tensors["clean"], repair
+        )
+        degradation_loss = self.degradation_loss(
+            refined_crop, crops.tensors["coarse"], crops.tensors["clean"], repair
+        )
+        residual_regularization_loss = self._residual_regularization_loss(
+            predicted_residual_physical, repair
+        )
         total_loss = (
             self.config.lambda_diffusion * diffusion_loss
             + self.config.lambda_exact_reconstruction * exact_loss
+            + self.config.lambda_degradation * degradation_loss
+            + (
+                self.config.lambda_residual_regularization
+                * residual_regularization_loss
+            )
         )
         repair_cells = repair.sum(dim=(1, 2, 3))
         crop_cells = crops.valid_mask.sum(dim=(1, 2, 3)).clamp_min(1)
@@ -899,16 +1006,25 @@ class FineDiffusionRefiner(nn.Module):
                 / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
             ),
             "predicted_residual_abs_mean": (
-                residual_x0.abs().sum()
-                / (repair.sum() * residual_x0.shape[1]).clamp_min(1)
+                predicted_residual_physical.abs().sum()
+                / (
+                    repair.sum() * predicted_residual_physical.shape[1]
+                    + self.config.denominator_epsilon
+                )
             ),
             "diffusion_loss": diffusion_loss.detach(),
             "exact_reconstruction_loss": exact_loss.detach(),
+            "coarse_exact_reconstruction_loss": coarse_exact_loss.detach(),
+            "degradation_loss": degradation_loss.detach(),
+            "residual_regularization_loss": residual_regularization_loss.detach(),
         }
         output: dict = {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
             "exact_reconstruction_loss": exact_loss,
+            "coarse_exact_reconstruction_loss": coarse_exact_loss,
+            "degradation_loss": degradation_loss,
+            "residual_regularization_loss": residual_regularization_loss,
             "coarse_lidar_bev": coarse_lidar_bev,
             "final_lidar_bev": final,
             "reconstruction_mask": reconstruction_mask,
@@ -923,9 +1039,8 @@ class FineDiffusionRefiner(nn.Module):
                 "noisy_residual": residual_t,
                 "epsilon": epsilon_masked,
                 "predicted_epsilon": epsilon_pred,
-                "predicted_residual_crop": self.normalization.denormalize_residual(
-                    residual_x0
-                ),
+                "residual_x0_normalized": residual_x0_normalized,
+                "predicted_residual_crop": predicted_residual_physical,
                 "local_condition": local_condition,
                 "refined_crop": refined_crop,
                 "refined_lidar_bev": refined_full,
@@ -937,8 +1052,12 @@ class FineDiffusionRefiner(nn.Module):
     ) -> torch.Tensor:
         if sampling_steps not in {1, 3, 5, 10}:
             raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
+        if sampling_steps > self.config.sampling_start_timestep + 1:
+            raise ValueError(
+                "sampling_steps cannot exceed sampling_start_timestep + 1"
+            )
         return torch.linspace(
-            self.config.training_timesteps - 1,
+            self.config.sampling_start_timestep,
             0,
             sampling_steps,
             device=device,
@@ -982,7 +1101,12 @@ class FineDiffusionRefiner(nn.Module):
                 "final_lidar_bev": faulty_lidar_bev.clone(),
                 "reconstruction_mask": reconstruction_mask,
             }
-        residual_t = repair * torch.randn(
+        timesteps = self._sampling_timesteps(
+            sampling_steps or self.config.sampling_steps,
+            coarse_lidar_bev.device,
+        )
+        start_timestep = timesteps[0].expand(coarse_lidar_bev.shape[0])
+        noise = torch.randn(
             (
                 coarse_lidar_bev.shape[0],
                 self.config.lidar_channels,
@@ -992,15 +1116,18 @@ class FineDiffusionRefiner(nn.Module):
             dtype=coarse_lidar_bev.dtype,
             generator=generator,
         )
+        sigma_start = self.schedule.extract(
+            self.schedule.sqrt_one_minus_alpha_bars,
+            start_timestep,
+            noise,
+        )
+        residual_t = repair * sigma_start * noise
+        initial_residual = residual_t.detach().clone()
         _trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
         )
-        timesteps = self._sampling_timesteps(
-            sampling_steps or self.config.sampling_steps,
-            coarse_lidar_bev.device,
-        )
         intermediates = []
-        residual_x0 = torch.zeros_like(residual_t)
+        residual_x0_normalized = torch.zeros_like(residual_t)
         for index, scalar_timestep in enumerate(timesteps):
             timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
             previous_scalar = (
@@ -1012,7 +1139,7 @@ class FineDiffusionRefiner(nn.Module):
             epsilon_pred, _local_condition = self._predict_epsilon(
                 residual_t, crops, timestep, global_embedding
             )
-            residual_t, residual_x0 = self.schedule.ddim_step(
+            residual_t, residual_x0_normalized = self.schedule.ddim_step(
                 residual_t,
                 epsilon_pred,
                 timestep,
@@ -1023,18 +1150,20 @@ class FineDiffusionRefiner(nn.Module):
             )
             if return_debug:
                 intermediates.append(residual_t.detach().clone())
-        residual_crop = self.normalization.denormalize_residual(
-            residual_x0 * repair
-        )
+        predicted_residual_physical = self.normalization.denormalize_residual(
+            residual_x0_normalized * repair
+        ) * repair
         refined_crop = (
-            crops.tensors["coarse"] + residual_crop
+            crops.tensors["coarse"] + predicted_residual_physical
         ).clamp(0.0, 1.0)
         refined_full, final = self._compose_full(
             crops, refined_crop, faulty_lidar_bev, reconstruction_mask
         )
         output: dict = {
             "coarse_lidar_bev": coarse_lidar_bev,
-            "predicted_residual": crops.paste(residual_crop) * reconstruction_mask,
+            "predicted_residual": (
+                crops.paste(predicted_residual_physical) * reconstruction_mask
+            ),
             "refined_lidar_bev": refined_full,
             "final_lidar_bev": final,
             "reconstruction_mask": reconstruction_mask,
@@ -1043,4 +1172,8 @@ class FineDiffusionRefiner(nn.Module):
         if return_debug:
             output["crop_batch"] = crops
             output["intermediate_residuals"] = intermediates
+            output["sampling_timesteps"] = timesteps.detach().clone()
+            output["sampling_start_timestep"] = start_timestep.detach().clone()
+            output["initial_residual"] = initial_residual
+            output["residual_x0_normalized"] = residual_x0_normalized.detach().clone()
         return output

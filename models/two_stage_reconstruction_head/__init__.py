@@ -87,6 +87,7 @@ from .diffusion_process.local_diffusion import (
     LocalConditionEncoder,
     LocalResidualDiffusionTransformer,
     MaskedExactReconstructionLoss,
+    MaskedNoDegradationLoss,
     ReconstructionCropBatch,
     ReconstructionCropExtractor,
     SinusoidalTimeEmbedding,
