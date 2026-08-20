@@ -51,7 +51,7 @@
     "grad_clip": 1.0,
     "mixed_precision": true,
     "seed": 42,
-    "sampled_validation_interval_epochs": 5
+    "sampled_validation_interval_epochs": 1
   },
   "evaluation": {
     "max_sampling_samples": 0
