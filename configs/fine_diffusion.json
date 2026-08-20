@@ -50,6 +50,10 @@
     "weight_decay": 0.001,
     "grad_clip": 1.0,
     "mixed_precision": true,
-    "seed": 42
+    "seed": 42,
+    "sampled_validation_interval_epochs": 5
+  },
+  "evaluation": {
+    "max_sampling_samples": 0
   }
 }

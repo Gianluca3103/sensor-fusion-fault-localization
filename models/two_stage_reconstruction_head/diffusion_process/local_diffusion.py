@@ -1024,6 +1024,7 @@ class FineDiffusionRefiner(nn.Module):
         epsilon: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
         return_debug: bool = False,
+        return_diagnostics: bool = True,
     ) -> dict[str, torch.Tensor | ReconstructionCropBatch | dict]:
         self._validate_inputs(
             coarse_lidar_bev,
@@ -1090,8 +1091,12 @@ class FineDiffusionRefiner(nn.Module):
         exact_loss = self.exact_loss(
             refined_crop, crops.tensors["clean"], repair
         )
-        coarse_exact_loss = self.exact_loss(
-            crops.tensors["coarse"].detach(), crops.tensors["clean"], repair
+        coarse_exact_loss = (
+            self.exact_loss(
+                crops.tensors["coarse"].detach(), crops.tensors["clean"], repair
+            )
+            if return_diagnostics
+            else diffusion_loss.new_zeros(())
         )
         degradation_loss = self.degradation_loss(
             refined_crop, crops.tensors["coarse"], crops.tensors["clean"], repair
@@ -1108,61 +1113,58 @@ class FineDiffusionRefiner(nn.Module):
                 * residual_regularization_loss
             )
         )
-        repair_cells = repair.sum(dim=(1, 2, 3))
-        crop_cells = crops.valid_mask.sum(dim=(1, 2, 3)).clamp_min(1)
-        diagnostics = {
-            "average_reconstruction_mask_area": repair_cells.mean(),
-            "average_crop_area": crop_cells.mean(),
-            "average_crop_height": crops.crop_heights.float().mean(),
-            "average_crop_width": crops.crop_widths.float().mean(),
-            "repair_fraction_of_crop": (repair_cells / crop_cells).mean(),
-            "halo_fraction_of_crop": (
-                crops.tensors["halo"].sum(dim=(1, 2, 3)) / crop_cells
-            ).mean(),
-            "diffusion_timestep": timestep.float().mean(),
-            "residual_gt_physical_abs_mean": (
-                residual_gt_physical.abs().sum()
-                / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
-            ),
-            "residual_gt_normalized_abs_mean": (
-                residual_gt_normalized.abs().sum()
-                / (repair.sum() * residual_gt_normalized.shape[1]).clamp_min(1)
-            ),
-            "predicted_residual_physical_abs_mean": (
-                predicted_residual_physical.abs().sum()
-                / (
-                    repair.sum() * predicted_residual_physical.shape[1]
-                    + self.config.denominator_epsilon
-                )
-            ),
-            "predicted_residual_normalized_abs_mean": (
-                residual_x0_normalized.abs().sum()
-                / (
-                    repair.sum() * residual_x0_normalized.shape[1]
-                    + self.config.denominator_epsilon
-                )
-            ),
-            "diffusion_loss": diffusion_loss.detach(),
-            "exact_reconstruction_loss": exact_loss.detach(),
-            "coarse_exact_reconstruction_loss": coarse_exact_loss.detach(),
-            "degradation_loss": degradation_loss.detach(),
-            "residual_regularization_loss": residual_regularization_loss.detach(),
-        }
-        physical_gt_magnitude = diagnostics["residual_gt_physical_abs_mean"]
-        diagnostics["predicted_to_gt_physical_residual_ratio"] = (
-            diagnostics["predicted_residual_physical_abs_mean"]
-            / (physical_gt_magnitude + self.config.denominator_epsilon)
-        )
-        selected = repair.expand_as(residual_gt_physical) > 0.5
-        for channel in range(self.config.lidar_channels):
-            channel_values = residual_gt_physical[:, channel : channel + 1][
-                selected[:, channel : channel + 1]
-            ]
-            diagnostics[f"residual_gt_physical_std_channel_{channel}"] = (
-                channel_values.float().std(unbiased=False)
-                if channel_values.numel()
-                else residual_gt_physical.new_zeros(())
+        diagnostics = {}
+        if return_diagnostics:
+            repair_cells = repair.sum(dim=(1, 2, 3))
+            crop_cells = crops.valid_mask.sum(dim=(1, 2, 3)).clamp_min(1)
+            diagnostics = {
+                "average_reconstruction_mask_area": repair_cells.mean(),
+                "average_crop_area": crop_cells.mean(),
+                "average_crop_height": crops.crop_heights.float().mean(),
+                "average_crop_width": crops.crop_widths.float().mean(),
+                "repair_fraction_of_crop": (repair_cells / crop_cells).mean(),
+                "halo_fraction_of_crop": (
+                    crops.tensors["halo"].sum(dim=(1, 2, 3)) / crop_cells
+                ).mean(),
+                "diffusion_timestep": timestep.float().mean(),
+                "residual_gt_physical_abs_mean": (
+                    residual_gt_physical.abs().sum()
+                    / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
+                ),
+                "residual_gt_normalized_abs_mean": (
+                    residual_gt_normalized.abs().sum()
+                    / (repair.sum() * residual_gt_normalized.shape[1]).clamp_min(1)
+                ),
+                "predicted_residual_physical_abs_mean": (
+                    predicted_residual_physical.abs().sum()
+                    / (
+                        repair.sum() * predicted_residual_physical.shape[1]
+                        + self.config.denominator_epsilon
+                    )
+                ),
+                "predicted_residual_normalized_abs_mean": (
+                    residual_x0_normalized.abs().sum()
+                    / (
+                        repair.sum() * residual_x0_normalized.shape[1]
+                        + self.config.denominator_epsilon
+                    )
+                ),
+            }
+            physical_gt_magnitude = diagnostics["residual_gt_physical_abs_mean"]
+            diagnostics["predicted_to_gt_physical_residual_ratio"] = (
+                diagnostics["predicted_residual_physical_abs_mean"]
+                / (physical_gt_magnitude + self.config.denominator_epsilon)
             )
+            selected = repair.expand_as(residual_gt_physical) > 0.5
+            for channel in range(self.config.lidar_channels):
+                channel_values = residual_gt_physical[:, channel : channel + 1][
+                    selected[:, channel : channel + 1]
+                ]
+                diagnostics[f"residual_gt_physical_std_channel_{channel}"] = (
+                    channel_values.float().std(unbiased=False)
+                    if channel_values.numel()
+                    else residual_gt_physical.new_zeros(())
+                )
         output: dict = {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,

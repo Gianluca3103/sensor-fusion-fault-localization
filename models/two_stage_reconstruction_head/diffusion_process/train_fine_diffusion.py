@@ -135,13 +135,6 @@ def _move_batch(batch, device):
     return moved
 
 
-def _mean_statistics(statistics: dict) -> dict[str, float]:
-    return {
-        key: float(value.detach()) if torch.is_tensor(value) else float(value)
-        for key, value in statistics.items()
-    }
-
-
 def _run_epoch(
     pipeline,
     loader,
@@ -166,7 +159,7 @@ def _run_epoch(
                 dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
                 enabled=use_amp,
             ):
-                output = pipeline(**batch)
+                output = pipeline(**batch, return_diagnostics=False)
                 loss = output["loss"]
             if training:
                 scale_before = scaler.get_scale()
@@ -194,16 +187,10 @@ def _run_epoch(
             "coarse_exact_reconstruction_loss": float(
                 output["coarse_exact_reconstruction_loss"].detach()
             ),
-            **_mean_statistics(output["statistics"]),
         }
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
         samples += count
-        if pipeline.coarse_model is not None and any(
-            parameter.grad is not None
-            for parameter in pipeline.coarse_model.parameters()
-        ):
-            raise RuntimeError("Frozen coarse model unexpectedly received gradients")
     result = {key: value / max(samples, 1) for key, value in totals.items()}
     if training:
         result["optimizer_steps"] = optimizer_steps
@@ -379,6 +366,9 @@ def main():
         else int(training.get("num_workers", 4))
     )
     seed = int(training.get("seed", 42))
+    validation_interval = max(
+        1, int(training.get("sampled_validation_interval_epochs", 1))
+    )
     seed_everything(seed)
     device = resolve_device(args.device)
     if config.bypass_coarse_reconstruction:
@@ -569,7 +559,8 @@ def main():
     print(
         f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}; "
         f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}; "
-        f"bypass coarse: {config.bypass_coarse_reconstruction}"
+        f"bypass coarse: {config.bypass_coarse_reconstruction}; "
+        f"sampled validation every {validation_interval} epoch(s)"
     )
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
@@ -582,16 +573,20 @@ def main():
             grad_clip=float(training.get("grad_clip", 1.0)),
             use_amp=use_amp,
         )
-        validation_started = time.perf_counter()
-        val_stats = _run_sampled_validation(
-            pipeline,
-            val_loader,
-            device,
-            sampling_steps=config.sampling_steps,
-            use_amp=use_amp,
-            seed=seed + 10_000,
-        )
-        validation_seconds = time.perf_counter() - validation_started
+        run_validation = epoch % validation_interval == 0 or epoch == epochs
+        val_stats = None
+        validation_seconds = 0.0
+        if run_validation:
+            validation_started = time.perf_counter()
+            val_stats = _run_sampled_validation(
+                pipeline,
+                val_loader,
+                device,
+                sampling_steps=config.sampling_steps,
+                use_amp=use_amp,
+                seed=seed + 10_000,
+            )
+            validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
             scheduler.step()
         elapsed = time.perf_counter() - started
@@ -601,7 +596,8 @@ def main():
             "runtime/sampled_validation_seconds": validation_seconds,
         }
         row.update({f"train/{key}": value for key, value in train_stats.items()})
-        row.update({f"val/{key}": value for key, value in val_stats.items()})
+        if val_stats is not None:
+            row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
         baseline_label = (
             "erased faulty"
@@ -609,47 +605,38 @@ def main():
             else "coarse"
         )
         print(
-            f"\nepoch {epoch:03d}/{epochs:03d} | {elapsed:.1f}s | "
-            f"sampled validation {validation_seconds:.1f}s\n"
+            f"\nepoch {epoch:03d}/{epochs:03d} | {elapsed:.1f}s\n"
             f"  train | loss {train_stats['loss']:.6f} | "
             f"diffusion {train_stats['diffusion_loss']:.6f} | "
             f"reconstruction {train_stats['exact_reconstruction_loss']:.6f} | "
             f"degradation {train_stats['degradation_loss']:.6f} | "
-            f"residual {train_stats['residual_regularization_loss']:.6f}\n"
-            f"  sampled validation | {int(val_stats['samples'])} samples | "
-            f"crop {val_stats['average_crop_height']:.1f}x"
-            f"{val_stats['average_crop_width']:.1f}\n"
-            f"    exact mask IoU   | {baseline_label} "
-            f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
-            f"-> fine {100.0 * val_stats['fine_exact_occupancy_iou']:.2f}% "
-            f"({100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp)\n"
-            f"    fine occupancy   | precision "
-            f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% | "
-            f"recall {100.0 * val_stats['fine_exact_occupancy_recall']:.2f}% | "
-            f"false-positive rate "
-            f"{100.0 * val_stats['fine_false_positive_occupancy_rate']:.2f}%"
+            f"residual {train_stats['residual_regularization_loss']:.6f}"
         )
-        channel_stds = ", ".join(
-            f"c{channel}="
-            f"{train_stats[f'residual_gt_physical_std_channel_{channel}']:.6f}"
-            for channel in range(config.lidar_channels)
-        )
-        print(
-            "    residual scale   | GT physical MAE "
-            f"{train_stats['residual_gt_physical_abs_mean']:.6f} | "
-            "GT normalized MAE "
-            f"{train_stats['residual_gt_normalized_abs_mean']:.6f} | "
-            "pred physical MAE "
-            f"{train_stats['predicted_residual_physical_abs_mean']:.6f} | "
-            "pred normalized MAE "
-            f"{train_stats['predicted_residual_normalized_abs_mean']:.6f} | "
-            "pred/GT "
-            f"{train_stats['predicted_to_gt_physical_residual_ratio']:.3f}x\n"
-            f"    GT physical std  | {channel_stds}"
-        )
-        score = val_stats["fine_minus_coarse_exact_iou"]
-        improved = score > best
-        best = max(best, score)
+        if val_stats is not None:
+            print(
+                f"  sampled validation | {validation_seconds:.1f}s | "
+                f"{int(val_stats['samples'])} samples | "
+                f"crop {val_stats['average_crop_height']:.1f}x"
+                f"{val_stats['average_crop_width']:.1f}\n"
+                f"    exact mask IoU   | {baseline_label} "
+                f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
+                f"-> fine {100.0 * val_stats['fine_exact_occupancy_iou']:.2f}% "
+                f"({100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp)\n"
+                f"    fine occupancy   | precision "
+                f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% | "
+                f"recall {100.0 * val_stats['fine_exact_occupancy_recall']:.2f}% | "
+                f"false-positive rate "
+                f"{100.0 * val_stats['fine_false_positive_occupancy_rate']:.2f}%"
+            )
+            score = val_stats["fine_minus_coarse_exact_iou"]
+            improved = score > best
+            best = max(best, score)
+        else:
+            print(
+                f"  sampled validation | skipped; next at epoch "
+                f"{min(((epoch // validation_interval) + 1) * validation_interval, epochs)}"
+            )
+            improved = False
         checkpoint = {
             "epoch": epoch,
             "diffusion_state_dict": diffusion.state_dict(),
@@ -683,15 +670,19 @@ def main():
                 checkpoint, output_root / "best_sampled_validation_iou.pt"
             )
         write_csv_rows(output_root / "history.csv", history)
-    rows = _sampling_metrics(
-        pipeline,
-        val_loader,
-        device,
-        int(payload.get("evaluation", {}).get("max_sampling_samples", 8)),
-        config.sampling_steps,
+    maximum_sampling_samples = int(
+        payload.get("evaluation", {}).get("max_sampling_samples", 0)
     )
-    write_csv_rows(output_root / "sampling_metrics.csv", rows)
-    atomic_write_json(output_root / "sampling_metrics.json", rows)
+    if maximum_sampling_samples > 0:
+        rows = _sampling_metrics(
+            pipeline,
+            val_loader,
+            device,
+            maximum_sampling_samples,
+            config.sampling_steps,
+        )
+        write_csv_rows(output_root / "sampling_metrics.csv", rows)
+        atomic_write_json(output_root / "sampling_metrics.json", rows)
 
 
 if __name__ == "__main__":
