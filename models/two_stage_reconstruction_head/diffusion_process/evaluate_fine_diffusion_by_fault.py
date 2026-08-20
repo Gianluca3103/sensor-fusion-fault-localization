@@ -30,10 +30,12 @@ from models.two_stage_reconstruction_head import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
     FrozenCoarseFineDiffusionPipeline,
+    ResidualChannelNormalization,
     coarse_reconstruction_collate,
     coarse_reconstruction_metrics,
     coarse_reconstruction_range_metrics,
     load_frozen_coarse_model,
+    validate_fine_diffusion_checkpoint_compatibility,
 )
 from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
     _load_selector_config,
@@ -388,7 +390,37 @@ def main() -> None:
         raise ValueError("Checkpoint does not contain a fine diffusion model")
 
     diffusion_config = _diffusion_config_from_checkpoint(checkpoint["diffusion_config"])
-    normalizer = _normalizer_from_fine_config(args.fine_config, diffusion_config)
+    validate_fine_diffusion_checkpoint_compatibility(
+        checkpoint, diffusion_config
+    )
+    bev_normalizer = _normalizer_from_fine_config(
+        args.fine_config, diffusion_config
+    )
+    bev_metadata = checkpoint.get("bev_normalization")
+    if bev_metadata is not None:
+        bev_normalizer = BEVChannelNormalization(
+            means=bev_metadata["means"],
+            stds=bev_metadata["stds"],
+            epsilon=float(bev_metadata["epsilon"]),
+            source=bev_metadata.get("source", "fine_diffusion_checkpoint"),
+        )
+    residual_metadata = checkpoint.get("residual_normalization")
+    if residual_metadata is None:
+        raise ValueError(
+            "Fine Diffusion checkpoint lacks train-split residual "
+            "normalization. Start a fresh Fine Diffusion run."
+        )
+    residual_normalizer = ResidualChannelNormalization(
+        residual_metadata.get(
+            "raw_channel_stds", residual_metadata.get("channel_stds")
+        ),
+        minimum_std=float(
+            residual_metadata.get(
+                "minimum_std", diffusion_config.minimum_residual_std
+            )
+        ),
+        source=residual_metadata.get("source", "fine_diffusion_checkpoint"),
+    )
     if diffusion_config.bypass_coarse_reconstruction:
         coarse_checkpoint_path = None
         coarse = None
@@ -431,7 +463,9 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
         collate_fn=coarse_reconstruction_collate,
     )
-    diffusion = FineDiffusionRefiner(diffusion_config, normalizer).to(device)
+    diffusion = FineDiffusionRefiner(
+        diffusion_config, bev_normalizer, residual_normalizer
+    ).to(device)
     diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
     pipeline = FrozenCoarseFineDiffusionPipeline(coarse, diffusion).to(device)
     pipeline.eval()

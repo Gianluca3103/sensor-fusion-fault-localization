@@ -9,6 +9,14 @@ from models.two_stage_reconstruction_head.diffusion_process.local_diffusion impo
     MaskedNoDegradationLoss,
     ReconstructionCropExtractor,
     WindowAttention2d,
+    fine_diffusion_architecture_metadata,
+    validate_fine_diffusion_checkpoint_compatibility,
+)
+from models.two_stage_reconstruction_head.diffusion_process.diffusion_process import (
+    ResidualChannelNormalization,
+)
+from models.two_stage_reconstruction_head.diffusion_process.residual_statistics import (
+    estimate_training_residual_statistics,
 )
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,
@@ -98,6 +106,15 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_default_sampling_is_terminal_ten_step_ddim(self):
+        config = FineDiffusionConfig()
+        model = FineDiffusionRefiner(config)
+        timesteps = model._sampling_timesteps(10, torch.device("cpu"))
+        self.assertEqual(config.sampling_steps, 10)
+        self.assertEqual(int(timesteps[0]), 999)
+        self.assertEqual(int(timesteps[-1]), 0)
+        self.assertEqual(len(timesteps), 10)
+
     def test_sampling_timesteps_start_from_configured_low_strength_timestep(self):
         model = FineDiffusionRefiner(
             FineDiffusionConfig(
@@ -263,7 +280,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         crop_batch = debug["crops"]
         self.assertTrue(
             torch.equal(
-                debug["residual_gt"],
+                debug["residual_gt_physical"],
                 crop_batch.tensors["repair"]
                 * (
                     crop_batch.tensors["clean"]
@@ -281,7 +298,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         )
         outside = 1 - repair
         predicted_residual = crop_batch.paste(
-            debug["predicted_residual_crop"]
+            debug["predicted_residual_physical"]
         ) * repair
         self.assertTrue(
             torch.equal(predicted_residual * outside, torch.zeros_like(coarse))
@@ -293,6 +310,167 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             torch.equal(output["final_lidar_bev"] * halo, distinctive * halo)
         )
         self.assertTrue(torch.isfinite(output["loss"]))
+
+    def test_residual_normalization_round_trip_and_zero(self):
+        normalizer = ResidualChannelNormalization(
+            (0.1, 0.2, 0.4), minimum_std=1.0e-4
+        )
+        physical = torch.tensor(
+            [[[[0.0]], [[-0.3]], [[0.8]]]], dtype=torch.float32
+        )
+        restored = normalizer.denormalize(normalizer.normalize(physical))
+        self.assertTrue(torch.allclose(restored, physical, atol=1.0e-7))
+        self.assertEqual(float(restored[0, 0, 0, 0]), 0.0)
+
+    def test_sampling_adds_denormalized_residual_in_physical_units(self):
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        normalizer = ResidualChannelNormalization((0.1, 0.2, 0.4))
+        model = FineDiffusionRefiner(
+            _config(sampling_steps=1),
+            residual_normalization=normalizer,
+        ).eval()
+
+        def fixed_step(
+            residual_t,
+            _epsilon_prediction,
+            _timestep,
+            _previous_timestep,
+            reconstruction_mask,
+            **_kwargs,
+        ):
+            normalized = torch.ones_like(residual_t) * reconstruction_mask
+            return torch.zeros_like(residual_t), normalized
+
+        with mock.patch.object(model.schedule, "ddim_step", side_effect=fixed_step):
+            output = model.sample(
+                coarse, faulty, radar, repair, halo, sampling_steps=1
+            )
+        predicted = output["predicted_residual"]
+        for channel, expected in enumerate((0.1, 0.2, 0.4)):
+            selected = predicted[:, channel : channel + 1][repair > 0.5]
+            self.assertTrue(
+                torch.allclose(selected, torch.full_like(selected, expected))
+            )
+
+    def test_residual_statistics_use_only_masked_training_values(self):
+        train = {
+            "clean_lidar_bev": torch.tensor(
+                [[[[1.0, 3.0], [100.0, 100.0]],
+                  [[2.0, 4.0], [100.0, 100.0]],
+                  [[3.0, 7.0], [100.0, 100.0]]]]
+            ),
+            "coarse": torch.zeros(1, 3, 2, 2),
+            "reconstruction_mask": torch.tensor(
+                [[[[1.0, 1.0], [0.0, 0.0]]]]
+            ),
+        }
+        validation = {
+            **train,
+            "clean_lidar_bev": torch.full((1, 3, 2, 2), 1000.0),
+        }
+        statistics = estimate_training_residual_statistics(
+            [train],
+            move_batch=lambda batch: batch,
+            coarse_forward=lambda batch: batch["coarse"],
+            channels=3,
+            minimum_std=1.0e-4,
+        )
+        self.assertEqual(statistics["split"], "train")
+        self.assertEqual(statistics["channels"][0]["sample_count"], 2)
+        self.assertAlmostEqual(statistics["raw_channel_stds"][0], 1.0)
+        self.assertAlmostEqual(statistics["raw_channel_stds"][1], 1.0)
+        self.assertAlmostEqual(statistics["raw_channel_stds"][2], 2.0)
+        self.assertNotEqual(
+            statistics["channels"][0]["mean"],
+            float(validation["clean_lidar_bev"].mean()),
+        )
+
+    def test_coarse_is_present_in_ten_channel_main_stream(self):
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config()).eval()
+        output = model(
+            clean,
+            coarse,
+            faulty,
+            radar,
+            repair,
+            halo,
+            timestep=torch.tensor([4]),
+            epsilon=torch.zeros(1, 3, 8, 8),
+            return_debug=True,
+        )
+        debug = output["debug"]
+        self.assertEqual(debug["residual_stem_input"].shape[1], 10)
+        self.assertEqual(
+            model.transformer.residual_stem.in_channels, 10
+        )
+        self.assertTrue(
+            torch.equal(
+                debug["normalized_coarse_main_stream"],
+                model.normalization.normalize(debug["crops"].tensors["coarse"]),
+            )
+        )
+        altered = model(
+            clean,
+            (coarse + 0.05).clamp(0.0, 1.0),
+            faulty,
+            radar,
+            repair,
+            halo,
+            timestep=torch.tensor([4]),
+            epsilon=torch.zeros_like(debug["noisy_residual"]),
+            return_debug=True,
+        )["debug"]
+        self.assertFalse(
+            torch.equal(
+                debug["normalized_coarse_main_stream"],
+                altered["normalized_coarse_main_stream"],
+            )
+        )
+        self.assertFalse(
+            torch.equal(
+                debug["residual_stem_input"], altered["residual_stem_input"]
+            )
+        )
+
+    def test_legacy_residual_stem_checkpoint_has_clear_error(self):
+        config = _config()
+        legacy = {
+            "diffusion_state_dict": {
+                "transformer.residual_stem.weight": torch.zeros(
+                    config.hidden_dim, config.lidar_channels + 4, 3, 3
+                )
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "legacy residual stem"):
+            validate_fine_diffusion_checkpoint_compatibility(legacy, config)
+
+    def test_new_checkpoint_metadata_and_residual_scale_round_trip(self):
+        config = _config()
+        model = FineDiffusionRefiner(
+            config,
+            residual_normalization=ResidualChannelNormalization(
+                (0.1, 0.2, 0.3)
+            ),
+        )
+        checkpoint = {
+            "diffusion_state_dict": model.state_dict(),
+            "fine_diffusion_architecture": fine_diffusion_architecture_metadata(
+                config
+            ),
+            "residual_normalization": model.residual_normalization.metadata(),
+        }
+        validate_fine_diffusion_checkpoint_compatibility(checkpoint, config)
+        restored = ResidualChannelNormalization(
+            checkpoint["residual_normalization"]["raw_channel_stds"],
+            minimum_std=checkpoint["residual_normalization"]["minimum_std"],
+        )
+        self.assertTrue(
+            torch.equal(
+                restored.channel_stds,
+                model.residual_normalization.channel_stds,
+            )
+        )
 
     def test_inference_needs_no_clean_lidar_and_ddim_is_masked(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)

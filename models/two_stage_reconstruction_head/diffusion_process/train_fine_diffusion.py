@@ -32,10 +32,14 @@ from models.two_stage_reconstruction_head import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
     FrozenCoarseFineDiffusionPipeline,
+    ResidualChannelNormalization,
     build_selector_config,
     coarse_reconstruction_collate,
     load_frozen_coarse_model,
+    estimate_training_residual_statistics,
+    fine_diffusion_architecture_metadata,
     reconstruction_stage_metrics,
+    validate_fine_diffusion_checkpoint_compatibility,
 )
 
 
@@ -62,6 +66,11 @@ def _parse_args():
     parser.add_argument("--limit-train-samples", type=int)
     parser.add_argument("--limit-val-samples", type=int)
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--residual-statistics-only",
+        action="store_true",
+        help="Estimate train-only coarse residual statistics and exit.",
+    )
     return parser.parse_args()
 
 
@@ -76,7 +85,7 @@ def _load_components(path):
         raise ValueError("Unknown fine_diffusion settings: " + ", ".join(unknown))
     config = FineDiffusionConfig(**section)
     config.validate()
-    normalizer = BEVChannelNormalization(
+    bev_normalizer = BEVChannelNormalization(
         means=normalization_payload.get(
             "channel_means", (0.0,) * config.lidar_channels
         ),
@@ -86,7 +95,20 @@ def _load_components(path):
         epsilon=float(normalization_payload.get("epsilon", 1.0e-6)),
         source=normalization_payload.get("source", "configured"),
     )
-    return payload, config, normalizer
+    return payload, config, bev_normalizer
+
+
+def _residual_normalizer(metadata, config):
+    raw = metadata.get("raw_channel_stds", metadata.get("channel_stds"))
+    if raw is None:
+        raise KeyError("Residual normalization requires channel stds")
+    return ResidualChannelNormalization(
+        raw,
+        minimum_std=float(
+            metadata.get("minimum_std", config.minimum_residual_std)
+        ),
+        source=metadata.get("source", "fine_diffusion_checkpoint"),
+    )
 
 
 def _move_batch(batch, device):
@@ -342,7 +364,7 @@ def _sampling_metrics(pipeline, loader, device, maximum, sampling_steps):
 
 def main():
     args = _parse_args()
-    payload, config, normalizer = _load_components(args.config)
+    payload, config, bev_normalizer = _load_components(args.config)
     selector_payload = payload
     if args.selector_config:
         with Path(args.selector_config).open("r", encoding="utf-8") as handle:
@@ -396,7 +418,98 @@ def main():
     }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
-    diffusion = FineDiffusionRefiner(config, normalizer).to(device)
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    resume_checkpoint = (
+        torch.load(args.resume, map_location=device, weights_only=False)
+        if args.resume
+        else None
+    )
+    if resume_checkpoint is not None:
+        validate_fine_diffusion_checkpoint_compatibility(
+            resume_checkpoint, config
+        )
+        residual_metadata = resume_checkpoint.get("residual_normalization")
+        if residual_metadata is None:
+            raise ValueError(
+                "Fine Diffusion checkpoint lacks residual normalization. "
+                "Start a fresh run so train-only statistics can be estimated."
+            )
+        residual_statistics = resume_checkpoint.get("residual_statistics")
+        residual_normalizer = _residual_normalizer(
+            residual_metadata, config
+        )
+        bev_metadata = resume_checkpoint.get("bev_normalization")
+        if bev_metadata is not None:
+            bev_normalizer = BEVChannelNormalization(
+                means=bev_metadata["means"],
+                stds=bev_metadata["stds"],
+                epsilon=float(bev_metadata["epsilon"]),
+                source=bev_metadata.get("source", "fine_diffusion_checkpoint"),
+            )
+    else:
+        statistics_loader_options = dict(loader_options)
+        statistics_loader_options["persistent_workers"] = False
+        statistics_loader = DataLoader(
+            train_dataset, shuffle=False, **statistics_loader_options
+        )
+
+        def coarse_for_statistics(batch):
+            if config.bypass_coarse_reconstruction:
+                return batch["faulty_lidar_bev"] * (
+                    1.0 - batch["reconstruction_mask"]
+                )
+            coarse.eval()
+            output = coarse(
+                batch["faulty_lidar_bev"],
+                batch["radar_bev"],
+                batch["reconstruction_mask"],
+                batch["healthy_context_mask"],
+                batch["halo_mask"],
+                faulty_lidar_points=batch.get("faulty_lidar_points"),
+                radar_points=batch.get("radar_points"),
+            )
+            return output["coarse_lidar_bev"]
+
+        print("Estimating coarse-to-clean residual statistics from TRAIN only...")
+        residual_statistics = estimate_training_residual_statistics(
+            statistics_loader,
+            move_batch=lambda raw: _move_batch(raw, device),
+            coarse_forward=coarse_for_statistics,
+            channels=config.lidar_channels,
+            minimum_std=config.minimum_residual_std,
+        )
+        residual_metadata = {
+            "raw_channel_stds": residual_statistics["raw_channel_stds"],
+            "channel_stds": residual_statistics["effective_channel_stds"],
+            "minimum_std": config.minimum_residual_std,
+            "source": "training_split_coarse_to_clean_residuals",
+        }
+        residual_normalizer = _residual_normalizer(
+            residual_metadata, config
+        )
+        for item in residual_statistics["channels"]:
+            print(
+                f"  channel {item['channel']}: mean={item['mean']:.8f}, "
+                f"raw_std={item['raw_std']:.8f}, "
+                f"effective_std={item['effective_std']:.8f}, "
+                f"mean_abs={item['mean_absolute_value']:.8f}, "
+                f"p95_abs={item['p95_absolute_value']:.8f}, "
+                f"zero={item['fraction_approximately_zero']:.2%}, "
+                f"n={item['sample_count']}"
+            )
+
+    if residual_statistics is not None:
+        atomic_write_json(
+            output_root / "residual_statistics.json", residual_statistics
+        )
+    if args.residual_statistics_only:
+        print("Residual-statistics-only pass complete; training was not started.")
+        return
+
+    diffusion = FineDiffusionRefiner(
+        config, bev_normalizer, residual_normalizer
+    ).to(device)
     pipeline = FrozenCoarseFineDiffusionPipeline(coarse, diffusion).to(device)
     optimizer = torch.optim.AdamW(
         diffusion.parameters(),
@@ -406,11 +519,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = bool(training.get("mixed_precision", True)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    output_root = Path(args.output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
     start_epoch, best, history = 1, float("-inf"), []
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+    if resume_checkpoint is not None:
+        checkpoint = resume_checkpoint
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -428,7 +539,11 @@ def main():
         {
             "payload": payload,
             "fine_diffusion": config.to_dict(),
-            "normalization": normalizer.metadata(),
+            "normalization": bev_normalizer.metadata(),
+            "residual_normalization": residual_normalizer.metadata(),
+            "fine_diffusion_architecture": fine_diffusion_architecture_metadata(
+                config
+            ),
             "coarse_model_config": (
                 coarse.config.to_dict() if coarse is not None else None
             ),
@@ -499,6 +614,24 @@ def main():
             f"false-positive rate "
             f"{100.0 * val_stats['fine_false_positive_occupancy_rate']:.2f}%"
         )
+        channel_stds = ", ".join(
+            f"c{channel}="
+            f"{train_stats[f'residual_gt_physical_std_channel_{channel}']:.6f}"
+            for channel in range(config.lidar_channels)
+        )
+        print(
+            "    residual scale   | GT physical MAE "
+            f"{train_stats['residual_gt_physical_abs_mean']:.6f} | "
+            "GT normalized MAE "
+            f"{train_stats['residual_gt_normalized_abs_mean']:.6f} | "
+            "pred physical MAE "
+            f"{train_stats['predicted_residual_physical_abs_mean']:.6f} | "
+            "pred normalized MAE "
+            f"{train_stats['predicted_residual_normalized_abs_mean']:.6f} | "
+            "pred/GT "
+            f"{train_stats['predicted_to_gt_physical_residual_ratio']:.3f}x\n"
+            f"    GT physical std  | {channel_stds}"
+        )
         score = val_stats["fine_minus_coarse_exact_iou"]
         improved = score > best
         best = max(best, score)
@@ -506,6 +639,12 @@ def main():
             "epoch": epoch,
             "diffusion_state_dict": diffusion.state_dict(),
             "diffusion_config": config.to_dict(),
+            "fine_diffusion_architecture": fine_diffusion_architecture_metadata(
+                config
+            ),
+            "residual_normalization": residual_normalizer.metadata(),
+            "bev_normalization": bev_normalizer.metadata(),
+            "residual_statistics": residual_statistics,
             "coarse_checkpoint": (
                 str(Path(args.coarse_checkpoint).resolve())
                 if args.coarse_checkpoint

@@ -88,6 +88,53 @@ class BEVChannelNormalization(nn.Module):
         }
 
 
+class ResidualChannelNormalization(nn.Module):
+    """Per-channel coarse-to-clean residual scaling in physical BEV units."""
+
+    def __init__(
+        self,
+        channel_stds=(1.0, 1.0, 1.0),
+        *,
+        minimum_std: float = 1.0e-4,
+        source: str = "training_coarse_to_clean_residuals",
+    ) -> None:
+        super().__init__()
+        raw_stds = torch.as_tensor(channel_stds, dtype=torch.float32)
+        if raw_stds.ndim != 1 or raw_stds.numel() < 1:
+            raise ValueError("residual channel stds must be one-dimensional")
+        if not torch.isfinite(raw_stds).all() or torch.any(raw_stds < 0):
+            raise ValueError("residual channel stds must be finite and non-negative")
+        if minimum_std <= 0:
+            raise ValueError("minimum residual std must be positive")
+        self.register_buffer("raw_channel_stds", raw_stds)
+        self.register_buffer(
+            "channel_stds", raw_stds.clamp_min(float(minimum_std))
+        )
+        self.minimum_std = float(minimum_std)
+        self.source = str(source)
+
+    def _stds(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim != 4 or tensor.shape[1] != self.channel_stds.numel():
+            raise ValueError(
+                "Residual tensor channel count does not match normalization"
+            )
+        return self.channel_stds[None, :, None, None]
+
+    def normalize(self, residual_physical: torch.Tensor) -> torch.Tensor:
+        return residual_physical / self._stds(residual_physical)
+
+    def denormalize(self, residual_normalized: torch.Tensor) -> torch.Tensor:
+        return residual_normalized * self._stds(residual_normalized)
+
+    def metadata(self) -> dict:
+        return {
+            "raw_channel_stds": self.raw_channel_stds.tolist(),
+            "channel_stds": self.channel_stds.tolist(),
+            "minimum_std": self.minimum_std,
+            "source": self.source,
+        }
+
+
 def _cosine_betas(timesteps: int, offset: float = 0.008) -> torch.Tensor:
     steps = torch.arange(timesteps + 1, dtype=torch.float64)
     alpha_bar = torch.cos(

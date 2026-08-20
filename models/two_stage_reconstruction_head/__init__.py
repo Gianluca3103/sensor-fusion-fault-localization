@@ -77,6 +77,7 @@ from .diffusion_process.diffusion_process import (
     DiffusionProcessConfig,
     GaussianNoiseSchedule,
     MaskedEpsilonMSELoss,
+    ResidualChannelNormalization,
     residual_target,
 )
 from .diffusion_process.local_diffusion import (
@@ -92,6 +93,12 @@ from .diffusion_process.local_diffusion import (
     ReconstructionCropExtractor,
     SinusoidalTimeEmbedding,
     WindowAttention2d,
+    fine_diffusion_architecture_metadata,
+    validate_fine_diffusion_checkpoint_compatibility,
+)
+from .diffusion_process.residual_statistics import (
+    ResidualStatisticsAccumulator,
+    estimate_training_residual_statistics,
 )
 from .diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,

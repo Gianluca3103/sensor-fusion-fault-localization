@@ -16,11 +16,13 @@ from .diffusion_process import (
     DiffusionProcessConfig,
     GaussianNoiseSchedule,
     MaskedEpsilonMSELoss,
+    ResidualChannelNormalization,
     residual_target,
 )
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 2
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -62,7 +64,7 @@ class FineDiffusionConfig:
     global_context_dim: int = 128
     diffusion_prediction_type: str = "epsilon"
     training_timesteps: int = 1000
-    sampling_start_timestep: int = 500
+    sampling_start_timestep: int = 999
     sampling_steps: int = 10
     noise_schedule: str = "cosine"
     sampler: str = "ddim"
@@ -73,6 +75,7 @@ class FineDiffusionConfig:
     lambda_residual_regularization: float = 0.05
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
+    minimum_residual_std: float = 1.0e-4
 
     def validate(self) -> None:
         if not self.enabled:
@@ -125,6 +128,8 @@ class FineDiffusionConfig:
             raise ValueError("dropout must be in [0,1)")
         if self.denominator_epsilon <= 0:
             raise ValueError("denominator_epsilon must be positive")
+        if self.minimum_residual_std <= 0:
+            raise ValueError("minimum_residual_std must be positive")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -541,7 +546,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
             2 * config.lidar_channels + config.radar_channels + 2 + coordinates
         )
         self.residual_stem = nn.Conv2d(
-            config.lidar_channels + coordinates,
+            2 * config.lidar_channels + coordinates,
             config.hidden_dim,
             3,
             padding=1,
@@ -607,7 +612,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
         coordinates: torch.Tensor,
         timestep: torch.Tensor,
         global_embedding: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         local_condition_input = torch.cat(
             (
                 coarse,
@@ -622,14 +627,51 @@ class LocalResidualDiffusionTransformer(nn.Module):
         local_condition = self.local_condition_encoder(
             local_condition_input, valid
         )
-        tensor = self.residual_stem(
-            torch.cat((noisy_residual, coordinates), dim=1)
-        ) * valid
+        residual_stem_input = torch.cat(
+            (noisy_residual, coarse, coordinates), dim=1
+        )
+        tensor = self.residual_stem(residual_stem_input) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
         for block in self.blocks:
             tensor = block(tensor, local_condition, condition_vector, valid)
         epsilon = self.output_head(tensor) * reconstruction_mask * valid
-        return epsilon, local_condition
+        return epsilon, local_condition, {
+            "normalized_coarse_main_stream": coarse,
+            "residual_stem_input": residual_stem_input,
+        }
+
+
+def fine_diffusion_architecture_metadata(
+    config: FineDiffusionConfig,
+) -> dict[str, int | str]:
+    return {
+        "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
+        "residual_stem_input_channels": 2 * config.lidar_channels + 4,
+        "coarse_main_stream": "normalized_bev",
+    }
+
+
+def validate_fine_diffusion_checkpoint_compatibility(
+    checkpoint: Mapping, config: FineDiffusionConfig
+) -> None:
+    expected = 2 * config.lidar_channels + 4
+    weight = checkpoint.get("diffusion_state_dict", {}).get(
+        "transformer.residual_stem.weight"
+    )
+    actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
+    metadata = checkpoint.get("fine_diffusion_architecture")
+    if actual == config.lidar_channels + 4 or metadata is None:
+        raise ValueError(
+            "Fine Diffusion checkpoint uses the legacy residual stem without "
+            "direct coarse conditioning. Start a fresh Fine Diffusion run."
+        )
+    if actual != expected:
+        raise ValueError(
+            "Fine Diffusion residual-stem input mismatch: checkpoint has "
+            f"{actual} channels but this model requires {expected}."
+        )
+    if int(metadata.get("version", -1)) != FINE_DIFFUSION_ARCHITECTURE_VERSION:
+        raise ValueError("Unsupported Fine Diffusion checkpoint architecture")
 
 
 class MaskedExactReconstructionLoss(nn.Module):
@@ -738,6 +780,7 @@ class FineDiffusionRefiner(nn.Module):
         self,
         config: FineDiffusionConfig | None = None,
         normalization: BEVChannelNormalization | None = None,
+        residual_normalization: ResidualChannelNormalization | None = None,
     ):
         super().__init__()
         self.config = config or FineDiffusionConfig()
@@ -756,6 +799,14 @@ class FineDiffusionRefiner(nn.Module):
         self.normalization = normalization or BEVChannelNormalization(
             means=(0.0,) * self.config.lidar_channels,
             stds=(1.0,) * self.config.lidar_channels,
+        )
+        self.residual_normalization = (
+            residual_normalization
+            or ResidualChannelNormalization(
+                (1.0,) * self.config.lidar_channels,
+                minimum_std=self.config.minimum_residual_std,
+                source="identity_fallback",
+            )
         )
         self.transformer = LocalResidualDiffusionTransformer(self.config)
         self.diffusion_loss = MaskedEpsilonMSELoss(
@@ -869,7 +920,7 @@ class FineDiffusionRefiner(nn.Module):
         crops: ReconstructionCropBatch,
         timestep: torch.Tensor,
         global_embedding: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         values = crops.tensors
         return self.transformer(
             residual_t,
@@ -931,7 +982,7 @@ class FineDiffusionRefiner(nn.Module):
         batch = coarse_lidar_bev.shape[0]
         repair = crops.tensors["repair"] * crops.valid_mask
         residual_gt_physical = crops.tensors["residual_gt"] * repair
-        residual_gt = self.normalization.normalize_residual(
+        residual_gt_normalized = self.residual_normalization.normalize(
             residual_gt_physical
         ) * repair
         if timestep is None:
@@ -945,26 +996,26 @@ class FineDiffusionRefiner(nn.Module):
             raise ValueError("timestep must have shape [B]")
         if epsilon is None:
             epsilon = torch.randn(
-                residual_gt.shape,
-                device=residual_gt.device,
-                dtype=residual_gt.dtype,
+                residual_gt_normalized.shape,
+                device=residual_gt_normalized.device,
+                dtype=residual_gt_normalized.dtype,
                 generator=generator,
             )
-        if epsilon.shape != residual_gt.shape:
+        if epsilon.shape != residual_gt_normalized.shape:
             raise ValueError("epsilon must match the padded residual crop")
         residual_t, epsilon_masked = self.schedule.add_masked_noise(
-            residual_gt, epsilon, timestep, repair
+            residual_gt_normalized, epsilon, timestep, repair
         )
         trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
         )
-        epsilon_pred, local_condition = self._predict_epsilon(
+        epsilon_pred, local_condition, transformer_debug = self._predict_epsilon(
             residual_t, crops, timestep, global_embedding
         )
         residual_x0_normalized = self.schedule.predict_x0(
             residual_t, epsilon_pred, timestep
         ) * repair
-        predicted_residual_physical = self.normalization.denormalize_residual(
+        predicted_residual_physical = self.residual_normalization.denormalize(
             residual_x0_normalized
         ) * repair
         refined_crop = (
@@ -1007,14 +1058,25 @@ class FineDiffusionRefiner(nn.Module):
                 crops.tensors["halo"].sum(dim=(1, 2, 3)) / crop_cells
             ).mean(),
             "diffusion_timestep": timestep.float().mean(),
-            "residual_gt_abs_mean": (
+            "residual_gt_physical_abs_mean": (
                 residual_gt_physical.abs().sum()
                 / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
             ),
-            "predicted_residual_abs_mean": (
+            "residual_gt_normalized_abs_mean": (
+                residual_gt_normalized.abs().sum()
+                / (repair.sum() * residual_gt_normalized.shape[1]).clamp_min(1)
+            ),
+            "predicted_residual_physical_abs_mean": (
                 predicted_residual_physical.abs().sum()
                 / (
                     repair.sum() * predicted_residual_physical.shape[1]
+                    + self.config.denominator_epsilon
+                )
+            ),
+            "predicted_residual_normalized_abs_mean": (
+                residual_x0_normalized.abs().sum()
+                / (
+                    repair.sum() * residual_x0_normalized.shape[1]
                     + self.config.denominator_epsilon
                 )
             ),
@@ -1024,6 +1086,21 @@ class FineDiffusionRefiner(nn.Module):
             "degradation_loss": degradation_loss.detach(),
             "residual_regularization_loss": residual_regularization_loss.detach(),
         }
+        physical_gt_magnitude = diagnostics["residual_gt_physical_abs_mean"]
+        diagnostics["predicted_to_gt_physical_residual_ratio"] = (
+            diagnostics["predicted_residual_physical_abs_mean"]
+            / (physical_gt_magnitude + self.config.denominator_epsilon)
+        )
+        selected = repair.expand_as(residual_gt_physical) > 0.5
+        for channel in range(self.config.lidar_channels):
+            channel_values = residual_gt_physical[:, channel : channel + 1][
+                selected[:, channel : channel + 1]
+            ]
+            diagnostics[f"residual_gt_physical_std_channel_{channel}"] = (
+                channel_values.float().std(unbiased=False)
+                if channel_values.numel()
+                else residual_gt_physical.new_zeros(())
+            )
         output: dict = {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
@@ -1040,14 +1117,15 @@ class FineDiffusionRefiner(nn.Module):
             output["debug"] = {
                 "crops": crops,
                 "trusted_global_faulty_lidar": trusted_global,
-                "residual_gt": residual_gt_physical,
-                "normalized_residual_gt": residual_gt,
+                "residual_gt_physical": residual_gt_physical,
+                "residual_gt_normalized": residual_gt_normalized,
                 "noisy_residual": residual_t,
                 "epsilon": epsilon_masked,
                 "predicted_epsilon": epsilon_pred,
                 "residual_x0_normalized": residual_x0_normalized,
-                "predicted_residual_crop": predicted_residual_physical,
+                "predicted_residual_physical": predicted_residual_physical,
                 "local_condition": local_condition,
+                **transformer_debug,
                 "refined_crop": refined_crop,
                 "refined_lidar_bev": refined_full,
             }
@@ -1144,7 +1222,7 @@ class FineDiffusionRefiner(nn.Module):
                 else scalar_timestep.new_tensor(-1)
             )
             previous = previous_scalar.expand_as(timestep)
-            epsilon_pred, _local_condition = self._predict_epsilon(
+            epsilon_pred, _local_condition, transformer_debug = self._predict_epsilon(
                 residual_t, crops, timestep, global_embedding
             )
             residual_t, residual_x0_normalized = self.schedule.ddim_step(
@@ -1158,7 +1236,7 @@ class FineDiffusionRefiner(nn.Module):
             )
             if return_debug:
                 intermediates.append(residual_t.detach().clone())
-        predicted_residual_physical = self.normalization.denormalize_residual(
+        predicted_residual_physical = self.residual_normalization.denormalize(
             residual_x0_normalized * repair
         ) * repair
         refined_crop = (
@@ -1184,4 +1262,5 @@ class FineDiffusionRefiner(nn.Module):
             output["sampling_start_timestep"] = start_timestep.detach().clone()
             output["initial_residual"] = initial_residual
             output["residual_x0_normalized"] = residual_x0_normalized.detach().clone()
+            output.update(transformer_debug)
         return output
