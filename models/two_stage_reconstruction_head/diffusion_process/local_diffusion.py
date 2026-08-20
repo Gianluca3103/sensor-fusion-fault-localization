@@ -1256,7 +1256,7 @@ class FineDiffusionRefiner(nn.Module):
             coarse_lidar_bev.device,
         )
         start_timestep = timesteps[0].expand(coarse_lidar_bev.shape[0])
-        residual_t = torch.zeros(
+        initial_noise = torch.randn(
             (
                 coarse_lidar_bev.shape[0],
                 self.config.lidar_channels,
@@ -1264,7 +1264,14 @@ class FineDiffusionRefiner(nn.Module):
             ),
             device=coarse_lidar_bev.device,
             dtype=coarse_lidar_bev.dtype,
+            generator=generator,
         )
+        start_sigma = self.schedule.extract(
+            self.schedule.sqrt_one_minus_alpha_bars,
+            start_timestep,
+            initial_noise,
+        )
+        residual_t = repair * start_sigma * initial_noise
         initial_residual = residual_t.detach().clone()
         _trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
@@ -1318,7 +1325,10 @@ class FineDiffusionRefiner(nn.Module):
             output["sampling_timesteps"] = timesteps.detach().clone()
             output["sampling_start_timestep"] = start_timestep.detach().clone()
             output["initial_residual"] = initial_residual
-            output["initial_lidar_bev"] = coarse_lidar_bev.detach().clone()
+            output["initial_lidar_bev"] = (
+                coarse_lidar_bev
+                + crops.paste(initial_residual) * reconstruction_mask
+            ).detach()
             output["residual_x0_normalized"] = residual_x0_normalized.detach().clone()
             output.update(transformer_debug)
         return output

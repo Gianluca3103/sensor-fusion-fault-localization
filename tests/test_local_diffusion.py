@@ -156,9 +156,10 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(int(timesteps[-1]), 0)
         self.assertEqual(len(timesteps), 50)
 
-    def test_initial_sampling_residual_uses_zero_residual_prior(self):
+    def test_initial_sampling_residual_uses_masked_gaussian_prior(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()
+        generator = torch.Generator().manual_seed(17)
         output = model.sample(
             coarse,
             faulty,
@@ -166,12 +167,19 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             repair,
             halo,
             sampling_steps=3,
+            generator=generator,
             return_debug=True,
         )
 
         crops = output["crop_batch"]
-        self.assertEqual(int(output["initial_residual"].count_nonzero()), 0)
-        self.assertTrue(torch.equal(output["initial_lidar_bev"], coarse))
+        self.assertGreater(int(output["initial_residual"].count_nonzero()), 0)
+        expected_initial_lidar = (
+            coarse
+            + crops.paste(output["initial_residual"]) * repair
+        )
+        self.assertTrue(
+            torch.equal(output["initial_lidar_bev"], expected_initial_lidar)
+        )
         self.assertEqual(
             int(
                 (
