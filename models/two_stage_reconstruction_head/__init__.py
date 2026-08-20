@@ -79,15 +79,6 @@ from .diffusion_process.diffusion_process import (
     MaskedEpsilonMSELoss,
     residual_target,
 )
-from .diffusion_process.residual_diffusion import (
-    DiffusionDownBlock,
-    DiffusionUpBlock,
-    MaskedResidualDiffusion,
-    ResidualDiffusionUNet,
-    ResidualDiffusionUNetConfig,
-    SinusoidalTimeEmbedding,
-    TimeConditionedResidualBlock,
-)
 from .diffusion_process.local_diffusion import (
     DiffusionRefinementBlock,
     FineDiffusionConfig,
@@ -98,14 +89,12 @@ from .diffusion_process.local_diffusion import (
     MaskedExactReconstructionLoss,
     ReconstructionCropBatch,
     ReconstructionCropExtractor,
+    SinusoidalTimeEmbedding,
     WindowAttention2d,
 )
 from .diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,
-    FrozenCoarseDiffusionPipeline,
-    ResidualDiffusionSampler,
     load_frozen_coarse_model,
-    validate_diffusion_checkpoint_compatibility,
 )
 from .diffusion_process.diffusion_metrics import (
     bev_occupancy,

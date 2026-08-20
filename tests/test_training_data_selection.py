@@ -14,7 +14,7 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.train_coarse_rec
     _summarize_active_fractions,
     _write_tensorboard_epoch,
 )
-from models.two_stage_reconstruction_head.diffusion_process.train_residual_diffusion import (
+from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
     _move_batch as move_diffusion_batch,
     _split_paths as diffusion_split_paths,
 )

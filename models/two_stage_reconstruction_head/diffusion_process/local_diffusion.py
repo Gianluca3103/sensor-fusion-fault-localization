@@ -18,7 +18,27 @@ from .diffusion_process import (
     MaskedEpsilonMSELoss,
     residual_target,
 )
-from .residual_diffusion import SinusoidalTimeEmbedding
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Standard sinusoidal timestep embedding used by the fine refiner."""
+
+    def __init__(self, dimension: int):
+        super().__init__()
+        self.dimension = int(dimension)
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        half = self.dimension // 2
+        frequencies = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=timestep.device, dtype=torch.float32)
+            / max(half - 1, 1)
+        )
+        angles = timestep.float()[:, None] * frequencies[None]
+        embedding = torch.cat((angles.sin(), angles.cos()), dim=1)
+        if embedding.shape[1] < self.dimension:
+            embedding = F.pad(embedding, (0, self.dimension - embedding.shape[1]))
+        return embedding
 
 
 @dataclass(frozen=True)
