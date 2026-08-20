@@ -131,6 +131,7 @@ def _run_epoch(
     pipeline.train(training)
     totals: dict[str, float] = {}
     occupancy_counts = {"tp": 0.0, "fp": 0.0, "fn": 0.0, "empty": 0.0}
+    coarse_occupancy_counts = {"tp": 0.0, "fp": 0.0, "fn": 0.0}
     samples = optimizer_steps = 0
     for raw_batch in loader:
         batch = _move_batch(raw_batch, device)
@@ -177,22 +178,41 @@ def _run_epoch(
         with torch.no_grad():
             selected = batch["reconstruction_mask"] > 0.5
             predicted = output["final_lidar_bev"][:, 0:1] >= 0.5
+            coarse_predicted = output["coarse_lidar_bev"][:, 0:1] >= 0.5
             expected = batch["clean_lidar_bev"][:, 0:1] >= 0.5
             occupancy_counts["tp"] += float((predicted & expected & selected).sum())
             occupancy_counts["fp"] += float((predicted & ~expected & selected).sum())
             occupancy_counts["fn"] += float((~predicted & expected & selected).sum())
             occupancy_counts["empty"] += float((~expected & selected).sum())
+            coarse_occupancy_counts["tp"] += float(
+                (coarse_predicted & expected & selected).sum()
+            )
+            coarse_occupancy_counts["fp"] += float(
+                (coarse_predicted & ~expected & selected).sum()
+            )
+            coarse_occupancy_counts["fn"] += float(
+                (~coarse_predicted & expected & selected).sum()
+            )
         samples += count
         if any(parameter.grad is not None for parameter in pipeline.coarse_model.parameters()):
             raise RuntimeError("Frozen coarse model unexpectedly received gradients")
     result = {key: value / max(samples, 1) for key, value in totals.items()}
     tp, fp, fn = (occupancy_counts[key] for key in ("tp", "fp", "fn"))
+    coarse_tp, coarse_fp, coarse_fn = (
+        coarse_occupancy_counts[key] for key in ("tp", "fp", "fn")
+    )
     epsilon = 1.0e-8
+    exact_iou = tp / (tp + fp + fn + epsilon)
+    coarse_exact_iou = coarse_tp / (
+        coarse_tp + coarse_fp + coarse_fn + epsilon
+    )
     result.update(
         {
             "exact_occupancy_precision": tp / (tp + fp + epsilon),
             "exact_occupancy_recall": tp / (tp + fn + epsilon),
-            "exact_occupancy_iou": tp / (tp + fp + fn + epsilon),
+            "exact_occupancy_iou": exact_iou,
+            "coarse_exact_occupancy_iou": coarse_exact_iou,
+            "exact_iou_improvement_vs_coarse": exact_iou - coarse_exact_iou,
             "false_positive_occupancy_rate": fp
             / (occupancy_counts["empty"] + epsilon),
         }
@@ -231,6 +251,13 @@ def _sampling_metrics(pipeline, loader, device, maximum, sampling_steps):
                 {
                     "sample_path": raw_batch["sample_path"][index],
                     "exact_iou": float(metrics["final"]["occupancy"]["iou"]),
+                    "coarse_exact_iou": float(
+                        metrics["coarse"]["occupancy"]["iou"]
+                    ),
+                    "exact_iou_improvement_vs_coarse": float(
+                        metrics["final"]["occupancy"]["iou"]
+                        - metrics["coarse"]["occupancy"]["iou"]
+                    ),
                     "exact_f1": float(metrics["final"]["occupancy"]["f1"]),
                     "exact_precision": float(
                         metrics["final"]["occupancy"]["precision"]
@@ -356,24 +383,25 @@ def main():
         row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
         print(
-            f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
-            f"train/diffusion={train_stats['diffusion_loss']:.6f} "
-            f"train/exact={train_stats['exact_reconstruction_loss']:.6f} "
-            f"train/degradation={train_stats['degradation_loss']:.6f} "
-            f"train/residual_reg={train_stats['residual_regularization_loss']:.6f} "
-            f"val/loss={val_stats['loss']:.6f} "
-            f"val/diffusion={val_stats['diffusion_loss']:.6f} "
-            f"val/exact={val_stats['exact_reconstruction_loss']:.6f} "
-            f"val/degradation={val_stats['degradation_loss']:.6f} "
-            f"val/residual_reg={val_stats['residual_regularization_loss']:.6f} "
-            f"val/coarse_exact={val_stats['coarse_exact_reconstruction_loss']:.6f} "
-            f"val/residual_abs={val_stats['predicted_residual_abs_mean']:.6f} "
-            f"val/IoU={100.0 * val_stats['exact_occupancy_iou']:.2f}% "
-            f"val/P={100.0 * val_stats['exact_occupancy_precision']:.2f}% "
-            f"val/R={100.0 * val_stats['exact_occupancy_recall']:.2f}% "
-            f"val/FP={100.0 * val_stats['false_positive_occupancy_rate']:.2f}% "
-            f"crop={val_stats['average_crop_height']:.1f}x"
-            f"{val_stats['average_crop_width']:.1f} time={elapsed:.1f}s"
+            f"\nepoch {epoch:03d}/{epochs:03d} | {elapsed:.1f}s | "
+            f"crop {val_stats['average_crop_height']:.1f}x"
+            f"{val_stats['average_crop_width']:.1f}\n"
+            f"  train | loss {train_stats['loss']:.6f} | "
+            f"exact IoU {100.0 * train_stats['exact_occupancy_iou']:.2f}%\n"
+            f"  val   | loss {val_stats['loss']:.6f} | "
+            f"diffusion {val_stats['diffusion_loss']:.6f} | "
+            f"reconstruction {val_stats['exact_reconstruction_loss']:.6f} | "
+            f"degradation {val_stats['degradation_loss']:.6f} | "
+            f"residual {val_stats['residual_regularization_loss']:.6f}\n"
+            f"  exact reconstruction-mask occupancy\n"
+            f"        | coarse IoU {100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
+            f"-> fine IoU {100.0 * val_stats['exact_occupancy_iou']:.2f}% "
+            f"({100.0 * val_stats['exact_iou_improvement_vs_coarse']:+.2f} pp)\n"
+            f"        | precision {100.0 * val_stats['exact_occupancy_precision']:.2f}% | "
+            f"recall {100.0 * val_stats['exact_occupancy_recall']:.2f}% | "
+            f"false-positive rate "
+            f"{100.0 * val_stats['false_positive_occupancy_rate']:.2f}% | "
+            f"mean |residual| {val_stats['predicted_residual_abs_mean']:.6f}"
         )
         improved = val_stats["loss"] < best
         best = min(best, val_stats["loss"])
