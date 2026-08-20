@@ -195,7 +195,19 @@ class PointPillarsTests(unittest.TestCase):
         self.assertEqual(model_config.target_lidar_channels, 3)
         self.assertEqual(model_config.local_input_channels, 130)
 
-    def test_model_masks_features_and_both_pillar_encoders_receive_gradients(self):
+    def test_dual_radar_ablation_adds_native_four_channel_bev(self):
+        model_config, _, _ = build_configs(
+            {
+                "pointpillars": {"enabled": True},
+                "coarse_reconstruction": {
+                    "include_raw_radar_bev": True,
+                },
+            }
+        )
+        self.assertTrue(model_config.include_raw_radar_bev)
+        self.assertEqual(model_config.local_input_channels, 134)
+
+    def test_dual_radar_ablation_uses_pillars_and_raw_bev(self):
         pointpillars = PointPillarsConfig(
             enabled=True,
             output_channels=64,
@@ -206,6 +218,7 @@ class PointPillarsTests(unittest.TestCase):
             lidar_channels=64,
             radar_channels=64,
             target_lidar_channels=3,
+            include_raw_radar_bev=True,
             pointpillars=pointpillars,
             hrnet=HRNetConfig(
                 base_channels=2,
@@ -215,7 +228,7 @@ class PointPillarsTests(unittest.TestCase):
         )
         model = CoarseReconstructionModel(config, grid_geometry=_geometry()).train()
         faulty_bev = torch.rand(1, 3, 320, 320)
-        radar_bev = torch.zeros(1, 4, 320, 320)
+        radar_bev = torch.rand(1, 4, 320, 320)
         reconstruction = torch.zeros(1, 1, 320, 320)
         reconstruction[:, :, 260:300, 120:180] = 1.0
         healthy = 1.0 - reconstruction
@@ -251,6 +264,9 @@ class PointPillarsTests(unittest.TestCase):
         )
         self.assertEqual(tuple(outputs["lidar_pillar_bev"].shape), (1, 64, 320, 320))
         self.assertEqual(tuple(outputs["radar_pillar_bev"].shape), (1, 64, 320, 320))
+        self.assertTrue(torch.equal(outputs["radar_raw_bev"], radar_bev))
+        self.assertIsNotNone(model.radar_pillar_encoder)
+        self.assertEqual(tuple(outputs["local_input"].shape), (1, 134, 320, 320))
         self.assertEqual(tuple(outputs["reconstruction_mask"].shape), (1, 1, 320, 320))
         erased_values = outputs["erased_lidar_features"] * reconstruction
         self.assertEqual(float(erased_values.detach().abs().max()), 0.0)

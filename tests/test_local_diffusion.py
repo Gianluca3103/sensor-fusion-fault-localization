@@ -385,7 +385,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             float(validation["clean_lidar_bev"].mean()),
         )
 
-    def test_coarse_is_present_in_ten_channel_main_stream(self):
+    def test_coarse_is_raw_full_resolution_cross_attention_input(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config()).eval()
         output = model(
@@ -400,14 +400,50 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             return_debug=True,
         )
         debug = output["debug"]
-        self.assertEqual(debug["residual_stem_input"].shape[1], 10)
+        self.assertEqual(debug["residual_stem_input"].shape[1], 7)
         self.assertEqual(
-            model.transformer.residual_stem.in_channels, 10
+            model.transformer.residual_stem.in_channels, 7
+        )
+        self.assertEqual(
+            model.transformer.blocks[0].cross_attention.attention.kdim,
+            3,
+        )
+        self.assertEqual(
+            model.transformer.blocks[0].radar_cross_attention.attention.kdim,
+            4,
         )
         self.assertTrue(
             torch.equal(
-                debug["normalized_coarse_main_stream"],
+                debug["raw_coarse_cross_attention"],
                 model.normalization.normalize(debug["crops"].tensors["coarse"]),
+            )
+        )
+        self.assertEqual(
+            tuple(debug["raw_coarse_cross_attention"].shape[-2:]),
+            tuple(debug["crops"].tensors["coarse"].shape[-2:]),
+        )
+        self.assertTrue(
+            torch.equal(
+                debug["coarse_cross_attention_valid"],
+                debug["crops"].tensors["repair"]
+                * debug["crops"].valid_mask,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                debug["raw_radar_cross_attention"],
+                debug["crops"].tensors["radar"],
+            )
+        )
+        self.assertEqual(
+            tuple(debug["raw_radar_cross_attention"].shape[-2:]),
+            tuple(debug["crops"].tensors["radar"].shape[-2:]),
+        )
+        self.assertTrue(
+            torch.equal(
+                debug["radar_cross_attention_valid"],
+                debug["crops"].tensors["repair"]
+                * debug["crops"].valid_mask,
             )
         )
         altered = model(
@@ -423,13 +459,14 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         )["debug"]
         self.assertFalse(
             torch.equal(
-                debug["normalized_coarse_main_stream"],
-                altered["normalized_coarse_main_stream"],
+                debug["raw_coarse_cross_attention"],
+                altered["raw_coarse_cross_attention"],
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             torch.equal(
-                debug["residual_stem_input"], altered["residual_stem_input"]
+                debug["residual_stem_input"][:, :3],
+                debug["noisy_residual"],
             )
         )
 
@@ -535,9 +572,10 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         names = {name for name, parameter in model.named_parameters() if parameter.grad is not None}
         for expected in (
             "transformer.residual_stem",
-            "transformer.local_condition_encoder",
+            "transformer.auxiliary_condition_encoder",
             "self_attention",
             "cross_attention",
+            "radar_cross_attention",
             "ffn",
             "modulation",
             "global_encoder",

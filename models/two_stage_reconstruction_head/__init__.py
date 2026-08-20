@@ -85,7 +85,7 @@ from .diffusion_process.local_diffusion import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
     GlobalFaultyLidarEncoder,
-    LocalConditionEncoder,
+    AuxiliaryConditionEncoder,
     LocalResidualDiffusionTransformer,
     MaskedExactReconstructionLoss,
     MaskedNoDegradationLoss,

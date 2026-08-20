@@ -22,7 +22,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 2
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 4
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -335,7 +335,9 @@ class GlobalFaultyLidarEncoder(nn.Module):
         return self.projection(F.adaptive_avg_pool2d(features, 1).flatten(1))
 
 
-class LocalConditionEncoder(nn.Module):
+class AuxiliaryConditionEncoder(nn.Module):
+    """Encode non-coarse local evidence without altering the coarse BEV."""
+
     def __init__(self, input_channels: int, hidden_dim: int):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -431,7 +433,15 @@ def _reverse_windows(windows: torch.Tensor, metadata) -> torch.Tensor:
 class WindowAttention2d(nn.Module):
     """Windowed attention supporting independent query and key/value maps."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, window_size: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        window_size: int,
+        dropout: float,
+        *,
+        key_value_dim: int | None = None,
+    ):
         super().__init__()
         self.window_size = int(window_size)
         self.attention = nn.MultiheadAttention(
@@ -439,6 +449,8 @@ class WindowAttention2d(nn.Module):
             num_heads,
             dropout=dropout,
             batch_first=True,
+            kdim=key_value_dim,
+            vdim=key_value_dim,
         )
 
     def forward(
@@ -448,14 +460,18 @@ class WindowAttention2d(nn.Module):
         valid: torch.Tensor,
         *,
         shift: int = 0,
+        key_value_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query_windows, valid_windows, metadata = _partition_windows(
             query, valid, self.window_size, shift
         )
         key_windows, key_valid, _ = _partition_windows(
-            key_value, valid, self.window_size, shift
+            key_value,
+            valid if key_value_valid is None else key_value_valid,
+            self.window_size,
+            shift,
         )
-        active = valid_windows.any(dim=1)
+        active = valid_windows.any(dim=1) & key_valid.any(dim=1)
         output = torch.zeros_like(query_windows)
         if bool(active.any()):
             attended, _weights = self.attention(
@@ -497,6 +513,8 @@ class DiffusionRefinementBlock(nn.Module):
         condition_dim: int,
         dropout: float,
         shifted: bool,
+        coarse_channels: int,
+        radar_channels: int,
     ):
         super().__init__()
         self.shift = window_size // 2 if shifted else 0
@@ -507,16 +525,30 @@ class DiffusionRefinementBlock(nn.Module):
             hidden_dim, num_heads, window_size, dropout
         )
         self.cross_attention = WindowAttention2d(
-            hidden_dim, num_heads, window_size, dropout
+            hidden_dim,
+            num_heads,
+            window_size,
+            dropout,
+            key_value_dim=coarse_channels,
+        )
+        self.radar_cross_attention = WindowAttention2d(
+            hidden_dim,
+            num_heads,
+            window_size,
+            dropout,
+            key_value_dim=radar_channels,
         )
         self.ffn = ConvolutionalFFN(hidden_dim, dropout)
 
     def forward(
         self,
         tensor: torch.Tensor,
-        local_condition: torch.Tensor,
+        raw_coarse: torch.Tensor,
+        raw_radar: torch.Tensor,
         condition_vector: torch.Tensor,
         valid: torch.Tensor,
+        coarse_valid: torch.Tensor,
+        radar_valid: torch.Tensor,
     ) -> torch.Tensor:
         tensor = tensor + self.self_attention(
             self.self_norm(tensor, condition_vector),
@@ -526,9 +558,17 @@ class DiffusionRefinementBlock(nn.Module):
         )
         tensor = tensor + self.cross_attention(
             self.cross_norm(tensor, condition_vector),
-            local_condition,
+            raw_coarse,
             valid,
             shift=self.shift,
+            key_value_valid=coarse_valid,
+        )
+        tensor = tensor + self.radar_cross_attention(
+            self.cross_norm(tensor, condition_vector),
+            raw_radar,
+            valid,
+            shift=self.shift,
+            key_value_valid=radar_valid,
         )
         tensor = tensor + self.ffn(self.ffn_norm(tensor, condition_vector)) * valid
         return tensor * valid
@@ -542,17 +582,15 @@ class LocalResidualDiffusionTransformer(nn.Module):
         config.validate()
         self.config = config
         coordinates = 4
-        condition_channels = (
-            2 * config.lidar_channels + config.radar_channels + 2 + coordinates
-        )
+        auxiliary_channels = config.lidar_channels + 2 + coordinates
         self.residual_stem = nn.Conv2d(
-            2 * config.lidar_channels + coordinates,
+            config.lidar_channels + coordinates,
             config.hidden_dim,
             3,
             padding=1,
         )
-        self.local_condition_encoder = LocalConditionEncoder(
-            condition_channels, config.hidden_dim
+        self.auxiliary_condition_encoder = AuxiliaryConditionEncoder(
+            auxiliary_channels, config.hidden_dim
         )
         condition_dim = config.global_context_dim
         self.time_embedding = nn.Sequential(
@@ -577,6 +615,8 @@ class LocalResidualDiffusionTransformer(nn.Module):
                 condition_dim,
                 config.dropout,
                 config.use_shifted_windows and index % 2 == 1,
+                config.lidar_channels,
+                config.radar_channels,
             )
             for index in range(config.num_transformer_blocks)
         )
@@ -613,10 +653,8 @@ class LocalResidualDiffusionTransformer(nn.Module):
         timestep: torch.Tensor,
         global_embedding: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        local_condition_input = torch.cat(
+        auxiliary_condition_input = torch.cat(
             (
-                coarse,
-                radar,
                 trusted_faulty,
                 reconstruction_mask,
                 halo_mask,
@@ -624,19 +662,34 @@ class LocalResidualDiffusionTransformer(nn.Module):
             ),
             dim=1,
         )
-        local_condition = self.local_condition_encoder(
-            local_condition_input, valid
+        auxiliary_condition = self.auxiliary_condition_encoder(
+            auxiliary_condition_input, valid
         )
         residual_stem_input = torch.cat(
-            (noisy_residual, coarse, coordinates), dim=1
+            (noisy_residual, coordinates), dim=1
         )
-        tensor = self.residual_stem(residual_stem_input) * valid
+        tensor = (
+            self.residual_stem(residual_stem_input) + auxiliary_condition
+        ) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
+        coarse_valid = reconstruction_mask * valid
+        radar_valid = reconstruction_mask * valid
         for block in self.blocks:
-            tensor = block(tensor, local_condition, condition_vector, valid)
+            tensor = block(
+                tensor,
+                coarse,
+                radar,
+                condition_vector,
+                valid,
+                coarse_valid,
+                radar_valid,
+            )
         epsilon = self.output_head(tensor) * reconstruction_mask * valid
-        return epsilon, local_condition, {
-            "normalized_coarse_main_stream": coarse,
+        return epsilon, auxiliary_condition, {
+            "raw_coarse_cross_attention": coarse,
+            "coarse_cross_attention_valid": coarse_valid,
+            "raw_radar_cross_attention": radar,
+            "radar_cross_attention_valid": radar_valid,
             "residual_stem_input": residual_stem_input,
         }
 
@@ -646,24 +699,33 @@ def fine_diffusion_architecture_metadata(
 ) -> dict[str, int | str]:
     return {
         "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
-        "residual_stem_input_channels": 2 * config.lidar_channels + 4,
-        "coarse_main_stream": "normalized_bev",
+        "residual_stem_input_channels": config.lidar_channels + 4,
+        "coarse_cross_attention": "raw_full_resolution_reconstruction_mask",
+        "radar_cross_attention": "raw_full_resolution_reconstruction_mask",
     }
 
 
 def validate_fine_diffusion_checkpoint_compatibility(
     checkpoint: Mapping, config: FineDiffusionConfig
 ) -> None:
-    expected = 2 * config.lidar_channels + 4
+    expected = config.lidar_channels + 4
     weight = checkpoint.get("diffusion_state_dict", {}).get(
         "transformer.residual_stem.weight"
     )
     actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
     metadata = checkpoint.get("fine_diffusion_architecture")
-    if actual == config.lidar_channels + 4 or metadata is None:
+    architecture_version = (
+        metadata.get("version") if isinstance(metadata, Mapping) else None
+    )
+    if architecture_version in (None, 1):
         raise ValueError(
             "Fine Diffusion checkpoint uses the legacy residual stem without "
             "direct coarse conditioning. Start a fresh Fine Diffusion run."
+        )
+    if architecture_version != FINE_DIFFUSION_ARCHITECTURE_VERSION:
+        raise ValueError(
+            "Fine Diffusion checkpoint predates raw full-resolution coarse/radar "
+            "cross-attention. Start a fresh Fine Diffusion run."
         )
     if actual != expected:
         raise ValueError(

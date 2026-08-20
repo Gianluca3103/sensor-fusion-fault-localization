@@ -32,6 +32,7 @@ class CoarseReconstructionConfig:
     target_lidar_channels: int = 3
     use_healthy_context_mask: bool = True
     use_halo_context: bool = True
+    include_raw_radar_bev: bool = False
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
     pointpillars_v2: PointPillarsV2Config = field(
         default_factory=PointPillarsV2Config
@@ -62,7 +63,13 @@ class CoarseReconstructionConfig:
     @property
     def local_input_channels(self) -> int:
         mask_channels = 2 if self.use_healthy_context_mask else 1
-        return self.lidar_channels + self.radar_channels + mask_channels
+        raw_radar_channels = 4 if self.include_raw_radar_bev else 0
+        return (
+            self.lidar_channels
+            + self.radar_channels
+            + raw_radar_channels
+            + mask_channels
+        )
 
     def validate(self) -> None:
         for name in ("lidar_channels", "radar_channels", "target_lidar_channels"):
@@ -76,6 +83,8 @@ class CoarseReconstructionConfig:
             raise ValueError("use_healthy_context_mask must be boolean")
         if not isinstance(self.use_halo_context, bool):
             raise ValueError("use_halo_context must be boolean")
+        if not isinstance(self.include_raw_radar_bev, bool):
+            raise ValueError("include_raw_radar_bev must be boolean")
         self.pointpillars.validate()
         self.pointpillars_v2.validate()
         self.pointpillars_v3.validate()
@@ -99,6 +108,10 @@ class CoarseReconstructionConfig:
                 raise ValueError(
                     "PointPillars output_channels must match both sensor channel counts"
                 )
+        elif self.include_raw_radar_bev:
+            raise ValueError(
+                "include_raw_radar_bev is an ablation for PointPillars models"
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -228,6 +241,7 @@ def build_configs(payload: dict):
         radar_channels=radar_channels,
         use_healthy_context_mask=mask_payload.get("use_healthy_context_mask", True),
         use_halo_context=mask_payload.get("use_halo_context", True),
+        include_raw_radar_bev=coarse.get("include_raw_radar_bev", False),
         pointpillars=pointpillars,
         pointpillars_v2=pointpillars_v2,
         pointpillars_v3=pointpillars_v3,

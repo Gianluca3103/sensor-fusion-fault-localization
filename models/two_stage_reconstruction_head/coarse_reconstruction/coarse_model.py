@@ -221,10 +221,14 @@ class CoarseReconstructionModel(nn.Module):
 
         local_lidar_context = local_context_mask * lidar_sensor_bev
         local_radar_context = active_mask * radar_sensor_bev
-        local_input = torch.cat(
-            (local_lidar_context, local_radar_context, *mask_channels),
-            dim=1,
+        raw_radar_context = active_mask * (
+            radar_bev if radar_enabled else torch.zeros_like(radar_bev)
         )
+        input_streams = [local_lidar_context, local_radar_context]
+        if self.config.include_raw_radar_bev:
+            input_streams.append(raw_radar_context)
+        input_streams.extend(mask_channels)
+        local_input = torch.cat(input_streams, dim=1)
         hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
         replacement_raw = self.replacement_head(hrnet_features)
         occupancy_logits = replacement_raw[:, 0:1]
@@ -248,6 +252,7 @@ class CoarseReconstructionModel(nn.Module):
             "erased_lidar_features": erased_lidar_bev,
             "lidar_sensor_bev": lidar_sensor_bev,
             "radar_sensor_bev": radar_sensor_bev,
+            "radar_raw_bev": radar_bev,
             "replacement_raw": replacement_raw,
             "replacement_bev": replacement_bev,
             "occupancy_logits": occupancy_logits,
@@ -262,6 +267,7 @@ class CoarseReconstructionModel(nn.Module):
             "local_lidar_context": local_lidar_context,
             "local_radar_active": local_radar_context,
             "local_radar_context": local_radar_context,
+            "local_raw_radar_context": raw_radar_context,
             "local_input": local_input,
             "hrnet_features": hrnet_features,
             "lidar_pillar_bev": lidar_sensor_bev,
