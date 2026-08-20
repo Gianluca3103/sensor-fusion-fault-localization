@@ -448,56 +448,71 @@ def main():
                 source=bev_metadata.get("source", "fine_diffusion_checkpoint"),
             )
     else:
-        statistics_loader_options = dict(loader_options)
-        statistics_loader_options["persistent_workers"] = False
-        statistics_loader = DataLoader(
-            train_dataset, shuffle=False, **statistics_loader_options
-        )
-
-        def coarse_for_statistics(batch):
-            if config.bypass_coarse_reconstruction:
-                return batch["faulty_lidar_bev"] * (
-                    1.0 - batch["reconstruction_mask"]
-                )
-            coarse.eval()
-            output = coarse(
-                batch["faulty_lidar_bev"],
-                batch["radar_bev"],
-                batch["reconstruction_mask"],
-                batch["healthy_context_mask"],
-                batch["halo_mask"],
-                faulty_lidar_points=batch.get("faulty_lidar_points"),
-                radar_points=batch.get("radar_points"),
+        residual_statistics = None
+        if args.residual_statistics_only:
+            statistics_loader_options = dict(loader_options)
+            statistics_loader_options["persistent_workers"] = False
+            statistics_loader = DataLoader(
+                train_dataset, shuffle=False, **statistics_loader_options
             )
-            return output["coarse_lidar_bev"]
 
-        print("Estimating coarse-to-clean residual statistics from TRAIN only...")
-        residual_statistics = estimate_training_residual_statistics(
-            statistics_loader,
-            move_batch=lambda raw: _move_batch(raw, device),
-            coarse_forward=coarse_for_statistics,
-            channels=config.lidar_channels,
-            minimum_std=config.minimum_residual_std,
-        )
-        residual_metadata = {
-            "raw_channel_stds": residual_statistics["raw_channel_stds"],
-            "channel_stds": residual_statistics["effective_channel_stds"],
-            "minimum_std": config.minimum_residual_std,
-            "source": "training_split_coarse_to_clean_residuals",
-        }
+            def coarse_for_statistics(batch):
+                if config.bypass_coarse_reconstruction:
+                    return batch["faulty_lidar_bev"] * (
+                        1.0 - batch["reconstruction_mask"]
+                    )
+                coarse.eval()
+                output = coarse(
+                    batch["faulty_lidar_bev"],
+                    batch["radar_bev"],
+                    batch["reconstruction_mask"],
+                    batch["healthy_context_mask"],
+                    batch["halo_mask"],
+                    faulty_lidar_points=batch.get("faulty_lidar_points"),
+                    radar_points=batch.get("radar_points"),
+                )
+                return output["coarse_lidar_bev"]
+
+            print("Estimating coarse-to-clean residual statistics from TRAIN only...")
+            residual_statistics = estimate_training_residual_statistics(
+                statistics_loader,
+                move_batch=lambda raw: _move_batch(raw, device),
+                coarse_forward=coarse_for_statistics,
+                channels=config.lidar_channels,
+                minimum_std=config.minimum_residual_std,
+            )
+            residual_metadata = {
+                "raw_channel_stds": residual_statistics["raw_channel_stds"],
+                "channel_stds": residual_statistics["effective_channel_stds"],
+                "minimum_std": config.minimum_residual_std,
+                "source": "training_split_coarse_to_clean_residuals",
+            }
+        else:
+            unit_stds = [1.0] * config.lidar_channels
+            residual_metadata = {
+                "raw_channel_stds": unit_stds,
+                "channel_stds": unit_stds,
+                "minimum_std": config.minimum_residual_std,
+                "source": "fixed_unit_residual_scaling",
+            }
+            print(
+                "Using fixed unit residual scaling; "
+                "skipping the train-set residual-statistics pass."
+            )
         residual_normalizer = _residual_normalizer(
             residual_metadata, config
         )
-        for item in residual_statistics["channels"]:
-            print(
-                f"  channel {item['channel']}: mean={item['mean']:.8f}, "
-                f"raw_std={item['raw_std']:.8f}, "
-                f"effective_std={item['effective_std']:.8f}, "
-                f"mean_abs={item['mean_absolute_value']:.8f}, "
-                f"p95_abs={item['p95_absolute_value']:.8f}, "
-                f"zero={item['fraction_approximately_zero']:.2%}, "
-                f"n={item['sample_count']}"
-            )
+        if residual_statistics is not None:
+            for item in residual_statistics["channels"]:
+                print(
+                    f"  channel {item['channel']}: mean={item['mean']:.8f}, "
+                    f"raw_std={item['raw_std']:.8f}, "
+                    f"effective_std={item['effective_std']:.8f}, "
+                    f"mean_abs={item['mean_absolute_value']:.8f}, "
+                    f"p95_abs={item['p95_absolute_value']:.8f}, "
+                    f"zero={item['fraction_approximately_zero']:.2%}, "
+                    f"n={item['sample_count']}"
+                )
 
     if residual_statistics is not None:
         atomic_write_json(
