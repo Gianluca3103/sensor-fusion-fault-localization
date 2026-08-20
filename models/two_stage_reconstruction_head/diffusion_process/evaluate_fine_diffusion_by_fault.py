@@ -287,11 +287,14 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
     }
 
 
-def _print_table(groups: dict[str, dict]) -> None:
+def _print_table(
+    groups: dict[str, dict], *, baseline_label: str = "Coarse"
+) -> None:
     header = (
         f"{'Fault':<28} {'N':>6} {'Used':>6} {'Faulty IoU':>11} "
-        f"{'Coarse IoU':>11} {'Fine IoU':>10} {'Fine-Faulty':>12} "
-        f"{'Fine-Coarse':>12} {'Faulty@0.5m':>13} {'Coarse@0.5m':>13} "
+        f"{f'{baseline_label} IoU':>15} {'Fine IoU':>10} {'Fine-Faulty':>12} "
+        f"{f'Fine-{baseline_label}':>16} {'Faulty@0.5m':>13} "
+        f"{f'{baseline_label}@0.5m':>17} "
         f"{'Fine@0.5m':>11} {'Fine-Faulty@0.5m':>18} {'Fine F1@0.5m':>14} "
         f"{'Fine Halluc.':>13}"
     )
@@ -302,12 +305,12 @@ def _print_table(groups: dict[str, dict]) -> None:
             f"{name:<28} {summary['samples']:6d} "
             f"{summary.get('metric_samples', summary['samples']):6d} "
             f"{summary['micro/faulty_iou']:10.2%} "
-            f"{summary['micro/coarse_iou']:10.2%} "
+            f"{summary['micro/coarse_iou']:14.2%} "
             f"{summary['micro/fine_iou']:9.2%} "
             f"{summary['micro/fine_iou_improvement']:+11.2%} "
-            f"{summary['micro/fine_minus_coarse_iou']:+11.2%} "
+            f"{summary['micro/fine_minus_coarse_iou']:+15.2%} "
             f"{summary['macro/faulty_occupancy_tolerant_0_5m_iou']:12.2%} "
-            f"{summary['macro/coarse_occupancy_tolerant_0_5m_iou']:12.2%} "
+            f"{summary['macro/coarse_occupancy_tolerant_0_5m_iou']:16.2%} "
             f"{summary['macro/fine_occupancy_tolerant_0_5m_iou']:10.2%} "
             f"{summary['macro/fine_tolerant_0_5m_iou_improvement']:+17.2%} "
             f"{summary['macro/fine_occupancy_tolerant_0_5m_f1']:13.2%} "
@@ -386,12 +389,22 @@ def main() -> None:
 
     diffusion_config = _diffusion_config_from_checkpoint(checkpoint["diffusion_config"])
     normalizer = _normalizer_from_fine_config(args.fine_config, diffusion_config)
-    coarse_checkpoint_path = args.coarse_checkpoint or Path(checkpoint["coarse_checkpoint"])
-    coarse, coarse_checkpoint = load_frozen_coarse_model(
-        coarse_checkpoint_path,
-        device,
-        allow_pointpillars=True,
-    )
+    if diffusion_config.bypass_coarse_reconstruction:
+        coarse_checkpoint_path = None
+        coarse = None
+        coarse_checkpoint = {}
+        use_pointpillars = False
+    else:
+        recorded_coarse = checkpoint.get("coarse_checkpoint")
+        if args.coarse_checkpoint is None and not recorded_coarse:
+            raise ValueError("Fine checkpoint does not identify its coarse model")
+        coarse_checkpoint_path = args.coarse_checkpoint or Path(recorded_coarse)
+        coarse, coarse_checkpoint = load_frozen_coarse_model(
+            coarse_checkpoint_path,
+            device,
+            allow_pointpillars=True,
+        )
+        use_pointpillars = coarse.config.pointpillars_enabled
     selector_config = _load_selector_config(args.config)
     sample_paths = _split_paths(
         args.data_root, args.split, args.limit_samples, args.seed
@@ -402,11 +415,11 @@ def main() -> None:
         args.radar_root,
         data_root=args.data_root,
         selector_config=selector_config,
-        use_pointpillars=coarse.config.pointpillars_enabled,
+        use_pointpillars=use_pointpillars,
     )
     grid_geometry = (
         coarse.grid_geometry
-        if getattr(coarse, "grid_geometry", None) is not None
+        if coarse is not None and getattr(coarse, "grid_geometry", None) is not None
         else dataset.grid_geometry
     )
     loader = DataLoader(
@@ -579,7 +592,14 @@ def main() -> None:
     by_fault_severity = _group_summaries(records, lambda record: record["fault_group"])
     summary = {
         "checkpoint": str(args.checkpoint),
-        "coarse_checkpoint": str(coarse_checkpoint_path),
+        "coarse_checkpoint": (
+            str(coarse_checkpoint_path)
+            if coarse_checkpoint_path is not None
+            else None
+        ),
+        "bypass_coarse_reconstruction": (
+            diffusion_config.bypass_coarse_reconstruction
+        ),
         "fine_checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
         "sampling_steps": sampling_steps,
@@ -600,7 +620,14 @@ def main() -> None:
     atomic_write_json(args.output_root / "summary.json", summary)
     print()
     print(f"PER-FAULT FINE-DIFFUSION {args.split.upper()} RESULTS")
-    _print_table(by_fault_severity)
+    _print_table(
+        by_fault_severity,
+        baseline_label=(
+            "Erased faulty"
+            if diffusion_config.bypass_coarse_reconstruction
+            else "Coarse"
+        ),
+    )
     print(f"\nSaved evaluation to {args.output_root}")
 
 

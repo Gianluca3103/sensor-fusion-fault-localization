@@ -46,6 +46,7 @@ class FineDiffusionConfig:
     """Configuration for the V1 local residual-diffusion refiner."""
 
     enabled: bool = True
+    bypass_coarse_reconstruction: bool = False
     lidar_channels: int = 3
     radar_channels: int = 4
     hidden_dim: int = 64
@@ -97,8 +98,10 @@ class FineDiffusionConfig:
                 "sampling_start_timestep must be in "
                 "[1, training_timesteps)"
             )
-        if self.sampling_steps not in {1, 3, 5, 10}:
-            raise ValueError("sampling_steps must be one of 1, 3, 5, or 10")
+        if self.sampling_steps not in {1, 3, 5, 10, 25, 50}:
+            raise ValueError(
+                "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
+            )
         if self.sampling_steps > self.sampling_start_timestep + 1:
             raise ValueError(
                 "sampling_steps cannot exceed sampling_start_timestep + 1"

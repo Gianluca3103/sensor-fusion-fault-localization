@@ -43,7 +43,10 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--radar-root", required=True)
-    parser.add_argument("--coarse-checkpoint", required=True)
+    parser.add_argument(
+        "--coarse-checkpoint",
+        help="Required unless fine_diffusion.bypass_coarse_reconstruction is true.",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--config", default=str(REPO_ROOT / "configs" / "fine_diffusion.json")
@@ -174,7 +177,10 @@ def _run_epoch(
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
         samples += count
-        if any(parameter.grad is not None for parameter in pipeline.coarse_model.parameters()):
+        if pipeline.coarse_model is not None and any(
+            parameter.grad is not None
+            for parameter in pipeline.coarse_model.parameters()
+        ):
             raise RuntimeError("Frozen coarse model unexpectedly received gradients")
     result = {key: value / max(samples, 1) for key, value in totals.items()}
     if training:
@@ -353,10 +359,20 @@ def main():
     seed = int(training.get("seed", 42))
     seed_everything(seed)
     device = resolve_device(args.device)
-    coarse, coarse_checkpoint = load_frozen_coarse_model(
-        args.coarse_checkpoint, device, allow_pointpillars=True
-    )
-    use_pointpillars = coarse.config.pointpillars_enabled
+    if config.bypass_coarse_reconstruction:
+        coarse = None
+        coarse_checkpoint = None
+        use_pointpillars = False
+    else:
+        if not args.coarse_checkpoint:
+            raise ValueError(
+                "--coarse-checkpoint is required unless coarse reconstruction "
+                "is bypassed"
+            )
+        coarse, coarse_checkpoint = load_frozen_coarse_model(
+            args.coarse_checkpoint, device, allow_pointpillars=True
+        )
+        use_pointpillars = coarse.config.pointpillars_enabled
     dataset_options = {
         "radar_root": args.radar_root,
         "data_root": args.data_root,
@@ -413,14 +429,17 @@ def main():
             "payload": payload,
             "fine_diffusion": config.to_dict(),
             "normalization": normalizer.metadata(),
-            "coarse_model_config": coarse.config.to_dict(),
+            "coarse_model_config": (
+                coarse.config.to_dict() if coarse is not None else None
+            ),
             "args": vars(args),
         },
     )
     parameters = sum(p.numel() for p in diffusion.parameters())
     print(
         f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}; "
-        f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}"
+        f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}; "
+        f"bypass coarse: {config.bypass_coarse_reconstruction}"
     )
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
@@ -454,6 +473,11 @@ def main():
         row.update({f"train/{key}": value for key, value in train_stats.items()})
         row.update({f"val/{key}": value for key, value in val_stats.items()})
         history.append(row)
+        baseline_label = (
+            "erased faulty"
+            if config.bypass_coarse_reconstruction
+            else "coarse"
+        )
         print(
             f"\nepoch {epoch:03d}/{epochs:03d} | {elapsed:.1f}s | "
             f"sampled validation {validation_seconds:.1f}s\n"
@@ -465,7 +489,7 @@ def main():
             f"  sampled validation | {int(val_stats['samples'])} samples | "
             f"crop {val_stats['average_crop_height']:.1f}x"
             f"{val_stats['average_crop_width']:.1f}\n"
-            f"    exact mask IoU   | coarse "
+            f"    exact mask IoU   | {baseline_label} "
             f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
             f"-> fine {100.0 * val_stats['fine_exact_occupancy_iou']:.2f}% "
             f"({100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp)\n"
@@ -482,8 +506,16 @@ def main():
             "epoch": epoch,
             "diffusion_state_dict": diffusion.state_dict(),
             "diffusion_config": config.to_dict(),
-            "coarse_checkpoint": str(Path(args.coarse_checkpoint).resolve()),
-            "coarse_model_config": coarse_checkpoint["model_config"],
+            "coarse_checkpoint": (
+                str(Path(args.coarse_checkpoint).resolve())
+                if args.coarse_checkpoint
+                else None
+            ),
+            "coarse_model_config": (
+                coarse_checkpoint["model_config"]
+                if coarse_checkpoint is not None
+                else None
+            ),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),

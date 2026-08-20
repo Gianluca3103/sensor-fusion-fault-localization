@@ -52,18 +52,35 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
 
     def __init__(
         self,
-        coarse_model: CoarseReconstructionModel,
+        coarse_model: CoarseReconstructionModel | None,
         diffusion: FineDiffusionRefiner,
     ) -> None:
         super().__init__()
-        self.coarse_model = coarse_model.eval().requires_grad_(False)
+        if coarse_model is None and not diffusion.config.bypass_coarse_reconstruction:
+            raise ValueError(
+                "A coarse model is required unless coarse reconstruction is bypassed"
+            )
+        self.coarse_model = (
+            coarse_model.eval().requires_grad_(False)
+            if coarse_model is not None
+            else None
+        )
         self.diffusion = diffusion
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.coarse_model.eval()
+        if self.coarse_model is not None:
+            self.coarse_model.eval()
         self.diffusion.train(mode)
         return self
+
+    @property
+    def bypasses_coarse_reconstruction(self) -> bool:
+        return self.diffusion.config.bypass_coarse_reconstruction
+
+    @staticmethod
+    def _erased_faulty_base(faulty_lidar_bev, reconstruction_mask):
+        return faulty_lidar_bev * (1.0 - reconstruction_mask)
 
     def coarse_forward(
         self,
@@ -76,6 +93,18 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         faulty_lidar_points=None,
         radar_points=None,
     ):
+        if self.bypasses_coarse_reconstruction:
+            base = self._erased_faulty_base(
+                faulty_lidar_bev, reconstruction_mask
+            )
+            occupancy = base[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6)
+            return base, {
+                "coarse_lidar_bev": base,
+                "occupancy_logits": torch.logit(occupancy),
+                "bypassed_coarse_reconstruction": True,
+            }
+        if self.coarse_model is None:
+            raise RuntimeError("Coarse reconstruction model is unavailable")
         self.coarse_model.eval()
         with torch.no_grad():
             output = self.coarse_model(
@@ -160,4 +189,3 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             halo_mask,
             **sampling_options,
         )
-

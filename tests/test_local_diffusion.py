@@ -17,8 +17,9 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline i
 from models.two_stage_reconstruction_head.pointpillars import BEVGridGeometry
 
 
-def _config(*, global_context=True, sampling_steps=3):
+def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
     return FineDiffusionConfig(
+        bypass_coarse_reconstruction=bypass_coarse,
         hidden_dim=16,
         num_heads=4,
         num_transformer_blocks=2,
@@ -391,6 +392,26 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(
             any(parameter.grad is not None for parameter in pipeline.diffusion.parameters())
         )
+
+    def test_direct_ablation_erases_repair_region_without_coarse_model(self):
+        _clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        repair[:, :, 3:9, 4:11] = 1
+        pipeline = FrozenCoarseFineDiffusionPipeline(
+            None,
+            FineDiffusionRefiner(_config(bypass_coarse=True)),
+        ).eval()
+
+        base, diagnostics = pipeline.coarse_forward(
+            faulty,
+            radar,
+            repair,
+            torch.zeros_like(repair),
+            halo,
+        )
+
+        self.assertTrue(diagnostics["bypassed_coarse_reconstruction"])
+        self.assertTrue(torch.equal(base * (1 - repair), faulty * (1 - repair)))
+        self.assertEqual(int((base * repair).count_nonzero()), 0)
 
     def test_pointpillars_checkpoint_restores_grid_geometry(self):
         checkpoint = {
