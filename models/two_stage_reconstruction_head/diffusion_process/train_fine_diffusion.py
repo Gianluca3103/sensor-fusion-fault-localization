@@ -137,6 +137,57 @@ def _move_batch(batch, device):
     return moved
 
 
+class _BatchProgress:
+    """Small dependency-free progress display that also remains useful in logs."""
+
+    def __init__(self, label: str, total: int):
+        self.label = label
+        self.total = max(int(total), 1)
+        self.started = time.perf_counter()
+        self.is_terminal = sys.stdout.isatty()
+        # A piped run (for example through tee/nohup) gets at most 100 durable
+        # progress lines per epoch. An interactive terminal reuses one line.
+        self.interval = 1 if self.is_terminal else max(self.total // 100, 1)
+
+    def update(
+        self,
+        completed: int,
+        *,
+        samples: int,
+        loss: float | None = None,
+        data_seconds: float | None = None,
+        step_seconds: float | None = None,
+    ):
+        if completed != self.total and completed % self.interval != 0:
+            return
+        elapsed = max(time.perf_counter() - self.started, 1.0e-6)
+        rate = completed / elapsed
+        remaining = max(self.total - completed, 0)
+        eta = remaining / max(rate, 1.0e-8)
+        fraction = min(completed / self.total, 1.0)
+        width = 24
+        filled = min(int(fraction * width), width)
+        bar = "=" * filled + (">" if filled < width else "")
+        bar = bar.ljust(width, ".")
+        message = (
+            f"{self.label} [{bar}] {completed}/{self.total} "
+            f"({100.0 * fraction:5.1f}%) | {samples} samples | "
+            f"{rate:.2f} batches/s | ETA {eta / 60.0:.1f}m"
+        )
+        if loss is not None:
+            message += f" | loss {loss:.5f}"
+        if data_seconds is not None and step_seconds is not None:
+            message += (
+                f" | data {data_seconds / completed:.2f}s/batch"
+                f" | compute {step_seconds / completed:.2f}s/batch"
+            )
+        if self.is_terminal and completed != self.total:
+            print("\r" + message, end="", flush=True)
+        else:
+            prefix = "\r" if self.is_terminal else ""
+            print(prefix + message, flush=True)
+
+
 def _run_epoch(
     pipeline,
     loader,
@@ -146,12 +197,18 @@ def _run_epoch(
     scaler=None,
     grad_clip=0.0,
     use_amp=False,
+    progress_label="train",
 ):
     training = optimizer is not None
     pipeline.train(training)
     totals: dict[str, float] = {}
     samples = optimizer_steps = 0
-    for raw_batch in loader:
+    progress = _BatchProgress(progress_label, len(loader))
+    total_data_seconds = total_step_seconds = 0.0
+    previous_batch_finished = time.perf_counter()
+    for batch_index, raw_batch in enumerate(loader, start=1):
+        batch_received = time.perf_counter()
+        total_data_seconds += batch_received - previous_batch_finished
         batch = _move_batch(raw_batch, device)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -193,6 +250,16 @@ def _run_epoch(
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
         samples += count
+        batch_finished = time.perf_counter()
+        total_step_seconds += batch_finished - batch_received
+        progress.update(
+            batch_index,
+            samples=samples,
+            loss=values["loss"],
+            data_seconds=total_data_seconds,
+            step_seconds=total_step_seconds,
+        )
+        previous_batch_finished = batch_finished
     result = {key: value / max(samples, 1) for key, value in totals.items()}
     if training:
         result["optimizer_steps"] = optimizer_steps
@@ -208,6 +275,7 @@ def _run_sampled_validation(
     sampling_steps,
     use_amp=False,
     seed=0,
+    progress_label="validation",
 ):
     """Run the deployment sampler; clean LiDAR is used only after prediction."""
 
@@ -240,7 +308,12 @@ def _run_sampled_validation(
             values.to(dtype=torch.float32), tolerance_kernel, padding=2
         ) > 0
 
-    for raw_batch in loader:
+    progress = _BatchProgress(progress_label, len(loader))
+    total_data_seconds = total_step_seconds = 0.0
+    previous_batch_finished = time.perf_counter()
+    for batch_index, raw_batch in enumerate(loader, start=1):
+        batch_received = time.perf_counter()
+        total_data_seconds += batch_received - previous_batch_finished
         batch = _move_batch(raw_batch, device)
         with torch.autocast(
             device_type=device.type,
@@ -288,6 +361,15 @@ def _run_sampled_validation(
                 predicted_selected.sum()
             )
         samples += batch["clean_lidar_bev"].shape[0]
+        batch_finished = time.perf_counter()
+        total_step_seconds += batch_finished - batch_received
+        progress.update(
+            batch_index,
+            samples=int(samples),
+            data_seconds=total_data_seconds,
+            step_seconds=total_step_seconds,
+        )
+        previous_batch_finished = batch_finished
 
     epsilon = 1.0e-8
     result = {"samples": samples}
@@ -622,6 +704,7 @@ def main():
             scaler=scaler,
             grad_clip=float(training.get("grad_clip", 1.0)),
             use_amp=use_amp,
+            progress_label=f"epoch {epoch:03d}/{epochs:03d} train",
         )
         run_validation = epoch % validation_interval == 0 or epoch == epochs
         val_stats = None
@@ -635,6 +718,7 @@ def main():
                 sampling_steps=config.sampling_steps,
                 use_amp=use_amp,
                 seed=seed + 10_000,
+                progress_label=f"epoch {epoch:03d}/{epochs:03d} val",
             )
             validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
