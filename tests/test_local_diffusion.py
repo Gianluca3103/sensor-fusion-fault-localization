@@ -23,6 +23,9 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline i
     load_frozen_coarse_model,
 )
 from models.two_stage_reconstruction_head.pointpillars import BEVGridGeometry
+from models.two_stage_reconstruction_head.reconstruction_inputs import (
+    ReconstructionInputs,
+)
 
 
 def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
@@ -607,6 +610,41 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertIsNone(pipeline.coarse_model.scale.grad)
         self.assertTrue(
             any(parameter.grad is not None for parameter in pipeline.diffusion.parameters())
+        )
+
+    def test_pipeline_shares_one_input_object_across_both_stages(self):
+        captured = {}
+
+        class DummyCoarse(torch.nn.Module):
+            def forward(self, faulty, _radar, repair, _healthy, _halo, **kwargs):
+                captured["coarse"] = kwargs["shared_inputs"]
+                return {
+                    "coarse_lidar_bev": faulty * (1 - repair) + 0.5 * repair
+                }
+
+        clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        diffusion = FineDiffusionRefiner(_config())
+        pipeline = FrozenCoarseFineDiffusionPipeline(DummyCoarse(), diffusion)
+        with mock.patch.object(diffusion, "forward", return_value={}) as fine:
+            pipeline(
+                clean,
+                faulty,
+                radar,
+                repair,
+                torch.zeros_like(repair),
+                halo,
+            )
+
+        shared = fine.call_args.kwargs["shared_inputs"]
+        self.assertIsInstance(shared, ReconstructionInputs)
+        self.assertIs(shared, captured["coarse"])
+        self.assertIs(shared.faulty_lidar_bev, faulty)
+        self.assertIs(shared.radar_bev, radar)
+        self.assertTrue(
+            torch.equal(shared.trusted_faulty, faulty * (1 - repair))
+        )
+        self.assertTrue(
+            torch.equal(shared.effective_halo, halo * (1 - repair))
         )
 
     def test_direct_ablation_erases_repair_region_without_coarse_model(self):

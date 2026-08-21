@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..encoders import _group_count
+from ..reconstruction_inputs import ReconstructionInputs
 from .diffusion_process import (
     BEVChannelNormalization,
     MaskedFlowMSELoss,
@@ -931,21 +932,26 @@ class FineDiffusionRefiner(nn.Module):
         halo_mask: torch.Tensor,
         *,
         clean_lidar_bev: torch.Tensor | None = None,
+        shared_inputs: ReconstructionInputs | None = None,
     ) -> ReconstructionCropBatch:
-        trusted_faulty = faulty_lidar_bev * (1.0 - reconstruction_mask)
-        tensors = {
-            "coarse": coarse_lidar_bev,
-            "faulty": faulty_lidar_bev,
-            "trusted_faulty": trusted_faulty,
-            "radar": radar_bev,
-            "repair": reconstruction_mask,
-            "halo": halo_mask * (1.0 - reconstruction_mask),
-        }
+        if shared_inputs is None:
+            shared_inputs = ReconstructionInputs(
+                faulty_lidar_bev=faulty_lidar_bev,
+                radar_bev=radar_bev,
+                reconstruction_mask=reconstruction_mask,
+                healthy_context_mask=torch.zeros_like(reconstruction_mask),
+                halo_mask=halo_mask,
+            )
+        residual_gt = None
         if clean_lidar_bev is not None:
-            tensors["clean"] = clean_lidar_bev
-            tensors["residual_gt"] = residual_target(
+            residual_gt = residual_target(
                 clean_lidar_bev, coarse_lidar_bev, reconstruction_mask
             )
+        tensors = shared_inputs.fine_crop_tensors(
+            coarse_lidar_bev,
+            clean_lidar_bev=clean_lidar_bev,
+            residual_gt=residual_gt,
+        )
         return self.crop_extractor.extract(
             tensors, reconstruction_mask, halo_mask
         )
@@ -1002,6 +1008,7 @@ class FineDiffusionRefiner(nn.Module):
         generator: torch.Generator | None = None,
         return_debug: bool = False,
         return_diagnostics: bool = True,
+        shared_inputs: ReconstructionInputs | None = None,
     ) -> dict[str, torch.Tensor | ReconstructionCropBatch | dict]:
         self._validate_inputs(
             coarse_lidar_bev,
@@ -1018,6 +1025,7 @@ class FineDiffusionRefiner(nn.Module):
             reconstruction_mask,
             halo_mask,
             clean_lidar_bev=clean_lidar_bev,
+            shared_inputs=shared_inputs,
         )
         repair = crops.tensors["repair"] * crops.valid_mask
         residual_gt_physical = crops.tensors["residual_gt"] * repair
@@ -1212,6 +1220,7 @@ class FineDiffusionRefiner(nn.Module):
         sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
         return_debug: bool = False,
+        shared_inputs: ReconstructionInputs | None = None,
     ) -> dict[str, torch.Tensor | ReconstructionCropBatch | list]:
         """Refine a coarse BEV without requiring clean LiDAR supervision."""
 
@@ -1228,6 +1237,7 @@ class FineDiffusionRefiner(nn.Module):
             radar_bev,
             reconstruction_mask,
             halo_mask,
+            shared_inputs=shared_inputs,
         )
         repair = crops.tensors["repair"] * crops.valid_mask
         if int(repair.count_nonzero()) == 0:

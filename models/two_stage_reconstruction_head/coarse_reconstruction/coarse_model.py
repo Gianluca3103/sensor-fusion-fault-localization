@@ -12,6 +12,7 @@ from .hrnet_backbone import HRNetBackbone
 from ..PointPillarV2 import PointPillarsEncoderV2, PointPillarsV2Config
 from ..PointPillarV3 import PointPillarsEncoderV3, PointPillarsV3Config
 from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
+from ..reconstruction_inputs import ReconstructionInputs
 
 
 class CoarseReplacementHead(nn.Module):
@@ -188,7 +189,23 @@ class CoarseReconstructionModel(nn.Module):
         faulty_lidar_points: Sequence[torch.Tensor] | None = None,
         radar_points: Sequence[torch.Tensor] | None = None,
         radar_enabled: bool = True,
+        shared_inputs: ReconstructionInputs | None = None,
     ) -> dict[str, torch.Tensor]:
+        if shared_inputs is None:
+            shared_inputs = ReconstructionInputs(
+                faulty_lidar_bev=faulty_lidar_bev,
+                radar_bev=radar_bev,
+                reconstruction_mask=reconstruction_mask,
+                healthy_context_mask=healthy_context_mask,
+                halo_mask=halo_mask,
+                faulty_lidar_points=faulty_lidar_points,
+                radar_points=radar_points,
+            )
+        faulty_lidar_bev = shared_inputs.faulty_lidar_bev
+        radar_bev = shared_inputs.radar_bev
+        reconstruction_mask = shared_inputs.reconstruction_mask
+        healthy_context_mask = shared_inputs.healthy_context_mask
+        halo_mask = shared_inputs.effective_halo
         (
             lidar_sensor_bev,
             radar_sensor_bev,
@@ -197,12 +214,11 @@ class CoarseReconstructionModel(nn.Module):
         ) = self._sensor_features(
             faulty_lidar_bev,
             radar_bev,
-            faulty_lidar_points,
-            radar_points,
+            shared_inputs.faulty_lidar_points,
+            shared_inputs.radar_points,
             radar_enabled=radar_enabled,
         )
 
-        halo_mask = halo_mask * (1.0 - reconstruction_mask)
         if not self.config.use_halo_context:
             halo_mask = torch.zeros_like(halo_mask)
         active_mask = torch.maximum(reconstruction_mask, halo_mask)

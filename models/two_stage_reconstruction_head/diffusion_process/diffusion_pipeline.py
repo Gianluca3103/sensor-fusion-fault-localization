@@ -10,6 +10,7 @@ from torch import nn
 from ..coarse_reconstruction.coarse_config import CoarseReconstructionConfig
 from ..coarse_reconstruction.coarse_model import CoarseReconstructionModel
 from ..pointpillars import BEVGridGeometry
+from ..reconstruction_inputs import ReconstructionInputs
 from .local_diffusion import FineDiffusionRefiner
 
 
@@ -82,8 +83,8 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
     def _erased_faulty_base(faulty_lidar_bev, reconstruction_mask):
         return faulty_lidar_bev * (1.0 - reconstruction_mask)
 
-    def coarse_forward(
-        self,
+    @staticmethod
+    def _shared_inputs(
         faulty_lidar_bev,
         radar_bev,
         reconstruction_mask,
@@ -92,10 +93,21 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         *,
         faulty_lidar_points=None,
         radar_points=None,
-    ):
+    ) -> ReconstructionInputs:
+        return ReconstructionInputs(
+            faulty_lidar_bev=faulty_lidar_bev,
+            radar_bev=radar_bev,
+            reconstruction_mask=reconstruction_mask,
+            healthy_context_mask=healthy_context_mask,
+            halo_mask=halo_mask,
+            faulty_lidar_points=faulty_lidar_points,
+            radar_points=radar_points,
+        )
+
+    def coarse_forward_inputs(self, inputs: ReconstructionInputs):
         if self.bypasses_coarse_reconstruction:
             base = self._erased_faulty_base(
-                faulty_lidar_bev, reconstruction_mask
+                inputs.faulty_lidar_bev, inputs.reconstruction_mask
             )
             occupancy = base[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6)
             return base, {
@@ -108,15 +120,38 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         self.coarse_model.eval()
         with torch.no_grad():
             output = self.coarse_model(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
+                inputs.faulty_lidar_bev,
+                inputs.radar_bev,
+                inputs.reconstruction_mask,
+                inputs.healthy_context_mask,
+                inputs.halo_mask,
+                faulty_lidar_points=inputs.faulty_lidar_points,
+                radar_points=inputs.radar_points,
+                shared_inputs=inputs,
             )
         return output["coarse_lidar_bev"].detach(), output
+
+    def coarse_forward(
+        self,
+        faulty_lidar_bev,
+        radar_bev,
+        reconstruction_mask,
+        healthy_context_mask,
+        halo_mask,
+        *,
+        faulty_lidar_points=None,
+        radar_points=None,
+    ):
+        inputs = self._shared_inputs(
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            healthy_context_mask,
+            halo_mask,
+            faulty_lidar_points=faulty_lidar_points,
+            radar_points=radar_points,
+        )
+        return self.coarse_forward_inputs(inputs)
 
     def forward(
         self,
@@ -132,15 +167,18 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         radar_points=None,
         **diffusion_options,
     ):
+        shared_inputs = self._shared_inputs(
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            healthy_context_mask,
+            halo_mask,
+            faulty_lidar_points=faulty_lidar_points,
+            radar_points=radar_points,
+        )
         if coarse_lidar_bev is None:
-            coarse_lidar_bev, coarse_output = self.coarse_forward(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
+            coarse_lidar_bev, coarse_output = self.coarse_forward_inputs(
+                shared_inputs
             )
         else:
             coarse_lidar_bev = coarse_lidar_bev.detach()
@@ -152,6 +190,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             radar_bev,
             reconstruction_mask,
             halo_mask,
+            shared_inputs=shared_inputs,
             **diffusion_options,
         )
         output["coarse_output"] = coarse_output
@@ -171,15 +210,18 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         radar_points=None,
         **sampling_options,
     ):
+        shared_inputs = self._shared_inputs(
+            faulty_lidar_bev,
+            radar_bev,
+            reconstruction_mask,
+            healthy_context_mask,
+            halo_mask,
+            faulty_lidar_points=faulty_lidar_points,
+            radar_points=radar_points,
+        )
         if coarse_lidar_bev is None:
-            coarse_lidar_bev, _coarse_output = self.coarse_forward(
-                faulty_lidar_bev,
-                radar_bev,
-                reconstruction_mask,
-                healthy_context_mask,
-                halo_mask,
-                faulty_lidar_points=faulty_lidar_points,
-                radar_points=radar_points,
+            coarse_lidar_bev, _coarse_output = self.coarse_forward_inputs(
+                shared_inputs
             )
         return self.diffusion.sample(
             coarse_lidar_bev,
@@ -187,5 +229,6 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             radar_bev,
             reconstruction_mask,
             halo_mask,
+            shared_inputs=shared_inputs,
             **sampling_options,
         )
