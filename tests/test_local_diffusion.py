@@ -6,6 +6,7 @@ import torch
 from models.two_stage_reconstruction_head.diffusion_process.local_diffusion import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
+    MaskedExactReconstructionLoss,
     MaskedNoDegradationLoss,
     ReconstructionCropExtractor,
     WindowAttention2d,
@@ -265,6 +266,50 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         worse[:, 1:] = 0.1
         self.assertGreater(float(loss(worse, coarse, clean, mask)), 0.0)
 
+    def test_losses_ignore_non_finite_values_outside_repair_mask(self):
+        exact = MaskedExactReconstructionLoss()
+        degradation = MaskedNoDegradationLoss()
+        clean = torch.zeros(1, 3, 2, 2)
+        coarse = torch.full_like(clean, 0.25)
+        refined = coarse.clone()
+        mask = torch.zeros(1, 1, 2, 2)
+        mask[:, :, 0, 0] = 1.0
+        refined[:, :, 1, 1] = torch.nan
+
+        self.assertTrue(torch.isfinite(exact(refined, clean, mask)))
+        self.assertTrue(
+            torch.isfinite(degradation(refined, coarse, clean, mask))
+        )
+
+    def test_loss_reports_non_finite_value_inside_repair_mask(self):
+        loss = MaskedExactReconstructionLoss()
+        clean = torch.zeros(1, 3, 2, 2)
+        refined = torch.zeros_like(clean)
+        mask = torch.zeros(1, 1, 2, 2)
+        mask[:, :, 0, 0] = 1.0
+        refined[:, :, 0, 0] = torch.nan
+
+        with self.assertRaisesRegex(
+            FloatingPointError, "non-finite inside the reconstruction mask"
+        ):
+            loss(refined, clean, mask)
+
+    def test_bounded_update_clears_non_finite_values_outside_repair(self):
+        model = FineDiffusionRefiner(_config())
+        current = torch.zeros(1, 3, 2, 2)
+        predicted = torch.zeros_like(current)
+        predicted[:, :, 1, 1] = torch.nan
+        coarse = torch.full_like(current, 0.25)
+        repair = torch.zeros(1, 1, 2, 2)
+        repair[:, :, 0, 0] = 1.0
+
+        updated = model._bounded_residual_update(
+            current, predicted, coarse, repair
+        )
+
+        self.assertTrue(torch.isfinite(updated).all())
+        self.assertEqual(int(updated.count_nonzero()), 0)
+
     def test_residual_regularizer_is_masked_and_magnitude_sensitive(self):
         model = FineDiffusionRefiner(_config())
         mask = torch.zeros(1, 1, 2, 2)
@@ -442,9 +487,9 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             return_debug=True,
         )
         debug = output["debug"]
-        self.assertEqual(debug["residual_stem_input"].shape[1], 7)
+        self.assertEqual(debug["current_lidar_stem_input"].shape[1], 7)
         self.assertEqual(
-            model.transformer.residual_stem.in_channels, 7
+            model.transformer.current_lidar_stem.in_channels, 7
         )
         self.assertFalse(hasattr(model.transformer.blocks[0], "cross_attention"))
         self.assertEqual(
@@ -472,10 +517,59 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
-                debug["residual_stem_input"][:, :3],
-                debug["current_residual"],
+                debug["current_lidar_stem_input"][:, :3],
+                debug["current_lidar"],
             )
         )
+        expected_current_lidar = debug["crops"].tensors["coarse"] + (
+            model.residual_normalization.denormalize(
+                debug["current_residual"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(debug["current_lidar"], expected_current_lidar)
+        )
+        self.assertTrue(
+            torch.equal(
+                debug["current_lidar"], debug["crops"].tensors["coarse"]
+            )
+        )
+
+    def test_each_refinement_step_sees_updated_current_lidar(self):
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config()).train()
+        with torch.no_grad():
+            model.transformer.output_head[-1].bias.fill_(0.2)
+        stem_inputs = []
+
+        def capture_stem_input(_module, arguments):
+            stem_inputs.append(arguments[0][:, :3].detach().clone())
+
+        handle = model.transformer.current_lidar_stem.register_forward_pre_hook(
+            capture_stem_input
+        )
+        try:
+            output = model(
+                clean,
+                coarse,
+                faulty,
+                radar,
+                repair,
+                halo,
+                return_debug=True,
+            )
+        finally:
+            handle.remove()
+
+        debug = output["debug"]
+        coarse_crop = debug["crops"].tensors["coarse"]
+        self.assertEqual(len(stem_inputs), 3)
+        self.assertTrue(torch.equal(stem_inputs[0], coarse_crop))
+        self.assertFalse(torch.equal(stem_inputs[1], stem_inputs[0]))
+        expected_second = coarse_crop + model.residual_normalization.denormalize(
+            debug["training_intermediate_residuals"][0]
+        )
+        self.assertTrue(torch.equal(stem_inputs[1], expected_second))
 
     def test_legacy_residual_stem_checkpoint_has_clear_error(self):
         config = _config()
@@ -486,7 +580,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 )
             }
         }
-        with self.assertRaisesRegex(ValueError, "legacy residual stem"):
+        with self.assertRaisesRegex(ValueError, "predates explicit current-LiDAR"):
             validate_fine_diffusion_checkpoint_compatibility(legacy, config)
 
     def test_new_checkpoint_metadata_and_residual_scale_round_trip(self):
@@ -576,7 +670,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         output["loss"].backward()
         names = {name for name, parameter in model.named_parameters() if parameter.grad is not None}
         for expected in (
-            "transformer.residual_stem",
+            "transformer.current_lidar_stem",
             "transformer.auxiliary_condition_encoder",
             "self_attention",
             "cross_attention",

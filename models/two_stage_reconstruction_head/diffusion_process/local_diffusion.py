@@ -21,7 +21,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 8
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 9
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -534,7 +534,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
         self.config = config
         coordinates = 4
         auxiliary_channels = config.lidar_channels + 2 + coordinates
-        self.residual_stem = nn.Conv2d(
+        self.current_lidar_stem = nn.Conv2d(
             config.lidar_channels + coordinates,
             config.hidden_dim,
             3,
@@ -596,7 +596,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
 
     def forward(
         self,
-        current_residual: torch.Tensor,
+        current_lidar: torch.Tensor,
         trusted_faulty: torch.Tensor,
         radar: torch.Tensor,
         reconstruction_mask: torch.Tensor,
@@ -618,11 +618,12 @@ class LocalResidualDiffusionTransformer(nn.Module):
         auxiliary_condition = self.auxiliary_condition_encoder(
             auxiliary_condition_input, valid
         )
-        residual_stem_input = torch.cat(
-            (current_residual, coordinates), dim=1
+        current_lidar_stem_input = torch.cat(
+            (current_lidar, coordinates), dim=1
         )
         tensor = (
-            self.residual_stem(residual_stem_input) + auxiliary_condition
+            self.current_lidar_stem(current_lidar_stem_input)
+            + auxiliary_condition
         ) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
         radar_valid = reconstruction_mask * valid
@@ -635,11 +636,17 @@ class LocalResidualDiffusionTransformer(nn.Module):
                 radar_valid,
             )
         velocity = torch.tanh(self.output_head(tensor))
-        velocity = velocity * reconstruction_mask * valid
+        active_repair = (reconstruction_mask > 0.5) & (valid > 0.5)
+        velocity = torch.where(
+            active_repair.expand_as(velocity),
+            velocity,
+            torch.zeros_like(velocity),
+        )
         return velocity, auxiliary_condition, {
             "raw_radar_cross_attention": radar,
             "radar_cross_attention_valid": radar_valid,
-            "residual_stem_input": residual_stem_input,
+            "current_lidar": current_lidar,
+            "current_lidar_stem_input": current_lidar_stem_input,
         }
 
 
@@ -650,7 +657,10 @@ def fine_diffusion_architecture_metadata(
         "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
         "process": "coarse_anchored_residual_flow",
         "initial_state": "frozen_coarse_reconstruction",
-        "residual_stem_input_channels": config.lidar_channels + 4,
+        "internal_state": "normalized_current_residual",
+        "transformer_spatial_input": "current_lidar_plus_coordinates",
+        "current_lidar_stem_input_channels": config.lidar_channels + 4,
+        "refinement_feedback": "updated_current_lidar_each_step",
         "coarse_role": "initial_reconstruction_state_only",
         "radar_cross_attention": "raw_full_resolution_reconstruction_mask",
     }
@@ -661,7 +671,7 @@ def validate_fine_diffusion_checkpoint_compatibility(
 ) -> None:
     expected = config.lidar_channels + 4
     weight = checkpoint.get("diffusion_state_dict", {}).get(
-        "transformer.residual_stem.weight"
+        "transformer.current_lidar_stem.weight"
     )
     actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
     metadata = checkpoint.get("fine_diffusion_architecture")
@@ -670,17 +680,17 @@ def validate_fine_diffusion_checkpoint_compatibility(
     )
     if architecture_version in (None, 1):
         raise ValueError(
-            "Fine Diffusion checkpoint uses the legacy residual stem without "
-            "direct coarse conditioning. Start a fresh Fine Diffusion run."
+            "Fine Diffusion checkpoint predates explicit current-LiDAR spatial "
+            "conditioning. Start a fresh Fine Diffusion run."
         )
     if architecture_version != FINE_DIFFUSION_ARCHITECTURE_VERSION:
         raise ValueError(
-            "Fine checkpoint is not the coarse-anchored residual-flow "
-            "architecture. Start a fresh Fine Diffusion run."
+            "Fine checkpoint is not architecture v9 with current-LiDAR "
+            "spatial refinement. Start a fresh Fine Diffusion run."
         )
     if actual != expected:
         raise ValueError(
-            "Fine Diffusion residual-stem input mismatch: checkpoint has "
+            "Fine Diffusion current-LiDAR-stem input mismatch: checkpoint has "
             f"{actual} channels but this model requires {expected}."
         )
     if int(metadata.get("version", -1)) != FINE_DIFFUSION_ARCHITECTURE_VERSION:
@@ -705,24 +715,41 @@ class MaskedExactReconstructionLoss(nn.Module):
             clean_float = clean.float()
             mask_float = reconstruction_mask.float()
             occupied = clean_float[:, 0:1].clamp(0.0, 1.0)
+            selected = mask_float > 0.5
+            refined_occupancy = refined_float[:, 0:1][selected]
+            target_occupancy = occupied[selected]
+            if not bool(torch.isfinite(refined_occupancy).all()):
+                raise FloatingPointError(
+                    "Fine reconstruction occupancy is non-finite inside the "
+                    "reconstruction mask"
+                )
+            if refined_occupancy.numel() == 0:
+                return refined_float.sum() * 0.0
             occupancy = F.binary_cross_entropy(
-                refined_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
-                occupied,
-                reduction="none",
+                refined_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
+                target_occupancy,
+                reduction="mean",
             )
-            occupancy_loss = (occupancy * mask_float).sum() / (
-                mask_float.sum() + self.epsilon
-            )
+            occupancy_loss = occupancy
         if refined.shape[1] == 1:
             return occupancy_loss
-        continuous_mask = mask_float * occupied
-        continuous = F.smooth_l1_loss(
-            refined_float[:, 1:], clean_float[:, 1:], reduction="none"
+        continuous_selected = (selected & (occupied > 0.5)).expand(
+            -1, refined.shape[1] - 1, -1, -1
         )
-        denominator = (
-            continuous_mask.sum() * (refined.shape[1] - 1) + self.epsilon
+        refined_continuous = refined_float[:, 1:][continuous_selected]
+        clean_continuous = clean_float[:, 1:][continuous_selected]
+        if not bool(torch.isfinite(refined_continuous).all()):
+            raise FloatingPointError(
+                "Fine reconstruction geometry is non-finite inside occupied "
+                "reconstruction-mask cells"
+            )
+        continuous_loss = (
+            F.smooth_l1_loss(
+                refined_continuous, clean_continuous, reduction="mean"
+            )
+            if refined_continuous.numel()
+            else occupancy_loss.new_zeros(())
         )
-        continuous_loss = (continuous * continuous_mask).sum() / denominator
         return occupancy_loss + continuous_loss
 
 
@@ -746,43 +773,59 @@ class MaskedNoDegradationLoss(nn.Module):
             clean_float = clean.float()
             mask_float = reconstruction_mask.float()
             occupied = clean_float[:, 0:1].clamp(0.0, 1.0)
+            selected = mask_float > 0.5
+            refined_occupancy = refined_float[:, 0:1][selected]
+            coarse_occupancy = coarse_float[:, 0:1][selected]
+            target_occupancy = occupied[selected]
+            if not bool(torch.isfinite(refined_occupancy).all()):
+                raise FloatingPointError(
+                    "Fine reconstruction occupancy is non-finite inside the "
+                    "reconstruction mask"
+                )
+            if refined_occupancy.numel() == 0:
+                return refined_float.sum() * 0.0
 
             refined_occupancy_error = F.binary_cross_entropy(
-                refined_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
-                occupied,
+                refined_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
+                target_occupancy,
                 reduction="none",
             )
             coarse_occupancy_error = F.binary_cross_entropy(
-                coarse_float[:, 0:1].clamp(1.0e-6, 1.0 - 1.0e-6),
-                occupied,
+                coarse_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
+                target_occupancy,
                 reduction="none",
             )
             occupancy_degradation = F.relu(
                 refined_occupancy_error - coarse_occupancy_error
             )
-            occupancy_loss = (occupancy_degradation * mask_float).sum() / (
-                mask_float.sum() + self.epsilon
-            )
+            occupancy_loss = occupancy_degradation.mean()
 
             if refined.shape[1] == 1:
                 return occupancy_loss
 
-            continuous_mask = mask_float * occupied
+            continuous_selected = (selected & (occupied > 0.5)).expand(
+                -1, refined.shape[1] - 1, -1, -1
+            )
+            refined_continuous = refined_float[:, 1:][continuous_selected]
+            coarse_continuous = coarse_float[:, 1:][continuous_selected]
+            clean_continuous = clean_float[:, 1:][continuous_selected]
+            if not bool(torch.isfinite(refined_continuous).all()):
+                raise FloatingPointError(
+                    "Fine reconstruction geometry is non-finite inside occupied "
+                    "reconstruction-mask cells"
+                )
+            if refined_continuous.numel() == 0:
+                return occupancy_loss
             refined_continuous_error = F.smooth_l1_loss(
-                refined_float[:, 1:], clean_float[:, 1:], reduction="none"
+                refined_continuous, clean_continuous, reduction="none"
             )
             coarse_continuous_error = F.smooth_l1_loss(
-                coarse_float[:, 1:], clean_float[:, 1:], reduction="none"
+                coarse_continuous, clean_continuous, reduction="none"
             )
             continuous_degradation = F.relu(
                 refined_continuous_error - coarse_continuous_error
             )
-            denominator = (
-                continuous_mask.sum() * (refined.shape[1] - 1) + self.epsilon
-            )
-            continuous_loss = (
-                continuous_degradation * continuous_mask
-            ).sum() / denominator
+            continuous_loss = continuous_degradation.mean()
             return occupancy_loss + continuous_loss
 
 
@@ -842,12 +885,24 @@ class FineDiffusionRefiner(nn.Module):
         coarse_crop: torch.Tensor,
         repair: torch.Tensor,
     ) -> torch.Tensor:
-        updated = (current_residual + predicted_step) * repair
+        selected = repair > 0.5
+        updated = torch.where(
+            selected.expand_as(current_residual),
+            current_residual + predicted_step,
+            torch.zeros_like(current_residual),
+        )
         physical = self.residual_normalization.denormalize(updated)
-        bounded_physical = (
-            (coarse_crop + physical).clamp(0.0, 1.0) - coarse_crop
-        ) * repair
-        return self.residual_normalization.normalize(bounded_physical) * repair
+        bounded_physical = torch.where(
+            selected.expand_as(physical),
+            (coarse_crop + physical).clamp(0.0, 1.0) - coarse_crop,
+            torch.zeros_like(physical),
+        )
+        normalized = self.residual_normalization.normalize(bounded_physical)
+        return torch.where(
+            selected.expand_as(normalized),
+            normalized,
+            torch.zeros_like(normalized),
+        )
 
     def _validate_inputs(
         self,
@@ -944,8 +999,11 @@ class FineDiffusionRefiner(nn.Module):
         global_embedding: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         values = crops.tensors
+        current_lidar = values["coarse"] + (
+            self.residual_normalization.denormalize(residual_t)
+        )
         velocity_physical, condition, debug = self.transformer(
-            residual_t,
+            current_lidar,
             self.normalization.normalize(values["trusted_faulty"]),
             values["radar"],
             values["repair"],
@@ -960,6 +1018,7 @@ class FineDiffusionRefiner(nn.Module):
             velocity_physical
         ) * repair
         debug["predicted_velocity_physical"] = velocity_physical
+        debug["current_residual"] = residual_t
         return velocity_normalized, condition, debug
 
     @staticmethod

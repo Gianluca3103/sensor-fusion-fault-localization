@@ -144,10 +144,8 @@ class _BatchProgress:
         self.label = label
         self.total = max(int(total), 1)
         self.started = time.perf_counter()
-        self.is_terminal = sys.stdout.isatty()
-        # A piped run (for example through tee/nohup) gets at most 100 durable
-        # progress lines per epoch. An interactive terminal reuses one line.
-        self.interval = 1 if self.is_terminal else max(self.total // 100, 1)
+        # Refresh roughly twice per percentage point without flooding stdout.
+        self.interval = max(self.total // 200, 1)
 
     def update(
         self,
@@ -181,11 +179,10 @@ class _BatchProgress:
                 f" | data {data_seconds / completed:.2f}s/batch"
                 f" | compute {step_seconds / completed:.2f}s/batch"
             )
-        if self.is_terminal and completed != self.total:
+        if completed != self.total:
             print("\r" + message, end="", flush=True)
         else:
-            prefix = "\r" if self.is_terminal else ""
-            print(prefix + message, flush=True)
+            print("\r" + message, flush=True)
 
 
 def _run_epoch(
