@@ -406,7 +406,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             float(validation["clean_lidar_bev"].mean()),
         )
 
-    def test_coarse_is_raw_full_resolution_cross_attention_input(self):
+    def test_coarse_is_only_starting_state_and_radar_drives_cross_attention(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config()).eval()
         output = model(
@@ -423,31 +423,13 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(
             model.transformer.residual_stem.in_channels, 7
         )
-        self.assertEqual(
-            model.transformer.blocks[0].cross_attention.attention.kdim,
-            3,
-        )
+        self.assertFalse(hasattr(model.transformer.blocks[0], "cross_attention"))
         self.assertEqual(
             model.transformer.blocks[0].radar_cross_attention.attention.kdim,
             4,
         )
-        self.assertTrue(
-            torch.equal(
-                debug["raw_coarse_cross_attention"],
-                model.normalization.normalize(debug["crops"].tensors["coarse"]),
-            )
-        )
-        self.assertEqual(
-            tuple(debug["raw_coarse_cross_attention"].shape[-2:]),
-            tuple(debug["crops"].tensors["coarse"].shape[-2:]),
-        )
-        self.assertTrue(
-            torch.equal(
-                debug["coarse_cross_attention_valid"],
-                debug["crops"].tensors["repair"]
-                * debug["crops"].valid_mask,
-            )
-        )
+        self.assertNotIn("raw_coarse_cross_attention", debug)
+        self.assertNotIn("coarse_cross_attention_valid", debug)
         self.assertTrue(
             torch.equal(
                 debug["raw_radar_cross_attention"],
@@ -463,21 +445,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 debug["radar_cross_attention_valid"],
                 debug["crops"].tensors["repair"]
                 * debug["crops"].valid_mask,
-            )
-        )
-        altered = model(
-            clean,
-            (coarse + 0.05).clamp(0.0, 1.0),
-            faulty,
-            radar,
-            repair,
-            halo,
-            return_debug=True,
-        )["debug"]
-        self.assertFalse(
-            torch.equal(
-                debug["raw_coarse_cross_attention"],
-                altered["raw_coarse_cross_attention"],
             )
         )
         self.assertTrue(

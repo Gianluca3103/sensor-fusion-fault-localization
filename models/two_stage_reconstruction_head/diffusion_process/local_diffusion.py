@@ -20,7 +20,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 6
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 7
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -497,23 +497,15 @@ class DiffusionRefinementBlock(nn.Module):
         condition_dim: int,
         dropout: float,
         shifted: bool,
-        coarse_channels: int,
         radar_channels: int,
     ):
         super().__init__()
         self.shift = window_size // 2 if shifted else 0
         self.self_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
-        self.cross_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
+        self.radar_cross_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
         self.ffn_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
         self.self_attention = WindowAttention2d(
             hidden_dim, num_heads, window_size, dropout
-        )
-        self.cross_attention = WindowAttention2d(
-            hidden_dim,
-            num_heads,
-            window_size,
-            dropout,
-            key_value_dim=coarse_channels,
         )
         self.radar_cross_attention = WindowAttention2d(
             hidden_dim,
@@ -527,11 +519,9 @@ class DiffusionRefinementBlock(nn.Module):
     def forward(
         self,
         tensor: torch.Tensor,
-        raw_coarse: torch.Tensor,
         raw_radar: torch.Tensor,
         condition_vector: torch.Tensor,
         valid: torch.Tensor,
-        coarse_valid: torch.Tensor,
         radar_valid: torch.Tensor,
     ) -> torch.Tensor:
         tensor = tensor + self.self_attention(
@@ -540,15 +530,8 @@ class DiffusionRefinementBlock(nn.Module):
             valid,
             shift=self.shift,
         )
-        tensor = tensor + self.cross_attention(
-            self.cross_norm(tensor, condition_vector),
-            raw_coarse,
-            valid,
-            shift=self.shift,
-            key_value_valid=coarse_valid,
-        )
         tensor = tensor + self.radar_cross_attention(
-            self.cross_norm(tensor, condition_vector),
+            self.radar_cross_norm(tensor, condition_vector),
             raw_radar,
             valid,
             shift=self.shift,
@@ -599,7 +582,6 @@ class LocalResidualDiffusionTransformer(nn.Module):
                 condition_dim,
                 config.dropout,
                 config.use_shifted_windows and index % 2 == 1,
-                config.lidar_channels,
                 config.radar_channels,
             )
             for index in range(config.num_transformer_blocks)
@@ -631,7 +613,6 @@ class LocalResidualDiffusionTransformer(nn.Module):
     def forward(
         self,
         current_residual: torch.Tensor,
-        coarse: torch.Tensor,
         trusted_faulty: torch.Tensor,
         radar: torch.Tensor,
         reconstruction_mask: torch.Tensor,
@@ -660,23 +641,18 @@ class LocalResidualDiffusionTransformer(nn.Module):
             self.residual_stem(residual_stem_input) + auxiliary_condition
         ) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
-        coarse_valid = reconstruction_mask * valid
         radar_valid = reconstruction_mask * valid
         for block in self.blocks:
             tensor = block(
                 tensor,
-                coarse,
                 radar,
                 condition_vector,
                 valid,
-                coarse_valid,
                 radar_valid,
             )
         velocity = torch.tanh(self.output_head(tensor))
         velocity = velocity * reconstruction_mask * valid
         return velocity, auxiliary_condition, {
-            "raw_coarse_cross_attention": coarse,
-            "coarse_cross_attention_valid": coarse_valid,
             "raw_radar_cross_attention": radar,
             "radar_cross_attention_valid": radar_valid,
             "residual_stem_input": residual_stem_input,
@@ -691,7 +667,7 @@ def fine_diffusion_architecture_metadata(
         "process": "coarse_anchored_residual_flow",
         "initial_state": "frozen_coarse_reconstruction",
         "residual_stem_input_channels": config.lidar_channels + 4,
-        "coarse_cross_attention": "raw_full_resolution_reconstruction_mask",
+        "coarse_role": "initial_reconstruction_state_only",
         "radar_cross_attention": "raw_full_resolution_reconstruction_mask",
     }
 
@@ -984,7 +960,6 @@ class FineDiffusionRefiner(nn.Module):
         values = crops.tensors
         velocity_physical, condition, debug = self.transformer(
             residual_t,
-            self.normalization.normalize(values["coarse"]),
             self.normalization.normalize(values["trusted_faulty"]),
             values["radar"],
             values["repair"],
