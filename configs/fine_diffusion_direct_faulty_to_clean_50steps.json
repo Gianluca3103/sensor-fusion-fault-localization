@@ -15,7 +15,6 @@
     "diffusion_prediction_type": "residual_flow",
     "training_timesteps": 1000,
     "sampling_steps": 50,
-    "coarse_start_training_fraction": 0.25,
     "lambda_diffusion": 1.0,
     "lambda_exact_reconstruction": 1.0,
     "lambda_degradation": 1.0,

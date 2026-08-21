@@ -105,14 +105,14 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
-    def test_default_sampling_is_forward_ten_step_residual_flow(self):
+    def test_default_sampling_is_forward_three_step_residual_flow(self):
         config = FineDiffusionConfig()
         model = FineDiffusionRefiner(config)
-        timesteps = model._sampling_timesteps(10, torch.device("cpu"))
-        self.assertEqual(config.sampling_steps, 10)
+        timesteps = model._sampling_timesteps(3, torch.device("cpu"))
+        self.assertEqual(config.sampling_steps, 3)
         self.assertEqual(int(timesteps[0]), 0)
-        self.assertEqual(int(timesteps[-1]), 900)
-        self.assertEqual(len(timesteps), 10)
+        self.assertEqual(int(timesteps[-1]), 667)
+        self.assertEqual(len(timesteps), 3)
 
     def test_sampling_flow_always_starts_from_zero_progress(self):
         model = FineDiffusionRefiner(
@@ -192,6 +192,34 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             )
         )
 
+    def test_training_trajectory_starts_from_coarse_without_teacher_state(self):
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config(sampling_steps=3)).train()
+
+        output = model(
+            clean,
+            coarse,
+            faulty,
+            radar,
+            repair,
+            halo,
+            return_debug=True,
+        )
+
+        debug = output["debug"]
+        self.assertEqual(
+            len(debug["training_intermediate_residuals"]), 3
+        )
+        self.assertTrue(
+            all(
+                int(state.count_nonzero()) == 0
+                for state in debug["training_intermediate_residuals"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(output["final_lidar_bev"] * repair, coarse * repair)
+        )
+
     def test_no_degradation_loss_only_penalizes_worse_refinement(self):
         loss = MaskedNoDegradationLoss()
         clean = torch.zeros(1, 3, 2, 2)
@@ -267,7 +295,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             radar,
             repair,
             halo,
-            timestep=torch.tensor([2, 7]),
             return_debug=True,
         )
         debug = output["debug"]
@@ -389,7 +416,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             radar,
             repair,
             halo,
-            timestep=torch.tensor([4]),
             return_debug=True,
         )
         debug = output["debug"]
@@ -446,7 +472,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             radar,
             repair,
             halo,
-            timestep=torch.tensor([4]),
             return_debug=True,
         )["debug"]
         self.assertFalse(
@@ -544,7 +569,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             radar,
             repair,
             halo,
-            timestep=torch.tensor([0]),
         )
         self.assertTrue(torch.isfinite(output["loss"]))
 
@@ -558,7 +582,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             radar,
             repair,
             halo,
-            timestep=torch.tensor([5]),
         )
         output["loss"].backward()
         names = {name for name, parameter in model.named_parameters() if parameter.grad is not None}
@@ -588,7 +611,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 radar,
                 repair,
                 halo,
-                timestep=torch.tensor([11]),
             )
             self.assertTrue(torch.isfinite(output["loss"]))
 
@@ -613,7 +635,6 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             repair,
             torch.zeros_like(repair),
             halo,
-            timestep=torch.tensor([4]),
         )
         output["loss"].backward()
         self.assertIsNone(pipeline.coarse_model.scale.grad)

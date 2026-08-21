@@ -20,7 +20,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 5
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 6
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -62,8 +62,7 @@ class FineDiffusionConfig:
     global_context_dim: int = 128
     diffusion_prediction_type: str = "residual_flow"
     training_timesteps: int = 1000
-    sampling_steps: int = 10
-    coarse_start_training_fraction: float = 0.25
+    sampling_steps: int = 3
     lambda_diffusion: float = 1.0
     lambda_exact_reconstruction: float = 1.0
     lambda_degradation: float = 1.0
@@ -101,8 +100,6 @@ class FineDiffusionConfig:
             raise ValueError(
                 "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
             )
-        if not 0.0 <= self.coarse_start_training_fraction <= 1.0:
-            raise ValueError("coarse_start_training_fraction must be in [0,1]")
         for name in (
             "lambda_diffusion",
             "lambda_exact_reconstruction",
@@ -881,6 +878,20 @@ class FineDiffusionRefiner(nn.Module):
             predicted_residual_physical.abs() * reconstruction_mask
         ).sum() / denominator
 
+    def _bounded_residual_update(
+        self,
+        current_residual: torch.Tensor,
+        predicted_step: torch.Tensor,
+        coarse_crop: torch.Tensor,
+        repair: torch.Tensor,
+    ) -> torch.Tensor:
+        updated = (current_residual + predicted_step) * repair
+        physical = self.residual_normalization.denormalize(updated)
+        bounded_physical = (
+            (coarse_crop + physical).clamp(0.0, 1.0) - coarse_crop
+        ) * repair
+        return self.residual_normalization.normalize(bounded_physical) * repair
+
     def _validate_inputs(
         self,
         coarse_lidar_bev: torch.Tensor,
@@ -1013,7 +1024,6 @@ class FineDiffusionRefiner(nn.Module):
         reconstruction_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         *,
-        timestep: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
         return_debug: bool = False,
         return_diagnostics: bool = True,
@@ -1034,46 +1044,52 @@ class FineDiffusionRefiner(nn.Module):
             halo_mask,
             clean_lidar_bev=clean_lidar_bev,
         )
-        batch = coarse_lidar_bev.shape[0]
         repair = crops.tensors["repair"] * crops.valid_mask
         residual_gt_physical = crops.tensors["residual_gt"] * repair
         residual_gt_normalized = self.residual_normalization.normalize(
             residual_gt_physical
         ) * repair
-        if timestep is None:
-            timestep = torch.randint(
-                self.config.training_timesteps,
-                (batch,),
-                device=coarse_lidar_bev.device,
-                generator=generator,
-            )
-            # Deployment always starts at the frozen coarse output. Expose the
-            # model to that exact state frequently instead of only 1/T times.
-            start_samples = torch.rand(
-                (batch,),
-                device=coarse_lidar_bev.device,
-                generator=generator,
-            ) < self.config.coarse_start_training_fraction
-            timestep = timestep.masked_fill(start_samples, 0)
-        if timestep.shape != (batch,):
-            raise ValueError("timestep must have shape [B]")
-        progress = (
-            timestep.to(residual_gt_normalized.dtype)
-            / float(self.config.training_timesteps - 1)
-        ).reshape(batch, 1, 1, 1)
-        # Linear flow path: progress zero is exactly coarse; progress one is
-        # clean. The target velocity is clean-minus-coarse everywhere.
-        residual_t = progress * residual_gt_normalized * repair
-        target_velocity = residual_gt_normalized * repair
         trusted_global, global_embedding = self.transformer.global_context(
             faulty_lidar_bev, reconstruction_mask
         )
-        velocity_pred, local_condition, transformer_debug = self._predict_velocity(
-            residual_t, crops, timestep, global_embedding
+        flow_timesteps = self._sampling_timesteps(
+            self.config.sampling_steps, coarse_lidar_bev.device
         )
-        residual_x0_normalized = (
-            residual_t + (1.0 - progress) * velocity_pred
-        ) * repair
+        residual_x0_normalized = torch.zeros_like(residual_gt_normalized)
+        flow_losses = []
+        training_intermediates = []
+        local_condition = residual_x0_normalized
+        transformer_debug = {}
+        target_velocity = residual_gt_normalized
+        velocity_pred = residual_x0_normalized
+        for index, scalar_timestep in enumerate(flow_timesteps):
+            timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
+            velocity_pred, local_condition, transformer_debug = (
+                self._predict_velocity(
+                    residual_x0_normalized,
+                    crops,
+                    timestep,
+                    global_embedding,
+                )
+            )
+            remaining_steps = len(flow_timesteps) - index
+            target_velocity = (
+                residual_gt_normalized - residual_x0_normalized.detach()
+            ) / float(remaining_steps)
+            target_velocity = target_velocity * repair
+            flow_losses.append(
+                self.diffusion_loss(velocity_pred, target_velocity, repair)
+            )
+            residual_x0_normalized = self._bounded_residual_update(
+                residual_x0_normalized,
+                velocity_pred,
+                crops.tensors["coarse"],
+                repair,
+            )
+            if return_debug:
+                training_intermediates.append(
+                    residual_x0_normalized.detach().clone()
+                )
         predicted_residual_physical = self.residual_normalization.denormalize(
             residual_x0_normalized
         ) * repair
@@ -1083,9 +1099,7 @@ class FineDiffusionRefiner(nn.Module):
         refined_full, final = self._compose_full(
             crops, refined_crop, faulty_lidar_bev, reconstruction_mask
         )
-        diffusion_loss = self.diffusion_loss(
-            velocity_pred, target_velocity, repair
-        )
+        diffusion_loss = torch.stack(flow_losses).mean()
         exact_loss = self.exact_loss(
             refined_crop, crops.tensors["clean"], repair
         )
@@ -1124,7 +1138,9 @@ class FineDiffusionRefiner(nn.Module):
                 "halo_fraction_of_crop": (
                     crops.tensors["halo"].sum(dim=(1, 2, 3)) / crop_cells
                 ).mean(),
-                "diffusion_timestep": timestep.float().mean(),
+                "refinement_steps": residual_gt_physical.new_tensor(
+                    len(flow_timesteps)
+                ),
                 "residual_gt_physical_abs_mean": (
                     residual_gt_physical.abs().sum()
                     / (repair.sum() * residual_gt_physical.shape[1]).clamp_min(1)
@@ -1181,10 +1197,11 @@ class FineDiffusionRefiner(nn.Module):
                 "trusted_global_faulty_lidar": trusted_global,
                 "residual_gt_physical": residual_gt_physical,
                 "residual_gt_normalized": residual_gt_normalized,
-                "flow_progress": progress,
-                "current_residual": residual_t,
+                "flow_timesteps": flow_timesteps,
+                "current_residual": residual_x0_normalized,
                 "target_velocity": target_velocity,
                 "predicted_velocity": velocity_pred,
+                "training_intermediate_residuals": training_intermediates,
                 "residual_x0_normalized": residual_x0_normalized,
                 "predicted_residual_physical": predicted_residual_physical,
                 "local_condition": local_condition,
@@ -1266,19 +1283,17 @@ class FineDiffusionRefiner(nn.Module):
         )
         intermediates = []
         residual_x0_normalized = torch.zeros_like(residual_t)
-        step_size = 1.0 / float(len(timesteps))
         for scalar_timestep in timesteps:
             timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
             velocity_pred, _local_condition, transformer_debug = self._predict_velocity(
                 residual_t, crops, timestep, global_embedding
             )
-            residual_t = (residual_t + step_size * velocity_pred) * repair
-            physical = self.residual_normalization.denormalize(residual_t)
-            physical = (
-                (crops.tensors["coarse"] + physical).clamp(0.0, 1.0)
-                - crops.tensors["coarse"]
-            ) * repair
-            residual_t = self.residual_normalization.normalize(physical) * repair
+            residual_t = self._bounded_residual_update(
+                residual_t,
+                velocity_pred,
+                crops.tensors["coarse"],
+                repair,
+            )
             if return_debug:
                 intermediates.append(residual_t.detach().clone())
         residual_x0_normalized = residual_t
