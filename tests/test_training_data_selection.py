@@ -16,12 +16,20 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.train_coarse_rec
 )
 from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
     _move_batch as move_diffusion_batch,
+    _resolve_amp_dtype,
     _split_paths as diffusion_split_paths,
 )
 from models.two_stage_reconstruction_head import MaskedBEVReconstructionLoss
 
 
 class TrainingDataSelectionTests(unittest.TestCase):
+    def test_fine_diffusion_amp_dtype_resolution(self):
+        self.assertIs(_resolve_amp_dtype("bfloat16"), torch.bfloat16)
+        self.assertIs(_resolve_amp_dtype("bf16"), torch.bfloat16)
+        self.assertIs(_resolve_amp_dtype("float16"), torch.float16)
+        with self.assertRaisesRegex(ValueError, "amp_dtype"):
+            _resolve_amp_dtype("float32")
+
     def test_epoch_metrics_exclude_samples_without_repair_boxes(self):
         class IdentityModel(torch.nn.Module):
             def forward(

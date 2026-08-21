@@ -46,6 +46,7 @@
     "weight_decay": 0.001,
     "grad_clip": 1.0,
     "mixed_precision": true,
+    "amp_dtype": "bfloat16",
     "seed": 42,
     "sampled_validation_interval_epochs": 1
   },

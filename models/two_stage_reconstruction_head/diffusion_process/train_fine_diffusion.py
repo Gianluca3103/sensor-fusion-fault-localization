@@ -113,6 +113,19 @@ def _residual_normalizer(metadata, config):
     )
 
 
+def _resolve_amp_dtype(name: str) -> torch.dtype:
+    normalized = str(name).strip().lower()
+    choices = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    if normalized not in choices:
+        raise ValueError("training.amp_dtype must be bfloat16 or float16")
+    return choices[normalized]
+
+
 def _move_batch(batch, device):
     mapping = {
         "clean_lidar_bev": "clean_bev",
@@ -194,6 +207,7 @@ def _run_epoch(
     scaler=None,
     grad_clip=0.0,
     use_amp=False,
+    amp_dtype=torch.bfloat16,
     progress_label="train",
 ):
     training = optimizer is not None
@@ -212,7 +226,7 @@ def _run_epoch(
         with torch.set_grad_enabled(training):
             with torch.autocast(
                 device_type=device.type,
-                dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
+                dtype=amp_dtype,
                 enabled=use_amp,
             ):
                 output = pipeline(**batch, return_diagnostics=False)
@@ -271,6 +285,7 @@ def _run_sampled_validation(
     *,
     sampling_steps,
     use_amp=False,
+    amp_dtype=torch.bfloat16,
     seed=0,
     progress_label="validation",
 ):
@@ -314,7 +329,7 @@ def _run_sampled_validation(
         batch = _move_batch(raw_batch, device)
         with torch.autocast(
             device_type=device.type,
-            dtype=torch.float16 if device.type == "cuda" else torch.bfloat16,
+            dtype=amp_dtype,
             enabled=use_amp,
         ):
             sampled = pipeline.sample(
@@ -652,14 +667,18 @@ def main():
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = bool(training.get("mixed_precision", True)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = _resolve_amp_dtype(training.get("amp_dtype", "bfloat16"))
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and amp_dtype == torch.float16
+    )
     start_epoch, best, history = 1, float("-inf"), []
     if resume_checkpoint is not None:
         checkpoint = resume_checkpoint
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        if scaler.is_enabled():
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
         restore_rng_state(checkpoint.get("rng_state"))
         start_epoch = int(checkpoint["epoch"]) + 1
         best = float(
@@ -689,6 +708,7 @@ def main():
         f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}; "
         f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}; "
         f"bypass coarse: {config.bypass_coarse_reconstruction}; "
+        f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"
     )
     for epoch in range(start_epoch, epochs + 1):
@@ -701,6 +721,7 @@ def main():
             scaler=scaler,
             grad_clip=float(training.get("grad_clip", 1.0)),
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             progress_label=f"epoch {epoch:03d}/{epochs:03d} train",
         )
         run_validation = epoch % validation_interval == 0 or epoch == epochs
@@ -714,6 +735,7 @@ def main():
                 device,
                 sampling_steps=config.sampling_steps,
                 use_amp=use_amp,
+                amp_dtype=amp_dtype,
                 seed=seed + 10_000,
                 progress_label=f"epoch {epoch:03d}/{epochs:03d} val",
             )
