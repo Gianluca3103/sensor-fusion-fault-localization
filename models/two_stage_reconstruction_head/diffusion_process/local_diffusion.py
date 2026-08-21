@@ -21,7 +21,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 7
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 8
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -58,7 +58,6 @@ class FineDiffusionConfig:
     num_transformer_blocks: int = 4
     window_size: int = 8
     use_shifted_windows: bool = True
-    crop_context_margin_cells: int = 8
     use_global_faulty_context: bool = True
     global_context_dim: int = 128
     diffusion_prediction_type: str = "residual_flow"
@@ -88,8 +87,6 @@ class FineDiffusionConfig:
                 raise ValueError(f"{name} must be positive")
         if self.hidden_dim % self.num_heads:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        if self.crop_context_margin_cells < 0:
-            raise ValueError("crop_context_margin_cells must be non-negative")
         if self.diffusion_prediction_type != "residual_flow":
             raise ValueError(
                 "Fine refinement requires residual_flow prediction; Gaussian "
@@ -154,12 +151,11 @@ class ReconstructionCropBatch:
 
 
 class ReconstructionCropExtractor:
-    """Extract metric-preserving crops and pad them for dense batching."""
+    """Crop the exact repair/halo union and add invalid technical padding."""
 
-    def __init__(self, context_margin_cells: int = 8, pad_multiple: int = 8):
-        if context_margin_cells < 0 or pad_multiple < 1:
-            raise ValueError("Invalid crop margin or padding multiple")
-        self.context_margin_cells = int(context_margin_cells)
+    def __init__(self, pad_multiple: int = 8):
+        if pad_multiple < 1:
+            raise ValueError("pad_multiple must be positive")
         self.pad_multiple = int(pad_multiple)
 
     @staticmethod
@@ -179,23 +175,12 @@ class ReconstructionCropExtractor:
         self,
         repair: torch.Tensor,
         halo: torch.Tensor,
-        height: int,
-        width: int,
     ) -> tuple[tuple[int, int, int, int], bool]:
-        repair_extent = self._extent(repair > 0.5)
-        if repair_extent is None:
+        crop_mask = torch.maximum(repair, halo)
+        crop_extent = self._extent(crop_mask > 0.5)
+        if crop_extent is None:
             return (0, 1, 0, 1), False
-        top, bottom, left, right = repair_extent
-        top = max(0, top - self.context_margin_cells)
-        bottom = min(height, bottom + self.context_margin_cells)
-        left = max(0, left - self.context_margin_cells)
-        right = min(width, right + self.context_margin_cells)
-        halo_extent = self._extent(halo > 0.5)
-        if halo_extent is not None:
-            halo_top, halo_bottom, halo_left, halo_right = halo_extent
-            top, bottom = min(top, halo_top), max(bottom, halo_bottom)
-            left, right = min(left, halo_left), max(right, halo_right)
-        return (top, bottom, left, right), True
+        return crop_extent, True
 
     def extract(
         self,
@@ -217,8 +202,6 @@ class ReconstructionCropExtractor:
             self._box(
                 reconstruction_mask[index, 0],
                 halo_mask[index, 0],
-                height,
-                width,
             )
             for index in range(batch)
         ]
@@ -815,10 +798,7 @@ class FineDiffusionRefiner(nn.Module):
         super().__init__()
         self.config = config or FineDiffusionConfig()
         self.config.validate()
-        self.crop_extractor = ReconstructionCropExtractor(
-            self.config.crop_context_margin_cells,
-            self.config.window_size,
-        )
+        self.crop_extractor = ReconstructionCropExtractor(self.config.window_size)
         self.normalization = normalization or BEVChannelNormalization(
             means=(0.0,) * self.config.lidar_channels,
             stds=(1.0,) * self.config.lidar_channels,

@@ -9,7 +9,6 @@
     "num_transformer_blocks": 4,
     "window_size": 8,
     "use_shifted_windows": true,
-    "crop_context_margin_cells": 8,
     "use_global_faulty_context": true,
     "global_context_dim": 128,
     "diffusion_prediction_type": "residual_flow",

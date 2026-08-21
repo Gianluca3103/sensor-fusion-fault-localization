@@ -35,7 +35,6 @@ def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
         num_heads=4,
         num_transformer_blocks=2,
         window_size=4,
-        crop_context_margin_cells=2,
         use_global_faulty_context=global_context,
         global_context_dim=16,
         training_timesteps=12,
@@ -64,9 +63,9 @@ def _inputs(batch=2, size=16):
 
 
 class ReconstructionCropExtractorTests(unittest.TestCase):
-    def test_bounds_margin_halo_alignment_and_padding(self):
+    def test_exact_union_bounds_radar_alignment_and_padding(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
-        extractor = ReconstructionCropExtractor(2, 4)
+        extractor = ReconstructionCropExtractor(4)
         crops = extractor.extract(
             {"clean": clean, "coarse": coarse, "radar": radar},
             repair,
@@ -82,6 +81,27 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
         )
         self.assertEqual(int(crops.valid_mask[:, :, 7].count_nonzero()), 0)
 
+    def test_repair_only_crop_has_no_margin_and_padding_is_invalid(self):
+        repair = torch.zeros(1, 1, 16, 16)
+        repair[:, :, 5:7, 6:9] = 1
+        halo = torch.zeros_like(repair)
+        radar = torch.arange(4 * 16 * 16, dtype=torch.float32).reshape(
+            1, 4, 16, 16
+        )
+
+        crops = ReconstructionCropExtractor(4).extract(
+            {"radar": radar, "repair": repair}, repair, halo
+        )
+
+        self.assertEqual(crops.boxes.tolist(), [[5, 7, 6, 9]])
+        self.assertEqual(tuple(crops.valid_mask.shape), (1, 1, 4, 4))
+        self.assertTrue(
+            torch.equal(crops.tensors["radar"][:, :, :2, :3], radar[:, :, 5:7, 6:9])
+        )
+        self.assertEqual(int(crops.valid_mask.sum()), 6)
+        self.assertEqual(int(crops.valid_mask[:, :, 2:, :].count_nonzero()), 0)
+        self.assertEqual(int(crops.valid_mask[:, :, :, 3:].count_nonzero()), 0)
+
     def test_empty_and_every_border_are_safe(self):
         for region in (
             (0, 2, 5, 8),
@@ -92,7 +112,7 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
         ):
             tensor = torch.zeros(1, 1, 16, 16)
             tensor[:, :, region[0] : region[1], region[2] : region[3]] = 1
-            crops = ReconstructionCropExtractor(2, 4).extract(
+            crops = ReconstructionCropExtractor(4).extract(
                 {"value": tensor}, tensor, torch.zeros_like(tensor)
             )
             top, bottom, left, right = crops.boxes[0].tolist()
@@ -101,7 +121,7 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
             self.assertLessEqual(bottom, 16)
             self.assertLessEqual(right, 16)
         empty = torch.zeros(1, 1, 16, 16)
-        crops = ReconstructionCropExtractor(2, 4).extract(
+        crops = ReconstructionCropExtractor(4).extract(
             {"value": empty}, empty, empty
         )
         self.assertFalse(bool(crops.active_samples[0]))
