@@ -1,0 +1,60 @@
+# Inherit the official upstream PV-RCNN++ architecture and override only the
+# dataset/classes/range and the one raw-feature reduction required by VoD's
+# four-column LiDAR format.
+_BASE_CONFIG_: 'cfgs/waymo_models/pv_rcnn_plusplus.yaml'
+
+CLASS_NAMES: ['Car', 'Pedestrian', 'Cyclist']
+
+DATA_CONFIG:
+    _BASE_CONFIG_: '../../../configs/openpcdet/vod_dataset.yaml'
+
+MODEL:
+    NAME: PVRCNNPlusPlus
+
+    DENSE_HEAD:
+        CLASS_NAMES_EACH_HEAD: [[ 'Car', 'Pedestrian', 'Cyclist' ]]
+        POST_PROCESSING:
+            SCORE_THRESH: 0.1
+            POST_CENTER_LIMIT_RANGE: [0.0, -32.0, -3.0, 64.0, 32.0, 3.0]
+            MAX_OBJ_PER_SAMPLE: 500
+            NMS_CONFIG:
+                NMS_TYPE: nms_gpu
+                NMS_THRESH: 0.7
+                NMS_PRE_MAXSIZE: 4096
+                NMS_POST_MAXSIZE: 500
+
+    PFE:
+        SA_LAYER:
+            raw_points:
+                # VoD supplies one non-XYZ feature: measured reflectivity.
+                # Upstream Waymo uses two; 1 is the minimal compatibility edit.
+                NUM_REDUCED_CHANNELS: 1
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.1
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
+        NMS_CONFIG:
+            MULTI_CLASSES_NMS: False
+            NMS_TYPE: nms_gpu
+            NMS_THRESH: 0.7
+            NMS_PRE_MAXSIZE: 4096
+            NMS_POST_MAXSIZE: 500
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 2
+    NUM_EPOCHS: 80
+    OPTIMIZER: adam_onecycle
+    LR: 0.01
+    WEIGHT_DECAY: 0.001
+    MOMENTUM: 0.9
+    MOMS: [0.95, 0.85]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    DECAY_STEP_LIST: [60, 72]
+    LR_DECAY: 0.1
+    LR_CLIP: 0.0000001
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+    GRAD_NORM_CLIP: 10

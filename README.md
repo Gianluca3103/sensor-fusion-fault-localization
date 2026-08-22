@@ -24,6 +24,8 @@ unchanged.
 - `models/two_stage_reconstruction_head/coarse_reconstruction/evaluate_coarse_by_fault.py`:
   evaluate exact and tolerant reconstruction metrics by fault.
 - `models/two_stage_reconstruction_head/diffusion_process/`: unchanged Stage-II code.
+- `pcdet_integration/`: isolated adapters for official OpenPCDet PV-RCNN++
+  downstream evaluation. See `docs/openpcdet_pvrcnnpp_vod.md`.
 
 ## Canonical configuration
 

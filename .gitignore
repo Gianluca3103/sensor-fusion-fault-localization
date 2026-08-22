@@ -14,6 +14,9 @@ env/
 .vscode/
 .matplotlib/
 
+# Installed upstream detector dependency (bootstrap script pins the revision).
+third_party/OpenPCDet/
+
 # Local raw datasets. Keep only placeholders.
 data/**
 !data/

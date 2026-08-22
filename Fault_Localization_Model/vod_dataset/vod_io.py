@@ -135,7 +135,18 @@ def align_radar_to_lidar(
     return aligned
 
 
-def _split_ids(public_root: Path, split: str) -> list[str]:
+def resolve_vod_public_root(vod_root: str | Path) -> Path:
+    """Resolve either a VoD parent directory or ``view_of_delft_PUBLIC`` itself."""
+
+    root = Path(vod_root)
+    nested = root / "view_of_delft_PUBLIC"
+    return nested if nested.is_dir() else root
+
+
+def load_vod_split_ids(vod_root: str | Path, split: str) -> list[str]:
+    """Read an official VoD ImageSets split without changing its ordering."""
+
+    public_root = resolve_vod_public_root(vod_root)
     split_path = public_root / "lidar" / "ImageSets" / f"{split}.txt"
     if not split_path.is_file():
         raise FileNotFoundError(f"VoD split file is missing: {split_path}")
@@ -144,6 +155,12 @@ def _split_ids(public_root: Path, split: str) -> list[str]:
     if len(set(identifiers)) != len(identifiers):
         raise ValueError(f"VoD split contains duplicate frame IDs: {split_path}")
     return identifiers
+
+
+def _split_ids(public_root: Path, split: str) -> list[str]:
+    """Backward-compatible internal alias."""
+
+    return load_vod_split_ids(public_root, split)
 
 
 def discover_vod_frames(
@@ -161,9 +178,7 @@ def discover_vod_frames(
             f"Unsupported VoD radar variant {radar_variant!r}; expected one of "
             f"{SUPPORTED_RADAR_VARIANTS}"
         )
-    public_root = Path(vod_root)
-    if (public_root / "view_of_delft_PUBLIC").is_dir():
-        public_root /= "view_of_delft_PUBLIC"
+    public_root = resolve_vod_public_root(vod_root)
 
     lidar_root = public_root / "lidar" / "training"
     radar_root = public_root / radar_variant / "training"

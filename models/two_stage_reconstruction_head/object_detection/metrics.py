@@ -138,6 +138,18 @@ def evaluate_detection_conditions(
                 condition: gt_index in matches[condition]["detected_gt"]
                 for condition in conditions
             }
+            matched_iou = {
+                condition: next(
+                    (
+                        iou
+                        for _prediction_index, matched_gt_index, iou
+                        in matches[condition]["matches"]
+                        if matched_gt_index == gt_index
+                    ),
+                    0.0,
+                )
+                for condition in conditions
+            }
             lost = detected["clean"] and not detected["faulty"]
             recovered_coarse = lost and detected["coarse"]
             recovered_fine = lost and detected["fine"]
@@ -159,6 +171,7 @@ def evaluate_detection_conditions(
                     "gt_index": gt_index,
                     **box.to_dict(),
                     **{f"{condition}_detected": detected[condition] for condition in conditions},
+                    **{f"{condition}_iou": matched_iou[condition] for condition in conditions},
                     "lost_after_fault": lost,
                     "recovered_by_coarse": recovered_coarse,
                     "recovered_by_fine": recovered_fine,
