@@ -8,6 +8,7 @@ from .vod_io import (
     align_radar_to_lidar,
     discover_vod_frames,
     load_vod_lidar,
+    load_vod_lidar_to_camera,
     load_vod_radar,
     load_vod_radar_to_lidar,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "align_radar_to_lidar",
     "discover_vod_frames",
     "load_vod_lidar",
+    "load_vod_lidar_to_camera",
     "load_vod_radar",
     "load_vod_radar_to_lidar",
     "accumulate_vod_radar_scans",

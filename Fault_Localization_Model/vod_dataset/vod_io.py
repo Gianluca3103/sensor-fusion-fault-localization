@@ -106,6 +106,12 @@ def load_vod_radar_to_lidar(
     ).copy()
 
 
+def load_vod_lidar_to_camera(calibration_path: str | Path) -> np.ndarray:
+    """Return the official KITTI ``Tr_velo_to_cam`` transform for one frame."""
+
+    return _named_transform(calibration_path).copy()
+
+
 def align_radar_to_lidar(
     radar_points: np.ndarray,
     lidar_from_radar: np.ndarray,
