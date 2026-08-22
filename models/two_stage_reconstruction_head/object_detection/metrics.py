@@ -74,7 +74,13 @@ def evaluate_detection_conditions(
     and coarse/fine recovery measurements unambiguous.
     """
 
-    conditions = ("clean", "faulty", "coarse", "fine")
+    if not frame_records:
+        raise ValueError("frame_records cannot be empty")
+    conditions = tuple(frame_records[0]["predictions"])
+    required = {"clean", "faulty", "coarse"}
+    missing = sorted(required - set(conditions))
+    if missing:
+        raise ValueError("Missing required conditions: " + ", ".join(missing))
     aggregates = {
         condition: {
             class_name: {"tp": 0, "fp": 0, "fn": 0, "ious": [], "events": [], "gt": 0}
@@ -152,8 +158,8 @@ def evaluate_detection_conditions(
             }
             lost = detected["clean"] and not detected["faulty"]
             recovered_coarse = lost and detected["coarse"]
-            recovered_fine = lost and detected["fine"]
-            additional_fine = lost and detected["fine"] and not detected["coarse"]
+            recovered_fine = lost and detected.get("fine", False)
+            additional_fine = recovered_fine and not detected["coarse"]
             recovery["clean_detected"] += int(detected["clean"])
             recovery["lost_after_fault"] += int(lost)
             recovery["coarse_recovered"] += int(recovered_coarse)
@@ -221,10 +227,13 @@ def evaluate_detection_conditions(
         }
     maps = {condition: summary["conditions"][condition]["map"] for condition in conditions}
     summary["map_improvement"] = {
-        "coarse_minus_faulty": maps["coarse"] - maps["faulty"],
-        "fine_minus_faulty": maps["fine"] - maps["faulty"],
-        "fine_minus_coarse": maps["fine"] - maps["coarse"],
+        "coarse_minus_faulty": maps["coarse"] - maps["faulty"]
     }
+    if "fine" in maps:
+        summary["map_improvement"].update(
+            fine_minus_faulty=maps["fine"] - maps["faulty"],
+            fine_minus_coarse=maps["fine"] - maps["coarse"],
+        )
     lost = recovery["lost_after_fault"]
     summary["object_recovery"] = {
         **dict(recovery),

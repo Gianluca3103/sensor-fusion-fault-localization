@@ -1,4 +1,4 @@
-"""Evaluate one frozen OpenPCDet PV-RCNN++ on four reconstruction conditions."""
+"""Evaluate one frozen OpenPCDet PV-RCNN++ on selected conditions."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from pcdet_integration.openpcdet_eval import (
 )
 
 
-CONDITIONS = ("clean", "faulty", "coarse", "fine")
+ALL_CONDITIONS = ("clean", "faulty", "coarse", "fine")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,6 +54,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--visualize-samples", type=int, default=50)
+    parser.add_argument(
+        "--conditions",
+        nargs="+",
+        choices=ALL_CONDITIONS,
+        default=ALL_CONDITIONS,
+    )
     args = parser.parse_args()
     if args.split == "test" and args.label_root is None:
         raise ValueError(
@@ -151,9 +157,13 @@ def _visualize(
     roots: dict[str, Path],
     gt: list[RotatedBEVBox],
     predictions: dict[str, list[RotatedBEVBox]],
+    conditions: tuple[str, ...],
 ) -> None:
-    figure, axes = plt.subplots(1, 4, figsize=(20, 6), sharex=True, sharey=True)
-    for axis, condition in zip(axes, CONDITIONS):
+    figure, axes = plt.subplots(
+        1, len(conditions), figsize=(5 * len(conditions), 6), sharex=True, sharey=True
+    )
+    axes = np.atleast_1d(axes)
+    for axis, condition in zip(axes, conditions):
         points = np.load(roots[condition] / "points" / f"{frame_id}.npy")
         axis.scatter(points[:, 1], points[:, 0], s=0.15, c="0.65", rasterized=True)
         for box in gt:
@@ -178,7 +188,12 @@ def main() -> None:
         raise ValueError("iou-threshold must be in (0, 1]")
     add_openpcdet_to_path(args.openpcdet_root)
     cfg = load_openpcdet_config(args.openpcdet_root, args.config)
-    roots = {condition: args.conditions_root / condition for condition in CONDITIONS}
+    conditions = tuple(dict.fromkeys(args.conditions))
+    required = {"clean", "faulty", "coarse"}
+    missing = sorted(required - set(conditions))
+    if missing:
+        raise ValueError("Detection comparison requires: " + ", ".join(missing))
+    roots = {condition: args.conditions_root / condition for condition in conditions}
     for condition, root in roots.items():
         if not (root / "points").is_dir():
             raise FileNotFoundError(f"Missing {condition} points: {root / 'points'}")
@@ -194,7 +209,7 @@ def main() -> None:
     official = {}
     condition_predictions = {}
     model = None
-    for condition in CONDITIONS:
+    for condition in conditions:
         metrics, predictions, model = evaluate_checkpoint_on_condition(
             args.openpcdet_root,
             cfg,
@@ -224,7 +239,7 @@ def main() -> None:
     for frame_index, frame_id in enumerate(frame_ids):
         gt = annotation_loader.load(frame_id)
         by_condition = {}
-        for condition in CONDITIONS:
+        for condition in conditions:
             boxes = _prediction_boxes(condition_predictions[condition][frame_index])
             by_condition[condition] = boxes
             for prediction_index, box in enumerate(boxes):
@@ -246,6 +261,7 @@ def main() -> None:
                 roots,
                 gt,
                 by_condition,
+                conditions,
             )
 
     matching, frame_rows, object_rows = evaluate_detection_conditions(
@@ -253,13 +269,15 @@ def main() -> None:
     )
     official_deltas = {}
     for kind in ("bev_map", "3d_map"):
-        values = {condition: official[condition][kind] for condition in CONDITIONS}
+        values = {condition: official[condition][kind] for condition in conditions}
         if all(value is not None for value in values.values()):
-            official_deltas[kind] = {
-                "coarse_minus_faulty": values["coarse"] - values["faulty"],
-                "fine_minus_faulty": values["fine"] - values["faulty"],
-                "fine_minus_coarse": values["fine"] - values["coarse"],
-            }
+            deltas = {"coarse_minus_faulty": values["coarse"] - values["faulty"]}
+            if "fine" in values:
+                deltas.update(
+                    fine_minus_faulty=values["fine"] - values["faulty"],
+                    fine_minus_coarse=values["fine"] - values["coarse"],
+                )
+            official_deltas[kind] = deltas
     summary = {
         "detector": "official OpenPCDet PVRCNNPlusPlus",
         "detector_checkpoint": str(args.detector_checkpoint.resolve()),
