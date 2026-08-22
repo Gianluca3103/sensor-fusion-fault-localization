@@ -34,6 +34,23 @@ def _working_directory(path: Path):
         os.chdir(previous)
 
 
+@contextmanager
+def _trusted_checkpoint_loading(torch_module):
+    """Restore the pre-2.6 torch.load default for our own checkpoints only."""
+
+    original_load = torch_module.load
+
+    def trusted_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch_module.load = trusted_load
+    try:
+        yield
+    finally:
+        torch_module.load = original_load
+
+
 def load_openpcdet_config(openpcdet_root: str | Path, config_path: str | Path):
     """Load YAML from the cwd expected by upstream `_BASE_CONFIG_` handling."""
 
@@ -126,9 +143,13 @@ def evaluate_checkpoint_on_condition(
             num_class=len(condition_cfg.CLASS_NAMES),
             dataset=dataset,
         )
-        model.load_params_from_file(
-            filename=str(checkpoint), logger=logger, to_cpu=False
-        )
+        # OpenPCDet checkpoints include optimizer/NumPy metadata and therefore
+        # are not weights-only archives.  These checkpoints are produced by
+        # this project's own trusted training run.
+        with _trusted_checkpoint_loading(torch):
+            model.load_params_from_file(
+                filename=str(checkpoint), logger=logger, to_cpu=False
+            )
         model.cuda().eval().requires_grad_(False)
     else:
         model.dataset = dataset

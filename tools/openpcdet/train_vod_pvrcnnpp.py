@@ -35,6 +35,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable OpenPCDet's native CUDA automatic mixed precision training.",
+    )
     parser.add_argument("--extra-tag", default="vod_pvrcnnpp_clean")
     parser.add_argument("--skip-training", action="store_true")
     args = parser.parse_args()
@@ -67,6 +72,8 @@ def main() -> None:
             "--extra_tag",
             args.extra_tag,
         ]
+        if args.amp:
+            command.append("--use_amp")
         print("Running official OpenPCDet training:\n  " + " ".join(command))
         subprocess.run(command, cwd=openpcdet_root / "tools", check=True)
 
