@@ -9,6 +9,10 @@ import shutil
 import subprocess
 import sys
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from pcdet_integration.openpcdet_eval import (
     add_openpcdet_to_path,
     evaluate_checkpoint_on_condition,
