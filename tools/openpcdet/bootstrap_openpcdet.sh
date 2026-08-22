@@ -21,6 +21,21 @@ if [[ "$ACTUAL_COMMIT" != "$PINNED_COMMIT" ]]; then
 fi
 
 python -m pip install -r "$REPO_ROOT/requirements-openpcdet.txt"
-python -m pip install "${SPCONV_PACKAGE:-spconv-cu120>=2.3}"
+
+# spconv-cu120 only publishes CPython wheels through 3.11.  The reconstruction
+# environment currently uses Python 3.12, for which the maintained CUDA 12.6
+# package publishes compatible Linux wheels.  CUDA 12 minor-version
+# compatibility lets that package run with the newer CUDA driver/runtime used
+# by the Pod.  Keep SPCONV_PACKAGE as an explicit escape hatch.
+if [[ -z "${SPCONV_PACKAGE:-}" ]]; then
+    PYTHON_MINOR=$(python -c 'import sys; print(sys.version_info.minor)')
+    if (( PYTHON_MINOR >= 12 )); then
+        SPCONV_PACKAGE="spconv-cu126>=2.3.8"
+    else
+        SPCONV_PACKAGE="spconv-cu120>=2.3"
+    fi
+fi
+echo "Installing $SPCONV_PACKAGE"
+python -m pip install "$SPCONV_PACKAGE"
 python -m pip install -e "$OPENPCDET_ROOT"
 python "$REPO_ROOT/tools/openpcdet/check_openpcdet_environment.py" --strict

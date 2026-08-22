@@ -35,9 +35,11 @@ python tools/openpcdet/check_openpcdet_environment.py
 bash tools/openpcdet/bootstrap_openpcdet.sh
 ```
 
-The bootstrap defaults to `spconv-cu120>=2.3`. Override it when your audited
-PyTorch/CUDA environment requires another official spconv 2.x wheel, for
-example `SPCONV_PACKAGE=spconv-cu118 bash tools/openpcdet/bootstrap_openpcdet.sh`.
+The bootstrap selects `spconv-cu126>=2.3.8` on Python 3.12+ and
+`spconv-cu120>=2.3` on older supported Python versions. Override it when your
+audited PyTorch/CUDA environment requires another official spconv 2.x wheel,
+for example
+`SPCONV_PACKAGE=spconv-cu118 bash tools/openpcdet/bootstrap_openpcdet.sh`.
 
 The bootstrap pins official OpenPCDet commit
 `233f849829b6ac19afb8af8837a0246890908755`. On an RTX 5090, verify that the
