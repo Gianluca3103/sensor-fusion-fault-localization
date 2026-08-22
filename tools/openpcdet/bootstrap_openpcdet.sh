@@ -37,5 +37,8 @@ if [[ -z "${SPCONV_PACKAGE:-}" ]]; then
 fi
 echo "Installing $SPCONV_PACKAGE"
 python -m pip install "$SPCONV_PACKAGE"
-python -m pip install -e "$OPENPCDET_ROOT"
+# OpenPCDet's setup imports torch to build its CUDA extensions.  PEP 517's
+# temporary build environment does not inherit the already-installed torch,
+# so the editable build must deliberately use the active detector environment.
+python -m pip install --no-build-isolation -e "$OPENPCDET_ROOT"
 python "$REPO_ROOT/tools/openpcdet/check_openpcdet_environment.py" --strict
