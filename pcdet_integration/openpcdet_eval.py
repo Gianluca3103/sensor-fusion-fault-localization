@@ -163,7 +163,6 @@ def evaluate_checkpoint_on_condition(
         epoch_id="frozen_best",
         logger=logger,
         dist_test=False,
-        save_to_file=True,
         result_dir=output_root,
     )
     prediction_path = output_root / "result.pkl"
