@@ -22,8 +22,15 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     sys.path.insert(0, str(args.openpcdet_root))
-    from pcdet.datasets.custom.custom_dataset import CustomDataset
+    from pcdet.datasets.custom import custom_dataset as custom_dataset_module
     from pcdet.utils import common_utils
+
+    # The upstream CustomDataset implementation at our pinned OpenPCDet
+    # revision references ``Path`` in create_groundtruth_database without
+    # importing it.  Supply the standard pathlib symbol without modifying the
+    # isolated upstream dependency.
+    custom_dataset_module.Path = Path
+    CustomDataset = custom_dataset_module.CustomDataset
 
     cfg = load_openpcdet_config(args.openpcdet_root, args.dataset_config)
     dataset_cfg = cfg.DATA_CONFIG if "DATA_CONFIG" in cfg else cfg
@@ -37,16 +44,21 @@ def main() -> None:
     )
     for split in ("train", "val"):
         dataset.set_split(split)
-        infos = dataset.get_infos(
-            classes,
-            num_workers=args.workers,
-            has_label=True,
-            num_features=4,
-        )
         destination = args.data_root / f"vod_infos_{split}.pkl"
-        with destination.open("wb") as handle:
-            pickle.dump(infos, handle)
-        print(f"Saved {len(infos)} {split} infos: {destination}")
+        if destination.is_file():
+            with destination.open("rb") as handle:
+                infos = pickle.load(handle)
+            print(f"Reusing {len(infos)} {split} infos: {destination}")
+        else:
+            infos = dataset.get_infos(
+                classes,
+                num_workers=args.workers,
+                has_label=True,
+                num_features=4,
+            )
+            with destination.open("wb") as handle:
+                pickle.dump(infos, handle)
+            print(f"Saved {len(infos)} {split} infos: {destination}")
         if split == "train":
             dataset.create_groundtruth_database(destination, split="train")
             generated = args.data_root / "custom_dbinfos_train.pkl"
