@@ -1,7 +1,7 @@
 # Controlled lower-learning-rate ablation of the clean VoD PV-RCNN++ detector.
 # Architecture, dataset, augmentation, loss, and regularization match the baseline;
 # only LR and the one-cycle peak position differ.
-_BASE_CONFIG_: 'pv_rcnn_plusplus_vod.yaml'
+_BASE_CONFIG_: '../../../configs/openpcdet/pv_rcnn_plusplus_vod.yaml'
 
 OPTIMIZATION:
     BATCH_SIZE_PER_GPU: 2
