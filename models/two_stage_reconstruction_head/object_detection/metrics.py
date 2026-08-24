@@ -77,7 +77,7 @@ def evaluate_detection_conditions(
     if not frame_records:
         raise ValueError("frame_records cannot be empty")
     conditions = tuple(frame_records[0]["predictions"])
-    required = {"clean", "faulty", "coarse"}
+    required = {"clean", "faulty"}
     missing = sorted(required - set(conditions))
     if missing:
         raise ValueError("Missing required conditions: " + ", ".join(missing))
@@ -157,9 +157,9 @@ def evaluate_detection_conditions(
                 for condition in conditions
             }
             lost = detected["clean"] and not detected["faulty"]
-            recovered_coarse = lost and detected["coarse"]
+            recovered_coarse = lost and detected.get("coarse", False)
             recovered_fine = lost and detected.get("fine", False)
-            additional_fine = recovered_fine and not detected["coarse"]
+            additional_fine = recovered_fine and not detected.get("coarse", False)
             recovery["clean_detected"] += int(detected["clean"])
             recovery["lost_after_fault"] += int(lost)
             recovery["coarse_recovered"] += int(recovered_coarse)

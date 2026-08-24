@@ -27,9 +27,18 @@ from .metrics import evaluate_detection_conditions
 
 
 class CleanDetectionDataset(Dataset):
-    def __init__(self, paths: list[Path], annotations: VODAnnotationLoader):
+    def __init__(
+        self,
+        paths: list[Path],
+        annotations: VODAnnotationLoader,
+        *,
+        data_root: Path,
+        pointpillar_feature_cache_root: Path | None = None,
+    ):
         self.paths = tuple(paths)
         self.annotations = annotations
+        self.data_root = data_root
+        self.pointpillar_feature_cache_root = pointpillar_feature_cache_root
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -37,8 +46,20 @@ class CleanDetectionDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         path = self.paths[index]
         with np.load(path, allow_pickle=False) as sample:
-            clean = np.asarray(sample["clean_rgb"], dtype=np.float32).transpose(2, 0, 1) / 255.0
             metadata = json.loads(str(sample["metadata_json"]))
+            if self.pointpillar_feature_cache_root is None:
+                clean = np.asarray(sample["clean_rgb"], dtype=np.float32).transpose(2, 0, 1) / 255.0
+            else:
+                cache_path = (
+                    self.pointpillar_feature_cache_root
+                    / path.relative_to(self.data_root)
+                )
+                if not cache_path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing PointPillars feature cache: {cache_path}"
+                    )
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    clean = np.asarray(cached["clean_features"], dtype=np.float32)
         frame_id = str(metadata["frame_id"])
         return {
             "clean_bev": torch.from_numpy(clean),
@@ -60,6 +81,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--vod-root", required=True, type=Path)
     parser.add_argument("--label-root", type=Path)
+    parser.add_argument("--pointpillar-feature-cache-root", type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=50)
@@ -122,8 +144,12 @@ def main() -> None:
     annotations = VODAnnotationLoader(args.vod_root, geometry, label_root=args.label_root)
     annotations.validate_split(_frame_ids(train_paths))
     annotations.validate_split(_frame_ids(val_paths))
-    train_dataset = CleanDetectionDataset(train_paths, annotations)
-    val_dataset = CleanDetectionDataset(val_paths, annotations)
+    dataset_options = {
+        "data_root": args.data_root,
+        "pointpillar_feature_cache_root": args.pointpillar_feature_cache_root,
+    }
+    train_dataset = CleanDetectionDataset(train_paths, annotations, **dataset_options)
+    val_dataset = CleanDetectionDataset(val_paths, annotations, **dataset_options)
     loader_options = dict(
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
@@ -136,6 +162,7 @@ def main() -> None:
     )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **loader_options)
     config = BEVDetectorConfig(
+        input_channels=int(train_dataset[0]["clean_bev"].shape[0]),
         base_channels=args.base_channels,
         output_stride=args.output_stride,
         score_threshold=args.score_threshold,
@@ -197,6 +224,11 @@ def main() -> None:
             "validation_metrics": val_metrics,
             "training_split": "train_clean_only",
             "model_selection_split": "val_clean_only",
+            "input_representation": (
+                "post_pillar_scatter_features"
+                if args.pointpillar_feature_cache_root is not None
+                else "physical_lidar_bev"
+            ),
         }
         atomic_torch_save(checkpoint, args.output_root / "last_checkpoint.pt")
         if val_metrics["map"] > best_map:
@@ -213,6 +245,11 @@ def main() -> None:
             "train_samples": len(train_dataset),
             "validation_samples": len(val_dataset),
             "test_annotations_used": False,
+            "input_representation": (
+                "post_pillar_scatter_features"
+                if args.pointpillar_feature_cache_root is not None
+                else "physical_lidar_bev"
+            ),
         },
     )
 

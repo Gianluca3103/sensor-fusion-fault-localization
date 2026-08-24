@@ -1,0 +1,28 @@
+{
+  "pointpillar_feature_reconstruction": {
+    "lidar_feature_channels": 64,
+    "radar_feature_channels": 64,
+    "lidar_feature_height": 320,
+    "lidar_feature_width": 320,
+    "lambda_cosine": 0.05,
+    "faulty_cell_epsilon": 1e-6,
+    "use_halo_context": true
+  },
+  "hrnet": {
+    "base_channels": 16,
+    "num_stages": 4,
+    "blocks_per_stage": 2,
+    "residual_blocks_per_branch": 2,
+    "dropout": 0.1
+  },
+  "training": {
+    "epochs": 150,
+    "batch_size": 4,
+    "num_workers": 8,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.005,
+    "grad_clip": 1.0,
+    "mixed_precision": true,
+    "seed": 42
+  }
+}
