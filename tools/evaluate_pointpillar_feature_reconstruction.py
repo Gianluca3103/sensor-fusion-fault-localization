@@ -1,4 +1,4 @@
-"""Evaluate clean, faulty, and oracle-repaired post-scatter features."""
+"""Evaluate clean, faulty, and HRNet-reconstructed post-scatter features."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.pointpillar_feat
     PointPillarFeatureReconstructionConfig,
 )
 from models.two_stage_reconstruction_head.object_detection.annotations import (
-    DEFAULT_VOD_CLASSES,
     VODAnnotationLoader,
 )
 from models.two_stage_reconstruction_head.object_detection.detector import (
@@ -60,9 +59,7 @@ def _collate(batch: list[dict]) -> dict:
     tensor_keys = (
         "clean_features",
         "faulty_features",
-        "feature_repair_mask",
         "radar_features",
-        "feature_halo_mask",
     )
     return {
         **{key: torch.stack([item[key] for item in batch]) for key in tensor_keys},
@@ -116,30 +113,25 @@ def main() -> None:
         args.vod_root, geometry, label_root=args.label_root
     )
     conditions = (
-        ("clean", "faulty", "oracle", "coarse")
+        ("clean", "faulty", "coarse")
         if reconstructor is not None
-        else ("clean", "faulty", "oracle")
+        else ("clean", "faulty")
     )
     records = []
     with torch.inference_mode():
         for batch in loader:
             clean = batch["clean_features"].to(device, non_blocking=True)
             faulty = batch["faulty_features"].to(device, non_blocking=True)
-            repair = batch["feature_repair_mask"].to(device, non_blocking=True)
-            oracle = repair * clean + (1.0 - repair) * faulty
             coarse = None
             if reconstructor is not None:
                 coarse = reconstructor(
                     faulty,
                     batch["radar_features"].to(device, non_blocking=True),
-                    repair,
-                    batch["feature_halo_mask"].to(device, non_blocking=True),
                 )["coarse_features"]
             predictions = {}
             condition_tensors = [
                 ("clean", clean),
                 ("faulty", faulty),
-                ("oracle", oracle),
             ]
             if coarse is not None:
                 condition_tensors.append(("coarse", coarse))
@@ -167,13 +159,14 @@ def main() -> None:
                 )
 
     summary, frame_rows, object_rows = evaluate_detection_conditions(
-        records, DEFAULT_VOD_CLASSES, detector_config.match_iou_threshold
+        records, model.class_names, detector_config.match_iou_threshold
     )
     metrics = summary["conditions"]
-    summary["oracle_improvement"] = {
-        name: metrics["oracle"][name] - metrics["faulty"][name]
-        for name in ("map", "precision", "recall", "f1", "mean_matched_iou")
-    }
+    if "coarse" in metrics:
+        summary["coarse_improvement"] = {
+            name: metrics["coarse"][name] - metrics["faulty"][name]
+            for name in ("map", "precision", "recall", "f1", "mean_matched_iou")
+        }
     summary.update(
         detector_checkpoint=str(args.detector_checkpoint.resolve()),
         detector_frozen=True,
@@ -191,7 +184,7 @@ def main() -> None:
     atomic_write_json(args.output_root / "per_object_matching.json", object_rows)
     write_csv_rows(args.output_root / "frame_metrics.csv", frame_rows)
     write_csv_rows(args.output_root / "per_object_matching.csv", object_rows)
-    print("\nPOST-SCATTER FEATURE ORACLE")
+    print("\nPOST-SCATTER FEATURE RECONSTRUCTION")
     print(f"{'Condition':<10} {'mAP':>9} {'Precision':>11} {'Recall':>9} {'F1':>9}")
     print("-" * 52)
     for condition in conditions:
@@ -201,7 +194,11 @@ def main() -> None:
             f"{100*values['precision']:>10.2f}% "
             f"{100*values['recall']:>8.2f}% {100*values['f1']:>8.2f}%"
         )
-    print("Oracle - faulty:", json.dumps(summary["oracle_improvement"], indent=2))
+    if "coarse_improvement" in summary:
+        print(
+            "Coarse - faulty:",
+            json.dumps(summary["coarse_improvement"], indent=2),
+        )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Train the frozen downstream detector exclusively on clean VoD training BEVs."""
+"""Train a downstream detector exclusively on clean VoD training tensors."""
 
 from __future__ import annotations
 

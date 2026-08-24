@@ -13,23 +13,35 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from Fault_Localization_Model.sample_utils import load_sample_metadata
 from Fault_Localization_Model.io_utils import atomic_savez_compressed
 from Fault_Localization_Model.vod_dataset import load_vod_lidar, resolve_vod_public_root
 from models.Fault_Localization.training_utils import _split_paths, resolve_device, seed_everything
 from models.two_stage_reconstruction_head import (
-    CoarseReconstructionDataset,
     coarse_reconstruction_collate,
+    load_bev_triplet,
     load_frozen_coarse_model,
 )
-from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
-    _load_selector_config,
-)
-from models.two_stage_reconstruction_head.coarse_reconstruction.pointpillar_feature_reconstruction import (
-    project_mask_between_bev_grids,
-)
+
+
+class PointInputDataset(Dataset):
+    """Load aligned faulty LiDAR and radar points without fault selection."""
+
+    def __init__(self, paths, radar_root: Path):
+        self.paths = tuple(Path(path) for path in paths)
+        self.radar_root = radar_root
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return load_bev_triplet(
+            self.paths[index],
+            self.radar_root,
+            include_pointpillars_inputs=True,
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,14 +50,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--radar-root", required=True, type=Path)
     parser.add_argument("--encoder-checkpoint", required=True, type=Path)
-    parser.add_argument("--selector-config", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
-    parser.add_argument("--splits", nargs="+", choices=("train", "val"), default=("train", "val"))
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=("train", "val", "test"),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--visualize-masks", type=int, default=8)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -65,19 +80,11 @@ def main() -> None:
     feature_geometry = lidar_encoder.scatter.geometry
     if radar_encoder.scatter.geometry != feature_geometry:
         raise ValueError("LiDAR and radar post-scatter geometries differ")
-    selector = _load_selector_config(args.selector_config)
     counts = {}
-    visualized = 0
 
     for split in dict.fromkeys(args.splits):
         paths = _split_paths(args.data_root, split, None, args.seed)
-        dataset = CoarseReconstructionDataset(
-            paths,
-            args.radar_root,
-            data_root=args.data_root,
-            selector_config=selector,
-            use_pointpillars=True,
-        )
+        dataset = PointInputDataset(paths, args.radar_root)
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -120,66 +127,11 @@ def main() -> None:
                         written += 1
                         continue
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    source_geometry = dataset.grid_geometry
-                    masks = {}
-                    for source_name, target_name in (
-                        ("reconstruction_mask", "feature_repair_mask"),
-                        ("halo_mask", "feature_halo_mask"),
-                        ("healthy_context_mask", "feature_healthy_context_mask"),
-                    ):
-                        masks[target_name] = project_mask_between_bev_grids(
-                            batch[source_name][index].numpy(),
-                            source_geometry,
-                            feature_geometry,
-                        )[None]
-                    if visualized < args.visualize_masks:
-                        import matplotlib
-
-                        matplotlib.use("Agg")
-                        import matplotlib.pyplot as plt
-
-                        source_mask = batch["reconstruction_mask"][index, 0].numpy()
-                        projected_mask = masks["feature_repair_mask"][0]
-                        figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-                        axes[0].imshow(source_mask, origin="upper")
-                        axes[0].set_title("320x320 reconstruction mask")
-                        axes[1].imshow(projected_mask, origin="upper")
-                        axes[1].set_title("post-scatter feature mask")
-                        if projected_mask.shape == source_mask.shape:
-                            axes[2].imshow(
-                                projected_mask - source_mask,
-                                origin="upper",
-                                vmin=-1,
-                                vmax=1,
-                                cmap="coolwarm",
-                            )
-                            axes[2].set_title("projected - source")
-                        else:
-                            axes[2].text(
-                                0.5,
-                                0.5,
-                                "Different raster shapes\ncompare metric extents",
-                                ha="center",
-                                va="center",
-                            )
-                            axes[2].set_title("metric projection")
-                        for axis in axes:
-                            axis.set_axis_off()
-                        mask_root = args.output_root / "mask_alignment"
-                        mask_root.mkdir(parents=True, exist_ok=True)
-                        figure.savefig(
-                            mask_root / f"{split}_{visualized:03d}.png",
-                            dpi=140,
-                            bbox_inches="tight",
-                        )
-                        plt.close(figure)
-                        visualized += 1
                     atomic_savez_compressed(
                         destination,
                         clean_features=clean_features[index].float().cpu().numpy().astype(np.float16),
                         faulty_features=faulty_features[index].float().cpu().numpy().astype(np.float16),
                         radar_features=radar_features[index].float().cpu().numpy().astype(np.float16),
-                        **masks,
                     )
                     written += 1
                     if written % 100 == 0:
@@ -187,11 +139,16 @@ def main() -> None:
         counts[split] = written
 
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "tensor_name": "dense_features",
         "detector_interface_alias": "post_pillar_scatter",
-        "shape": [
+        "lidar_shape": [
             int(lidar_encoder.scatter.channels),
+            feature_geometry.height,
+            feature_geometry.width,
+        ],
+        "radar_shape": [
+            int(radar_encoder.scatter.channels),
             feature_geometry.height,
             feature_geometry.width,
         ],
@@ -200,6 +157,9 @@ def main() -> None:
         "encoder_epoch": int(checkpoint.get("epoch", -1)),
         "encoder_frozen": True,
         "same_lidar_encoder_for_clean_and_faulty": True,
+        "fault_selector_used": False,
+        "reconstruction_masks_used": False,
+        "clean_features_are_targets_only": True,
         "splits": counts,
         "feature_storage_dtype": "float16",
     }

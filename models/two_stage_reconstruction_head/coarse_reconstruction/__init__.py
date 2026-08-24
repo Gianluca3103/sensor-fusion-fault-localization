@@ -5,5 +5,4 @@ from .pointpillar_feature_reconstruction import (
     PointPillarFeatureCacheDataset,
     PointPillarFeatureReconstructionConfig,
     pointpillar_feature_reconstruction_loss,
-    project_mask_between_bev_grids,
 )

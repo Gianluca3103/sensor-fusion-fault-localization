@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
 
-from ..pointpillars import BEVGridGeometry
 from .hrnet_backbone import HRNetBackbone, HRNetConfig
 
 
@@ -22,9 +21,9 @@ class PointPillarFeatureReconstructionConfig:
     lidar_feature_height: int = 320
     lidar_feature_width: int = 320
     lambda_cosine: float = 0.05
+    lambda_changed: float = 5.0
     faulty_cell_epsilon: float = 1.0e-6
-    use_halo_context: bool = True
-    hrnet: HRNetConfig = HRNetConfig()
+    hrnet: HRNetConfig = field(default_factory=HRNetConfig)
 
     def validate(self) -> None:
         for name in (
@@ -37,6 +36,8 @@ class PointPillarFeatureReconstructionConfig:
                 raise ValueError(f"{name} must be positive")
         if self.lambda_cosine < 0:
             raise ValueError("lambda_cosine must be non-negative")
+        if self.lambda_changed < 0:
+            raise ValueError("lambda_changed must be non-negative")
         if self.faulty_cell_epsilon < 0:
             raise ValueError("faulty_cell_epsilon must be non-negative")
         self.hrnet.validate()
@@ -58,56 +59,8 @@ class PointPillarFeatureReconstructionConfig:
         return config
 
 
-def project_mask_between_bev_grids(
-    mask: np.ndarray,
-    source: BEVGridGeometry,
-    destination: BEVGridGeometry,
-) -> np.ndarray:
-    """Project a binary mask by metric cell centres, never image resizing."""
-
-    source.validate()
-    destination.validate()
-    array = np.asarray(mask)
-    if array.shape == (1, source.height, source.width):
-        array = array[0]
-    if array.shape != (source.height, source.width):
-        raise ValueError(
-            f"mask must match source geometry, got {array.shape}"
-        )
-    destination_rows, destination_cols = np.indices(
-        (destination.height, destination.width)
-    )
-    x = destination.x_min + (
-        destination.height - destination_rows - 0.5
-    ) * destination.pillar_size_x
-    y = destination.y_min + (
-        destination_cols + 0.5
-    ) * destination.pillar_size_y
-    source_rows = source.height - 1 - np.floor(
-        (x - source.x_min) / source.pillar_size_x
-    ).astype(np.int64)
-    source_cols = np.floor(
-        (y - source.y_min) / source.pillar_size_y
-    ).astype(np.int64)
-    valid = (
-        (x >= source.x_min)
-        & (x < source.x_max)
-        & (y >= source.y_min)
-        & (y < source.y_max)
-        & (source_rows >= 0)
-        & (source_rows < source.height)
-        & (source_cols >= 0)
-        & (source_cols < source.width)
-    )
-    projected = np.zeros(
-        (destination.height, destination.width), dtype=np.float32
-    )
-    projected[valid] = array[source_rows[valid], source_cols[valid]] > 0.5
-    return projected
-
-
 class PointPillarFeatureCacheDataset(Dataset):
-    """Load cached clean/faulty/radar post-scatter tensors and masks."""
+    """Load cached clean/faulty/radar post-scatter tensors."""
 
     def __init__(self, sample_paths, cache_root: str | Path, data_root: str | Path):
         self.sample_paths = tuple(Path(path) for path in sample_paths)
@@ -137,9 +90,6 @@ class PointPillarFeatureCacheDataset(Dataset):
                     "clean_features",
                     "faulty_features",
                     "radar_features",
-                    "feature_repair_mask",
-                    "feature_halo_mask",
-                    "feature_healthy_context_mask",
                 )
             }
         item["sample_path"] = str(sample_path)
@@ -147,7 +97,7 @@ class PointPillarFeatureCacheDataset(Dataset):
 
 
 class CoarsePointPillarFeatureReconstructor(nn.Module):
-    """Predict a masked residual on the detector's post-scatter tensor."""
+    """Predict a full-grid residual on the detector's post-scatter tensor."""
 
     def __init__(self, config: PointPillarFeatureReconstructionConfig):
         super().__init__()
@@ -156,7 +106,6 @@ class CoarsePointPillarFeatureReconstructor(nn.Module):
         input_channels = (
             config.lidar_feature_channels
             + config.radar_feature_channels
-            + 2
         )
         self.backbone = HRNetBackbone(input_channels, config.hrnet)
         self.residual_head = nn.Conv2d(
@@ -171,8 +120,6 @@ class CoarsePointPillarFeatureReconstructor(nn.Module):
         self,
         faulty_features: torch.Tensor,
         radar_features: torch.Tensor,
-        feature_repair_mask: torch.Tensor,
-        feature_halo_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         expected = (
             self.config.lidar_feature_channels,
@@ -192,36 +139,21 @@ class CoarsePointPillarFeatureReconstructor(nn.Module):
             self.config.lidar_feature_width,
         ):
             raise ValueError("radar_features do not match configured feature grid")
-        for name, mask in (
-            ("feature_repair_mask", feature_repair_mask),
-            ("feature_halo_mask", feature_halo_mask),
-        ):
-            if mask.shape != faulty_features.shape[:1] + (1,) + faulty_features.shape[2:]:
-                raise ValueError(f"{name} has incompatible shape {tuple(mask.shape)}")
-
-        repair = (feature_repair_mask > 0.5).to(faulty_features.dtype)
-        halo = (feature_halo_mask > 0.5).to(faulty_features.dtype)
-        context = halo if self.config.use_halo_context else torch.zeros_like(halo)
-        active = torch.maximum(repair, context)
-        network_input = torch.cat(
-            (faulty_features, active * radar_features, repair, context), dim=1
-        )
+        network_input = torch.cat((faulty_features, radar_features), dim=1)
         features, debug = self.backbone(network_input)
         predicted_delta = self.residual_head(features)
-        coarse_features = faulty_features + repair * predicted_delta
+        coarse_features = faulty_features + predicted_delta
         output = {
             "predicted_delta": predicted_delta,
             "coarse_features": coarse_features,
-            "feature_repair_mask": repair,
-            "feature_halo_mask": halo,
             "network_input": network_input,
         }
         output.update(debug)
         return output
 
 
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    expanded = mask.expand_as(values).to(values.dtype)
+def _supported_mean(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    expanded = support.expand_as(values).to(values.dtype)
     return (values * expanded).sum() / expanded.sum().clamp_min(1.0)
 
 
@@ -231,36 +163,37 @@ def pointpillar_feature_reconstruction_loss(
     faulty_features: torch.Tensor,
     config: PointPillarFeatureReconstructionConfig,
 ) -> dict[str, torch.Tensor]:
-    """Smooth-L1 plus optional cosine loss, supervised only inside repair."""
+    """Full-grid target loss with extra weight on target-derived changes."""
 
     coarse = output["coarse_features"]
-    repair = output["feature_repair_mask"]
     smooth_cells = F.smooth_l1_loss(coarse, clean_features, reduction="none")
-    smooth = _masked_mean(smooth_cells, repair)
+    smooth = smooth_cells.mean()
 
     cosine = 1.0 - F.cosine_similarity(
         coarse.float(), clean_features.float(), dim=1, eps=1.0e-8
     )
     cosine_support = (
         clean_features.float().square().sum(dim=1, keepdim=True) > 1.0e-12
-    ).to(repair.dtype)
-    cosine_loss = _masked_mean(cosine[:, None], repair * cosine_support)
-    total = smooth + config.lambda_cosine * cosine_loss
+    ).to(coarse.dtype)
+    cosine_loss = _supported_mean(cosine[:, None], cosine_support)
 
-    actual_fault = (
+    changed = (
         (clean_features - faulty_features).abs().amax(dim=1, keepdim=True)
         > config.faulty_cell_epsilon
-    ).to(repair.dtype) * repair
-    sacrificed = repair * (1.0 - actual_fault)
-    outside_error = (
-        (coarse - faulty_features).abs() * (1.0 - repair)
-    ).amax()
+    ).to(coarse.dtype)
+    unchanged = 1.0 - changed
+    changed_smooth = _supported_mean(smooth_cells, changed)
+    unchanged_smooth = _supported_mean(smooth_cells, unchanged)
+    total = (
+        smooth
+        + config.lambda_changed * changed_smooth
+        + config.lambda_cosine * cosine_loss
+    )
     return {
         "loss": total,
-        "smooth_l1_feature": smooth,
+        "smooth_l1_full_grid": smooth,
+        "smooth_l1_changed_cells": changed_smooth,
+        "smooth_l1_unchanged_cells": unchanged_smooth,
         "cosine_feature": cosine_loss,
-        "smooth_l1_actual_fault": _masked_mean(smooth_cells, actual_fault),
-        "smooth_l1_sacrificed_healthy": _masked_mean(smooth_cells, sacrificed),
-        "actual_fault_fraction": actual_fault.sum() / repair.sum().clamp_min(1.0),
-        "outside_repair_max_change": outside_error,
+        "changed_cell_fraction": changed.mean(),
     }

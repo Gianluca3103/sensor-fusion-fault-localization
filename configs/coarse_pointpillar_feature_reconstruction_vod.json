@@ -5,8 +5,8 @@
     "lidar_feature_height": 320,
     "lidar_feature_width": 320,
     "lambda_cosine": 0.05,
-    "faulty_cell_epsilon": 1e-6,
-    "use_halo_context": true
+    "lambda_changed": 5.0,
+    "faulty_cell_epsilon": 1e-6
   },
   "hrnet": {
     "base_channels": 16,

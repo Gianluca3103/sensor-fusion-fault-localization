@@ -66,9 +66,6 @@ def _collate(batch: list[dict]) -> dict:
         "clean_features",
         "faulty_features",
         "radar_features",
-        "feature_repair_mask",
-        "feature_halo_mask",
-        "feature_healthy_context_mask",
     )
     return {
         **{key: torch.stack([item[key] for item in batch]) for key in keys},
@@ -76,26 +73,44 @@ def _collate(batch: list[dict]) -> dict:
     }
 
 
-def _feature_metrics(coarse, clean, faulty, repair):
-    mask = repair.expand_as(clean)
-    cells = repair.sum().clamp_min(1.0)
-    channels = clean.shape[1]
-    faulty_error = (F.smooth_l1_loss(faulty, clean, reduction="none") * mask).sum() / (cells * channels)
-    coarse_error = (F.smooth_l1_loss(coarse, clean, reduction="none") * mask).sum() / (cells * channels)
-    cosine_mask = repair * (
+def _feature_metrics(coarse, clean, faulty, epsilon):
+    faulty_losses = F.smooth_l1_loss(faulty, clean, reduction="none")
+    coarse_losses = F.smooth_l1_loss(coarse, clean, reduction="none")
+    changed = (
+        (clean - faulty).abs().amax(dim=1, keepdim=True) > epsilon
+    ).to(clean.dtype)
+    faulty_error = faulty_losses.mean()
+    coarse_error = coarse_losses.mean()
+    faulty_changed_error = (
+        faulty_losses * changed.expand_as(clean)
+    ).sum() / changed.expand_as(clean).sum().clamp_min(1.0)
+    coarse_changed_error = (
+        coarse_losses * changed.expand_as(clean)
+    ).sum() / changed.expand_as(clean).sum().clamp_min(1.0)
+    cosine_support = (
         clean.float().square().sum(dim=1, keepdim=True) > 1.0e-12
-    ).to(repair.dtype)
-    cosine_cells = cosine_mask.sum().clamp_min(1.0)
+    ).to(clean.dtype)
+    cosine_cells = cosine_support.sum().clamp_min(1.0)
     faulty_cos = (
         F.cosine_similarity(faulty.float(), clean.float(), dim=1)[:, None]
-        * cosine_mask
+        * cosine_support
     ).sum() / cosine_cells
     coarse_cos = (
         F.cosine_similarity(coarse.float(), clean.float(), dim=1)[:, None]
-        * cosine_mask
+        * cosine_support
     ).sum() / cosine_cells
-    improvement = 100.0 * (faulty_error - coarse_error) / faulty_error.clamp_min(1.0e-12)
-    return faulty_error, coarse_error, faulty_cos, coarse_cos, improvement
+    improvement = 100.0 * (
+        faulty_changed_error - coarse_changed_error
+    ) / faulty_changed_error.clamp_min(1.0e-12)
+    return (
+        faulty_error,
+        coarse_error,
+        faulty_changed_error,
+        coarse_changed_error,
+        faulty_cos,
+        coarse_cos,
+        improvement,
+    )
 
 
 def _run_epoch(model, loader, device, scaler, optimizer=None):
@@ -121,8 +136,6 @@ def _run_epoch(model, loader, device, scaler, optimizer=None):
                 output = model(
                     tensors["faulty_features"],
                     tensors["radar_features"],
-                    tensors["feature_repair_mask"],
-                    tensors["feature_halo_mask"],
                 )
                 losses = pointpillar_feature_reconstruction_loss(
                     output,
@@ -142,15 +155,17 @@ def _run_epoch(model, loader, device, scaler, optimizer=None):
                 output["coarse_features"],
                 tensors["clean_features"],
                 tensors["faulty_features"],
-                tensors["feature_repair_mask"],
+                model.config.faulty_cell_epsilon,
             )
             values = {
                 **{key: float(value.detach()) for key, value in losses.items()},
                 "faulty_smooth_l1": float(metrics[0]),
                 "coarse_smooth_l1": float(metrics[1]),
-                "faulty_cosine": float(metrics[2]),
-                "coarse_cosine": float(metrics[3]),
-                "error_improvement_percent": float(metrics[4]),
+                "faulty_changed_smooth_l1": float(metrics[2]),
+                "coarse_changed_smooth_l1": float(metrics[3]),
+                "faulty_cosine": float(metrics[4]),
+                "coarse_cosine": float(metrics[5]),
+                "changed_error_improvement_percent": float(metrics[6]),
             }
             for key, value in values.items():
                 totals[key] = totals.get(key, 0.0) + value
@@ -165,11 +180,18 @@ def main() -> None:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Missing feature-cache manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    channels, height, width = (int(value) for value in manifest["shape"])
+    lidar_channels, height, width = (
+        int(value) for value in manifest["lidar_shape"]
+    )
+    radar_channels, radar_height, radar_width = (
+        int(value) for value in manifest["radar_shape"]
+    )
+    if (radar_height, radar_width) != (height, width):
+        raise ValueError("Cached LiDAR and radar feature grids do not align")
     config = replace(
         config,
-        lidar_feature_channels=channels,
-        radar_feature_channels=channels,
+        lidar_feature_channels=lidar_channels,
+        radar_feature_channels=radar_channels,
         lidar_feature_height=height,
         lidar_feature_width=width,
     )
@@ -218,12 +240,14 @@ def main() -> None:
         history.append(row)
         print(
             f"epoch {epoch:03d}: train/loss={train_stats['loss']:.6f} "
-            f"val/loss={val_stats['loss']:.6f} | repair SmoothL1 "
-            f"{val_stats['faulty_smooth_l1']:.6f} -> "
-            f"{val_stats['coarse_smooth_l1']:.6f} "
-            f"({val_stats['error_improvement_percent']:+.2f}%) | cosine "
+            f"val/loss={val_stats['loss']:.6f} | SmoothL1 "
+            f"full {val_stats['faulty_smooth_l1']:.6f} -> "
+            f"{val_stats['coarse_smooth_l1']:.6f} | changed "
+            f"{val_stats['faulty_changed_smooth_l1']:.6f} -> "
+            f"{val_stats['coarse_changed_smooth_l1']:.6f} "
+            f"({val_stats['changed_error_improvement_percent']:+.2f}%) | cosine "
             f"{val_stats['faulty_cosine']:.4f} -> {val_stats['coarse_cosine']:.4f} | "
-            f"outside={val_stats['outside_repair_max_change']:.3e}"
+            f"changed_cells={100*val_stats['changed_cell_fraction']:.2f}%"
         )
         checkpoint = {
             "epoch": epoch,
@@ -236,18 +260,21 @@ def main() -> None:
             "interface": "post_pillar_scatter_dense_features",
         }
         atomic_torch_save(checkpoint, args.output_root / "last_checkpoint.pt")
-        if val_stats["coarse_smooth_l1"] < best_error:
-            best_error = val_stats["coarse_smooth_l1"]
+        if val_stats["loss"] < best_error:
+            best_error = val_stats["loss"]
             atomic_torch_save(checkpoint, args.output_root / "best_model.pt")
         write_csv_rows(args.output_root / "history.csv", history)
     atomic_write_json(
         args.output_root / "training_summary.json",
         {
-            "best_validation_coarse_smooth_l1": best_error,
+            "best_validation_loss": best_error,
             "model_config": config.to_dict(),
             "train_samples": len(train_dataset),
             "validation_samples": len(val_dataset),
-            "outside_repair_is_hard_composited": True,
+            "fault_selector_used": False,
+            "full_grid_write_access": True,
+            "model_inputs": ["faulty_lidar_postscatter", "radar_postscatter"],
+            "training_target": "clean_lidar_postscatter",
         },
     )
 

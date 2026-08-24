@@ -226,14 +226,19 @@ def evaluate_detection_conditions(
             "per_class": per_class,
         }
     maps = {condition: summary["conditions"][condition]["map"] for condition in conditions}
-    summary["map_improvement"] = {
-        "coarse_minus_faulty": maps["coarse"] - maps["faulty"]
-    }
-    if "fine" in maps:
-        summary["map_improvement"].update(
-            fine_minus_faulty=maps["fine"] - maps["faulty"],
-            fine_minus_coarse=maps["fine"] - maps["coarse"],
+    summary["map_improvement"] = {}
+    if "coarse" in maps:
+        summary["map_improvement"]["coarse_minus_faulty"] = (
+            maps["coarse"] - maps["faulty"]
         )
+    if "fine" in maps:
+        summary["map_improvement"]["fine_minus_faulty"] = (
+            maps["fine"] - maps["faulty"]
+        )
+        if "coarse" in maps:
+            summary["map_improvement"]["fine_minus_coarse"] = (
+                maps["fine"] - maps["coarse"]
+            )
     lost = recovery["lost_after_fault"]
     summary["object_recovery"] = {
         **dict(recovery),

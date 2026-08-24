@@ -1,4 +1,4 @@
-"""A compact CenterNet-style rotated detector for three-channel LiDAR BEVs."""
+"""A compact CenterNet-style rotated detector for dense BEV tensors."""
 
 from __future__ import annotations
 
