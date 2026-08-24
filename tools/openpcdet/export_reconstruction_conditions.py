@@ -29,7 +29,10 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_
     _load_selector_config,
     _move_batch,
 )
-from pcdet_integration.reconstructed_points import repair_point_cloud
+from pcdet_integration.reconstructed_points import (
+    repair_point_cloud,
+    repair_point_cloud_with_clean_points,
+)
 from pcdet_integration.stage_inference import load_frozen_reconstruction_pipeline
 from pcdet_integration.vod_dataset import export_vod_custom_dataset
 
@@ -44,7 +47,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conditions",
         nargs="+",
-        choices=("clean", "faulty", "coarse", "fine"),
+        choices=(
+            "clean",
+            "faulty",
+            "oracle_raw",
+            "oracle_bev",
+            "coarse",
+            "fine",
+        ),
         default=("clean", "faulty", "coarse", "fine"),
     )
     parser.add_argument("--selector-config", required=True, type=Path)
@@ -176,6 +186,7 @@ def main() -> None:
                     else None
                 )
             masks = inputs["reconstruction_mask"].detach().float().cpu().numpy()
+            clean_numpy = inputs["clean_bev"].detach().float().cpu().numpy()
             coarse_numpy = coarse_bev.detach().float().cpu().numpy()
             fine_numpy = (
                 sampled["final_lidar_bev"].detach().float().cpu().numpy()
@@ -198,6 +209,22 @@ def main() -> None:
                     "faulty": faulty,
                     "coarse": coarse_points,
                 }
+                if "oracle_raw" in conditions:
+                    points_by_condition["oracle_raw"] = (
+                        repair_point_cloud_with_clean_points(
+                            faulty,
+                            clean,
+                            masks[index],
+                            dataset.grid_geometry,
+                        )
+                    )
+                if "oracle_bev" in conditions:
+                    points_by_condition["oracle_bev"] = repair_point_cloud(
+                        faulty,
+                        clean_numpy[index],
+                        masks[index],
+                        dataset.grid_geometry,
+                    )
                 if fine_numpy is not None:
                     points_by_condition["fine"] = repair_point_cloud(
                         faulty, fine_numpy[index], masks[index], dataset.grid_geometry
@@ -223,6 +250,14 @@ def main() -> None:
             int(fine_checkpoint.get("epoch", -1)) if fine_checkpoint else None
         ),
         "point_adapter": "pcdet_integration.reconstructed_points.repair_point_cloud",
+        "diagnostic_conditions": {
+            "oracle_raw": (
+                "faulty outside repair + measured clean LiDAR points inside repair"
+            ),
+            "oracle_bev": (
+                "faulty outside repair + clean BEV converted by the production adapter"
+            ),
+        },
         "conditions": {name: str(path.resolve()) for name, path in condition_roots.items()},
     }
     (args.output_root / "condition_manifest.json").write_text(

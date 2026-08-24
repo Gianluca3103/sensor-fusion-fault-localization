@@ -37,7 +37,14 @@ from pcdet_integration.openpcdet_eval import (
 )
 
 
-ALL_CONDITIONS = ("clean", "faulty", "coarse", "fine")
+ALL_CONDITIONS = (
+    "clean",
+    "faulty",
+    "oracle_raw",
+    "oracle_bev",
+    "coarse",
+    "fine",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -270,14 +277,20 @@ def main() -> None:
     official_deltas = {}
     for kind in ("bev_map", "3d_map"):
         values = {condition: official[condition][kind] for condition in conditions}
-        if all(value is not None for value in values.values()):
-            deltas = {"coarse_minus_faulty": values["coarse"] - values["faulty"]}
-            if "fine" in values:
-                deltas.update(
-                    fine_minus_faulty=values["fine"] - values["faulty"],
-                    fine_minus_coarse=values["fine"] - values["coarse"],
-                )
-            official_deltas[kind] = deltas
+        deltas = {}
+        faulty_value = values.get("faulty")
+        if faulty_value is not None:
+            for condition, value in values.items():
+                if condition != "faulty" and value is not None:
+                    deltas[f"{condition}_minus_faulty"] = value - faulty_value
+        for left, right in (
+            ("oracle_bev", "oracle_raw"),
+            ("coarse", "oracle_bev"),
+            ("fine", "coarse"),
+        ):
+            if values.get(left) is not None and values.get(right) is not None:
+                deltas[f"{left}_minus_{right}"] = values[left] - values[right]
+        official_deltas[kind] = deltas
     summary = {
         "detector": "official OpenPCDet PVRCNNPlusPlus",
         "detector_checkpoint": str(args.detector_checkpoint.resolve()),

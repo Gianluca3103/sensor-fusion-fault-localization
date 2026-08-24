@@ -2,7 +2,10 @@ import numpy as np
 from dataclasses import dataclass
 import unittest
 
-from pcdet_integration.reconstructed_points import repair_point_cloud
+from pcdet_integration.reconstructed_points import (
+    repair_point_cloud,
+    repair_point_cloud_with_clean_points,
+)
 
 
 @dataclass(frozen=True)
@@ -60,3 +63,28 @@ class ReconstructedPointTests(unittest.TestCase):
         repaired = repair_point_cloud(faulty, bev, repair, geometry)
 
         np.testing.assert_array_equal(repaired, faulty[1:])
+
+    def test_oracle_raw_repair_uses_clean_points_only_inside_mask(self):
+        geometry = BEVGridGeometry(0.0, 2.0, 0.0, 2.0, height=2, width=2)
+        faulty = np.asarray(
+            [[1.75, 0.25, 0.2, 0.4], [0.25, 1.75, -0.1, 0.8]],
+            dtype=np.float32,
+        )
+        clean = np.asarray(
+            [
+                [1.65, 0.35, 0.6, 0.3],
+                [1.55, 0.45, 0.8, 0.5],
+                [0.35, 1.65, -0.2, 0.9],
+            ],
+            dtype=np.float32,
+        )
+        repair = np.zeros((2, 2), dtype=np.float32)
+        repair[0, 0] = 1.0
+
+        repaired = repair_point_cloud_with_clean_points(
+            faulty, clean, repair, geometry
+        )
+
+        np.testing.assert_array_equal(repaired[0], faulty[1])
+        np.testing.assert_array_equal(repaired[1:], clean[:2])
+        self.assertEqual(repaired.dtype, np.float32)

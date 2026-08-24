@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from Fault_Localization_Model.bev_utils import HEIGHT_RANGE_M, metric_to_grid
+
+
 @dataclass(frozen=True)
 class ReconstructionPointCloudConfig:
     occupancy_threshold: float = 0.5
@@ -140,3 +142,37 @@ def repair_point_cloud(
         reflectivity = np.zeros(len(xy), dtype=np.float32)
     generated = np.column_stack((x, y, z, reflectivity)).astype(np.float32)
     return np.concatenate((preserved, generated), axis=0)
+
+
+def repair_point_cloud_with_clean_points(
+    faulty_points: np.ndarray,
+    clean_points: np.ndarray,
+    reconstruction_mask: np.ndarray,
+    geometry,
+) -> np.ndarray:
+    """Create an oracle repair using measured clean points inside the mask.
+
+    Faulty measurements outside the reconstruction mask remain byte-for-byte
+    unchanged.  Faulty measurements inside it are replaced by the matching
+    clean LiDAR measurements.  This is a diagnostic upper bound, not a model
+    input or a deployable reconstruction method.
+    """
+
+    geometry.validate()
+    faulty = np.asarray(faulty_points, dtype=np.float32)
+    clean = np.asarray(clean_points, dtype=np.float32)
+    for name, points in (("faulty_points", faulty), ("clean_points", clean)):
+        if points.ndim != 2 or points.shape[1] != 4:
+            raise ValueError(
+                f"{name} must be [N,4] x/y/z/reflectivity, got {points.shape}"
+            )
+        if not np.isfinite(points).all():
+            raise ValueError(f"{name} contains NaN or Inf")
+
+    repair = _as_mask(reconstruction_mask, geometry)
+    faulty_inside = points_inside_bev_mask(faulty, repair, geometry)
+    clean_inside = points_inside_bev_mask(clean, repair, geometry)
+    return np.concatenate(
+        (faulty[~faulty_inside].copy(), clean[clean_inside].copy()),
+        axis=0,
+    )
