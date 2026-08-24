@@ -24,6 +24,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--epochs", required=True, type=int)
+    parser.add_argument("--start-epoch", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--poll-seconds", type=float, default=10.0)
@@ -142,9 +143,12 @@ def _evaluate(args: argparse.Namespace, checkpoint: Path, epoch: int) -> dict:
 
 def main() -> None:
     args = _arguments()
+    if not 1 <= args.start_epoch <= args.epochs:
+        raise ValueError("start_epoch must be between 1 and epochs")
     args.output_root.mkdir(parents=True, exist_ok=True)
     csv_path = args.output_root / "metrics_by_epoch.csv"
     completed = _completed_epochs(csv_path)
+    target_epochs = set(range(args.start_epoch, args.epochs + 1))
     previous_sizes: dict[Path, int] = {}
 
     print(
@@ -154,11 +158,15 @@ def main() -> None:
     )
     print("-" * 66, flush=True)
 
-    while len(completed) < args.epochs:
+    while not target_epochs.issubset(completed):
         checkpoints = sorted(
             args.checkpoint_dir.glob("checkpoint_epoch_*.pth"), key=_epoch
         )
-        pending = [path for path in checkpoints if _epoch(path) not in completed]
+        pending = [
+            path
+            for path in checkpoints
+            if _epoch(path) in target_epochs and _epoch(path) not in completed
+        ]
         progressed = False
         for checkpoint in pending:
             epoch = _epoch(checkpoint)
@@ -176,7 +184,7 @@ def main() -> None:
                 f"{row['cyclist_3d_ap_r40']:8.3f}",
                 flush=True,
             )
-        if len(completed) >= args.epochs:
+        if target_epochs.issubset(completed):
             break
         if not progressed:
             time.sleep(args.poll_seconds)
