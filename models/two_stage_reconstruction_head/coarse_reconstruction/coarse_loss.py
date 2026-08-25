@@ -534,15 +534,16 @@ def _tolerant_occupancy_metrics(
     # Bidirectional tolerant matching has no single TP count. This monotonic
     # F1-equivalent reports IoU on the familiar scale: IoU = F1 / (2 - F1).
     iou = _safe_ratio(f1, 2.0 - f1, epsilon)
+    tolerance_key = f"{tolerance_m:g}".replace(".", "_") + "m"
     return {
         "occupancy_tolerant_precision": precision,
         "occupancy_tolerant_recall": recall,
         "occupancy_tolerant_f1": f1,
         "occupancy_tolerant_iou": iou,
-        "occupancy_tolerant_0_5m_precision": precision,
-        "occupancy_tolerant_0_5m_recall": recall,
-        "occupancy_tolerant_0_5m_f1": f1,
-        "occupancy_tolerant_0_5m_iou": iou,
+        f"occupancy_tolerant_{tolerance_key}_precision": precision,
+        f"occupancy_tolerant_{tolerance_key}_recall": recall,
+        f"occupancy_tolerant_{tolerance_key}_f1": f1,
+        f"occupancy_tolerant_{tolerance_key}_iou": iou,
     }
 
 

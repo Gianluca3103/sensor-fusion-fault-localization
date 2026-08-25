@@ -77,6 +77,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument(
+        "--tolerance-m",
+        type=float,
+        default=0.5,
+        help=(
+            "Physical tolerance in metres used for tolerant occupancy IoU/F1 "
+            "(default: 0.5)."
+        ),
+    )
+    parser.add_argument(
         "--occupancy-threshold",
         type=float,
         default=0.5,
@@ -222,6 +231,7 @@ def _stage_metric_bundle(
     *,
     occupancy_logits: torch.Tensor | None = None,
     observability: torch.Tensor | None = None,
+    tolerance_m: float = 0.5,
 ) -> dict[str, torch.Tensor]:
     outputs = _stage_outputs(bev, mask, occupancy_logits=occupancy_logits)
     metrics = coarse_reconstruction_metrics(
@@ -231,6 +241,7 @@ def _stage_metric_bundle(
         epsilon,
         observability,
         include_tolerant=True,
+        tolerance_m=tolerance_m,
     )
     renamed = _rename_coarse_metrics(metrics, prefix)
     ranges = coarse_reconstruction_range_metrics(
@@ -359,14 +370,17 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
 
 
 def _print_table(
-    groups: dict[str, dict], *, baseline_label: str = "Coarse"
+    groups: dict[str, dict], *, baseline_label: str = "Coarse", tolerance_m: float = 0.5
 ) -> None:
+    tolerance_label = f"{tolerance_m:g}m"
     header = (
         f"{'Fault':<28} {'N':>6} {'Used':>6} {'Faulty IoU':>11} "
         f"{f'{baseline_label} IoU':>15} {'Fine IoU':>10} {'Fine-Faulty':>12} "
-        f"{f'Fine-{baseline_label}':>16} {'Faulty@0.5m':>13} "
-        f"{f'{baseline_label}@0.5m':>17} "
-        f"{'Fine@0.5m':>11} {'Fine-Faulty@0.5m':>18} {'Fine F1@0.5m':>14} "
+        f"{f'Fine-{baseline_label}':>16} {f'Faulty@{tolerance_label}':>13} "
+        f"{f'{baseline_label}@{tolerance_label}':>17} "
+        f"{f'Fine@{tolerance_label}':>11} "
+        f"{f'Fine-Faulty@{tolerance_label}':>18} "
+        f"{f'Fine F1@{tolerance_label}':>14} "
         f"{'Fine Halluc.':>13}"
     )
     print(header)
@@ -380,11 +394,11 @@ def _print_table(
             f"{summary['micro/fine_iou']:9.2%} "
             f"{summary['micro/fine_iou_improvement']:+11.2%} "
             f"{summary['micro/fine_minus_coarse_iou']:+15.2%} "
-            f"{summary['macro/faulty_occupancy_tolerant_0_5m_iou']:12.2%} "
-            f"{summary['macro/coarse_occupancy_tolerant_0_5m_iou']:16.2%} "
-            f"{summary['macro/fine_occupancy_tolerant_0_5m_iou']:10.2%} "
-            f"{summary['macro/fine_tolerant_0_5m_iou_improvement']:+17.2%} "
-            f"{summary['macro/fine_occupancy_tolerant_0_5m_f1']:13.2%} "
+            f"{summary['macro/faulty_occupancy_tolerant_iou']:12.2%} "
+            f"{summary['macro/coarse_occupancy_tolerant_iou']:16.2%} "
+            f"{summary['macro/fine_occupancy_tolerant_iou']:10.2%} "
+            f"{summary['macro/fine_tolerant_iou_improvement']:+17.2%} "
+            f"{summary['macro/fine_occupancy_tolerant_f1']:13.2%} "
             f"{summary['macro/fine_occupancy_hallucination_rate']:12.2%}"
         )
 
@@ -474,6 +488,8 @@ def main() -> None:
         raise ValueError("visualization count cannot be negative")
     if not 0.0 < args.occupancy_threshold < 1.0:
         raise ValueError("occupancy threshold must be strictly between 0 and 1")
+    if args.tolerance_m < 0.0:
+        raise ValueError("tolerance must be non-negative")
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -624,6 +640,7 @@ def main() -> None:
                     epsilon,
                     observability,
                     include_tolerant=True,
+                    tolerance_m=args.tolerance_m,
                 )
                 coarse_metrics.update(
                     coarse_reconstruction_range_metrics(
@@ -648,6 +665,7 @@ def main() -> None:
                     grid_geometry,
                     epsilon,
                     observability=observability,
+                    tolerance_m=args.tolerance_m,
                 )
                 sample_path = str(batch["sample_path"][index])
                 sample_metadata = metadata[sample_path]
@@ -694,18 +712,31 @@ def main() -> None:
                     record["fine_occupancy_exact_iou"]
                     - record["coarse_occupancy_exact_iou"]
                 )
-                record["coarse_tolerant_0_5m_iou_improvement"] = (
-                    record["coarse_occupancy_tolerant_0_5m_iou"]
-                    - record["faulty_occupancy_tolerant_0_5m_iou"]
+                record["coarse_tolerant_iou_improvement"] = (
+                    record["coarse_occupancy_tolerant_iou"]
+                    - record["faulty_occupancy_tolerant_iou"]
                 )
-                record["fine_tolerant_0_5m_iou_improvement"] = (
-                    record["fine_occupancy_tolerant_0_5m_iou"]
-                    - record["faulty_occupancy_tolerant_0_5m_iou"]
+                record["fine_tolerant_iou_improvement"] = (
+                    record["fine_occupancy_tolerant_iou"]
+                    - record["faulty_occupancy_tolerant_iou"]
                 )
-                record["fine_minus_coarse_tolerant_0_5m_iou"] = (
-                    record["fine_occupancy_tolerant_0_5m_iou"]
-                    - record["coarse_occupancy_tolerant_0_5m_iou"]
+                record["fine_minus_coarse_tolerant_iou"] = (
+                    record["fine_occupancy_tolerant_iou"]
+                    - record["coarse_occupancy_tolerant_iou"]
                 )
+                if abs(args.tolerance_m - 0.5) < 1.0e-9:
+                    record["coarse_tolerant_0_5m_iou_improvement"] = (
+                        record["coarse_occupancy_tolerant_0_5m_iou"]
+                        - record["faulty_occupancy_tolerant_0_5m_iou"]
+                    )
+                    record["fine_tolerant_0_5m_iou_improvement"] = (
+                        record["fine_occupancy_tolerant_0_5m_iou"]
+                        - record["faulty_occupancy_tolerant_0_5m_iou"]
+                    )
+                    record["fine_minus_coarse_tolerant_0_5m_iou"] = (
+                        record["fine_occupancy_tolerant_0_5m_iou"]
+                        - record["coarse_occupancy_tolerant_0_5m_iou"]
+                    )
                 records.append(record)
                 if (
                     visualized[record["fault_group"]]
@@ -744,6 +775,7 @@ def main() -> None:
         "fine_checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
         "sampling_steps": sampling_steps,
+        "tolerance_m": args.tolerance_m,
         "occupancy_threshold": args.occupancy_threshold,
         "overall": summarize_records(records),
         "by_fault": by_fault,
@@ -769,6 +801,7 @@ def main() -> None:
             if diffusion_config.bypass_coarse_reconstruction
             else "Coarse"
         ),
+        tolerance_m=args.tolerance_m,
     )
     _print_transition_table(by_fault_severity, args.occupancy_threshold)
     overall = summary["overall"]

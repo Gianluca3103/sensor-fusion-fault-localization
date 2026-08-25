@@ -110,6 +110,53 @@ class CoarseBaselineLossTests(unittest.TestCase):
             outside_metrics["coarse_occupancy_tolerant_0_5m_iou"].item(), 0.0
         )
 
+    def test_point_two_meter_metric_is_one_cardinal_cell(self):
+        clean = torch.zeros(1, 3, 5, 5)
+        clean[:, 0, 2, 2] = 1.0
+        mask = torch.ones(1, 1, 5, 5)
+
+        cardinal_logits = torch.full((1, 1, 5, 5), -20.0)
+        cardinal_logits[:, :, 2, 3] = 20.0
+        cardinal = _model_outputs(
+            _raw(
+                cardinal_logits,
+                torch.zeros_like(cardinal_logits),
+                torch.zeros_like(cardinal_logits),
+            ),
+            mask,
+        )
+        cardinal_metrics = coarse_reconstruction_metrics(
+            cardinal,
+            torch.zeros_like(clean),
+            clean,
+            tolerance_m=0.2,
+        )
+        self.assertEqual(
+            cardinal_metrics["coarse_occupancy_tolerant_0_2m_iou"].item(),
+            1.0,
+        )
+
+        diagonal_logits = torch.full((1, 1, 5, 5), -20.0)
+        diagonal_logits[:, :, 3, 3] = 20.0
+        diagonal = _model_outputs(
+            _raw(
+                diagonal_logits,
+                torch.zeros_like(diagonal_logits),
+                torch.zeros_like(diagonal_logits),
+            ),
+            mask,
+        )
+        diagonal_metrics = coarse_reconstruction_metrics(
+            diagonal,
+            torch.zeros_like(clean),
+            clean,
+            tolerance_m=0.2,
+        )
+        self.assertEqual(
+            diagonal_metrics["coarse_occupancy_tolerant_0_2m_iou"].item(),
+            0.0,
+        )
+
     def test_completely_wrong_occupancy(self):
         occupancy = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
         clean = torch.cat((occupancy, occupancy, occupancy), dim=1)
