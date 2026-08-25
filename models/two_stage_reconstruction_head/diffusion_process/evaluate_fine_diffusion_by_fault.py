@@ -76,6 +76,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-samples", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument(
+        "--occupancy-threshold",
+        type=float,
+        default=0.5,
+        help="Threshold shared by coarse-to-fine occupancy transition counts.",
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
         "--visualize-samples-per-fault",
@@ -113,11 +119,19 @@ def _normalizer_from_fine_config(
     )
 
 
-def _diffusion_config_from_checkpoint(payload: dict) -> FineDiffusionConfig:
+def _diffusion_config_from_checkpoint(
+    payload: dict, architecture: dict | None = None
+) -> FineDiffusionConfig:
     valid = {item.name for item in fields(FineDiffusionConfig)}
     config_payload = {
         key: value for key, value in dict(payload).items() if key in valid
     }
+    if (
+        isinstance(architecture, dict)
+        and int(architecture.get("version", -1)) == 10
+        and "transformer_spatial_input_mode" not in config_payload
+    ):
+        config_payload["transformer_spatial_input_mode"] = "current_lidar"
     unknown = sorted(set(payload) - valid)
     if unknown:
         raise ValueError(
@@ -141,6 +155,45 @@ def _stage_outputs(
         "reconstruction_mask": reconstruction_mask,
         "occupancy_logits": occupancy_logits,
         "coarse_lidar_bev": bev,
+    }
+
+
+TRANSITION_KEYS = (
+    "beneficial_additions",
+    "harmful_additions",
+    "beneficial_removals",
+    "harmful_removals",
+)
+
+
+def _occupancy_transition_counts(
+    clean: torch.Tensor,
+    coarse: torch.Tensor,
+    fine: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    threshold: float,
+) -> dict[str, int]:
+    """Classify every coarse-to-fine occupancy change inside repair cells."""
+
+    valid = reconstruction_mask > 0.5
+    clean_occupied = clean[:, 0:1] >= threshold
+    coarse_occupied = coarse[:, 0:1] >= threshold
+    fine_occupied = fine[:, 0:1] >= threshold
+    coarse_empty = ~coarse_occupied
+    fine_empty = ~fine_occupied
+    return {
+        "beneficial_additions": int(
+            (valid & clean_occupied & coarse_empty & fine_occupied).sum()
+        ),
+        "harmful_additions": int(
+            (valid & ~clean_occupied & coarse_empty & fine_occupied).sum()
+        ),
+        "beneficial_removals": int(
+            (valid & ~clean_occupied & coarse_occupied & fine_empty).sum()
+        ),
+        "harmful_removals": int(
+            (valid & clean_occupied & coarse_occupied & fine_empty).sum()
+        ),
     }
 
 
@@ -205,6 +258,8 @@ def summarize_records(records: list[dict]) -> dict:
         "sequence_id",
         "frame_id",
         "target_occupied_cells",
+        "occupancy_threshold",
+        *TRANSITION_KEYS,
     }
     metric_keys = [
         key
@@ -233,6 +288,20 @@ def summarize_records(records: list[dict]) -> dict:
     summary["excluded_empty_target_samples"] = len(empty_target)
     summary["excluded_metric_samples"] = len(records) - len(evaluable)
     summary["repair_cells"] = sum(record["repair_cells"] for record in evaluable)
+    transition_total = 0
+    for key in TRANSITION_KEYS:
+        count = sum(int(record.get(key, 0)) for record in evaluable)
+        summary[f"transitions/{key}"] = count
+        transition_total += count
+    summary["transitions/total_changed_cells"] = transition_total
+    for key in TRANSITION_KEYS:
+        count = summary[f"transitions/{key}"]
+        summary[f"transitions/{key}_fraction_of_changes"] = _safe_ratio(
+            count, transition_total
+        )
+        summary[f"transitions/{key}_rate_per_repair_cell"] = _safe_ratio(
+            count, summary["repair_cells"]
+        )
     for key in metric_keys:
         if key == "repair_cells":
             continue
@@ -320,6 +389,26 @@ def _print_table(
         )
 
 
+def _print_transition_table(groups: dict[str, dict], threshold: float) -> None:
+    print()
+    print(f"COARSE -> FINE OCCUPANCY TRANSITIONS (threshold={threshold:.3f})")
+    header = (
+        f"{'Fault':<28} {'Used':>6} {'Beneficial +':>14} {'Harmful +':>11} "
+        f"{'Beneficial -':>14} {'Harmful -':>11} {'Changed':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+    for name, summary in groups.items():
+        print(
+            f"{name:<28} {summary.get('metric_samples', 0):6d} "
+            f"{summary['transitions/beneficial_additions']:14d} "
+            f"{summary['transitions/harmful_additions']:11d} "
+            f"{summary['transitions/beneficial_removals']:14d} "
+            f"{summary['transitions/harmful_removals']:11d} "
+            f"{summary['transitions/total_changed_cells']:10d}"
+        )
+
+
 def _save_comparison(
     destination: Path,
     clean_bev: torch.Tensor,
@@ -383,13 +472,18 @@ def main() -> None:
         raise ValueError("batch size must be positive and workers non-negative")
     if args.visualize_samples_per_fault < 0:
         raise ValueError("visualization count cannot be negative")
+    if not 0.0 < args.occupancy_threshold < 1.0:
+        raise ValueError("occupancy threshold must be strictly between 0 and 1")
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if "diffusion_state_dict" not in checkpoint or "diffusion_config" not in checkpoint:
         raise ValueError("Checkpoint does not contain a fine diffusion model")
 
-    diffusion_config = _diffusion_config_from_checkpoint(checkpoint["diffusion_config"])
+    diffusion_config = _diffusion_config_from_checkpoint(
+        checkpoint["diffusion_config"],
+        checkpoint.get("fine_diffusion_architecture"),
+    )
     validate_fine_diffusion_checkpoint_compatibility(
         checkpoint, diffusion_config
     )
@@ -501,6 +595,9 @@ def main() -> None:
                     inputs["healthy_context_mask"],
                     inputs["halo_mask"],
                     coarse_lidar_bev=coarse_bev,
+                    coarse_output=coarse_outputs,
+                    faulty_lidar_points=inputs.get("faulty_lidar_points"),
+                    radar_points=inputs.get("radar_points"),
                     sampling_steps=sampling_steps,
                 )
             fine_bev = sampled["final_lidar_bev"]
@@ -575,6 +672,16 @@ def main() -> None:
                     counts = _occupancy_counts(probability, clean[:, 0:1], sample_mask)
                     record.update({f"{prefix}_{key}": value for key, value in counts.items()})
                 record["target_occupied_cells"] = record["fine_tp"] + record["fine_fn"]
+                record["occupancy_threshold"] = args.occupancy_threshold
+                record.update(
+                    _occupancy_transition_counts(
+                        clean,
+                        coarse_sample,
+                        fine_sample,
+                        sample_mask,
+                        args.occupancy_threshold,
+                    )
+                )
                 record["coarse_exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]
                     - record["faulty_occupancy_exact_iou"]
@@ -637,6 +744,7 @@ def main() -> None:
         "fine_checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
         "sampling_steps": sampling_steps,
+        "occupancy_threshold": args.occupancy_threshold,
         "overall": summarize_records(records),
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,
@@ -661,6 +769,15 @@ def main() -> None:
             if diffusion_config.bypass_coarse_reconstruction
             else "Coarse"
         ),
+    )
+    _print_transition_table(by_fault_severity, args.occupancy_threshold)
+    overall = summary["overall"]
+    print(
+        "\nOverall transitions: "
+        f"beneficial additions={overall['transitions/beneficial_additions']}, "
+        f"harmful additions={overall['transitions/harmful_additions']}, "
+        f"beneficial removals={overall['transitions/beneficial_removals']}, "
+        f"harmful removals={overall['transitions/harmful_removals']}"
     )
     print(f"\nSaved evaluation to {args.output_root}")
 

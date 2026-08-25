@@ -268,6 +268,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         halo_mask,
         *,
         coarse_lidar_bev=None,
+        coarse_output=None,
         faulty_lidar_points=None,
         radar_points=None,
         **sampling_options,
@@ -282,11 +283,13 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             radar_points=radar_points,
         )
         if coarse_lidar_bev is None:
+            if coarse_output is not None:
+                raise ValueError(
+                    "coarse_output cannot be supplied without coarse_lidar_bev"
+                )
             coarse_lidar_bev, coarse_output = self.coarse_forward_inputs(
                 shared_inputs
             )
-        else:
-            coarse_output = None
         shared_inputs = self._with_pointpillar_conditioning(
             shared_inputs, coarse_output
         )

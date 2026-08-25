@@ -539,9 +539,9 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             return_debug=True,
         )
         debug = output["debug"]
-        self.assertEqual(debug["current_lidar_stem_input"].shape[1], 7)
+        self.assertEqual(debug["residual_stem_input"].shape[1], 7)
         self.assertEqual(
-            model.transformer.current_lidar_stem.in_channels, 7
+            model.transformer.residual_stem.in_channels, 7
         )
         self.assertFalse(hasattr(model.transformer.blocks[0], "cross_attention"))
         self.assertEqual(
@@ -569,25 +569,13 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
-                debug["current_lidar_stem_input"][:, :3],
-                debug["current_lidar"],
+                debug["residual_stem_input"][:, :3],
+                debug["current_residual"],
             )
         )
-        expected_current_lidar = debug["crops"].tensors["coarse"] + (
-            model.residual_normalization.denormalize(
-                debug["current_residual"]
-            )
-        )
-        self.assertTrue(
-            torch.equal(debug["current_lidar"], expected_current_lidar)
-        )
-        self.assertTrue(
-            torch.equal(
-                debug["current_lidar"], debug["crops"].tensors["coarse"]
-            )
-        )
+        self.assertEqual(int(debug["current_residual"].count_nonzero()), 0)
 
-    def test_each_refinement_step_sees_updated_current_lidar(self):
+    def test_each_refinement_step_sees_updated_residual(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config()).train()
         with torch.no_grad():
@@ -597,7 +585,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         def capture_stem_input(_module, arguments):
             stem_inputs.append(arguments[0][:, :3].detach().clone())
 
-        handle = model.transformer.current_lidar_stem.register_forward_pre_hook(
+        handle = model.transformer.residual_stem.register_forward_pre_hook(
             capture_stem_input
         )
         try:
@@ -614,13 +602,10 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             handle.remove()
 
         debug = output["debug"]
-        coarse_crop = debug["crops"].tensors["coarse"]
         self.assertEqual(len(stem_inputs), 3)
-        self.assertTrue(torch.equal(stem_inputs[0], coarse_crop))
+        self.assertEqual(int(stem_inputs[0].count_nonzero()), 0)
         self.assertFalse(torch.equal(stem_inputs[1], stem_inputs[0]))
-        expected_second = coarse_crop + model.residual_normalization.denormalize(
-            debug["training_intermediate_residuals"][0]
-        )
+        expected_second = debug["training_intermediate_residuals"][0]
         self.assertTrue(torch.equal(stem_inputs[1], expected_second))
 
     def test_legacy_residual_stem_checkpoint_has_clear_error(self):
@@ -632,7 +617,9 @@ class FineDiffusionRefinerTests(unittest.TestCase):
                 )
             }
         }
-        with self.assertRaisesRegex(ValueError, "predates explicit current-LiDAR"):
+        with self.assertRaisesRegex(
+            ValueError, "neither supported v10"
+        ):
             validate_fine_diffusion_checkpoint_compatibility(legacy, config)
 
     def test_new_checkpoint_metadata_and_residual_scale_round_trip(self):
@@ -722,7 +709,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         output["loss"].backward()
         names = {name for name, parameter in model.named_parameters() if parameter.grad is not None}
         for expected in (
-            "transformer.current_lidar_stem",
+            "transformer.residual_stem",
             "transformer.auxiliary_condition_encoder",
             "self_attention",
             "cross_attention",
@@ -848,6 +835,47 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(tuple(shared.radar_pillar_bev.shape), (1, 7, 16, 16))
         self.assertEqual(float(shared.lidar_pillar_bev.mean()), 1.0)
         self.assertEqual(float(shared.radar_pillar_bev.mean()), 2.0)
+
+    def test_sampling_reuses_explicit_coarse_pointpillar_output(self):
+        class DummyConfig:
+            pointpillars_enabled = True
+
+        class DummyCoarse(torch.nn.Module):
+            config = DummyConfig()
+
+            def _sensor_features(self, *_args, **_kwargs):
+                raise AssertionError("PointPillars must not be recomputed")
+
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        diffusion = FineDiffusionRefiner(_config(pointpillars=True))
+        pipeline = FrozenCoarseFineDiffusionPipeline(DummyCoarse(), diffusion)
+        coarse_output = {
+            "coarse_lidar_bev": coarse,
+            "lidar_pillar_bev": faulty.new_ones(1, 6, 16, 16),
+            "radar_pillar_bev": faulty.new_full((1, 7, 16, 16), 2.0),
+        }
+        with mock.patch.object(diffusion, "sample", return_value={}) as sample:
+            pipeline.sample(
+                faulty,
+                radar,
+                repair,
+                torch.zeros_like(repair),
+                halo,
+                coarse_lidar_bev=coarse,
+                coarse_output=coarse_output,
+            )
+
+        shared = sample.call_args.kwargs["shared_inputs"]
+        self.assertTrue(
+            torch.equal(
+                shared.lidar_pillar_bev, coarse_output["lidar_pillar_bev"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                shared.radar_pillar_bev, coarse_output["radar_pillar_bev"]
+            )
+        )
 
     def test_direct_ablation_erases_repair_region_without_coarse_model(self):
         _clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)
