@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -61,6 +62,16 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             raise ValueError(
                 "A coarse model is required unless coarse reconstruction is bypassed"
             )
+        if diffusion.config.use_pointpillars_conditioning:
+            if coarse_model is None:
+                raise ValueError(
+                    "Fine PointPillars conditioning requires a frozen coarse model"
+                )
+            if not coarse_model.config.pointpillars_enabled:
+                raise ValueError(
+                    "Fine PointPillars conditioning requires a PointPillars "
+                    "coarse checkpoint"
+                )
         self.coarse_model = (
             coarse_model.eval().requires_grad_(False)
             if coarse_model is not None
@@ -131,6 +142,54 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             )
         return output["coarse_lidar_bev"].detach(), output
 
+    def _with_pointpillar_conditioning(
+        self,
+        inputs: ReconstructionInputs,
+        coarse_output: dict | None,
+    ) -> ReconstructionInputs:
+        """Attach frozen LiDAR/radar post-scatter tensors for fine conditioning."""
+
+        if not self.diffusion.config.use_pointpillars_conditioning:
+            return inputs
+        if self.coarse_model is None:
+            raise RuntimeError("Frozen coarse PointPillars model is unavailable")
+        if coarse_output is not None:
+            lidar_pillars = coarse_output.get("lidar_pillar_bev")
+            radar_pillars = coarse_output.get("radar_pillar_bev")
+        else:
+            lidar_pillars = radar_pillars = None
+        if lidar_pillars is None or radar_pillars is None:
+            with torch.no_grad():
+                (
+                    lidar_pillars,
+                    radar_pillars,
+                    _lidar_statistics,
+                    _radar_statistics,
+                ) = self.coarse_model._sensor_features(
+                    inputs.faulty_lidar_bev,
+                    inputs.radar_bev,
+                    inputs.faulty_lidar_points,
+                    inputs.radar_points,
+                    radar_enabled=True,
+                )
+        expected_lidar = self.diffusion.config.lidar_pillar_channels
+        expected_radar = self.diffusion.config.radar_pillar_channels
+        if lidar_pillars.shape[1] != expected_lidar:
+            raise ValueError(
+                "LiDAR PointPillars channel mismatch: fine diffusion expects "
+                f"{expected_lidar}, frozen encoder produced {lidar_pillars.shape[1]}"
+            )
+        if radar_pillars.shape[1] != expected_radar:
+            raise ValueError(
+                "Radar PointPillars channel mismatch: fine diffusion expects "
+                f"{expected_radar}, frozen encoder produced {radar_pillars.shape[1]}"
+            )
+        return replace(
+            inputs,
+            lidar_pillar_bev=lidar_pillars.detach(),
+            radar_pillar_bev=radar_pillars.detach(),
+        )
+
     def coarse_forward(
         self,
         faulty_lidar_bev,
@@ -183,6 +242,9 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         else:
             coarse_lidar_bev = coarse_lidar_bev.detach()
             coarse_output = None
+        shared_inputs = self._with_pointpillar_conditioning(
+            shared_inputs, coarse_output
+        )
         output = self.diffusion(
             clean_lidar_bev,
             coarse_lidar_bev,
@@ -220,9 +282,14 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             radar_points=radar_points,
         )
         if coarse_lidar_bev is None:
-            coarse_lidar_bev, _coarse_output = self.coarse_forward_inputs(
+            coarse_lidar_bev, coarse_output = self.coarse_forward_inputs(
                 shared_inputs
             )
+        else:
+            coarse_output = None
+        shared_inputs = self._with_pointpillar_conditioning(
+            shared_inputs, coarse_output
+        )
         return self.diffusion.sample(
             coarse_lidar_bev,
             faulty_lidar_bev,

@@ -523,6 +523,16 @@ def main():
             args.coarse_checkpoint, device, allow_pointpillars=True
         )
         use_pointpillars = coarse.config.pointpillars_enabled
+        if config.use_pointpillars_conditioning:
+            if not use_pointpillars:
+                raise ValueError(
+                    "Configured fine PointPillars conditioning requires a "
+                    "PointPillars coarse checkpoint"
+                )
+            if coarse.config.lidar_channels != config.lidar_pillar_channels:
+                raise ValueError("Fine/coarse LiDAR PointPillars channels differ")
+            if coarse.config.radar_channels != config.radar_pillar_channels:
+                raise ValueError("Fine/coarse radar PointPillars channels differ")
     dataset_options = {
         "radar_root": args.radar_root,
         "data_root": args.data_root,
@@ -707,6 +717,7 @@ def main():
     print(
         f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}; "
         f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}; "
+        f"Fine PointPillars conditioning: {config.use_pointpillars_conditioning}; "
         f"bypass coarse: {config.bypass_coarse_reconstruction}; "
         f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"

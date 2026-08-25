@@ -19,6 +19,8 @@ class ReconstructionInputs:
     halo_mask: torch.Tensor
     faulty_lidar_points: Sequence[torch.Tensor] | None = None
     radar_points: Sequence[torch.Tensor] | None = None
+    lidar_pillar_bev: torch.Tensor | None = None
+    radar_pillar_bev: torch.Tensor | None = None
     trusted_faulty: torch.Tensor = field(init=False, repr=False)
     effective_halo: torch.Tensor = field(init=False, repr=False)
 
@@ -51,6 +53,18 @@ class ReconstructionInputs:
             raise ValueError("Shared reconstruction tensors must use one device")
         if any(tensor.dtype != self.faulty_lidar_bev.dtype for tensor in shared):
             raise TypeError("Shared reconstruction tensors must use one dtype")
+        for name, tensor in (
+            ("lidar_pillar_bev", self.lidar_pillar_bev),
+            ("radar_pillar_bev", self.radar_pillar_bev),
+        ):
+            if tensor is None:
+                continue
+            if tensor.ndim != 4:
+                raise ValueError(f"{name} must have shape [B,C,H,W]")
+            if tensor.shape[0] != mask_shape[0] or tensor.shape[-2:] != mask_shape[-2:]:
+                raise ValueError(f"{name} must align with reconstruction_mask")
+            if tensor.device != self.faulty_lidar_bev.device:
+                raise ValueError(f"{name} must use the shared input device")
         object.__setattr__(
             self,
             "trusted_faulty",
@@ -83,4 +97,8 @@ class ReconstructionInputs:
             tensors["clean"] = clean_lidar_bev
         if residual_gt is not None:
             tensors["residual_gt"] = residual_gt
+        if self.lidar_pillar_bev is not None:
+            tensors["lidar_pillars"] = self.lidar_pillar_bev
+        if self.radar_pillar_bev is not None:
+            tensors["radar_pillars"] = self.radar_pillar_bev
         return tensors

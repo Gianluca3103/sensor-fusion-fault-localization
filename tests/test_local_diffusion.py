@@ -29,7 +29,13 @@ from models.two_stage_reconstruction_head.reconstruction_inputs import (
 )
 
 
-def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
+def _config(
+    *,
+    global_context=True,
+    sampling_steps=3,
+    bypass_coarse=False,
+    pointpillars=False,
+):
     return FineDiffusionConfig(
         bypass_coarse_reconstruction=bypass_coarse,
         hidden_dim=16,
@@ -40,6 +46,9 @@ def _config(*, global_context=True, sampling_steps=3, bypass_coarse=False):
         global_context_dim=16,
         training_timesteps=12,
         sampling_steps=sampling_steps,
+        use_pointpillars_conditioning=pointpillars,
+        lidar_pillar_channels=6,
+        radar_pillar_channels=7,
     )
 
 
@@ -129,6 +138,49 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_dual_sensor_pointpillars_conditioning_uses_expected_branches(self):
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        lidar_pillars = torch.rand(1, 6, 16, 16)
+        radar_pillars = torch.rand(1, 7, 16, 16)
+        shared = ReconstructionInputs(
+            faulty_lidar_bev=faulty,
+            radar_bev=radar,
+            reconstruction_mask=repair,
+            healthy_context_mask=torch.zeros_like(repair),
+            halo_mask=halo,
+            lidar_pillar_bev=lidar_pillars,
+            radar_pillar_bev=radar_pillars,
+        )
+        model = FineDiffusionRefiner(_config(pointpillars=True)).eval()
+
+        output = model(
+            clean,
+            coarse,
+            faulty,
+            radar,
+            repair,
+            halo,
+            shared_inputs=shared,
+            return_debug=True,
+        )
+
+        debug = output["debug"]
+        self.assertEqual(model.transformer.lidar_pillar_stem.in_channels, 6)
+        self.assertEqual(
+            model.transformer.blocks[0].radar_cross_attention.attention.kdim,
+            7,
+        )
+        self.assertEqual(debug["crops"].tensors["lidar_pillars"].shape[1], 6)
+        self.assertEqual(debug["crops"].tensors["radar_pillars"].shape[1], 7)
+        self.assertTrue(
+            torch.equal(
+                debug["radar_cross_attention"],
+                debug["crops"].tensors["radar_pillars"],
+            )
+        )
+        self.assertNotIn("raw_radar_cross_attention", debug)
+        self.assertTrue(torch.isfinite(output["loss"]))
+
     def test_default_sampling_is_forward_three_step_residual_flow(self):
         config = FineDiffusionConfig()
         model = FineDiffusionRefiner(config)
@@ -760,6 +812,42 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(shared.effective_halo, halo * (1 - repair))
         )
+
+    def test_pipeline_reuses_frozen_coarse_pointpillar_features(self):
+        class DummyConfig:
+            pointpillars_enabled = True
+
+        class DummyCoarse(torch.nn.Module):
+            config = DummyConfig()
+
+            def forward(self, faulty, _radar, repair, _healthy, _halo, **_kwargs):
+                batch, _channels, height, width = faulty.shape
+                return {
+                    "coarse_lidar_bev": faulty * (1 - repair) + 0.5 * repair,
+                    "lidar_pillar_bev": faulty.new_ones(batch, 6, height, width),
+                    "radar_pillar_bev": faulty.new_full(
+                        (batch, 7, height, width), 2.0
+                    ),
+                }
+
+        clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        diffusion = FineDiffusionRefiner(_config(pointpillars=True))
+        pipeline = FrozenCoarseFineDiffusionPipeline(DummyCoarse(), diffusion)
+        with mock.patch.object(diffusion, "forward", return_value={}) as fine:
+            pipeline(
+                clean,
+                faulty,
+                radar,
+                repair,
+                torch.zeros_like(repair),
+                halo,
+            )
+
+        shared = fine.call_args.kwargs["shared_inputs"]
+        self.assertEqual(tuple(shared.lidar_pillar_bev.shape), (1, 6, 16, 16))
+        self.assertEqual(tuple(shared.radar_pillar_bev.shape), (1, 7, 16, 16))
+        self.assertEqual(float(shared.lidar_pillar_bev.mean()), 1.0)
+        self.assertEqual(float(shared.radar_pillar_bev.mean()), 2.0)
 
     def test_direct_ablation_erases_repair_region_without_coarse_model(self):
         _clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)

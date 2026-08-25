@@ -21,7 +21,7 @@ from .diffusion_process import (
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 9
+FINE_DIFFUSION_ARCHITECTURE_VERSION = 10
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -53,6 +53,9 @@ class FineDiffusionConfig:
     bypass_coarse_reconstruction: bool = False
     lidar_channels: int = 3
     radar_channels: int = 4
+    use_pointpillars_conditioning: bool = False
+    lidar_pillar_channels: int = 64
+    radar_pillar_channels: int = 64
     hidden_dim: int = 64
     num_heads: int = 4
     num_transformer_blocks: int = 4
@@ -77,6 +80,8 @@ class FineDiffusionConfig:
         for name in (
             "lidar_channels",
             "radar_channels",
+            "lidar_pillar_channels",
+            "radar_pillar_channels",
             "hidden_dim",
             "num_heads",
             "num_transformer_blocks",
@@ -87,6 +92,13 @@ class FineDiffusionConfig:
                 raise ValueError(f"{name} must be positive")
         if self.hidden_dim % self.num_heads:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        if not isinstance(self.use_pointpillars_conditioning, bool):
+            raise ValueError("use_pointpillars_conditioning must be boolean")
+        if self.use_pointpillars_conditioning and self.bypass_coarse_reconstruction:
+            raise ValueError(
+                "PointPillars-conditioned fine diffusion cannot bypass the "
+                "frozen coarse model that supplies its encoders"
+            )
         if self.diffusion_prediction_type != "residual_flow":
             raise ValueError(
                 "Fine refinement requires residual_flow prediction; Gaussian "
@@ -540,6 +552,16 @@ class LocalResidualDiffusionTransformer(nn.Module):
             3,
             padding=1,
         )
+        self.lidar_pillar_stem = (
+            nn.Conv2d(
+                config.lidar_pillar_channels,
+                config.hidden_dim,
+                3,
+                padding=1,
+            )
+            if config.use_pointpillars_conditioning
+            else None
+        )
         self.auxiliary_condition_encoder = AuxiliaryConditionEncoder(
             auxiliary_channels, config.hidden_dim
         )
@@ -566,7 +588,11 @@ class LocalResidualDiffusionTransformer(nn.Module):
                 condition_dim,
                 config.dropout,
                 config.use_shifted_windows and index % 2 == 1,
-                config.radar_channels,
+                (
+                    config.radar_pillar_channels
+                    if config.use_pointpillars_conditioning
+                    else config.radar_channels
+                ),
             )
             for index in range(config.num_transformer_blocks)
         )
@@ -599,6 +625,8 @@ class LocalResidualDiffusionTransformer(nn.Module):
         current_lidar: torch.Tensor,
         trusted_faulty: torch.Tensor,
         radar: torch.Tensor,
+        lidar_pillars: torch.Tensor | None,
+        radar_pillars: torch.Tensor | None,
         reconstruction_mask: torch.Tensor,
         halo_mask: torch.Tensor,
         valid: torch.Tensor,
@@ -621,16 +649,29 @@ class LocalResidualDiffusionTransformer(nn.Module):
         current_lidar_stem_input = torch.cat(
             (current_lidar, coordinates), dim=1
         )
+        if self.config.use_pointpillars_conditioning:
+            if lidar_pillars is None or radar_pillars is None:
+                raise ValueError(
+                    "Fine diffusion requires both LiDAR and radar PointPillars "
+                    "feature maps"
+                )
+            assert self.lidar_pillar_stem is not None
+            lidar_pillar_condition = self.lidar_pillar_stem(lidar_pillars)
+            radar_attention = radar_pillars
+        else:
+            lidar_pillar_condition = torch.zeros_like(auxiliary_condition)
+            radar_attention = radar
         tensor = (
             self.current_lidar_stem(current_lidar_stem_input)
             + auxiliary_condition
+            + lidar_pillar_condition
         ) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
         radar_valid = reconstruction_mask * valid
         for block in self.blocks:
             tensor = block(
                 tensor,
-                radar,
+                radar_attention,
                 condition_vector,
                 valid,
                 radar_valid,
@@ -642,27 +683,47 @@ class LocalResidualDiffusionTransformer(nn.Module):
             velocity,
             torch.zeros_like(velocity),
         )
-        return velocity, auxiliary_condition, {
-            "raw_radar_cross_attention": radar,
+        debug = {
+            "radar_cross_attention": radar_attention,
             "radar_cross_attention_valid": radar_valid,
+            "lidar_pillar_condition": lidar_pillar_condition,
             "current_lidar": current_lidar,
             "current_lidar_stem_input": current_lidar_stem_input,
         }
+        if not self.config.use_pointpillars_conditioning:
+            debug["raw_radar_cross_attention"] = radar_attention
+        return velocity, auxiliary_condition, debug
 
 
 def fine_diffusion_architecture_metadata(
     config: FineDiffusionConfig,
-) -> dict[str, int | str]:
+) -> dict[str, bool | int | str]:
     return {
         "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
         "process": "coarse_anchored_residual_flow",
         "initial_state": "frozen_coarse_reconstruction",
         "internal_state": "normalized_current_residual",
-        "transformer_spatial_input": "current_lidar_plus_coordinates",
+        "transformer_spatial_input": (
+            "current_lidar_plus_coordinates_plus_lidar_pointpillars"
+            if config.use_pointpillars_conditioning
+            else "current_lidar_plus_coordinates"
+        ),
         "current_lidar_stem_input_channels": config.lidar_channels + 4,
         "refinement_feedback": "updated_current_lidar_each_step",
         "coarse_role": "initial_reconstruction_state_only",
-        "radar_cross_attention": "raw_full_resolution_reconstruction_mask",
+        "pointpillars_conditioning": config.use_pointpillars_conditioning,
+        "lidar_pillar_channels": config.lidar_pillar_channels,
+        "radar_pillar_channels": config.radar_pillar_channels,
+        "lidar_pillar_role": (
+            "spatial_stem_additive_condition"
+            if config.use_pointpillars_conditioning
+            else "disabled"
+        ),
+        "radar_cross_attention": (
+            "radar_pointpillars_postscatter"
+            if config.use_pointpillars_conditioning
+            else "raw_full_resolution_reconstruction_mask"
+        ),
     }
 
 
@@ -685,13 +746,20 @@ def validate_fine_diffusion_checkpoint_compatibility(
         )
     if architecture_version != FINE_DIFFUSION_ARCHITECTURE_VERSION:
         raise ValueError(
-            "Fine checkpoint is not architecture v9 with current-LiDAR "
-            "spatial refinement. Start a fresh Fine Diffusion run."
+            "Fine checkpoint is not architecture v10 with optional dual-sensor "
+            "PointPillars conditioning. Start a fresh Fine Diffusion run."
         )
     if actual != expected:
         raise ValueError(
             "Fine Diffusion current-LiDAR-stem input mismatch: checkpoint has "
             f"{actual} channels but this model requires {expected}."
+        )
+    state = checkpoint.get("diffusion_state_dict", {})
+    has_lidar_pillar_stem = "transformer.lidar_pillar_stem.weight" in state
+    if has_lidar_pillar_stem != config.use_pointpillars_conditioning:
+        raise ValueError(
+            "Fine Diffusion PointPillars conditioning does not match the "
+            "checkpoint architecture. Start a fresh run."
         )
     if int(metadata.get("version", -1)) != FINE_DIFFUSION_ARCHITECTURE_VERSION:
         raise ValueError("Unsupported Fine Diffusion checkpoint architecture")
@@ -1006,6 +1074,8 @@ class FineDiffusionRefiner(nn.Module):
             current_lidar,
             self.normalization.normalize(values["trusted_faulty"]),
             values["radar"],
+            values.get("lidar_pillars"),
+            values.get("radar_pillars"),
             values["repair"],
             values["halo"],
             crops.valid_mask,
