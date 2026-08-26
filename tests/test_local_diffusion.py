@@ -25,6 +25,7 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline i
     load_frozen_coarse_model,
 )
 from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
+    _operation_error_rates,
     _residual_regularization_weight_for_epoch,
 )
 from models.two_stage_reconstruction_head.pointpillars import BEVGridGeometry
@@ -203,7 +204,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             operation_add_weight=0.21,
             operation_remove_weight=0.395,
             operation_preserve_occupied_weight=0.395,
-            operation_preserve_empty_weight=1.00,
+            operation_preserve_empty_weight=0.21,
         )
         clean = torch.tensor([[[[1.0, 0.0, 1.0, 0.0]]]])
         coarse = torch.tensor([[[[0.0, 1.0, 1.0, 0.0]]]])
@@ -218,8 +219,8 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             0.21 * components["occupancy_add_loss"]
             + 0.395 * components["occupancy_remove_loss"]
             + 0.395 * components["occupancy_preserve_occupied_loss"]
-            + 1.00 * components["occupancy_preserve_empty_loss"]
-        ) / 2.00
+            + 0.21 * components["occupancy_preserve_empty_loss"]
+        ) / 1.21
         self.assertTrue(torch.allclose(components["occupancy_loss"], expected))
         self.assertTrue(torch.allclose(total, expected))
 
@@ -229,7 +230,7 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             operation_add_weight=0.21,
             operation_remove_weight=0.395,
             operation_preserve_occupied_weight=0.395,
-            operation_preserve_empty_weight=1.00,
+            operation_preserve_empty_weight=0.21,
         )
         clean = torch.tensor([[[[1.0, 1.0, 0.0]]]])
         coarse = torch.tensor([[[[0.0, 1.0, 0.0]]]])
@@ -243,11 +244,31 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         expected = (
             0.21 * components["occupancy_add_loss"]
             + 0.395 * components["occupancy_preserve_occupied_loss"]
-            + 1.00 * components["occupancy_preserve_empty_loss"]
-        ) / 1.605
+            + 0.21 * components["occupancy_preserve_empty_loss"]
+        ) / 0.815
         self.assertEqual(float(components["num_remove"]), 0.0)
         self.assertTrue(torch.isfinite(total))
         self.assertTrue(torch.allclose(total, expected))
+
+    def test_operation_error_rates_use_conditional_target_denominators(self):
+        rates = _operation_error_rates(
+            {
+                "harmful_additions": 2.0,
+                "preserve_empty_target": 10.0,
+                "harmful_removals": 2.0,
+                "preserve_occupied_target": 8.0,
+            }
+        )
+
+        self.assertAlmostEqual(rates["false_addition_rate"], 2.0 / 10.0)
+        self.assertNotAlmostEqual(
+            rates["false_addition_rate"], 2.0 / (2.0 + 1.0)
+        )
+        self.assertAlmostEqual(rates["harmful_removal_rate"], 2.0 / 8.0)
+        self.assertAlmostEqual(
+            rates["harmful_removal_rate"],
+            1.0 - rates["correct_occupied_retention_rate"],
+        )
 
     def test_dual_sensor_pointpillars_conditioning_uses_expected_branches(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)

@@ -343,6 +343,24 @@ def _residual_regularization_weight_for_epoch(
     return base * fraction
 
 
+def _operation_error_rates(
+    counts: dict[str, float], epsilon: float = 1.0e-8
+) -> dict[str, float]:
+    """Conditional preservation error rates for operation diagnostics."""
+
+    preserve_occupied = counts["preserve_occupied_target"]
+    retention = (
+        preserve_occupied - counts["harmful_removals"]
+    ) / (preserve_occupied + epsilon)
+    return {
+        "correct_occupied_retention_rate": retention,
+        "false_addition_rate": counts["harmful_additions"]
+        / max(counts["preserve_empty_target"], 1.0),
+        "harmful_removal_rate": counts["harmful_removals"]
+        / max(preserve_occupied, 1.0),
+    }
+
+
 @torch.inference_mode()
 def _run_sampled_validation(
     pipeline,
@@ -380,6 +398,7 @@ def _run_sampled_validation(
         "add_target": 0.0,
         "remove_target": 0.0,
         "preserve_occupied_target": 0.0,
+        "preserve_empty_target": 0.0,
     }
     samples = 0.0
     validation_loss_totals = {
@@ -460,15 +479,15 @@ def _run_sampled_validation(
         add_target = selected & expected & ~coarse
         remove_target = selected & ~expected & coarse
         preserve_occupied_target = selected & expected & coarse
+        preserve_empty_target = selected & ~expected & ~coarse
         counts["add_target"] += float(add_target.sum())
         counts["remove_target"] += float(remove_target.sum())
         counts["preserve_occupied_target"] += float(
             preserve_occupied_target.sum()
         )
+        counts["preserve_empty_target"] += float(preserve_empty_target.sum())
         counts["beneficial_additions"] += float((add_target & fine).sum())
-        counts["harmful_additions"] += float(
-            (selected & ~expected & ~coarse & fine).sum()
-        )
+        counts["harmful_additions"] += float((preserve_empty_target & fine).sum())
         counts["beneficial_removals"] += float((remove_target & ~fine).sum())
         counts["harmful_removals"] += float(
             (preserve_occupied_target & ~fine).sum()
@@ -573,9 +592,7 @@ def _run_sampled_validation(
     result["false_geometry_removal_rate"] = counts[
         "beneficial_removals"
     ] / (counts["remove_target"] + epsilon)
-    result["correct_occupied_retention_rate"] = (
-        counts["preserve_occupied_target"] - counts["harmful_removals"]
-    ) / (counts["preserve_occupied_target"] + epsilon)
+    result.update(_operation_error_rates(counts, epsilon))
     return result
 
 
@@ -1012,7 +1029,11 @@ def main():
                 "false removal "
                 f"{100.0 * val_stats['false_geometry_removal_rate']:.2f}% | "
                 "correct occupied retention "
-                f"{100.0 * val_stats['correct_occupied_retention_rate']:.2f}%"
+                f"{100.0 * val_stats['correct_occupied_retention_rate']:.2f}%\n"
+                "                      | false addition "
+                f"{100.0 * val_stats['false_addition_rate']:.2f}% | "
+                "harmful removal "
+                f"{100.0 * val_stats['harmful_removal_rate']:.2f}%"
             )
             score = val_stats["fine_minus_coarse_exact_iou"]
             improved = score > best

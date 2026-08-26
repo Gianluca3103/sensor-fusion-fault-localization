@@ -27,7 +27,7 @@
     "operation_add_weight": 0.21,
     "operation_remove_weight": 0.395,
     "operation_preserve_occupied_weight": 0.395,
-    "operation_preserve_empty_weight": 1.00,
+    "operation_preserve_empty_weight": 0.21,
     "dropout": 0.0,
     "denominator_epsilon": 1e-8,
     "minimum_residual_std": 0.0001,
