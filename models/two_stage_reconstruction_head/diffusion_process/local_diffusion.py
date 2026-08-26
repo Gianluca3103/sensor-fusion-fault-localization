@@ -73,6 +73,10 @@ class FineDiffusionConfig:
     lambda_residual_regularization: float = 0.05
     residual_regularization_mode: str = "cumulative_absolute"
     residual_regularization_decay_epochs: int = 0
+    occupancy_loss_mode: str = "standard_bce"
+    occupancy_threshold: float = 0.5
+    correction_group_weight: float = 1.0
+    preservation_group_weight: float = 0.5
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
     minimum_residual_std: float = 1.0e-4
@@ -141,6 +145,20 @@ class FineDiffusionConfig:
             raise ValueError(
                 "residual_regularization_decay_epochs must be non-negative"
             )
+        if self.occupancy_loss_mode not in (
+            "standard_bce",
+            "operation_balanced",
+        ):
+            raise ValueError(
+                "occupancy_loss_mode must be standard_bce or operation_balanced"
+            )
+        if not 0.0 < self.occupancy_threshold < 1.0:
+            raise ValueError("occupancy_threshold must be strictly between 0 and 1")
+        for name in ("correction_group_weight", "preservation_group_weight"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.correction_group_weight + self.preservation_group_weight <= 0.0:
+            raise ValueError("at least one occupancy group weight must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
         if self.denominator_epsilon <= 0:
@@ -815,23 +833,65 @@ def validate_fine_diffusion_checkpoint_compatibility(
 class MaskedExactReconstructionLoss(nn.Module):
     """Exact cell-aligned channel-aware loss inside the repair mask."""
 
-    def __init__(self, epsilon: float = 1.0e-8):
+    GROUPS = (
+        "add",
+        "remove",
+        "preserve_occupied",
+        "preserve_empty",
+    )
+
+    def __init__(
+        self,
+        epsilon: float = 1.0e-8,
+        *,
+        occupancy_loss_mode: str = "standard_bce",
+        occupancy_threshold: float = 0.5,
+        correction_group_weight: float = 1.0,
+        preservation_group_weight: float = 0.5,
+    ):
         super().__init__()
         self.epsilon = float(epsilon)
+        self.occupancy_loss_mode = str(occupancy_loss_mode)
+        self.occupancy_threshold = float(occupancy_threshold)
+        self.group_weights = {
+            "add": float(correction_group_weight),
+            "remove": float(correction_group_weight),
+            "preserve_occupied": float(preservation_group_weight),
+            "preserve_empty": float(preservation_group_weight),
+        }
+
+    def _occupancy_groups(
+        self,
+        clean_occupancy: torch.Tensor,
+        coarse_occupancy: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        clean_occupied = clean_occupancy >= self.occupancy_threshold
+        coarse_occupied = coarse_occupancy >= self.occupancy_threshold
+        return {
+            "add": selected & clean_occupied & ~coarse_occupied,
+            "remove": selected & ~clean_occupied & coarse_occupied,
+            "preserve_occupied": selected & clean_occupied & coarse_occupied,
+            "preserve_empty": selected & ~clean_occupied & ~coarse_occupied,
+        }
 
     def forward(
         self,
         refined: torch.Tensor,
         clean: torch.Tensor,
         reconstruction_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        coarse: torch.Tensor | None = None,
+        *,
+        return_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.autocast(device_type=refined.device.type, enabled=False):
             refined_float = refined.float()
             clean_float = clean.float()
             mask_float = reconstruction_mask.float()
             occupied = clean_float[:, 0:1].clamp(0.0, 1.0)
             selected = mask_float > 0.5
-            refined_occupancy = refined_float[:, 0:1][selected]
+            refined_occupancy_map = refined_float[:, 0:1]
+            refined_occupancy = refined_occupancy_map[selected]
             target_occupancy = occupied[selected]
             if not bool(torch.isfinite(refined_occupancy).all()):
                 raise FloatingPointError(
@@ -839,15 +899,70 @@ class MaskedExactReconstructionLoss(nn.Module):
                     "reconstruction mask"
                 )
             if refined_occupancy.numel() == 0:
-                return refined_float.sum() * 0.0
-            occupancy = F.binary_cross_entropy(
+                zero = refined_float.sum() * 0.0
+                components = {
+                    "occupancy_loss": zero,
+                    "continuous_loss": zero,
+                    **{f"occupancy_{name}_loss": zero for name in self.GROUPS},
+                    **{
+                        f"num_{name}": zero.detach()
+                        for name in self.GROUPS
+                    },
+                }
+                return (zero, components) if return_components else zero
+            per_cell_bce = F.binary_cross_entropy(
                 refined_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
                 target_occupancy,
-                reduction="mean",
+                reduction="none",
             )
-            occupancy_loss = occupancy
+            group_losses = {
+                name: per_cell_bce.new_zeros(()) for name in self.GROUPS
+            }
+            group_counts = {
+                name: per_cell_bce.new_zeros(()) for name in self.GROUPS
+            }
+            if coarse is not None:
+                coarse_occupancy = coarse.detach().float()[:, 0:1]
+                groups = self._occupancy_groups(
+                    occupied, coarse_occupancy, selected
+                )
+                selected_groups = {
+                    name: group[selected] for name, group in groups.items()
+                }
+                for name, group in selected_groups.items():
+                    count = group.sum(dtype=torch.float32)
+                    group_counts[name] = count
+                    if bool(count > 0):
+                        group_losses[name] = per_cell_bce[group].sum() / count
+            if self.occupancy_loss_mode == "operation_balanced":
+                if coarse is None:
+                    raise ValueError(
+                        "operation-balanced occupancy loss requires detached "
+                        "coarse occupancy"
+                    )
+                numerator = per_cell_bce.new_zeros(())
+                active_weight = 0.0
+                for name in self.GROUPS:
+                    if bool(group_counts[name] > 0):
+                        weight = self.group_weights[name]
+                        numerator = numerator + weight * group_losses[name]
+                        active_weight += weight
+                occupancy_loss = numerator / max(active_weight, self.epsilon)
+            else:
+                occupancy_loss = per_cell_bce.mean()
+        continuous_loss = occupancy_loss.new_zeros(())
         if refined.shape[1] == 1:
-            return occupancy_loss
+            total = occupancy_loss
+            components = {
+                "occupancy_loss": occupancy_loss,
+                "continuous_loss": continuous_loss,
+                **{
+                    f"occupancy_{name}_loss": group_losses[name]
+                    for name in self.GROUPS
+                },
+                **{f"num_{name}": group_counts[name] for name in self.GROUPS},
+            }
+            return (total, components) if return_components else total
         continuous_selected = (selected & (occupied > 0.5)).expand(
             -1, refined.shape[1] - 1, -1, -1
         )
@@ -865,7 +980,17 @@ class MaskedExactReconstructionLoss(nn.Module):
             if refined_continuous.numel()
             else occupancy_loss.new_zeros(())
         )
-        return occupancy_loss + continuous_loss
+        total = occupancy_loss + continuous_loss
+        components = {
+            "occupancy_loss": occupancy_loss,
+            "continuous_loss": continuous_loss,
+            **{
+                f"occupancy_{name}_loss": group_losses[name]
+                for name in self.GROUPS
+            },
+            **{f"num_{name}": group_counts[name] for name in self.GROUPS},
+        }
+        return (total, components) if return_components else total
 
 
 class MaskedNoDegradationLoss(nn.Module):
@@ -974,7 +1099,11 @@ class FineDiffusionRefiner(nn.Module):
             self.config.denominator_epsilon
         )
         self.exact_loss = MaskedExactReconstructionLoss(
-            self.config.denominator_epsilon
+            self.config.denominator_epsilon,
+            occupancy_loss_mode=self.config.occupancy_loss_mode,
+            occupancy_threshold=self.config.occupancy_threshold,
+            correction_group_weight=self.config.correction_group_weight,
+            preservation_group_weight=self.config.preservation_group_weight,
         )
         self.degradation_loss = MaskedNoDegradationLoss(
             self.config.denominator_epsilon
@@ -1273,8 +1402,12 @@ class FineDiffusionRefiner(nn.Module):
             crops, refined_crop, faulty_lidar_bev, reconstruction_mask
         )
         diffusion_loss = torch.stack(flow_losses).mean()
-        exact_loss = self.exact_loss(
-            refined_crop, crops.tensors["clean"], repair
+        exact_loss, exact_components = self.exact_loss(
+            refined_crop,
+            crops.tensors["clean"],
+            repair,
+            crops.tensors["coarse"].detach(),
+            return_components=True,
         )
         coarse_exact_loss = (
             self.exact_loss(
@@ -1368,6 +1501,14 @@ class FineDiffusionRefiner(nn.Module):
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
             "exact_reconstruction_loss": exact_loss,
+            "exact_occupancy_loss": exact_components["occupancy_loss"],
+            "occupancy_operation_loss": exact_components["occupancy_loss"],
+            "exact_continuous_loss": exact_components["continuous_loss"],
+            **{
+                key: value
+                for key, value in exact_components.items()
+                if key.startswith("occupancy_") or key.startswith("num_")
+            },
             "coarse_exact_reconstruction_loss": coarse_exact_loss,
             "degradation_loss": degradation_loss,
             "residual_regularization_loss": residual_regularization_loss,

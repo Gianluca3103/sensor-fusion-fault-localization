@@ -142,6 +142,60 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_operation_balanced_exact_loss_partitions_all_four_groups(self):
+        loss_fn = MaskedExactReconstructionLoss(
+            occupancy_loss_mode="operation_balanced",
+            occupancy_threshold=0.5,
+            correction_group_weight=1.0,
+            preservation_group_weight=0.5,
+        )
+        clean = torch.tensor([[[[1.0, 0.0, 1.0, 0.0]]]])
+        coarse = torch.tensor([[[[0.0, 1.0, 1.0, 0.0]]]])
+        refined = torch.tensor([[[[0.8, 0.2, 0.7, 0.1]]]])
+        mask = torch.ones(1, 1, 1, 4)
+
+        total, components = loss_fn(
+            refined, clean, mask, coarse, return_components=True
+        )
+
+        for name in loss_fn.GROUPS:
+            self.assertEqual(float(components[f"num_{name}"]), 1.0)
+        weighted = (
+            components["occupancy_add_loss"]
+            + components["occupancy_remove_loss"]
+            + 0.5 * components["occupancy_preserve_occupied_loss"]
+            + 0.5 * components["occupancy_preserve_empty_loss"]
+        ) / 3.0
+        self.assertTrue(torch.allclose(components["occupancy_loss"], weighted))
+        self.assertTrue(torch.allclose(total, weighted))
+
+        groups = loss_fn._occupancy_groups(clean, coarse, mask > 0.5)
+        membership = torch.stack(tuple(groups.values())).sum(dim=0)
+        self.assertTrue(torch.equal(membership, torch.ones_like(membership)))
+
+    def test_operation_balanced_exact_loss_ignores_absent_groups(self):
+        loss_fn = MaskedExactReconstructionLoss(
+            occupancy_loss_mode="operation_balanced",
+            correction_group_weight=1.0,
+            preservation_group_weight=0.5,
+        )
+        clean = torch.ones(1, 1, 1, 2)
+        coarse = torch.zeros_like(clean)
+        refined = torch.full_like(clean, 0.75)
+        mask = torch.ones_like(clean)
+
+        total, components = loss_fn(
+            refined, clean, mask, coarse, return_components=True
+        )
+
+        self.assertTrue(torch.isfinite(total))
+        self.assertEqual(float(components["num_add"]), 2.0)
+        for name in ("remove", "preserve_occupied", "preserve_empty"):
+            self.assertEqual(float(components[f"num_{name}"]), 0.0)
+        self.assertTrue(
+            torch.allclose(total, components["occupancy_add_loss"])
+        )
+
     def test_dual_sensor_pointpillars_conditioning_uses_expected_branches(self):
         clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         lidar_pillars = torch.rand(1, 6, 16, 16)
@@ -911,6 +965,48 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             )
 
         shared = sample.call_args.kwargs["shared_inputs"]
+        self.assertTrue(
+            torch.equal(
+                shared.lidar_pillar_bev, coarse_output["lidar_pillar_bev"]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                shared.radar_pillar_bev, coarse_output["radar_pillar_bev"]
+            )
+        )
+
+    def test_validation_loss_reuses_explicit_coarse_pointpillar_output(self):
+        class DummyConfig:
+            pointpillars_enabled = True
+
+        class DummyCoarse(torch.nn.Module):
+            config = DummyConfig()
+
+            def _sensor_features(self, *_args, **_kwargs):
+                raise AssertionError("PointPillars must not be recomputed")
+
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        diffusion = FineDiffusionRefiner(_config(pointpillars=True))
+        pipeline = FrozenCoarseFineDiffusionPipeline(DummyCoarse(), diffusion)
+        coarse_output = {
+            "coarse_lidar_bev": coarse,
+            "lidar_pillar_bev": faulty.new_ones(1, 6, 16, 16),
+            "radar_pillar_bev": faulty.new_full((1, 7, 16, 16), 2.0),
+        }
+        with mock.patch.object(diffusion, "forward", return_value={}) as forward:
+            pipeline(
+                clean,
+                faulty,
+                radar,
+                repair,
+                torch.zeros_like(repair),
+                halo,
+                coarse_lidar_bev=coarse,
+                coarse_output=coarse_output,
+            )
+
+        shared = forward.call_args.kwargs["shared_inputs"]
         self.assertTrue(
             torch.equal(
                 shared.lidar_pillar_bev, coarse_output["lidar_pillar_bev"]

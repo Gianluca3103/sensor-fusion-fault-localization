@@ -214,6 +214,14 @@ def _run_epoch(
     training = optimizer is not None
     pipeline.train(training)
     totals: dict[str, float] = {}
+    occupancy_groups = (
+        "add",
+        "remove",
+        "preserve_occupied",
+        "preserve_empty",
+    )
+    group_loss_sums = {name: 0.0 for name in occupancy_groups}
+    group_cell_counts = {name: 0.0 for name in occupancy_groups}
     samples = optimizer_steps = 0
     progress = _BatchProgress(progress_label, len(loader))
     total_data_seconds = total_step_seconds = 0.0
@@ -257,6 +265,15 @@ def _run_epoch(
             "exact_reconstruction_loss": float(
                 output["exact_reconstruction_loss"].detach()
             ),
+            "exact_occupancy_loss": float(
+                output["exact_occupancy_loss"].detach()
+            ),
+            "occupancy_operation_loss": float(
+                output["occupancy_operation_loss"].detach()
+            ),
+            "exact_continuous_loss": float(
+                output["exact_continuous_loss"].detach()
+            ),
             "degradation_loss": float(output["degradation_loss"].detach()),
             "residual_regularization_loss": float(
                 output["residual_regularization_loss"].detach()
@@ -273,6 +290,11 @@ def _run_epoch(
         }
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
+        for name in occupancy_groups:
+            group_count = float(output[f"num_{name}"].detach())
+            group_loss = float(output[f"occupancy_{name}_loss"].detach())
+            group_cell_counts[name] += group_count
+            group_loss_sums[name] += group_loss * group_count
         samples += count
         batch_finished = time.perf_counter()
         total_step_seconds += batch_finished - batch_received
@@ -285,6 +307,19 @@ def _run_epoch(
         )
         previous_batch_finished = batch_finished
     result = {key: value / max(samples, 1) for key, value in totals.items()}
+    total_group_cells = sum(group_cell_counts.values())
+    for name in occupancy_groups:
+        result[f"occupancy_{name}_loss"] = (
+            group_loss_sums[name] / group_cell_counts[name]
+            if group_cell_counts[name] > 0.0
+            else 0.0
+        )
+        result[f"num_{name}"] = group_cell_counts[name]
+        result[f"percent_{name}"] = (
+            100.0 * group_cell_counts[name] / total_group_cells
+            if total_group_cells > 0.0
+            else 0.0
+        )
     if training:
         result["optimizer_steps"] = optimizer_steps
     return result
@@ -315,8 +350,9 @@ def _run_sampled_validation(
     amp_dtype=torch.bfloat16,
     seed=0,
     progress_label="validation",
+    residual_regularization_weight=0.0,
 ):
-    """Run the deployment sampler; clean LiDAR is used only after prediction."""
+    """Run clean-free sampling, then separately calculate validation losses."""
 
     pipeline.eval()
     counts = {
@@ -333,8 +369,26 @@ def _run_sampled_validation(
         "coarse_tolerant_matched_targets": 0.0,
         "coarse_prediction_count": 0.0,
         "target_count": 0.0,
+        "beneficial_additions": 0.0,
+        "harmful_additions": 0.0,
+        "beneficial_removals": 0.0,
+        "harmful_removals": 0.0,
+        "add_target": 0.0,
+        "remove_target": 0.0,
+        "preserve_occupied_target": 0.0,
     }
     samples = 0.0
+    validation_loss_totals = {
+        "loss": 0.0,
+        "diffusion_loss": 0.0,
+        "exact_reconstruction_loss": 0.0,
+        "exact_occupancy_loss": 0.0,
+        "exact_continuous_loss": 0.0,
+        "degradation_loss": 0.0,
+        "residual_regularization_loss": 0.0,
+        "residual_regularization_weight": 0.0,
+        "weighted_residual_regularization_loss": 0.0,
+    }
     generator = torch.Generator(device=device).manual_seed(seed)
     offsets = torch.arange(-2, 3, device=device, dtype=torch.float32)
     rows, columns = torch.meshgrid(offsets, offsets, indexing="ij")
@@ -359,6 +413,15 @@ def _run_sampled_validation(
             dtype=amp_dtype,
             enabled=use_amp,
         ):
+            coarse_lidar_bev, coarse_output = pipeline.coarse_forward(
+                batch["faulty_lidar_bev"],
+                batch["radar_bev"],
+                batch["reconstruction_mask"],
+                batch["healthy_context_mask"],
+                batch["halo_mask"],
+                faulty_lidar_points=batch.get("faulty_lidar_points"),
+                radar_points=batch.get("radar_points"),
+            )
             sampled = pipeline.sample(
                 batch["faulty_lidar_bev"],
                 batch["radar_bev"],
@@ -367,14 +430,45 @@ def _run_sampled_validation(
                 batch["halo_mask"],
                 faulty_lidar_points=batch.get("faulty_lidar_points"),
                 radar_points=batch.get("radar_points"),
+                coarse_lidar_bev=coarse_lidar_bev,
+                coarse_output=coarse_output,
                 sampling_steps=sampling_steps,
                 generator=generator,
+            )
+            validation_objective = pipeline(
+                **batch,
+                coarse_lidar_bev=coarse_lidar_bev,
+                coarse_output=coarse_output,
+                return_diagnostics=False,
+                residual_regularization_weight=residual_regularization_weight,
+            )
+
+        batch_samples = batch["clean_lidar_bev"].shape[0]
+        for name in validation_loss_totals:
+            validation_loss_totals[name] += (
+                float(validation_objective[name].detach()) * batch_samples
             )
 
         selected = batch["reconstruction_mask"] > 0.5
         expected = batch["clean_lidar_bev"][:, 0:1] >= 0.5
         coarse = sampled["coarse_lidar_bev"][:, 0:1] >= 0.5
         fine = sampled["final_lidar_bev"][:, 0:1] >= 0.5
+        add_target = selected & expected & ~coarse
+        remove_target = selected & ~expected & coarse
+        preserve_occupied_target = selected & expected & coarse
+        counts["add_target"] += float(add_target.sum())
+        counts["remove_target"] += float(remove_target.sum())
+        counts["preserve_occupied_target"] += float(
+            preserve_occupied_target.sum()
+        )
+        counts["beneficial_additions"] += float((add_target & fine).sum())
+        counts["harmful_additions"] += float(
+            (selected & ~expected & ~coarse & fine).sum()
+        )
+        counts["beneficial_removals"] += float((remove_target & ~fine).sum())
+        counts["harmful_removals"] += float(
+            (preserve_occupied_target & ~fine).sum()
+        )
         expected_selected = expected & selected
         target_neighborhood = dilate(expected_selected)
         counts["target_count"] += float(expected_selected.sum())
@@ -399,7 +493,7 @@ def _run_sampled_validation(
             counts[f"{prefix}_prediction_count"] += float(
                 predicted_selected.sum()
             )
-        samples += batch["clean_lidar_bev"].shape[0]
+        samples += batch_samples
         batch_finished = time.perf_counter()
         total_step_seconds += batch_finished - batch_received
         progress.update(
@@ -412,6 +506,8 @@ def _run_sampled_validation(
 
     epsilon = 1.0e-8
     result = {"samples": samples}
+    for name, total in validation_loss_totals.items():
+        result[name] = total / max(samples, 1.0)
     for prefix in ("coarse", "fine"):
         tp = counts[f"{prefix}_tp"]
         fp = counts[f"{prefix}_fp"]
@@ -421,6 +517,12 @@ def _run_sampled_validation(
         )
         result[f"{prefix}_exact_occupancy_f1"] = 2.0 * tp / (
             2.0 * tp + fp + fn + epsilon
+        )
+        result[f"{prefix}_exact_occupancy_precision"] = tp / (
+            tp + fp + epsilon
+        )
+        result[f"{prefix}_exact_occupancy_recall"] = tp / (
+            tp + fn + epsilon
         )
         tolerant_precision = counts[
             f"{prefix}_tolerant_matched_predictions"
@@ -454,6 +556,22 @@ def _run_sampled_validation(
         result["fine_tolerant_0_5m_f1"]
         - result["coarse_tolerant_0_5m_f1"]
     )
+    for name in (
+        "beneficial_additions",
+        "harmful_additions",
+        "beneficial_removals",
+        "harmful_removals",
+    ):
+        result[name] = counts[name]
+    result["missing_geometry_recovery_rate"] = counts[
+        "beneficial_additions"
+    ] / (counts["add_target"] + epsilon)
+    result["false_geometry_removal_rate"] = counts[
+        "beneficial_removals"
+    ] / (counts["remove_target"] + epsilon)
+    result["correct_occupied_retention_rate"] = (
+        counts["preserve_occupied_target"] - counts["harmful_removals"]
+    ) / (counts["preserve_occupied_target"] + epsilon)
     return result
 
 
@@ -780,6 +898,7 @@ def main():
                 amp_dtype=amp_dtype,
                 seed=seed + 10_000,
                 progress_label=f"epoch {epoch:03d}/{epochs:03d} val",
+                residual_regularization_weight=residual_regularization_weight,
             )
             validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
@@ -810,10 +929,41 @@ def main():
             f"weighted "
             f"{train_stats['weighted_residual_regularization_loss']:.6f})"
         )
+        print(
+            f"  exact components | L_occ_operation "
+            f"{train_stats['occupancy_operation_loss']:.6f} | L_continuous "
+            f"{train_stats['exact_continuous_loss']:.6f}\n"
+            f"  occupancy groups | add "
+            f"{train_stats['occupancy_add_loss']:.6f} "
+            f"({int(train_stats['num_add'])}, "
+            f"{train_stats['percent_add']:.2f}%) | remove "
+            f"{train_stats['occupancy_remove_loss']:.6f} "
+            f"({int(train_stats['num_remove'])}, "
+            f"{train_stats['percent_remove']:.2f}%)\n"
+            f"                   | preserve occupied "
+            f"{train_stats['occupancy_preserve_occupied_loss']:.6f} "
+            f"({int(train_stats['num_preserve_occupied'])}, "
+            f"{train_stats['percent_preserve_occupied']:.2f}%) | "
+            f"preserve empty "
+            f"{train_stats['occupancy_preserve_empty_loss']:.6f} "
+            f"({int(train_stats['num_preserve_empty'])}, "
+            f"{train_stats['percent_preserve_empty']:.2f}%)"
+        )
         if val_stats is not None:
             print(
                 f"  sampled validation | {validation_seconds:.1f}s | "
                 f"{int(val_stats['samples'])} samples\n"
+                f"    validation loss  | total {val_stats['loss']:.6f} | "
+                f"flow {val_stats['diffusion_loss']:.6f} | exact "
+                f"{val_stats['exact_reconstruction_loss']:.6f} | "
+                f"occupancy {val_stats['exact_occupancy_loss']:.6f} | "
+                f"continuous {val_stats['exact_continuous_loss']:.6f}\n"
+                f"                     | degradation "
+                f"{val_stats['degradation_loss']:.6f} | residual "
+                f"{val_stats['residual_regularization_loss']:.6f} "
+                f"(weight {val_stats['residual_regularization_weight']:.5f}, "
+                f"weighted "
+                f"{val_stats['weighted_residual_regularization_loss']:.6f})\n"
                 f"    exact IoU/F1     | {baseline_label} "
                 f"{100.0 * val_stats['coarse_exact_occupancy_iou']:.2f}% "
                 f"/ {100.0 * val_stats['coarse_exact_occupancy_f1']:.2f}% "
@@ -822,6 +972,12 @@ def main():
                 f"    exact improvement| IoU "
                 f"{100.0 * val_stats['fine_minus_coarse_exact_iou']:+.2f} pp | "
                 f"F1 {100.0 * val_stats['fine_minus_coarse_exact_f1']:+.2f} pp\n"
+                f"    exact P/R        | {baseline_label} "
+                f"{100.0 * val_stats['coarse_exact_occupancy_precision']:.2f}% / "
+                f"{100.0 * val_stats['coarse_exact_occupancy_recall']:.2f}% "
+                f"-> fine "
+                f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% / "
+                f"{100.0 * val_stats['fine_exact_occupancy_recall']:.2f}%\n"
                 f"    0.5m IoU/F1      | {baseline_label} "
                 f"{100.0 * val_stats['coarse_tolerant_0_5m_iou']:.2f}% "
                 f"/ {100.0 * val_stats['coarse_tolerant_0_5m_f1']:.2f}% "
@@ -830,6 +986,19 @@ def main():
                 f"    0.5m improvement | IoU "
                 f"{100.0 * val_stats['fine_minus_coarse_tolerant_0_5m_iou']:+.2f} pp | "
                 f"F1 {100.0 * val_stats['fine_minus_coarse_tolerant_0_5m_f1']:+.2f} pp"
+            )
+            print(
+                "    transitions       | "
+                f"beneficial + {int(val_stats['beneficial_additions'])} | "
+                f"harmful + {int(val_stats['harmful_additions'])} | "
+                f"beneficial - {int(val_stats['beneficial_removals'])} | "
+                f"harmful - {int(val_stats['harmful_removals'])}\n"
+                "    operation rates   | missing recovery "
+                f"{100.0 * val_stats['missing_geometry_recovery_rate']:.2f}% | "
+                "false removal "
+                f"{100.0 * val_stats['false_geometry_removal_rate']:.2f}% | "
+                "correct occupied retention "
+                f"{100.0 * val_stats['correct_occupied_retention_rate']:.2f}%"
             )
             score = val_stats["fine_minus_coarse_exact_iou"]
             improved = score > best
