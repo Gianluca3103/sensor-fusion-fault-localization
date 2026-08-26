@@ -77,6 +77,10 @@ class FineDiffusionConfig:
     occupancy_threshold: float = 0.5
     correction_group_weight: float = 1.0
     preservation_group_weight: float = 0.5
+    operation_add_weight: float = 0.21
+    operation_remove_weight: float = 0.59
+    operation_preserve_occupied_weight: float = 0.20
+    operation_preserve_empty_weight: float = 1.00
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
     minimum_residual_std: float = 1.0e-4
@@ -148,9 +152,11 @@ class FineDiffusionConfig:
         if self.occupancy_loss_mode not in (
             "standard_bce",
             "operation_balanced",
+            "weighted_operation",
         ):
             raise ValueError(
-                "occupancy_loss_mode must be standard_bce or operation_balanced"
+                "occupancy_loss_mode must be standard_bce, operation_balanced, "
+                "or weighted_operation"
             )
         if not 0.0 < self.occupancy_threshold < 1.0:
             raise ValueError("occupancy_threshold must be strictly between 0 and 1")
@@ -159,6 +165,17 @@ class FineDiffusionConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.correction_group_weight + self.preservation_group_weight <= 0.0:
             raise ValueError("at least one occupancy group weight must be positive")
+        operation_weight_names = (
+            "operation_add_weight",
+            "operation_remove_weight",
+            "operation_preserve_occupied_weight",
+            "operation_preserve_empty_weight",
+        )
+        for name in operation_weight_names:
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if sum(getattr(self, name) for name in operation_weight_names) <= 0.0:
+            raise ValueError("at least one weighted-operation weight must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
         if self.denominator_epsilon <= 0:
@@ -848,16 +865,26 @@ class MaskedExactReconstructionLoss(nn.Module):
         occupancy_threshold: float = 0.5,
         correction_group_weight: float = 1.0,
         preservation_group_weight: float = 0.5,
+        operation_add_weight: float = 0.21,
+        operation_remove_weight: float = 0.59,
+        operation_preserve_occupied_weight: float = 0.20,
+        operation_preserve_empty_weight: float = 1.00,
     ):
         super().__init__()
         self.epsilon = float(epsilon)
         self.occupancy_loss_mode = str(occupancy_loss_mode)
         self.occupancy_threshold = float(occupancy_threshold)
-        self.group_weights = {
+        self.balanced_group_weights = {
             "add": float(correction_group_weight),
             "remove": float(correction_group_weight),
             "preserve_occupied": float(preservation_group_weight),
             "preserve_empty": float(preservation_group_weight),
+        }
+        self.weighted_operation_group_weights = {
+            "add": float(operation_add_weight),
+            "remove": float(operation_remove_weight),
+            "preserve_occupied": float(operation_preserve_occupied_weight),
+            "preserve_empty": float(operation_preserve_empty_weight),
         }
 
     def _occupancy_groups(
@@ -934,17 +961,25 @@ class MaskedExactReconstructionLoss(nn.Module):
                     group_counts[name] = count
                     if bool(count > 0):
                         group_losses[name] = per_cell_bce[group].sum() / count
-            if self.occupancy_loss_mode == "operation_balanced":
+            if self.occupancy_loss_mode in (
+                "operation_balanced",
+                "weighted_operation",
+            ):
                 if coarse is None:
                     raise ValueError(
-                        "operation-balanced occupancy loss requires detached "
+                        "operation-aware occupancy loss requires detached "
                         "coarse occupancy"
                     )
+                group_weights = (
+                    self.weighted_operation_group_weights
+                    if self.occupancy_loss_mode == "weighted_operation"
+                    else self.balanced_group_weights
+                )
                 numerator = per_cell_bce.new_zeros(())
                 active_weight = 0.0
                 for name in self.GROUPS:
                     if bool(group_counts[name] > 0):
-                        weight = self.group_weights[name]
+                        weight = group_weights[name]
                         numerator = numerator + weight * group_losses[name]
                         active_weight += weight
                 occupancy_loss = numerator / max(active_weight, self.epsilon)
@@ -1104,6 +1139,14 @@ class FineDiffusionRefiner(nn.Module):
             occupancy_threshold=self.config.occupancy_threshold,
             correction_group_weight=self.config.correction_group_weight,
             preservation_group_weight=self.config.preservation_group_weight,
+            operation_add_weight=self.config.operation_add_weight,
+            operation_remove_weight=self.config.operation_remove_weight,
+            operation_preserve_occupied_weight=(
+                self.config.operation_preserve_occupied_weight
+            ),
+            operation_preserve_empty_weight=(
+                self.config.operation_preserve_empty_weight
+            ),
         )
         self.degradation_loss = MaskedNoDegradationLoss(
             self.config.denominator_epsilon
@@ -1411,7 +1454,10 @@ class FineDiffusionRefiner(nn.Module):
         )
         coarse_exact_loss = (
             self.exact_loss(
-                crops.tensors["coarse"].detach(), crops.tensors["clean"], repair
+                crops.tensors["coarse"].detach(),
+                crops.tensors["clean"],
+                repair,
+                crops.tensors["coarse"].detach(),
             )
             if return_diagnostics
             else diffusion_loss.new_zeros(())

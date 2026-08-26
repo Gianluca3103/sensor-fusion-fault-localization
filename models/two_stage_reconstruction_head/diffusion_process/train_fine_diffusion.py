@@ -320,6 +320,10 @@ def _run_epoch(
             if total_group_cells > 0.0
             else 0.0
         )
+    result["num_add_target"] = result["num_add"]
+    result["num_remove_target"] = result["num_remove"]
+    result["percent_add_target"] = result["percent_add"]
+    result["percent_remove_target"] = result["percent_remove"]
     if training:
         result["optimizer_steps"] = optimizer_steps
     return result
@@ -867,6 +871,16 @@ def main():
         f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"
     )
+    if config.occupancy_loss_mode == "weighted_operation":
+        print(
+            "Operation weights:\n"
+            f"  add               = {config.operation_add_weight:.2f}\n"
+            f"  remove            = {config.operation_remove_weight:.2f}\n"
+            "  preserve occupied = "
+            f"{config.operation_preserve_occupied_weight:.2f}\n"
+            "  preserve empty    = "
+            f"{config.operation_preserve_empty_weight:.2f}"
+        )
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
         residual_regularization_weight = (
