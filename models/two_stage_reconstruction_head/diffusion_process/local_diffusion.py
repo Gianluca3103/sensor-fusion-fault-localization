@@ -78,8 +78,8 @@ class FineDiffusionConfig:
     correction_group_weight: float = 1.0
     preservation_group_weight: float = 0.5
     operation_add_weight: float = 0.21
-    operation_remove_weight: float = 0.59
-    operation_preserve_occupied_weight: float = 0.20
+    operation_remove_weight: float = 0.395
+    operation_preserve_occupied_weight: float = 0.395
     operation_preserve_empty_weight: float = 1.00
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
@@ -866,8 +866,8 @@ class MaskedExactReconstructionLoss(nn.Module):
         correction_group_weight: float = 1.0,
         preservation_group_weight: float = 0.5,
         operation_add_weight: float = 0.21,
-        operation_remove_weight: float = 0.59,
-        operation_preserve_occupied_weight: float = 0.20,
+        operation_remove_weight: float = 0.395,
+        operation_preserve_occupied_weight: float = 0.395,
         operation_preserve_empty_weight: float = 1.00,
     ):
         super().__init__()

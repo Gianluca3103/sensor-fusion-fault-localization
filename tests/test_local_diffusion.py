@@ -201,8 +201,8 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             occupancy_loss_mode="weighted_operation",
             occupancy_threshold=0.5,
             operation_add_weight=0.21,
-            operation_remove_weight=0.59,
-            operation_preserve_occupied_weight=0.20,
+            operation_remove_weight=0.395,
+            operation_preserve_occupied_weight=0.395,
             operation_preserve_empty_weight=1.00,
         )
         clean = torch.tensor([[[[1.0, 0.0, 1.0, 0.0]]]])
@@ -216,8 +216,8 @@ class FineDiffusionRefinerTests(unittest.TestCase):
 
         expected = (
             0.21 * components["occupancy_add_loss"]
-            + 0.59 * components["occupancy_remove_loss"]
-            + 0.20 * components["occupancy_preserve_occupied_loss"]
+            + 0.395 * components["occupancy_remove_loss"]
+            + 0.395 * components["occupancy_preserve_occupied_loss"]
             + 1.00 * components["occupancy_preserve_empty_loss"]
         ) / 2.00
         self.assertTrue(torch.allclose(components["occupancy_loss"], expected))
@@ -227,8 +227,8 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         loss_fn = MaskedExactReconstructionLoss(
             occupancy_loss_mode="weighted_operation",
             operation_add_weight=0.21,
-            operation_remove_weight=0.59,
-            operation_preserve_occupied_weight=0.20,
+            operation_remove_weight=0.395,
+            operation_preserve_occupied_weight=0.395,
             operation_preserve_empty_weight=1.00,
         )
         clean = torch.tensor([[[[1.0, 1.0, 0.0]]]])
@@ -242,9 +242,9 @@ class FineDiffusionRefinerTests(unittest.TestCase):
 
         expected = (
             0.21 * components["occupancy_add_loss"]
-            + 0.20 * components["occupancy_preserve_occupied_loss"]
+            + 0.395 * components["occupancy_preserve_occupied_loss"]
             + 1.00 * components["occupancy_preserve_empty_loss"]
-        ) / 1.41
+        ) / 1.605
         self.assertEqual(float(components["num_remove"]), 0.0)
         self.assertTrue(torch.isfinite(total))
         self.assertTrue(torch.allclose(total, expected))

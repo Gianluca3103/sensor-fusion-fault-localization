@@ -874,12 +874,12 @@ def main():
     if config.occupancy_loss_mode == "weighted_operation":
         print(
             "Operation weights:\n"
-            f"  add               = {config.operation_add_weight:.2f}\n"
-            f"  remove            = {config.operation_remove_weight:.2f}\n"
+            f"  add               = {config.operation_add_weight:g}\n"
+            f"  remove            = {config.operation_remove_weight:g}\n"
             "  preserve occupied = "
-            f"{config.operation_preserve_occupied_weight:.2f}\n"
+            f"{config.operation_preserve_occupied_weight:g}\n"
             "  preserve empty    = "
-            f"{config.operation_preserve_empty_weight:.2f}"
+            f"{config.operation_preserve_empty_weight:g}"
         )
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
