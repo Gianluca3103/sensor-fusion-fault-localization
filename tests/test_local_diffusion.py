@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+from dataclasses import replace
 
 import torch
 
@@ -22,6 +23,9 @@ from models.two_stage_reconstruction_head.diffusion_process.residual_statistics 
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline import (
     FrozenCoarseFineDiffusionPipeline,
     load_frozen_coarse_model,
+)
+from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
+    _residual_regularization_weight_for_epoch,
 )
 from models.two_stage_reconstruction_head.pointpillars import BEVGridGeometry
 from models.two_stage_reconstruction_head.reconstruction_inputs import (
@@ -385,6 +389,47 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             float(model._residual_regularization_loss(outside_only, mask)),
             0.0,
         )
+
+    def test_per_step_residual_regularizer_penalizes_only_excess_magnitude(self):
+        model = FineDiffusionRefiner(
+            replace(_config(), residual_regularization_mode="per_step_excess")
+        )
+        mask = torch.ones(1, 1, 1, 2)
+        target = torch.full((1, 3, 1, 2), 0.2)
+        conservative = torch.full_like(target, 0.1)
+        aggressive = torch.full_like(target, 0.5)
+
+        self.assertEqual(
+            float(
+                model._per_step_excess_regularization_loss(
+                    conservative, target, mask
+                )
+            ),
+            0.0,
+        )
+        self.assertGreater(
+            float(
+                model._per_step_excess_regularization_loss(
+                    aggressive, target, mask
+                )
+            ),
+            0.0,
+        )
+
+    def test_residual_weight_decays_to_zero_after_five_completed_epochs(self):
+        config = replace(
+            _config(),
+            lambda_residual_regularization=0.05,
+            residual_regularization_decay_epochs=5,
+        )
+        weights = [
+            _residual_regularization_weight_for_epoch(config, epoch)
+            for epoch in range(1, 7)
+        ]
+        for actual, expected in zip(
+            weights, [0.05, 0.04, 0.03, 0.02, 0.01, 0.0]
+        ):
+            self.assertAlmostEqual(actual, expected)
 
     def test_window_attention_tolerates_amp_output_dtype(self):
         attention = WindowAttention2d(

@@ -71,6 +71,8 @@ class FineDiffusionConfig:
     lambda_exact_reconstruction: float = 1.0
     lambda_degradation: float = 1.0
     lambda_residual_regularization: float = 0.05
+    residual_regularization_mode: str = "cumulative_absolute"
+    residual_regularization_decay_epochs: int = 0
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
     minimum_residual_std: float = 1.0e-4
@@ -127,6 +129,18 @@ class FineDiffusionConfig:
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if self.residual_regularization_mode not in (
+            "cumulative_absolute",
+            "per_step_excess",
+        ):
+            raise ValueError(
+                "residual_regularization_mode must be cumulative_absolute "
+                "or per_step_excess"
+            )
+        if self.residual_regularization_decay_epochs < 0:
+            raise ValueError(
+                "residual_regularization_decay_epochs must be non-negative"
+            )
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
         if self.denominator_epsilon <= 0:
@@ -979,6 +993,27 @@ class FineDiffusionRefiner(nn.Module):
             predicted_residual_physical.abs() * reconstruction_mask
         ).sum() / denominator
 
+    def _per_step_excess_regularization_loss(
+        self,
+        predicted_step_normalized: torch.Tensor,
+        target_step_normalized: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize only per-step magnitude beyond the required target step."""
+
+        predicted_physical = self.residual_normalization.denormalize(
+            predicted_step_normalized
+        )
+        target_physical = self.residual_normalization.denormalize(
+            target_step_normalized
+        )
+        excess = F.relu(predicted_physical.abs() - target_physical.abs())
+        denominator = (
+            reconstruction_mask.sum() * predicted_physical.shape[1]
+            + self.config.denominator_epsilon
+        )
+        return (excess * reconstruction_mask).sum() / denominator
+
     def _bounded_residual_update(
         self,
         current_residual: torch.Tensor,
@@ -1154,6 +1189,7 @@ class FineDiffusionRefiner(nn.Module):
         return_debug: bool = False,
         return_diagnostics: bool = True,
         shared_inputs: ReconstructionInputs | None = None,
+        residual_regularization_weight: float | None = None,
     ) -> dict[str, torch.Tensor | ReconstructionCropBatch | dict]:
         self._validate_inputs(
             coarse_lidar_bev,
@@ -1185,6 +1221,7 @@ class FineDiffusionRefiner(nn.Module):
         )
         residual_x0_normalized = torch.zeros_like(residual_gt_normalized)
         flow_losses = []
+        step_residual_regularization_losses = []
         training_intermediates = []
         local_condition = residual_x0_normalized
         transformer_debug = {}
@@ -1208,6 +1245,14 @@ class FineDiffusionRefiner(nn.Module):
             flow_losses.append(
                 self.diffusion_loss(velocity_pred, target_velocity, repair)
             )
+            if self.config.residual_regularization_mode == "per_step_excess":
+                step_residual_regularization_losses.append(
+                    self._per_step_excess_regularization_loss(
+                        velocity_pred,
+                        target_velocity,
+                        repair,
+                    )
+                )
             residual_x0_normalized = self._bounded_residual_update(
                 residual_x0_normalized,
                 velocity_pred,
@@ -1241,17 +1286,29 @@ class FineDiffusionRefiner(nn.Module):
         degradation_loss = self.degradation_loss(
             refined_crop, crops.tensors["coarse"], crops.tensors["clean"], repair
         )
-        residual_regularization_loss = self._residual_regularization_loss(
-            predicted_residual_physical, repair
+        if self.config.residual_regularization_mode == "per_step_excess":
+            residual_regularization_loss = torch.stack(
+                step_residual_regularization_losses
+            ).mean()
+        else:
+            residual_regularization_loss = self._residual_regularization_loss(
+                predicted_residual_physical, repair
+            )
+        effective_residual_weight = (
+            self.config.lambda_residual_regularization
+            if residual_regularization_weight is None
+            else float(residual_regularization_weight)
+        )
+        if effective_residual_weight < 0.0:
+            raise ValueError("residual regularization weight must be non-negative")
+        weighted_residual_regularization_loss = (
+            effective_residual_weight * residual_regularization_loss
         )
         total_loss = (
             self.config.lambda_diffusion * diffusion_loss
             + self.config.lambda_exact_reconstruction * exact_loss
             + self.config.lambda_degradation * degradation_loss
-            + (
-                self.config.lambda_residual_regularization
-                * residual_regularization_loss
-            )
+            + weighted_residual_regularization_loss
         )
         diagnostics = {}
         if return_diagnostics:
@@ -1314,6 +1371,12 @@ class FineDiffusionRefiner(nn.Module):
             "coarse_exact_reconstruction_loss": coarse_exact_loss,
             "degradation_loss": degradation_loss,
             "residual_regularization_loss": residual_regularization_loss,
+            "weighted_residual_regularization_loss": (
+                weighted_residual_regularization_loss
+            ),
+            "residual_regularization_weight": total_loss.new_tensor(
+                effective_residual_weight
+            ),
             "coarse_lidar_bev": coarse_lidar_bev,
             "final_lidar_bev": final,
             "reconstruction_mask": reconstruction_mask,

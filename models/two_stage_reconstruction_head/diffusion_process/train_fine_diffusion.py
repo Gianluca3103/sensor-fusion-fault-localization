@@ -209,6 +209,7 @@ def _run_epoch(
     use_amp=False,
     amp_dtype=torch.bfloat16,
     progress_label="train",
+    residual_regularization_weight=None,
 ):
     training = optimizer is not None
     pipeline.train(training)
@@ -229,7 +230,13 @@ def _run_epoch(
                 dtype=amp_dtype,
                 enabled=use_amp,
             ):
-                output = pipeline(**batch, return_diagnostics=False)
+                output = pipeline(
+                    **batch,
+                    return_diagnostics=False,
+                    residual_regularization_weight=(
+                        residual_regularization_weight if training else 0.0
+                    ),
+                )
                 loss = output["loss"]
             if training:
                 scale_before = scaler.get_scale()
@@ -254,6 +261,12 @@ def _run_epoch(
             "residual_regularization_loss": float(
                 output["residual_regularization_loss"].detach()
             ),
+            "residual_regularization_weight": float(
+                output["residual_regularization_weight"].detach()
+            ),
+            "weighted_residual_regularization_loss": float(
+                output["weighted_residual_regularization_loss"].detach()
+            ),
             "coarse_exact_reconstruction_loss": float(
                 output["coarse_exact_reconstruction_loss"].detach()
             ),
@@ -275,6 +288,20 @@ def _run_epoch(
     if training:
         result["optimizer_steps"] = optimizer_steps
     return result
+
+
+def _residual_regularization_weight_for_epoch(
+    config: FineDiffusionConfig, epoch: int
+) -> float:
+    """Linearly remove residual restraint after N completed epochs."""
+
+    base = float(config.lambda_residual_regularization)
+    decay_epochs = int(config.residual_regularization_decay_epochs)
+    if decay_epochs == 0:
+        return base
+    completed_epochs = max(int(epoch) - 1, 0)
+    fraction = max(0.0, 1.0 - completed_epochs / float(decay_epochs))
+    return base * fraction
 
 
 @torch.inference_mode()
@@ -724,6 +751,9 @@ def main():
     )
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
+        residual_regularization_weight = (
+            _residual_regularization_weight_for_epoch(config, epoch)
+        )
         train_stats = _run_epoch(
             pipeline,
             train_loader,
@@ -734,6 +764,7 @@ def main():
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             progress_label=f"epoch {epoch:03d}/{epochs:03d} train",
+            residual_regularization_weight=residual_regularization_weight,
         )
         run_validation = epoch % validation_interval == 0 or epoch == epochs
         val_stats = None
@@ -774,7 +805,10 @@ def main():
             f"diffusion {train_stats['diffusion_loss']:.6f} | "
             f"reconstruction {train_stats['exact_reconstruction_loss']:.6f} | "
             f"degradation {train_stats['degradation_loss']:.6f} | "
-            f"residual {train_stats['residual_regularization_loss']:.6f}"
+            f"residual {train_stats['residual_regularization_loss']:.6f} "
+            f"(weight {train_stats['residual_regularization_weight']:.5f}, "
+            f"weighted "
+            f"{train_stats['weighted_residual_regularization_loss']:.6f})"
         )
         if val_stats is not None:
             print(
