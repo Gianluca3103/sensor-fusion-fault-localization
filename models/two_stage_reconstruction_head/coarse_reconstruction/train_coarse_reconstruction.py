@@ -182,6 +182,10 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "context_crop_boxes",
         "context_crop_heights",
         "context_crop_widths",
+        "context_padded_heights",
+        "context_padded_widths",
+        "context_bucket_padded_shapes",
+        "context_bucket_count",
         "context_deepest_heights",
         "context_deepest_widths",
     ):

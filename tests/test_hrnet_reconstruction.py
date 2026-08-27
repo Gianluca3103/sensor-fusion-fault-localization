@@ -305,6 +305,39 @@ class HRNetIntegrationTests(unittest.TestCase):
         outputs["coarse_lidar_bev"].square().mean().backward()
         self.assertIsNotNone(model.replacement_head.head.weight.grad)
 
+    def test_contextual_hrnet_groups_samples_by_individual_padded_shape(self):
+        model = CoarseReconstructionModel(
+            self._direct_config(minimum_context_crop_size=80)
+        ).train()
+        faulty = torch.rand(2, 3, 320, 320)
+        radar = torch.rand(2, 4, 320, 320)
+        repair = torch.zeros(2, 1, 320, 320)
+        repair[0, :, 10:14, 10:14] = 1
+        repair[1, :, 100:191, 120:217] = 1
+        halo = torch.zeros_like(repair)
+        with patch.object(
+            model.hrnet_backbone,
+            "forward",
+            wraps=model.hrnet_backbone.forward,
+        ) as forward:
+            outputs = model(faulty, radar, repair, halo, halo)
+        called_shapes = sorted(
+            tuple(call.args[0].shape[-2:]) for call in forward.call_args_list
+        )
+        self.assertEqual(called_shapes, [(80, 80), (96, 104)])
+        self.assertEqual(
+            outputs["context_bucket_padded_shapes"].tolist(),
+            [[80, 80], [96, 104]],
+        )
+        self.assertEqual(int(outputs["context_bucket_count"]), 2)
+        outside = 1 - repair
+        self.assertTrue(torch.equal(
+            outputs["coarse_lidar_bev"] * outside,
+            faulty * outside,
+        ))
+        outputs["coarse_lidar_bev"].square().mean().backward()
+        self.assertIsNotNone(model.replacement_head.head.weight.grad)
+
 
 if __name__ == "__main__":
     unittest.main()

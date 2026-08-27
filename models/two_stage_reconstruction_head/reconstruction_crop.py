@@ -20,6 +20,8 @@ class ReconstructionCropBatch:
     active_samples: torch.Tensor
     crop_heights: torch.Tensor
     crop_widths: torch.Tensor
+    padded_heights: torch.Tensor
+    padded_widths: torch.Tensor
     full_height: int
     full_width: int
 
@@ -130,8 +132,16 @@ class ReconstructionCropExtractor:
         )
         crop_heights = [bottom - top for top, bottom, _left, _right in boxes]
         crop_widths = [right - left for _top, _bottom, left, right in boxes]
-        padded_height = math.ceil(max(crop_heights) / self.pad_multiple) * self.pad_multiple
-        padded_width = math.ceil(max(crop_widths) / self.pad_multiple) * self.pad_multiple
+        padded_heights = [
+            math.ceil(value / self.pad_multiple) * self.pad_multiple
+            for value in crop_heights
+        ]
+        padded_widths = [
+            math.ceil(value / self.pad_multiple) * self.pad_multiple
+            for value in crop_widths
+        ]
+        padded_height = max(padded_heights)
+        padded_width = max(padded_widths)
         cropped: dict[str, torch.Tensor] = {}
         for name, tensor in tensors.items():
             output = tensor.new_zeros(
@@ -155,6 +165,8 @@ class ReconstructionCropExtractor:
             active_samples=active,
             crop_heights=torch.tensor(crop_heights, device=reconstruction_mask.device),
             crop_widths=torch.tensor(crop_widths, device=reconstruction_mask.device),
+            padded_heights=torch.tensor(padded_heights, device=reconstruction_mask.device),
+            padded_widths=torch.tensor(padded_widths, device=reconstruction_mask.device),
             full_height=height,
             full_width=width,
         )

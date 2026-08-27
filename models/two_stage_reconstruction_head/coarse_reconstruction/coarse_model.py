@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .coarse_config import CoarseReconstructionConfig
 from .hrnet_backbone import HRNetBackbone
@@ -114,6 +115,71 @@ class CoarseReconstructionModel(nn.Module):
             if self.config.minimum_context_crop_size > 0
             else None
         )
+
+    @staticmethod
+    def _pad_spatial(
+        tensor: torch.Tensor,
+        target_height: int,
+        target_width: int,
+    ) -> torch.Tensor:
+        height, width = tensor.shape[-2:]
+        return F.pad(tensor, (0, target_width - width, 0, target_height - height))
+
+    def _run_context_buckets(
+        self,
+        local_input: torch.Tensor,
+        crops,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Run HRNet on exact per-sample padded shapes, grouped when equal."""
+
+        shape_pairs = list(
+            zip(crops.padded_heights.tolist(), crops.padded_widths.tolist())
+        )
+        buckets: dict[tuple[int, int], list[int]] = {}
+        for index, shape in enumerate(shape_pairs):
+            buckets.setdefault(shape, []).append(index)
+
+        sample_features: list[torch.Tensor | None] = [None] * local_input.shape[0]
+        sample_replacements: list[torch.Tensor | None] = [None] * local_input.shape[0]
+        sample_debug: dict[str, list[torch.Tensor | None]] = {}
+        for (height, width), sample_indices in buckets.items():
+            indices = torch.tensor(
+                sample_indices, device=local_input.device, dtype=torch.long
+            )
+            bucket_input = local_input.index_select(0, indices)[..., :height, :width]
+            bucket_features, bucket_debug = self.hrnet_backbone(bucket_input)
+            bucket_replacement = self.replacement_head(bucket_features)
+            for bucket_index, sample_index in enumerate(sample_indices):
+                sample_features[sample_index] = bucket_features[bucket_index : bucket_index + 1]
+                sample_replacements[sample_index] = bucket_replacement[
+                    bucket_index : bucket_index + 1
+                ]
+                for name, value in bucket_debug.items():
+                    sample_debug.setdefault(
+                        name, [None] * local_input.shape[0]
+                    )[sample_index] = value[bucket_index : bucket_index + 1]
+
+        def combine(values: list[torch.Tensor | None]) -> torch.Tensor:
+            present = [value for value in values if value is not None]
+            if len(present) != len(values):
+                raise RuntimeError("Context bucket output is incomplete")
+            target_height = max(value.shape[-2] for value in present)
+            target_width = max(value.shape[-1] for value in present)
+            return torch.cat(
+                [self._pad_spatial(value, target_height, target_width) for value in present],
+                dim=0,
+            )
+
+        features = combine(sample_features)
+        replacements = combine(sample_replacements)
+        debug = {name: combine(values) for name, values in sample_debug.items()}
+        bucket_shapes = crops.padded_heights.new_tensor(shape_pairs)
+        return features, replacements, debug, bucket_shapes
 
     def _select_lidar_fields(
         self, point_clouds: Sequence[torch.Tensor]
@@ -297,8 +363,17 @@ class CoarseReconstructionModel(nn.Module):
             input_streams.append(raw_radar_context)
         input_streams.extend(mask_channels)
         local_input = torch.cat(input_streams, dim=1)
-        hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
-        replacement_crop = self.replacement_head(hrnet_features)
+        if crops is not None:
+            (
+                hrnet_features,
+                replacement_crop,
+                hrnet_debug,
+                context_bucket_shapes,
+            ) = self._run_context_buckets(local_input, crops)
+        else:
+            hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
+            replacement_crop = self.replacement_head(hrnet_features)
+            context_bucket_shapes = None
         replacement_raw = (
             crops.paste(replacement_crop) if crops is not None else replacement_crop
         )
@@ -356,6 +431,19 @@ class CoarseReconstructionModel(nn.Module):
                     "context_valid_mask": crops.valid_mask,
                     "context_crop_heights": crops.crop_heights,
                     "context_crop_widths": crops.crop_widths,
+                    "context_padded_heights": crops.padded_heights,
+                    "context_padded_widths": crops.padded_widths,
+                    "context_bucket_padded_shapes": context_bucket_shapes,
+                    "context_bucket_count": crops.padded_heights.new_tensor(
+                        len(
+                            set(
+                                zip(
+                                    crops.padded_heights.tolist(),
+                                    crops.padded_widths.tolist(),
+                                )
+                            )
+                        )
+                    ),
                     "context_deepest_heights": torch.div(
                         crops.crop_heights + 7, 8, rounding_mode="floor"
                     ),
