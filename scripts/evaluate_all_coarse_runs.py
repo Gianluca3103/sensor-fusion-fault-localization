@@ -1,4 +1,4 @@
-"""Evaluate every saved coarse-reconstruction run on one held-out test split."""
+"""Evaluate every saved coarse-reconstruction run on one common dataset split."""
 
 from __future__ import annotations
 
@@ -27,6 +27,12 @@ def _parse_args() -> argparse.Namespace:
         help="Fallback test dataset when a run's saved data root is unavailable.",
     )
     parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "test"),
+        default="test",
+        help="Common dataset split used for every model (default: test).",
+    )
     parser.add_argument("--radar3-root", type=Path)
     parser.add_argument("--radar5-root", type=Path)
     parser.add_argument("--radar10-root", type=Path)
@@ -41,6 +47,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--pattern", default="coarse_*")
+    parser.add_argument(
+        "--checkpoint-name",
+        choices=("auto", "best_model.pt", "best_tolerant_iou.pt"),
+        default="auto",
+        help=(
+            "Checkpoint selected in every run. 'auto' preserves the previous "
+            "best-tolerant-first behavior."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -76,11 +91,14 @@ def _run_stack(run: Path, resolved: dict[str, Any]) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _has_test_files(root: Path | None) -> bool:
+def _has_split_files(root: Path | None, split: str) -> bool:
     if root is None:
         return False
-    split = root / "test"
-    return split.is_dir() and next(split.rglob("*.npz"), None) is not None
+    split_root = root / split
+    return (
+        split_root.is_dir()
+        and next(split_root.rglob("*.npz"), None) is not None
+    )
 
 
 def _choose_radar_root(
@@ -89,6 +107,7 @@ def _choose_radar_root(
     args: argparse.Namespace,
 ) -> tuple[Path | None, str]:
     stack = _run_stack(run, resolved)
+    split = getattr(args, "split", "test")
 
     saved = resolved.get("args", {}).get("radar_root")
     saved_root = Path(saved) if saved else None
@@ -112,7 +131,7 @@ def _choose_radar_root(
         if candidate in seen:
             continue
         seen.add(candidate)
-        if _has_test_files(candidate):
+        if _has_split_files(candidate, split):
             return candidate, f"radar{stack or '?'}"
     requirement = f"radar stack={stack or 'unknown'}"
     return None, requirement
@@ -122,6 +141,7 @@ def _choose_data_root(
     resolved: dict[str, Any],
     args: argparse.Namespace,
 ) -> Path | None:
+    split = getattr(args, "split", "test")
     saved = resolved.get("args", {}).get("data_root")
     candidates = [
         Path(saved) if saved else None,
@@ -135,12 +155,14 @@ def _choose_data_root(
         if candidate in seen:
             continue
         seen.add(candidate)
-        if _has_test_files(candidate):
+        if _has_split_files(candidate, split):
             return candidate
     return None
 
 
-def _checkpoint_path(run: Path) -> Path:
+def _checkpoint_path(run: Path, checkpoint_name: str) -> Path:
+    if checkpoint_name != "auto":
+        return run / checkpoint_name
     tolerant = run / "best_tolerant_iou.pt"
     return tolerant if tolerant.is_file() else run / "best_model.pt"
 
@@ -274,9 +296,9 @@ def main() -> None:
         raise FileNotFoundError(
             f"Selector configuration is missing: {args.selector_config}"
         )
-    if not _has_test_files(args.data_root):
+    if not _has_split_files(args.data_root, args.split):
         raise FileNotFoundError(
-            f"Test split is missing or empty: {args.data_root / 'test'}"
+            f"Dataset split is missing or empty: {args.data_root / args.split}"
         )
     runs = _discover_runs(args.runs_root, args.pattern)
     if not runs:
@@ -292,13 +314,23 @@ def main() -> None:
         resolved = _read_json(resolved_path)
         radar_root, radar_description = _choose_radar_root(run, resolved, args)
         data_root = _choose_data_root(resolved, args)
-        checkpoint = _checkpoint_path(run)
+        checkpoint = _checkpoint_path(run, args.checkpoint_name)
         row = _run_metadata(run, resolved, radar_root, data_root, checkpoint)
         selector_config = args.selector_config or resolved_path
         row["selector_config"] = str(selector_config)
         destination = args.output_root / run.name
         summary_path = destination / "summary.json"
         print(f"\n[{index}/{len(runs)}] {run.name}", flush=True)
+
+        if not checkpoint.is_file():
+            row.update(
+                status="skipped",
+                error=f"Requested checkpoint is missing: {checkpoint.name}",
+            )
+            print(f"  SKIP: {row['error']}", flush=True)
+            rows.append(row)
+            _write_comparison(args.output_root, rows)
+            continue
 
         if radar_root is None:
             row.update(
@@ -332,7 +364,7 @@ def main() -> None:
             "--config",
             str(selector_config),
             "--split",
-            "test",
+            args.split,
             "--device",
             args.device,
             "--batch-size",
@@ -402,22 +434,24 @@ def main() -> None:
             exact_precision=overall.get("micro/coarse_precision", 0.0),
             exact_recall=overall.get("micro/coarse_recall", 0.0),
             tolerant_iou_0_5m=overall.get(
-                "macro/coarse_occupancy_tolerant_0_5m_iou", 0.0
+                "micro/coarse_occupancy_tolerant_0_5m_iou", 0.0
             ),
             faulty_tolerant_iou_0_5m=overall.get(
-                "macro/faulty_occupancy_tolerant_0_5m_iou", 0.0
+                "micro/faulty_occupancy_tolerant_0_5m_iou", 0.0
             ),
             tolerant_iou_0_5m_improvement=overall.get(
-                "macro/tolerant_0_5m_iou_improvement", 0.0
+                "micro/coarse_occupancy_tolerant_0_5m_iou", 0.0
+            ) - overall.get(
+                "micro/faulty_occupancy_tolerant_0_5m_iou", 0.0
             ),
             tolerant_f1_0_5m=overall.get(
-                "macro/coarse_occupancy_tolerant_0_5m_f1", 0.0
+                "micro/coarse_occupancy_tolerant_0_5m_f1", 0.0
             ),
             tolerant_precision_0_5m=overall.get(
-                "macro/coarse_occupancy_tolerant_0_5m_precision", 0.0
+                "micro/coarse_occupancy_tolerant_0_5m_precision", 0.0
             ),
             tolerant_recall_0_5m=overall.get(
-                "macro/coarse_occupancy_tolerant_0_5m_recall", 0.0
+                "micro/coarse_occupancy_tolerant_0_5m_recall", 0.0
             ),
         )
         rows.append(row)

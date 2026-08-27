@@ -29,6 +29,11 @@ from models.two_stage_reconstruction_head import (
     coarse_reconstruction_range_metrics,
     load_config,
 )
+from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss import (
+    BEV_RESOLUTION_M,
+    OCCUPANCY_TOLERANCE_M,
+    _dilate_with_metric_disk,
+)
 
 
 def _load_selector_config(path: Path) -> FaultSelectorConfig:
@@ -113,6 +118,36 @@ def _occupancy_counts(
     }
 
 
+def _tolerant_occupancy_counts(
+    probability: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, int]:
+    valid = mask > 0
+    predicted = (probability >= 0.5) & valid
+    occupied = (target >= 0.5) & valid
+    target_neighborhood = _dilate_with_metric_disk(
+        occupied,
+        OCCUPANCY_TOLERANCE_M,
+        BEV_RESOLUTION_M,
+    )
+    prediction_neighborhood = _dilate_with_metric_disk(
+        predicted,
+        OCCUPANCY_TOLERANCE_M,
+        BEV_RESOLUTION_M,
+    )
+    return {
+        "tolerant_matched_predictions": int(
+            (predicted & target_neighborhood).sum()
+        ),
+        "tolerant_matched_targets": int(
+            (occupied & prediction_neighborhood).sum()
+        ),
+        "tolerant_prediction_count": int(predicted.sum()),
+        "tolerant_target_count": int(occupied.sum()),
+    }
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
@@ -144,11 +179,21 @@ def summarize_records(records: list[dict]) -> dict:
         "frame_id",
         "target_occupied_cells",
     }
+    count_suffixes = (
+        "_tp",
+        "_fp",
+        "_fn",
+        "_tn",
+        "_tolerant_matched_predictions",
+        "_tolerant_matched_targets",
+        "_tolerant_prediction_count",
+        "_tolerant_target_count",
+    )
     metric_keys = [
         key
         for key, value in records[0].items()
         if key not in ignored
-        and not key.endswith(("_tp", "_fp", "_fn", "_tn"))
+        and not key.endswith(count_suffixes)
         and isinstance(value, (int, float))
     ]
     summary = {
@@ -202,6 +247,46 @@ def summarize_records(records: list[dict]) -> dict:
                 f"micro/{prefix}_recall": recall,
                 f"micro/{prefix}_f1": f1,
                 f"micro/{prefix}_iou": _safe_ratio(tp, tp + fp + fn),
+            }
+        )
+        tolerant_matched_predictions = sum(
+            record.get(f"{prefix}_tolerant_matched_predictions", 0)
+            for record in evaluable_records
+        )
+        tolerant_matched_targets = sum(
+            record.get(f"{prefix}_tolerant_matched_targets", 0)
+            for record in evaluable_records
+        )
+        tolerant_prediction_count = sum(
+            record.get(f"{prefix}_tolerant_prediction_count", 0)
+            for record in evaluable_records
+        )
+        tolerant_target_count = sum(
+            record.get(f"{prefix}_tolerant_target_count", 0)
+            for record in evaluable_records
+        )
+        tolerant_precision = _safe_ratio(
+            tolerant_matched_predictions, tolerant_prediction_count
+        )
+        tolerant_recall = _safe_ratio(
+            tolerant_matched_targets, tolerant_target_count
+        )
+        tolerant_f1 = _safe_ratio(
+            2.0 * tolerant_precision * tolerant_recall,
+            tolerant_precision + tolerant_recall,
+        )
+        summary.update(
+            {
+                f"micro/{prefix}_occupancy_tolerant_0_5m_precision": (
+                    tolerant_precision
+                ),
+                f"micro/{prefix}_occupancy_tolerant_0_5m_recall": (
+                    tolerant_recall
+                ),
+                f"micro/{prefix}_occupancy_tolerant_0_5m_f1": tolerant_f1,
+                f"micro/{prefix}_occupancy_tolerant_0_5m_iou": _safe_ratio(
+                    tolerant_f1, 2.0 - tolerant_f1
+                ),
             }
         )
     summary["micro/iou_improvement"] = (
@@ -578,6 +663,28 @@ def main() -> None:
                 )
                 record.update(
                     {f"faulty_{key}": value for key, value in faulty_counts.items()}
+                )
+                coarse_tolerant_counts = _tolerant_occupancy_counts(
+                    torch.sigmoid(sample_outputs["occupancy_logits"]),
+                    inputs["clean_bev"][index : index + 1, 0:1],
+                    sample_outputs["reconstruction_mask"],
+                )
+                faulty_tolerant_counts = _tolerant_occupancy_counts(
+                    inputs["faulty_bev"][index : index + 1, 0:1],
+                    inputs["clean_bev"][index : index + 1, 0:1],
+                    sample_outputs["reconstruction_mask"],
+                )
+                record.update(
+                    {
+                        f"coarse_{key}": value
+                        for key, value in coarse_tolerant_counts.items()
+                    }
+                )
+                record.update(
+                    {
+                        f"faulty_{key}": value
+                        for key, value in faulty_tolerant_counts.items()
+                    }
                 )
                 record["target_occupied_cells"] = (
                     coarse_counts["tp"] + coarse_counts["fn"]
