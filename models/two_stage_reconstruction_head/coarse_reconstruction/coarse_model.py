@@ -12,6 +12,7 @@ from .hrnet_backbone import HRNetBackbone
 from ..PointPillarV2 import PointPillarsEncoderV2, PointPillarsV2Config
 from ..PointPillarV3 import PointPillarsEncoderV3, PointPillarsV3Config
 from ..pointpillars import BEVGridGeometry, PointPillarsEncoder
+from ..reconstruction_crop import ReconstructionCropExtractor
 from ..reconstruction_inputs import ReconstructionInputs
 
 
@@ -104,6 +105,14 @@ class CoarseReconstructionModel(nn.Module):
         self.replacement_head = CoarseReplacementHead(
             self.hrnet_backbone.out_channels,
             self.config.target_lidar_channels,
+        )
+        self.context_crop_extractor = (
+            ReconstructionCropExtractor(
+                pad_multiple=self.config.context_crop_pad_multiple,
+                minimum_size=self.config.minimum_context_crop_size,
+            )
+            if self.config.minimum_context_crop_size > 0
+            else None
         )
 
     def _select_lidar_fields(
@@ -224,21 +233,64 @@ class CoarseReconstructionModel(nn.Module):
         active_mask = torch.maximum(reconstruction_mask, halo_mask)
         erased_lidar_bev = (1.0 - reconstruction_mask) * lidar_sensor_bev
 
-        if self.config.use_healthy_context_mask:
-            local_context_mask = (
-                healthy_context_mask * (1.0 - reconstruction_mask)
-                if self.config.use_halo_context
-                else torch.zeros_like(healthy_context_mask)
+        crops = None
+        if self.context_crop_extractor is not None:
+            crops = self.context_crop_extractor.extract(
+                {
+                    "lidar": lidar_sensor_bev,
+                    "radar": radar_sensor_bev,
+                    "raw_radar": (
+                        radar_bev if radar_enabled else torch.zeros_like(radar_bev)
+                    ),
+                    "repair": reconstruction_mask,
+                    "healthy": healthy_context_mask,
+                    "halo": halo_mask,
+                },
+                reconstruction_mask,
+                halo_mask,
             )
-            mask_channels = (reconstruction_mask, local_context_mask)
+            lidar_input = crops.tensors["lidar"]
+            radar_input = crops.tensors["radar"]
+            raw_radar_input = crops.tensors["raw_radar"]
+            repair_input = crops.tensors["repair"]
+            healthy_input = crops.tensors["healthy"]
+            halo_input = crops.tensors["halo"]
+            real_context = crops.valid_mask * (1.0 - repair_input)
         else:
-            local_context_mask = 1.0 - reconstruction_mask
-            mask_channels = (reconstruction_mask,)
+            lidar_input = lidar_sensor_bev
+            radar_input = radar_sensor_bev
+            raw_radar_input = (
+                radar_bev if radar_enabled else torch.zeros_like(radar_bev)
+            )
+            repair_input = reconstruction_mask
+            healthy_input = healthy_context_mask
+            halo_input = halo_mask
+            real_context = 1.0 - repair_input
 
-        local_lidar_context = local_context_mask * lidar_sensor_bev
-        local_radar_context = active_mask * radar_sensor_bev
-        raw_radar_context = active_mask * (
-            radar_bev if radar_enabled else torch.zeros_like(radar_bev)
+        if self.config.use_healthy_context_mask:
+            if crops is not None:
+                # The explicit context channel describes every real, observable
+                # cell added around repair+halo; repair itself stays erased.
+                local_context_mask = real_context
+            else:
+                local_context_mask = (
+                    healthy_input * (1.0 - repair_input)
+                    if self.config.use_halo_context
+                    else torch.zeros_like(healthy_input)
+                )
+            mask_channels = (repair_input, local_context_mask)
+        else:
+            local_context_mask = real_context
+            mask_channels = (repair_input,)
+
+        local_lidar_context = real_context * lidar_input
+        local_radar_context = (
+            crops.valid_mask * radar_input if crops is not None else active_mask * radar_input
+        )
+        raw_radar_context = (
+            crops.valid_mask * raw_radar_input
+            if crops is not None
+            else active_mask * raw_radar_input
         )
         input_streams = [local_lidar_context, local_radar_context]
         if self.config.include_raw_radar_bev:
@@ -246,7 +298,10 @@ class CoarseReconstructionModel(nn.Module):
         input_streams.extend(mask_channels)
         local_input = torch.cat(input_streams, dim=1)
         hrnet_features, hrnet_debug = self.hrnet_backbone(local_input)
-        replacement_raw = self.replacement_head(hrnet_features)
+        replacement_crop = self.replacement_head(hrnet_features)
+        replacement_raw = (
+            crops.paste(replacement_crop) if crops is not None else replacement_crop
+        )
         occupancy_logits = replacement_raw[:, 0:1]
         predicted_density = replacement_raw[:, 1:2]
         predicted_height = replacement_raw[:, 2:3]
@@ -285,11 +340,32 @@ class CoarseReconstructionModel(nn.Module):
             "local_radar_context": local_radar_context,
             "local_raw_radar_context": raw_radar_context,
             "local_input": local_input,
-            "hrnet_features": hrnet_features,
+            "hrnet_features": (
+                crops.paste(hrnet_features) if crops is not None else hrnet_features
+            ),
             "lidar_pillar_bev": lidar_sensor_bev,
             "radar_pillar_bev": radar_sensor_bev,
             "lidar_pillar_statistics": lidar_pillar_statistics,
             "radar_pillar_statistics": radar_pillar_statistics,
         }
+        if crops is not None:
+            outputs.update(
+                {
+                    "context_crop_boxes": crops.boxes,
+                    "context_source_boxes": crops.source_boxes,
+                    "context_valid_mask": crops.valid_mask,
+                    "context_crop_heights": crops.crop_heights,
+                    "context_crop_widths": crops.crop_widths,
+                    "context_deepest_heights": torch.div(
+                        crops.crop_heights + 7, 8, rounding_mode="floor"
+                    ),
+                    "context_deepest_widths": torch.div(
+                        crops.crop_widths + 7, 8, rounding_mode="floor"
+                    ),
+                    "replacement_crop_raw": replacement_crop,
+                    "crop_reconstruction_mask": repair_input,
+                    "crop_halo_mask": halo_input,
+                }
+            )
         outputs.update(hrnet_debug)
         return outputs

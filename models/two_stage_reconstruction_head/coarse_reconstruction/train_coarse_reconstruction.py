@@ -148,6 +148,9 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
         "healthy_context_mask",
         "halo_mask",
         "local_input",
+        "context_valid_mask",
+        "crop_reconstruction_mask",
+        "crop_halo_mask",
         "lidar_pillar_bev",
         "radar_pillar_bev",
         "hrnet_stage_1_branch_0",
@@ -174,6 +177,16 @@ def _shape_log(inputs: dict, outputs: dict) -> dict:
     result.update(
         {key: list(outputs[key].shape) for key in names if key in outputs}
     )
+    for key in (
+        "context_source_boxes",
+        "context_crop_boxes",
+        "context_crop_heights",
+        "context_crop_widths",
+        "context_deepest_heights",
+        "context_deepest_widths",
+    ):
+        if key in outputs:
+            result[key] = outputs[key].detach().cpu().tolist()
     for sensor in ("lidar", "radar"):
         statistics = outputs.get(f"{sensor}_pillar_statistics")
         if statistics:

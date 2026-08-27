@@ -33,6 +33,8 @@ class CoarseReconstructionConfig:
     use_healthy_context_mask: bool = True
     use_halo_context: bool = True
     include_raw_radar_bev: bool = False
+    minimum_context_crop_size: int = 0
+    context_crop_pad_multiple: int = 8
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
     pointpillars_v2: PointPillarsV2Config = field(
         default_factory=PointPillarsV2Config
@@ -85,6 +87,10 @@ class CoarseReconstructionConfig:
             raise ValueError("use_halo_context must be boolean")
         if not isinstance(self.include_raw_radar_bev, bool):
             raise ValueError("include_raw_radar_bev must be boolean")
+        if self.minimum_context_crop_size < 0:
+            raise ValueError("minimum_context_crop_size must be non-negative")
+        if self.context_crop_pad_multiple < 1:
+            raise ValueError("context_crop_pad_multiple must be positive")
         self.pointpillars.validate()
         self.pointpillars_v2.validate()
         self.pointpillars_v3.validate()
@@ -242,6 +248,10 @@ def build_configs(payload: dict):
         use_healthy_context_mask=mask_payload.get("use_healthy_context_mask", True),
         use_halo_context=mask_payload.get("use_halo_context", True),
         include_raw_radar_bev=coarse.get("include_raw_radar_bev", False),
+        minimum_context_crop_size=coarse.get(
+            "minimum_context_crop_size", 0
+        ),
+        context_crop_pad_multiple=coarse.get("context_crop_pad_multiple", 8),
         pointpillars=pointpillars,
         pointpillars_v2=pointpillars_v2,
         pointpillars_v3=pointpillars_v3,

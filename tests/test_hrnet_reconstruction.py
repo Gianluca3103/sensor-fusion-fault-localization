@@ -13,6 +13,9 @@ from models.two_stage_reconstruction_head import (
     build_configs,
     coarse_reconstruction_range_metrics,
 )
+from models.two_stage_reconstruction_head.reconstruction_crop import (
+    ReconstructionCropExtractor,
+)
 
 
 def _backbone(base_channels=2):
@@ -104,7 +107,7 @@ class HRNetBackboneTests(unittest.TestCase):
 
 
 class HRNetIntegrationTests(unittest.TestCase):
-    def _direct_config(self, *, halo=True):
+    def _direct_config(self, *, halo=True, minimum_context_crop_size=0):
         config, _loss, _selector = build_configs(
             {
                 "hrnet": {
@@ -117,7 +120,10 @@ class HRNetIntegrationTests(unittest.TestCase):
                     "use_healthy_context_mask": True,
                     "use_halo_context": halo,
                 },
-                "coarse_reconstruction": {},
+                "coarse_reconstruction": {
+                    "minimum_context_crop_size": minimum_context_crop_size,
+                    "context_crop_pad_multiple": 8,
+                },
             }
         )
         return config
@@ -208,6 +214,96 @@ class HRNetIntegrationTests(unittest.TestCase):
         )
         for name in ("0_15m", "15_30m", "30_45m", "45_60m", "over_60m"):
             self.assertIn(f"range_{name}/occupancy_iou", metrics)
+
+    def test_tiny_interior_region_expands_to_80_without_changing_masks(self):
+        extractor = ReconstructionCropExtractor(pad_multiple=8, minimum_size=80)
+        repair = torch.zeros(1, 1, 320, 320)
+        halo = torch.zeros_like(repair)
+        repair[:, :, 150:154, 160:166] = 1
+        halo[:, :, 146:158, 156:170] = 1
+        original_repair = repair.clone()
+        original_halo = halo.clone()
+        crops = extractor.extract({"repair": repair, "halo": halo}, repair, halo)
+        self.assertEqual(crops.crop_heights.tolist(), [80])
+        self.assertEqual(crops.crop_widths.tolist(), [80])
+        self.assertEqual(tuple(crops.valid_mask.shape[-2:]), (80, 80))
+        self.assertTrue(torch.equal(repair, original_repair))
+        self.assertTrue(torch.equal(halo, original_halo))
+
+    def test_edge_regions_shift_inward_and_preserve_minimum(self):
+        extractor = ReconstructionCropExtractor(pad_multiple=8, minimum_size=80)
+        for row_slice, column_slice, expected in (
+            (slice(0, 4), slice(0, 5), (0, 80, 0, 80)),
+            (slice(316, 320), slice(315, 320), (240, 320, 240, 320)),
+        ):
+            repair = torch.zeros(1, 1, 320, 320)
+            repair[:, :, row_slice, column_slice] = 1
+            crops = extractor.extract({"repair": repair}, repair, torch.zeros_like(repair))
+            self.assertEqual(tuple(crops.boxes[0].tolist()), expected)
+            self.assertEqual(crops.crop_heights.tolist(), [80])
+            self.assertEqual(crops.crop_widths.tolist(), [80])
+
+    def test_technical_padding_is_invalid_and_stride_eight_compatible(self):
+        extractor = ReconstructionCropExtractor(pad_multiple=8, minimum_size=81)
+        repair = torch.zeros(1, 1, 320, 320)
+        repair[:, :, 100:105, 100:105] = 1
+        crops = extractor.extract({"repair": repair}, repair, torch.zeros_like(repair))
+        self.assertEqual(tuple(crops.valid_mask.shape[-2:]), (88, 88))
+        self.assertEqual(int(crops.valid_mask.sum()), 81 * 81)
+        self.assertEqual(int(crops.valid_mask[:, :, 81:, :].sum()), 0)
+        self.assertEqual(int(crops.valid_mask[:, :, :, 81:].sum()), 0)
+
+    def test_modalities_share_identical_crop_coordinates(self):
+        extractor = ReconstructionCropExtractor(pad_multiple=8, minimum_size=80)
+        coordinates = torch.arange(320 * 320).reshape(1, 1, 320, 320).float()
+        repair = torch.zeros(1, 1, 320, 320)
+        repair[:, :, 20:30, 40:50] = 1
+        crops = extractor.extract(
+            {"lidar": coordinates, "radar": coordinates + 7},
+            repair,
+            torch.zeros_like(repair),
+        )
+        valid = crops.valid_mask.bool()
+        self.assertTrue(torch.equal(
+            crops.tensors["radar"][valid] - crops.tensors["lidar"][valid],
+            torch.full_like(crops.tensors["lidar"][valid], 7),
+        ))
+
+    def test_batch_uses_shared_technical_shape_with_per_sample_validity(self):
+        extractor = ReconstructionCropExtractor(pad_multiple=8, minimum_size=80)
+        repair = torch.zeros(2, 1, 320, 320)
+        repair[0, :, 10:14, 10:14] = 1
+        repair[1, :, 100:191, 120:217] = 1
+        crops = extractor.extract(
+            {"repair": repair}, repair, torch.zeros_like(repair)
+        )
+        self.assertEqual(crops.crop_heights.tolist(), [80, 91])
+        self.assertEqual(crops.crop_widths.tolist(), [80, 97])
+        self.assertEqual(tuple(crops.valid_mask.shape), (2, 1, 96, 104))
+        self.assertEqual(int(crops.valid_mask[0].sum()), 80 * 80)
+        self.assertEqual(int(crops.valid_mask[1].sum()), 91 * 97)
+
+    def test_contextual_coarse_forward_has_stride8_deepest_and_outside_invariant(self):
+        model = CoarseReconstructionModel(
+            self._direct_config(minimum_context_crop_size=80)
+        ).train()
+        faulty = torch.rand(1, 3, 320, 320)
+        radar = torch.rand(1, 4, 320, 320)
+        repair = torch.zeros(1, 1, 320, 320)
+        repair[:, :, 150:154, 150:154] = 1
+        halo = torch.zeros_like(repair)
+        halo[:, :, 145:160, 145:160] = 1
+        halo *= 1 - repair
+        outputs = model(faulty, radar, repair, halo, halo)
+        self.assertEqual(tuple(outputs["local_input"].shape[-2:]), (80, 80))
+        self.assertEqual(
+            tuple(outputs["hrnet_stage_4_branch_3"].shape[-2:]), (10, 10)
+        )
+        self.assertTrue(torch.equal(
+            outputs["coarse_lidar_bev"] * (1 - repair), faulty * (1 - repair)
+        ))
+        outputs["coarse_lidar_bev"].square().mean().backward()
+        self.assertIsNotNone(model.replacement_head.head.weight.grad)
 
 
 if __name__ == "__main__":
