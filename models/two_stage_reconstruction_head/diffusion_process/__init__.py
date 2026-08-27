@@ -7,6 +7,7 @@ from .local_diffusion import (
     ReconstructionCropExtractor,
 )
 from .diffusion_process import ResidualChannelNormalization
+from .basic_diffusion_unet import BasicDiffusionUNet
 from .residual_statistics import (
     ResidualStatisticsAccumulator,
     estimate_training_residual_statistics,

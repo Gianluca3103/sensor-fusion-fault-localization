@@ -48,13 +48,26 @@ class ReconstructionCropBatch:
 class ReconstructionCropExtractor:
     """Crop repair/halo, optionally add real context, then technical padding."""
 
-    def __init__(self, pad_multiple: int = 8, minimum_size: int = 1):
+    def __init__(
+        self,
+        pad_multiple: int = 8,
+        minimum_size: int = 1,
+        *,
+        minimum_height: int | None = None,
+        minimum_width: int | None = None,
+    ):
         if pad_multiple < 1:
             raise ValueError("pad_multiple must be positive")
         if minimum_size < 1:
             raise ValueError("minimum_size must be positive")
+        resolved_height = minimum_size if minimum_height is None else minimum_height
+        resolved_width = minimum_size if minimum_width is None else minimum_width
+        if resolved_height < 1 or resolved_width < 1:
+            raise ValueError("minimum crop dimensions must be positive")
         self.pad_multiple = int(pad_multiple)
         self.minimum_size = int(minimum_size)
+        self.minimum_height = int(resolved_height)
+        self.minimum_width = int(resolved_width)
 
     @staticmethod
     def _extent(mask: torch.Tensor) -> tuple[int, int, int, int] | None:
@@ -93,8 +106,12 @@ class ReconstructionCropExtractor:
             return (0, 1, 0, 1), (0, 1, 0, 1), False
         top, bottom, left, right = crop_extent
         height, width = repair.shape[-2:]
-        top, bottom = self._expand_axis(top, bottom, self.minimum_size, height)
-        left, right = self._expand_axis(left, right, self.minimum_size, width)
+        top, bottom = self._expand_axis(
+            top, bottom, self.minimum_height, height
+        )
+        left, right = self._expand_axis(
+            left, right, self.minimum_width, width
+        )
         return (top, bottom, left, right), crop_extent, True
 
     def _box(

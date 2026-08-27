@@ -19,31 +19,12 @@ from .diffusion_process import (
     ResidualChannelNormalization,
     residual_target,
 )
+from .basic_diffusion_unet import BasicDiffusionUNet, SinusoidalTimeEmbedding
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_ARCHITECTURE_VERSION = 11
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """Standard sinusoidal timestep embedding used by the fine refiner."""
-
-    def __init__(self, dimension: int):
-        super().__init__()
-        self.dimension = int(dimension)
-
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        half = self.dimension // 2
-        frequencies = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(half, device=timestep.device, dtype=torch.float32)
-            / max(half - 1, 1)
-        )
-        angles = timestep.float()[:, None] * frequencies[None]
-        embedding = torch.cat((angles.sin(), angles.cos()), dim=1)
-        if embedding.shape[1] < self.dimension:
-            embedding = F.pad(embedding, (0, self.dimension - embedding.shape[1]))
-        return embedding
+FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 11
+FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -52,6 +33,7 @@ class FineDiffusionConfig:
 
     enabled: bool = True
     bypass_coarse_reconstruction: bool = False
+    fine_backbone: str = "transformer"
     lidar_channels: int = 3
     radar_channels: int = 4
     use_pointpillars_conditioning: bool = False
@@ -85,10 +67,18 @@ class FineDiffusionConfig:
     dropout: float = 0.0
     denominator_epsilon: float = 1.0e-8
     minimum_residual_std: float = 1.0e-4
+    fine_unet_base_channels: int = 64
+    fine_unet_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8)
+    fine_unet_num_downsamples: int = 3
+    fine_unet_resblocks_per_level: int = 2
+    fine_min_context_height: int = 1
+    fine_min_context_width: int = 1
 
     def validate(self) -> None:
         if not self.enabled:
             raise ValueError("Fine diffusion must be enabled")
+        if self.fine_backbone not in ("transformer", "unet"):
+            raise ValueError("fine_backbone must be transformer or unet")
         for name in (
             "lidar_channels",
             "radar_channels",
@@ -118,6 +108,32 @@ class FineDiffusionConfig:
             raise ValueError(
                 "PointPillars-conditioned fine diffusion cannot bypass the "
                 "frozen coarse model that supplies its encoders"
+            )
+        if self.fine_backbone == "unet" and self.use_pointpillars_conditioning:
+            raise ValueError(
+                "Basic Diffusion U-Net uses raw aligned radar and does not accept "
+                "PointPillars conditioning"
+            )
+        if self.fine_unet_base_channels < 1:
+            raise ValueError("fine_unet_base_channels must be positive")
+        if self.fine_unet_num_downsamples != 3:
+            raise ValueError("Basic Diffusion U-Net requires exactly 3 downsamples")
+        if len(self.fine_unet_channel_multipliers) != 4 or any(
+            multiplier < 1 for multiplier in self.fine_unet_channel_multipliers
+        ):
+            raise ValueError(
+                "fine_unet_channel_multipliers must contain 4 positive values"
+            )
+        if self.fine_unet_resblocks_per_level < 1:
+            raise ValueError("fine_unet_resblocks_per_level must be positive")
+        if self.fine_min_context_height < 1 or self.fine_min_context_width < 1:
+            raise ValueError("Fine minimum context dimensions must be positive")
+        if self.fine_backbone == "unet" and (
+            self.fine_min_context_height < 80
+            or self.fine_min_context_width < 80
+        ):
+            raise ValueError(
+                "Basic Diffusion U-Net requires at least 80x80 local context"
             )
         if self.diffusion_prediction_type != "residual_flow":
             raise ValueError(
@@ -642,12 +658,40 @@ class LocalResidualDiffusionTransformer(nn.Module):
 
 def fine_diffusion_architecture_metadata(
     config: FineDiffusionConfig,
-) -> dict[str, bool | int | str]:
-    return {
-        "version": FINE_DIFFUSION_ARCHITECTURE_VERSION,
+) -> dict[str, object]:
+    common: dict[str, object] = {
         "process": "coarse_anchored_residual_flow",
         "initial_state": "frozen_coarse_reconstruction",
         "internal_state": "normalized_current_residual",
+        "fine_backbone": config.fine_backbone,
+        "coarse_role": "frozen_reconstruction_baseline_only",
+        "refinement_feedback": "updated_normalized_residual_each_step",
+    }
+    if config.fine_backbone == "unet":
+        return {
+            **common,
+            "version": FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION,
+            "backbone_name": "basic_diffusion_unet",
+            "input_channels": (
+                2 * config.lidar_channels + config.radar_channels + 3
+            ),
+            "channel_hierarchy": [
+                config.fine_unet_base_channels * multiplier
+                for multiplier in config.fine_unet_channel_multipliers
+            ],
+            "num_downsamples": config.fine_unet_num_downsamples,
+            "deepest_stride": 2 ** config.fine_unet_num_downsamples,
+            "resblocks_per_level": config.fine_unet_resblocks_per_level,
+            "minimum_context": [
+                config.fine_min_context_height,
+                config.fine_min_context_width,
+            ],
+            "radar_conditioning": "raw_spatial_concatenation",
+            "pointpillars_conditioning": False,
+        }
+    return {
+        **common,
+        "version": FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION,
         "transformer_spatial_input_mode": config.transformer_spatial_input_mode,
         "transformer_spatial_input": (
             f"{config.transformer_spatial_input_mode}_plus_coordinates_plus_"
@@ -666,7 +710,6 @@ def fine_diffusion_architecture_metadata(
             if config.transformer_spatial_input_mode == "zero_residual"
             else "updated_current_lidar_each_step"
         ),
-        "coarse_role": "frozen_reconstruction_baseline_only",
         "pointpillars_conditioning": config.use_pointpillars_conditioning,
         "lidar_pillar_channels": config.lidar_pillar_channels,
         "radar_pillar_channels": config.radar_pillar_channels,
@@ -686,16 +729,39 @@ def fine_diffusion_architecture_metadata(
 def validate_fine_diffusion_checkpoint_compatibility(
     checkpoint: Mapping, config: FineDiffusionConfig
 ) -> None:
-    expected = config.lidar_channels + 4
     state = checkpoint.get("diffusion_state_dict", {})
     metadata = checkpoint.get("fine_diffusion_architecture")
     architecture_version = (
         metadata.get("version") if isinstance(metadata, Mapping) else None
     )
+    checkpoint_backbone = (
+        metadata.get("fine_backbone", "transformer")
+        if isinstance(metadata, Mapping)
+        else "transformer"
+    )
+    if checkpoint_backbone != config.fine_backbone:
+        raise ValueError(
+            "Fine Diffusion backbone does not match its checkpoint. Start a "
+            "fresh architecture-ablation run."
+        )
+    if config.fine_backbone == "unet":
+        if architecture_version != FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION:
+            raise ValueError("Unsupported Basic Diffusion U-Net checkpoint version")
+        expected = 2 * config.lidar_channels + config.radar_channels + 3
+        weight = state.get("unet.input_projection.weight")
+        actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
+        if actual != expected:
+            raise ValueError(
+                "Basic Diffusion U-Net input mismatch: checkpoint has "
+                f"{actual} channels but this model requires {expected}."
+            )
+        return
+
+    expected = config.lidar_channels + 4
     if architecture_version == 10:
         expected_mode = "current_lidar"
         stem_name = "transformer.current_lidar_stem.weight"
-    elif architecture_version == FINE_DIFFUSION_ARCHITECTURE_VERSION:
+    elif architecture_version == FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION:
         expected_mode = "zero_residual"
         stem_name = "transformer.residual_stem.weight"
     else:
@@ -991,7 +1057,14 @@ class FineDiffusionRefiner(nn.Module):
         super().__init__()
         self.config = config or FineDiffusionConfig()
         self.config.validate()
-        self.crop_extractor = ReconstructionCropExtractor(self.config.window_size)
+        crop_multiple = (
+            8 if self.config.fine_backbone == "unet" else self.config.window_size
+        )
+        self.crop_extractor = ReconstructionCropExtractor(
+            crop_multiple,
+            minimum_height=self.config.fine_min_context_height,
+            minimum_width=self.config.fine_min_context_width,
+        )
         self.normalization = normalization or BEVChannelNormalization(
             means=(0.0,) * self.config.lidar_channels,
             stds=(1.0,) * self.config.lidar_channels,
@@ -1004,7 +1077,21 @@ class FineDiffusionRefiner(nn.Module):
                 source="identity_fallback",
             )
         )
-        self.transformer = LocalResidualDiffusionTransformer(self.config)
+        if self.config.fine_backbone == "transformer":
+            self.transformer = LocalResidualDiffusionTransformer(self.config)
+            self.unet = None
+        else:
+            self.transformer = None
+            self.unet = BasicDiffusionUNet(
+                lidar_channels=self.config.lidar_channels,
+                radar_channels=self.config.radar_channels,
+                base_channels=self.config.fine_unet_base_channels,
+                channel_multipliers=tuple(
+                    self.config.fine_unet_channel_multipliers
+                ),
+                num_downsamples=self.config.fine_unet_num_downsamples,
+                resblocks_per_level=self.config.fine_unet_resblocks_per_level,
+            )
         self.diffusion_loss = MaskedFlowMSELoss(
             self.config.denominator_epsilon
         )
@@ -1182,25 +1269,41 @@ class FineDiffusionRefiner(nn.Module):
         global_embedding: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         values = crops.tensors
-        if self.config.transformer_spatial_input_mode == "current_lidar":
-            spatial_state = values["coarse"] + (
-                self.residual_normalization.denormalize(residual_t)
+        if self.config.fine_backbone == "unet":
+            if self.unet is None:
+                raise RuntimeError("Basic Diffusion U-Net is unavailable")
+            velocity_physical, debug = self.unet(
+                residual_t,
+                self.normalization.normalize(values["coarse"]),
+                values["radar"],
+                values["repair"],
+                values["halo"],
+                crops.valid_mask,
+                timestep,
             )
+            condition = debug["unet_contextual_input"]
         else:
-            spatial_state = residual_t
-        velocity_physical, condition, debug = self.transformer(
-            spatial_state,
-            self.normalization.normalize(values["trusted_faulty"]),
-            values["radar"],
-            values.get("lidar_pillars"),
-            values.get("radar_pillars"),
-            values["repair"],
-            values["halo"],
-            crops.valid_mask,
-            _coordinate_channels(crops),
-            timestep,
-            global_embedding,
-        )
+            if self.transformer is None:
+                raise RuntimeError("Fine Diffusion Transformer is unavailable")
+            if self.config.transformer_spatial_input_mode == "current_lidar":
+                spatial_state = values["coarse"] + (
+                    self.residual_normalization.denormalize(residual_t)
+                )
+            else:
+                spatial_state = residual_t
+            velocity_physical, condition, debug = self.transformer(
+                spatial_state,
+                self.normalization.normalize(values["trusted_faulty"]),
+                values["radar"],
+                values.get("lidar_pillars"),
+                values.get("radar_pillars"),
+                values["repair"],
+                values["halo"],
+                crops.valid_mask,
+                _coordinate_channels(crops),
+                timestep,
+                global_embedding,
+            )
         repair = values["repair"] * crops.valid_mask
         velocity_normalized = self.residual_normalization.normalize(
             velocity_physical
@@ -1208,6 +1311,23 @@ class FineDiffusionRefiner(nn.Module):
         debug["predicted_velocity_physical"] = velocity_physical
         debug["current_residual"] = residual_t
         return velocity_normalized, condition, debug
+
+    def _global_context(
+        self,
+        faulty_lidar_bev: torch.Tensor,
+        reconstruction_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config.fine_backbone == "transformer":
+            if self.transformer is None:
+                raise RuntimeError("Fine Diffusion Transformer is unavailable")
+            return self.transformer.global_context(
+                faulty_lidar_bev, reconstruction_mask
+            )
+        trusted = faulty_lidar_bev * (1.0 - reconstruction_mask)
+        embedding = faulty_lidar_bev.new_zeros(
+            (faulty_lidar_bev.shape[0], self.config.global_context_dim)
+        )
+        return trusted, embedding
 
     @staticmethod
     def _compose_full(
@@ -1260,7 +1380,7 @@ class FineDiffusionRefiner(nn.Module):
         residual_gt_normalized = self.residual_normalization.normalize(
             residual_gt_physical
         ) * repair
-        trusted_global, global_embedding = self.transformer.global_context(
+        trusted_global, global_embedding = self._global_context(
             faulty_lidar_bev, reconstruction_mask
         )
         flow_timesteps = self._sampling_timesteps(
@@ -1533,7 +1653,7 @@ class FineDiffusionRefiner(nn.Module):
             dtype=coarse_lidar_bev.dtype,
         )
         initial_residual = residual_t.detach().clone()
-        _trusted_global, global_embedding = self.transformer.global_context(
+        _trusted_global, global_embedding = self._global_context(
             faulty_lidar_bev, reconstruction_mask
         )
         intermediates = []

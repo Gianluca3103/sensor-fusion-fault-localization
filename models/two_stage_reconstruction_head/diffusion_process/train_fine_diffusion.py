@@ -888,6 +888,25 @@ def main():
         f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"
     )
+    if config.fine_backbone == "unet":
+        hierarchy = [
+            config.fine_unet_base_channels * multiplier
+            for multiplier in config.fine_unet_channel_multipliers
+        ]
+        input_channels = 2 * config.lidar_channels + config.radar_channels + 3
+        print(
+            "Fine backbone: basic diffusion U-Net\n"
+            f"  input channels: {input_channels}\n"
+            f"  channel hierarchy: {hierarchy}\n"
+            f"  downsampling count: {config.fine_unet_num_downsamples}\n"
+            f"  deepest stride: {2 ** config.fine_unet_num_downsamples}\n"
+            f"  ResBlocks per level: {config.fine_unet_resblocks_per_level}\n"
+            "  minimum context crop: "
+            f"{config.fine_min_context_height}x{config.fine_min_context_width}\n"
+            f"  Fine parameter count: {parameters:,}"
+        )
+    else:
+        print("Fine backbone: local residual diffusion Transformer")
     if config.occupancy_loss_mode == "weighted_operation":
         print(
             "Operation weights:\n"
