@@ -107,7 +107,13 @@ class HRNetBackboneTests(unittest.TestCase):
 
 
 class HRNetIntegrationTests(unittest.TestCase):
-    def _direct_config(self, *, halo=True, minimum_context_crop_size=0):
+    def _direct_config(
+        self,
+        *,
+        halo=True,
+        minimum_context_crop_size=0,
+        context_shape_bucket_multiple=8,
+    ):
         config, _loss, _selector = build_configs(
             {
                 "hrnet": {
@@ -123,6 +129,7 @@ class HRNetIntegrationTests(unittest.TestCase):
                 "coarse_reconstruction": {
                     "minimum_context_crop_size": minimum_context_crop_size,
                     "context_crop_pad_multiple": 8,
+                    "context_shape_bucket_multiple": context_shape_bucket_multiple,
                 },
             }
         )
@@ -337,6 +344,33 @@ class HRNetIntegrationTests(unittest.TestCase):
         ))
         outputs["coarse_lidar_bev"].square().mean().backward()
         self.assertIsNotNone(model.replacement_head.head.weight.grad)
+
+    def test_contextual_hrnet_quantizes_nearby_shapes_into_one_bucket(self):
+        model = CoarseReconstructionModel(
+            self._direct_config(
+                minimum_context_crop_size=80,
+                context_shape_bucket_multiple=32,
+            )
+        ).train()
+        faulty = torch.rand(2, 3, 320, 320)
+        radar = torch.rand(2, 4, 320, 320)
+        repair = torch.zeros(2, 1, 320, 320)
+        repair[0, :, 10:14, 10:14] = 1
+        repair[1, :, 100:191, 120:211] = 1
+        halo = torch.zeros_like(repair)
+        with patch.object(
+            model.hrnet_backbone,
+            "forward",
+            wraps=model.hrnet_backbone.forward,
+        ) as forward:
+            outputs = model(faulty, radar, repair, halo, halo)
+        self.assertEqual(len(forward.call_args_list), 1)
+        self.assertEqual(tuple(forward.call_args.args[0].shape), (2, 9, 96, 96))
+        self.assertEqual(
+            outputs["context_bucket_padded_shapes"].tolist(),
+            [[96, 96], [96, 96]],
+        )
+        self.assertEqual(int(outputs["context_bucket_count"]), 1)
 
 
 if __name__ == "__main__":

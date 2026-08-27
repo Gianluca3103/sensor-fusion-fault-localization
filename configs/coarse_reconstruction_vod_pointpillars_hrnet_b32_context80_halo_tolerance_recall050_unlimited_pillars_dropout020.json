@@ -23,6 +23,7 @@
     "enabled": true,
     "minimum_context_crop_size": 80,
     "context_crop_pad_multiple": 8,
+    "context_shape_bucket_multiple": 32,
     "loss": {
       "lambda_occupancy": 1.0,
       "lambda_density": 1.0,

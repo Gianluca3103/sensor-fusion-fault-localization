@@ -135,11 +135,25 @@ class CoarseReconstructionModel(nn.Module):
         dict[str, torch.Tensor],
         torch.Tensor,
     ]:
-        """Run HRNet on exact per-sample padded shapes, grouped when equal."""
+        """Run HRNet in bounded-padding shape buckets for GPU efficiency."""
 
-        shape_pairs = list(
+        exact_shape_pairs = list(
             zip(crops.padded_heights.tolist(), crops.padded_widths.tolist())
         )
+        maximum_height, maximum_width = local_input.shape[-2:]
+        bucket_multiple = self.config.context_shape_bucket_multiple
+
+        def bucket_dimension(value: int, maximum: int) -> int:
+            rounded = ((value + bucket_multiple - 1) // bucket_multiple) * bucket_multiple
+            return min(rounded, maximum)
+
+        shape_pairs = [
+            (
+                bucket_dimension(height, maximum_height),
+                bucket_dimension(width, maximum_width),
+            )
+            for height, width in exact_shape_pairs
+        ]
         buckets: dict[tuple[int, int], list[int]] = {}
         for index, shape in enumerate(shape_pairs):
             buckets.setdefault(shape, []).append(index)
@@ -435,14 +449,7 @@ class CoarseReconstructionModel(nn.Module):
                     "context_padded_widths": crops.padded_widths,
                     "context_bucket_padded_shapes": context_bucket_shapes,
                     "context_bucket_count": crops.padded_heights.new_tensor(
-                        len(
-                            set(
-                                zip(
-                                    crops.padded_heights.tolist(),
-                                    crops.padded_widths.tolist(),
-                                )
-                            )
-                        )
+                        len(set(map(tuple, context_bucket_shapes.tolist())))
                     ),
                     "context_deepest_heights": torch.div(
                         crops.crop_heights + 7, 8, rounding_mode="floor"

@@ -35,6 +35,7 @@ class CoarseReconstructionConfig:
     include_raw_radar_bev: bool = False
     minimum_context_crop_size: int = 0
     context_crop_pad_multiple: int = 8
+    context_shape_bucket_multiple: int = 8
     pointpillars: PointPillarsConfig = field(default_factory=PointPillarsConfig)
     pointpillars_v2: PointPillarsV2Config = field(
         default_factory=PointPillarsV2Config
@@ -91,6 +92,16 @@ class CoarseReconstructionConfig:
             raise ValueError("minimum_context_crop_size must be non-negative")
         if self.context_crop_pad_multiple < 1:
             raise ValueError("context_crop_pad_multiple must be positive")
+        if self.context_shape_bucket_multiple < self.context_crop_pad_multiple:
+            raise ValueError(
+                "context_shape_bucket_multiple must be at least "
+                "context_crop_pad_multiple"
+            )
+        if self.context_shape_bucket_multiple % self.context_crop_pad_multiple:
+            raise ValueError(
+                "context_shape_bucket_multiple must be divisible by "
+                "context_crop_pad_multiple"
+            )
         self.pointpillars.validate()
         self.pointpillars_v2.validate()
         self.pointpillars_v3.validate()
@@ -252,6 +263,9 @@ def build_configs(payload: dict):
             "minimum_context_crop_size", 0
         ),
         context_crop_pad_multiple=coarse.get("context_crop_pad_multiple", 8),
+        context_shape_bucket_multiple=coarse.get(
+            "context_shape_bucket_multiple", 8
+        ),
         pointpillars=pointpillars,
         pointpillars_v2=pointpillars_v2,
         pointpillars_v3=pointpillars_v3,
