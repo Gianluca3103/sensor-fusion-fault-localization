@@ -23,7 +23,8 @@ from .basic_diffusion_unet import BasicDiffusionUNet, SinusoidalTimeEmbedding
 
 
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
-FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 11
+FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 15
+FINE_DIFFUSION_TRANSFORMER_LEGACY_ARCHITECTURE_VERSION = 11
 FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION = 12
 FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION = 13
 FINE_DIFFUSION_UNET_FAIR_ARCHITECTURE_VERSION = 14
@@ -43,6 +44,7 @@ class FineDiffusionConfig:
     radar_pillar_channels: int = 64
     transformer_spatial_input_mode: str = "zero_residual"
     hidden_dim: int = 64
+    attention_dim: int | None = None
     num_heads: int = 4
     num_transformer_blocks: int = 4
     window_size: int = 8
@@ -96,8 +98,13 @@ class FineDiffusionConfig:
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
-        if self.hidden_dim % self.num_heads:
-            raise ValueError("hidden_dim must be divisible by num_heads")
+        attention_dim = (
+            self.hidden_dim if self.attention_dim is None else self.attention_dim
+        )
+        if attention_dim < 1:
+            raise ValueError("attention_dim must be positive when configured")
+        if attention_dim % self.num_heads:
+            raise ValueError("attention_dim must be divisible by num_heads")
         if not isinstance(self.use_pointpillars_conditioning, bool):
             raise ValueError("use_pointpillars_conditioning must be boolean")
         if self.transformer_spatial_input_mode not in (
@@ -375,17 +382,64 @@ class WindowAttention2d(nn.Module):
         dropout: float,
         *,
         key_value_dim: int | None = None,
+        attention_dim: int | None = None,
     ):
         super().__init__()
         self.window_size = int(window_size)
-        self.attention = nn.MultiheadAttention(
-            hidden_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-            kdim=key_value_dim,
-            vdim=key_value_dim,
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.attention_dim = int(attention_dim or hidden_dim)
+        self.head_dim = self.attention_dim // self.num_heads
+        self.dropout = float(dropout)
+        self.uses_projected_attention = self.attention_dim != self.hidden_dim
+        if self.uses_projected_attention:
+            source_dim = int(key_value_dim or hidden_dim)
+            self.attention = None
+            self.query_projection = nn.Linear(hidden_dim, self.attention_dim)
+            self.key_projection = nn.Linear(source_dim, self.attention_dim)
+            self.value_projection = nn.Linear(source_dim, self.attention_dim)
+            self.output_projection = nn.Linear(self.attention_dim, hidden_dim)
+        else:
+            self.attention = nn.MultiheadAttention(
+                hidden_dim,
+                num_heads,
+                dropout=dropout,
+                batch_first=True,
+                kdim=key_value_dim,
+                vdim=key_value_dim,
+            )
+            self.query_projection = None
+            self.key_projection = None
+            self.value_projection = None
+            self.output_projection = None
+
+    def _projected_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        key_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, query_length, _channels = query.shape
+        key_length = key.shape[1]
+        queries = self.query_projection(query).reshape(
+            batch, query_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        keys = self.key_projection(key).reshape(
+            batch, key_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        values = self.value_projection(key).reshape(
+            batch, key_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        attended = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            attn_mask=key_valid[:, None, None, :],
+            dropout_p=(self.dropout if self.training else 0.0),
+        ).transpose(1, 2).reshape(
+            batch, query_length, self.attention_dim
         )
+        return self.output_projection(attended)
 
     def forward(
         self,
@@ -408,13 +462,20 @@ class WindowAttention2d(nn.Module):
         active = valid_windows.any(dim=1) & key_valid.any(dim=1)
         output = torch.zeros_like(query_windows)
         if bool(active.any()):
-            attended, _weights = self.attention(
-                query_windows[active],
-                key_windows[active],
-                key_windows[active],
-                key_padding_mask=~key_valid[active],
-                need_weights=False,
-            )
+            if self.uses_projected_attention:
+                attended = self._projected_attention(
+                    query_windows[active],
+                    key_windows[active],
+                    key_valid[active],
+                )
+            else:
+                attended, _weights = self.attention(
+                    query_windows[active],
+                    key_windows[active],
+                    key_windows[active],
+                    key_padding_mask=~key_valid[active],
+                    need_weights=False,
+                )
             output[active] = attended.to(output.dtype) * valid_windows[
                 active, :, None
             ]
@@ -448,6 +509,7 @@ class DiffusionRefinementBlock(nn.Module):
         dropout: float,
         shifted: bool,
         radar_channels: int,
+        attention_dim: int | None = None,
     ):
         super().__init__()
         self.shift = window_size // 2 if shifted else 0
@@ -455,7 +517,11 @@ class DiffusionRefinementBlock(nn.Module):
         self.radar_cross_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
         self.ffn_norm = AdaptiveLayerNorm2d(hidden_dim, condition_dim)
         self.self_attention = WindowAttention2d(
-            hidden_dim, num_heads, window_size, dropout
+            hidden_dim,
+            num_heads,
+            window_size,
+            dropout,
+            attention_dim=attention_dim,
         )
         self.radar_cross_attention = WindowAttention2d(
             hidden_dim,
@@ -463,6 +529,7 @@ class DiffusionRefinementBlock(nn.Module):
             window_size,
             dropout,
             key_value_dim=radar_channels,
+            attention_dim=attention_dim,
         )
         self.ffn = ConvolutionalFFN(hidden_dim, dropout)
 
@@ -551,6 +618,7 @@ class LocalResidualDiffusionTransformer(nn.Module):
                     if config.use_pointpillars_conditioning
                     else config.radar_channels
                 ),
+                config.attention_dim,
             )
             for index in range(config.num_transformer_blocks)
         )
@@ -739,7 +807,16 @@ def fine_diffusion_architecture_metadata(
         }
     return {
         **common,
-        "version": FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION,
+        "version": (
+            FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION
+            if config.attention_dim is not None
+            and config.attention_dim != config.hidden_dim
+            else FINE_DIFFUSION_TRANSFORMER_LEGACY_ARCHITECTURE_VERSION
+        ),
+        "hidden_dim": config.hidden_dim,
+        "attention_dim": config.attention_dim or config.hidden_dim,
+        "num_heads": config.num_heads,
+        "num_transformer_blocks": config.num_transformer_blocks,
         "transformer_spatial_input_mode": config.transformer_spatial_input_mode,
         "transformer_spatial_input": (
             f"{config.transformer_spatial_input_mode}_plus_coordinates_plus_"
@@ -836,13 +913,16 @@ def validate_fine_diffusion_checkpoint_compatibility(
     if architecture_version == 10:
         expected_mode = "current_lidar"
         stem_name = "transformer.current_lidar_stem.weight"
-    elif architecture_version == FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION:
+    elif architecture_version in (
+        FINE_DIFFUSION_TRANSFORMER_LEGACY_ARCHITECTURE_VERSION,
+        FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION,
+    ):
         expected_mode = "zero_residual"
         stem_name = "transformer.residual_stem.weight"
     else:
         raise ValueError(
-            "Fine Diffusion checkpoint is neither supported v10 current-LiDAR "
-            "evaluation nor v11 zero-residual refinement."
+            "Fine Diffusion checkpoint is neither supported v10 current-LiDAR, "
+            "v11 legacy zero-residual, nor v15 projected-attention refinement."
         )
     if config.transformer_spatial_input_mode != expected_mode:
         raise ValueError(
@@ -860,6 +940,17 @@ def validate_fine_diffusion_checkpoint_compatibility(
         raise ValueError(
             "Fine Diffusion PointPillars conditioning does not match the "
             "checkpoint architecture. Start a fresh run."
+        )
+    projected_attention = (
+        config.attention_dim is not None
+        and config.attention_dim != config.hidden_dim
+    )
+    if projected_attention != (
+        architecture_version == FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION
+    ):
+        raise ValueError(
+            "Fine Diffusion attention projection does not match its checkpoint. "
+            "Start a fresh architecture-ablation run."
         )
 
 

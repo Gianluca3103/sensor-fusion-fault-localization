@@ -576,6 +576,48 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(output.dtype, query.dtype)
         self.assertEqual(output.shape, query.shape)
 
+    def test_projected_attention_supports_hidden_128_with_six_heads(self):
+        config = FineDiffusionConfig(
+            hidden_dim=128,
+            attention_dim=192,
+            num_heads=6,
+            num_transformer_blocks=6,
+        )
+        config.validate()
+        attention = WindowAttention2d(
+            hidden_dim=128,
+            attention_dim=192,
+            num_heads=6,
+            window_size=2,
+            dropout=0.0,
+            key_value_dim=64,
+        )
+        query = torch.rand(1, 128, 4, 4)
+        radar = torch.rand(1, 64, 4, 4)
+        valid = torch.ones(1, 1, 4, 4)
+
+        output = attention(query, radar, valid)
+
+        self.assertEqual(output.shape, query.shape)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertTrue(attention.uses_projected_attention)
+
+    def test_projected_attention_metadata_requires_fresh_architecture(self):
+        config = FineDiffusionConfig(
+            hidden_dim=128,
+            attention_dim=192,
+            num_heads=6,
+            num_transformer_blocks=6,
+        )
+
+        metadata = fine_diffusion_architecture_metadata(config)
+
+        self.assertEqual(metadata["version"], 15)
+        self.assertEqual(metadata["hidden_dim"], 128)
+        self.assertEqual(metadata["attention_dim"], 192)
+        self.assertEqual(metadata["num_heads"], 6)
+        self.assertEqual(metadata["num_transformer_blocks"], 6)
+
     def test_training_residual_masking_leakage_and_final_preservation(self):
         clean, coarse, faulty, radar, repair, halo = _inputs()
         distinctive = faulty.clone()
