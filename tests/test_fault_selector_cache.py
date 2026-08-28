@@ -9,6 +9,7 @@ import torch
 
 from models.two_stage_reconstruction_head.cache_fault_selector_masks import (
     _discover_sample_paths,
+    _selector_config_from_payload,
 )
 from models.two_stage_reconstruction_head import (
     CoarseReconstructionDataset,
@@ -23,6 +24,22 @@ from models.two_stage_reconstruction_head import (
 
 
 class FaultSelectorCacheTests(unittest.TestCase):
+    def test_cache_cli_accepts_source_and_resolved_selector_configs(self):
+        expected = FaultSelectorConfig(
+            min_lidar_loss_fraction=0.73,
+            min_repair_fault_fraction=0.81,
+        )
+
+        source = _selector_config_from_payload(
+            {"fault_selector": expected.__dict__}
+        )
+        resolved = _selector_config_from_payload(
+            {"selector": expected.__dict__}
+        )
+
+        self.assertEqual(source, expected)
+        self.assertEqual(resolved, expected)
+
     def _write_sample(self, root: Path):
         data_root = root / "data"
         sample_path = data_root / "train" / "sample.npz"

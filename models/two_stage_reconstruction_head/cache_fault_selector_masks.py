@@ -16,7 +16,11 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from models.two_stage_reconstruction_head import build_selector_config, load_config
+from models.two_stage_reconstruction_head import (
+    FaultSelectorConfig,
+    build_selector_config,
+    load_config,
+)
 from models.two_stage_reconstruction_head.fault_selector_cache import (
     build_selector_cache_entry,
     selector_cache_root,
@@ -47,6 +51,19 @@ def _discover_sample_paths(data_root: Path) -> list[Path]:
     return sample_paths
 
 
+def _selector_config_from_payload(payload: dict) -> FaultSelectorConfig:
+    """Accept source configs and saved run ``resolved_config.json`` files."""
+
+    if "selector" not in payload:
+        return build_selector_config(payload)
+    selector_payload = payload["selector"]
+    if not isinstance(selector_payload, dict):
+        raise ValueError("resolved selector configuration must be an object")
+    config = FaultSelectorConfig(**selector_payload)
+    config.validate()
+    return config
+
+
 def main():
     args = _parse_args()
     if args.num_workers < 1:
@@ -55,7 +72,7 @@ def main():
     if not data_root.is_dir():
         raise FileNotFoundError(f"Dataset root is missing: {data_root}")
     cache_root = selector_cache_root(data_root)
-    config = build_selector_config(load_config(args.config))
+    config = _selector_config_from_payload(load_config(args.config))
 
     sample_paths = _discover_sample_paths(data_root)
     printed_split = False
