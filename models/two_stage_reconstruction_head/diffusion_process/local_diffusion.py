@@ -310,26 +310,51 @@ class AdaptiveLayerNorm2d(nn.Module):
         return normalized * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
 
 
-def _partition_windows(
-    tensor: torch.Tensor,
+@dataclass(frozen=True)
+class WindowLayout:
+    """Reusable window geometry and validity for one padded crop shape."""
+
+    valid_windows: torch.Tensor
+    metadata: tuple[int, int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class CrossAttentionCache:
+    """Step-invariant radar windows and their projected keys/values."""
+
+    query_layout: WindowLayout
+    key_layout: WindowLayout
+    active_windows: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TransformerInferenceCache:
+    """All spatial conditioning that is invariant across refinement steps."""
+
+    coordinates: torch.Tensor
+    auxiliary_condition: torch.Tensor
+    lidar_pillar_condition: torch.Tensor
+    radar_attention: torch.Tensor
+    radar_valid: torch.Tensor
+    self_layouts: tuple[WindowLayout, ...]
+    radar_caches: tuple[CrossAttentionCache, ...]
+
+
+def _window_layout(
     valid: torch.Tensor,
     window_size: int,
     shift: int,
-):
-    batch, channels, height, width = tensor.shape
+) -> WindowLayout:
+    batch, _one, height, width = valid.shape
     pad_top = pad_left = shift
     padded_height = math.ceil((height + shift) / window_size) * window_size
     padded_width = math.ceil((width + shift) / window_size) * window_size
     pad_bottom = padded_height - height - pad_top
     pad_right = padded_width - width - pad_left
-    tensor = F.pad(tensor, (pad_left, pad_right, pad_top, pad_bottom))
     valid = F.pad(valid, (pad_left, pad_right, pad_top, pad_bottom))
     rows, columns = padded_height // window_size, padded_width // window_size
-    windows = (
-        tensor.reshape(batch, channels, rows, window_size, columns, window_size)
-        .permute(0, 2, 4, 3, 5, 1)
-        .reshape(batch * rows * columns, window_size * window_size, channels)
-    )
     valid_windows = (
         valid.reshape(batch, 1, rows, window_size, columns, window_size)
         .permute(0, 2, 4, 3, 5, 1)
@@ -338,7 +363,6 @@ def _partition_windows(
     )
     metadata = (
         batch,
-        channels,
         height,
         width,
         padded_height,
@@ -347,13 +371,68 @@ def _partition_windows(
         columns,
         shift,
     )
-    return windows, valid_windows, metadata
+    return WindowLayout(valid_windows=valid_windows, metadata=metadata)
+
+
+def _partition_tensor(
+    tensor: torch.Tensor,
+    layout: WindowLayout,
+) -> torch.Tensor:
+    batch, channels, height, width = tensor.shape
+    (
+        expected_batch,
+        expected_height,
+        expected_width,
+        padded_height,
+        padded_width,
+        rows,
+        columns,
+        shift,
+    ) = layout.metadata
+    if (batch, height, width) != (
+        expected_batch,
+        expected_height,
+        expected_width,
+    ):
+        raise ValueError("tensor does not match cached window layout")
+    tensor = F.pad(
+        tensor,
+        (
+            shift,
+            padded_width - width - shift,
+            shift,
+            padded_height - height - shift,
+        ),
+    )
+    window_height = padded_height // rows
+    window_width = padded_width // columns
+    return (
+        tensor.reshape(
+            batch,
+            channels,
+            rows,
+            window_height,
+            columns,
+            window_width,
+        )
+        .permute(0, 2, 4, 3, 5, 1)
+        .reshape(batch * rows * columns, -1, channels)
+    )
+
+
+def _partition_windows(
+    tensor: torch.Tensor,
+    valid: torch.Tensor,
+    window_size: int,
+    shift: int,
+):
+    layout = _window_layout(valid, window_size, shift)
+    return _partition_tensor(tensor, layout), layout.valid_windows, layout.metadata
 
 
 def _reverse_windows(windows: torch.Tensor, metadata) -> torch.Tensor:
     (
         batch,
-        channels,
         height,
         width,
         padded_height,
@@ -362,6 +441,7 @@ def _reverse_windows(windows: torch.Tensor, metadata) -> torch.Tensor:
         columns,
         shift,
     ) = metadata
+    channels = windows.shape[-1]
     window_size = int(math.sqrt(windows.shape[1]))
     tensor = (
         windows.reshape(batch, rows, columns, window_size, window_size, channels)
@@ -412,6 +492,214 @@ class WindowAttention2d(nn.Module):
             self.key_projection = None
             self.value_projection = None
             self.output_projection = None
+        self._fused_self_weight: torch.Tensor | None = None
+        self._fused_self_bias: torch.Tensor | None = None
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._fused_self_weight = None
+            self._fused_self_bias = None
+        return super().train(mode)
+
+    def prepare_for_inference(self) -> None:
+        """Cache a fused QKV matrix without changing checkpoint parameters."""
+
+        if self.training or not self.uses_projected_attention:
+            return
+        if self._fused_self_weight is None:
+            self._fused_self_weight = torch.cat(
+                (
+                    self.query_projection.weight,
+                    self.key_projection.weight,
+                    self.value_projection.weight,
+                ),
+                dim=0,
+            ).detach()
+            self._fused_self_bias = torch.cat(
+                (
+                    self.query_projection.bias,
+                    self.key_projection.bias,
+                    self.value_projection.bias,
+                ),
+                dim=0,
+            ).detach()
+
+    def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch, length, _channels = tensor.shape
+        return tensor.reshape(
+            batch, length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+    def _output_projection(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.uses_projected_attention:
+            return self.output_projection(tensor)
+        return self.attention.out_proj(tensor)
+
+    def _project_self_qkv(
+        self, tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.uses_projected_attention:
+            self.prepare_for_inference()
+            if self._fused_self_weight is not None:
+                projected = F.linear(
+                    tensor,
+                    self._fused_self_weight,
+                    self._fused_self_bias,
+                )
+                return projected.chunk(3, dim=-1)
+            return (
+                self.query_projection(tensor),
+                self.key_projection(tensor),
+                self.value_projection(tensor),
+            )
+        if self.attention.in_proj_weight is not None:
+            return F.linear(
+                tensor,
+                self.attention.in_proj_weight,
+                self.attention.in_proj_bias,
+            ).chunk(3, dim=-1)
+        bias = self.attention.in_proj_bias
+        query_bias, key_bias, value_bias = (
+            bias.chunk(3) if bias is not None else (None, None, None)
+        )
+        return (
+            F.linear(tensor, self.attention.q_proj_weight, query_bias),
+            F.linear(tensor, self.attention.k_proj_weight, key_bias),
+            F.linear(tensor, self.attention.v_proj_weight, value_bias),
+        )
+
+    def _project_query(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.uses_projected_attention:
+            return self.query_projection(tensor)
+        bias = self.attention.in_proj_bias
+        query_bias = bias[: self.attention.embed_dim] if bias is not None else None
+        weight = (
+            self.attention.in_proj_weight[: self.attention.embed_dim]
+            if self.attention.in_proj_weight is not None
+            else self.attention.q_proj_weight
+        )
+        return F.linear(tensor, weight, query_bias)
+
+    def _project_key_value(
+        self, tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.uses_projected_attention:
+            return self.key_projection(tensor), self.value_projection(tensor)
+        embed_dim = self.attention.embed_dim
+        bias = self.attention.in_proj_bias
+        key_bias = bias[embed_dim : 2 * embed_dim] if bias is not None else None
+        value_bias = bias[2 * embed_dim :] if bias is not None else None
+        if self.attention.in_proj_weight is not None:
+            key_weight = self.attention.in_proj_weight[embed_dim : 2 * embed_dim]
+            value_weight = self.attention.in_proj_weight[2 * embed_dim :]
+        else:
+            key_weight = self.attention.k_proj_weight
+            value_weight = self.attention.v_proj_weight
+        return (
+            F.linear(tensor, key_weight, key_bias),
+            F.linear(tensor, value_weight, value_bias),
+        )
+
+    def _attend_projected(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        key_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        query_length = queries.shape[1]
+        attended = F.scaled_dot_product_attention(
+            self._reshape_heads(queries),
+            self._reshape_heads(keys),
+            self._reshape_heads(values),
+            attn_mask=key_valid[:, None, None, :],
+            dropout_p=(self.dropout if self.training else 0.0),
+        ).transpose(1, 2).reshape(
+            queries.shape[0], query_length, self.attention_dim
+        )
+        return self._output_projection(attended)
+
+    def forward_self(
+        self,
+        tensor: torch.Tensor,
+        layout: WindowLayout,
+    ) -> torch.Tensor:
+        """Inference self-attention with one partition and one fused QKV map."""
+
+        windows = _partition_tensor(tensor, layout)
+        valid_windows = layout.valid_windows
+        active = valid_windows.any(dim=1)
+        output = torch.zeros_like(windows)
+        active_windows = windows[active]
+        queries, keys, values = self._project_self_qkv(active_windows)
+        attended = self._attend_projected(
+            queries,
+            keys,
+            values,
+            valid_windows[active],
+        )
+        output[active] = attended.to(output.dtype) * valid_windows[
+            active, :, None
+        ]
+        return _reverse_windows(output, layout.metadata)
+
+    def prepare_cross_attention_cache_from_windows(
+        self,
+        key_windows: torch.Tensor,
+        query_layout: WindowLayout,
+        key_layout: WindowLayout,
+    ) -> CrossAttentionCache:
+        """Project K/V from radar windows shared by blocks with one shift."""
+
+        active = query_layout.valid_windows.any(dim=1) & (
+            key_layout.valid_windows.any(dim=1)
+        )
+        keys, values = self._project_key_value(key_windows[active])
+        return CrossAttentionCache(
+            query_layout=query_layout,
+            key_layout=key_layout,
+            active_windows=active,
+            keys=keys,
+            values=values,
+        )
+
+    def prepare_cross_attention_cache(
+        self,
+        key_value: torch.Tensor,
+        query_valid: torch.Tensor,
+        key_value_valid: torch.Tensor,
+        *,
+        shift: int,
+    ) -> CrossAttentionCache:
+        query_layout = _window_layout(query_valid, self.window_size, shift)
+        key_layout = _window_layout(key_value_valid, self.window_size, shift)
+        return self.prepare_cross_attention_cache_from_windows(
+            _partition_tensor(key_value, key_layout),
+            query_layout,
+            key_layout,
+        )
+
+    def forward_cross(
+        self,
+        query: torch.Tensor,
+        cache: CrossAttentionCache,
+    ) -> torch.Tensor:
+        """Cross-attend to step-invariant, preprojected radar keys/values."""
+
+        query_windows = _partition_tensor(query, cache.query_layout)
+        output = torch.zeros_like(query_windows)
+        active = cache.active_windows
+        queries = self._project_query(query_windows[active])
+        attended = self._attend_projected(
+            queries,
+            cache.keys,
+            cache.values,
+            cache.key_layout.valid_windows[active],
+        )
+        output[active] = attended.to(output.dtype) * (
+            cache.query_layout.valid_windows[active, :, None]
+        )
+        return _reverse_windows(output, cache.query_layout.metadata)
 
     def _projected_attention(
         self,
@@ -419,27 +707,13 @@ class WindowAttention2d(nn.Module):
         key: torch.Tensor,
         key_valid: torch.Tensor,
     ) -> torch.Tensor:
-        batch, query_length, _channels = query.shape
-        key_length = key.shape[1]
-        queries = self.query_projection(query).reshape(
-            batch, query_length, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        keys = self.key_projection(key).reshape(
-            batch, key_length, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        values = self.value_projection(key).reshape(
-            batch, key_length, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        attended = F.scaled_dot_product_attention(
-            queries,
+        keys, values = self._project_key_value(key)
+        return self._attend_projected(
+            self._project_query(query),
             keys,
             values,
-            attn_mask=key_valid[:, None, None, :],
-            dropout_p=(self.dropout if self.training else 0.0),
-        ).transpose(1, 2).reshape(
-            batch, query_length, self.attention_dim
+            key_valid,
         )
-        return self.output_projection(attended)
 
     def forward(
         self,
@@ -540,20 +814,39 @@ class DiffusionRefinementBlock(nn.Module):
         condition_vector: torch.Tensor,
         valid: torch.Tensor,
         radar_valid: torch.Tensor,
+        *,
+        self_layout: WindowLayout | None = None,
+        radar_cache: CrossAttentionCache | None = None,
     ) -> torch.Tensor:
-        tensor = tensor + self.self_attention(
-            self.self_norm(tensor, condition_vector),
-            self.self_norm(tensor, condition_vector),
-            valid,
-            shift=self.shift,
-        )
-        tensor = tensor + self.radar_cross_attention(
-            self.radar_cross_norm(tensor, condition_vector),
-            raw_radar,
-            valid,
-            shift=self.shift,
-            key_value_valid=radar_valid,
-        )
+        normalized = self.self_norm(tensor, condition_vector)
+        if self_layout is None:
+            self_update = self.self_attention(
+                normalized,
+                normalized,
+                valid,
+                shift=self.shift,
+            )
+        else:
+            self_update = self.self_attention.forward_self(
+                normalized,
+                self_layout,
+            )
+        tensor = tensor + self_update
+        radar_query = self.radar_cross_norm(tensor, condition_vector)
+        if radar_cache is None:
+            radar_update = self.radar_cross_attention(
+                radar_query,
+                raw_radar,
+                valid,
+                shift=self.shift,
+                key_value_valid=radar_valid,
+            )
+        else:
+            radar_update = self.radar_cross_attention.forward_cross(
+                radar_query,
+                radar_cache,
+            )
+        tensor = tensor + radar_update
         tensor = tensor + self.ffn(self.ffn_norm(tensor, condition_vector)) * valid
         return tensor * valid
 
@@ -646,6 +939,84 @@ class LocalResidualDiffusionTransformer(nn.Module):
             embedding = self.global_encoder(trusted)
         return trusted, embedding
 
+    def prepare_inference_cache(
+        self,
+        trusted_faulty: torch.Tensor,
+        radar: torch.Tensor,
+        lidar_pillars: torch.Tensor | None,
+        radar_pillars: torch.Tensor | None,
+        reconstruction_mask: torch.Tensor,
+        halo_mask: torch.Tensor,
+        valid: torch.Tensor,
+        coordinates: torch.Tensor,
+    ) -> TransformerInferenceCache:
+        """Precompute conditioning that is unchanged by residual-flow steps."""
+
+        for block in self.blocks:
+            block.self_attention.prepare_for_inference()
+
+        auxiliary_condition_input = torch.cat(
+            (trusted_faulty, reconstruction_mask, halo_mask, coordinates),
+            dim=1,
+        )
+        auxiliary_condition = self.auxiliary_condition_encoder(
+            auxiliary_condition_input,
+            valid,
+        )
+        if self.config.use_pointpillars_conditioning:
+            if lidar_pillars is None or radar_pillars is None:
+                raise ValueError(
+                    "Fine diffusion requires both LiDAR and radar PointPillars "
+                    "feature maps"
+                )
+            assert self.lidar_pillar_stem is not None
+            lidar_pillar_condition = self.lidar_pillar_stem(lidar_pillars)
+            radar_attention = radar_pillars
+        else:
+            lidar_pillar_condition = torch.zeros_like(auxiliary_condition)
+            radar_attention = radar
+        radar_valid = reconstruction_mask * valid
+        layouts_by_shift: dict[int, WindowLayout] = {}
+        radar_layouts_by_shift: dict[int, WindowLayout] = {}
+        radar_windows_by_shift: dict[int, torch.Tensor] = {}
+        for block in self.blocks:
+            shift = block.shift
+            if shift not in layouts_by_shift:
+                layouts_by_shift[shift] = _window_layout(
+                    valid,
+                    block.self_attention.window_size,
+                    shift,
+                )
+                radar_layouts_by_shift[shift] = _window_layout(
+                    radar_valid,
+                    block.radar_cross_attention.window_size,
+                    shift,
+                )
+                radar_windows_by_shift[shift] = _partition_tensor(
+                    radar_attention,
+                    radar_layouts_by_shift[shift],
+                )
+        self_layouts = tuple(
+            layouts_by_shift[block.shift] for block in self.blocks
+        )
+        radar_caches = tuple(
+            block.radar_cross_attention.prepare_cross_attention_cache_from_windows(
+                radar_windows_by_shift[block.shift],
+                layouts_by_shift[block.shift],
+                radar_layouts_by_shift[block.shift],
+            )
+            for block in self.blocks
+        )
+        return TransformerInferenceCache(
+            coordinates=coordinates,
+            auxiliary_condition=auxiliary_condition,
+            lidar_pillar_condition=lidar_pillar_condition,
+            radar_attention=radar_attention,
+            radar_valid=radar_valid,
+            self_layouts=self_layouts,
+            radar_caches=radar_caches,
+        )
+
     def forward(
         self,
         spatial_state: torch.Tensor,
@@ -659,21 +1030,29 @@ class LocalResidualDiffusionTransformer(nn.Module):
         coordinates: torch.Tensor,
         timestep: torch.Tensor,
         global_embedding: torch.Tensor,
+        inference_cache: TransformerInferenceCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        auxiliary_condition_input = torch.cat(
-            (
-                trusted_faulty,
-                reconstruction_mask,
-                halo_mask,
-                coordinates,
-            ),
-            dim=1,
-        )
-        auxiliary_condition = self.auxiliary_condition_encoder(
-            auxiliary_condition_input, valid
-        )
+        if inference_cache is None:
+            auxiliary_condition_input = torch.cat(
+                (
+                    trusted_faulty,
+                    reconstruction_mask,
+                    halo_mask,
+                    coordinates,
+                ),
+                dim=1,
+            )
+            auxiliary_condition = self.auxiliary_condition_encoder(
+                auxiliary_condition_input, valid
+            )
+        else:
+            coordinates = inference_cache.coordinates
+            auxiliary_condition = inference_cache.auxiliary_condition
         spatial_stem_input = torch.cat((spatial_state, coordinates), dim=1)
-        if self.config.use_pointpillars_conditioning:
+        if inference_cache is not None:
+            lidar_pillar_condition = inference_cache.lidar_pillar_condition
+            radar_attention = inference_cache.radar_attention
+        elif self.config.use_pointpillars_conditioning:
             if lidar_pillars is None or radar_pillars is None:
                 raise ValueError(
                     "Fine diffusion requires both LiDAR and radar PointPillars "
@@ -696,14 +1075,28 @@ class LocalResidualDiffusionTransformer(nn.Module):
             + lidar_pillar_condition
         ) * valid
         condition_vector = self.time_embedding(timestep) + global_embedding
-        radar_valid = reconstruction_mask * valid
-        for block in self.blocks:
+        radar_valid = (
+            inference_cache.radar_valid
+            if inference_cache is not None
+            else reconstruction_mask * valid
+        )
+        for index, block in enumerate(self.blocks):
             tensor = block(
                 tensor,
                 radar_attention,
                 condition_vector,
                 valid,
                 radar_valid,
+                self_layout=(
+                    inference_cache.self_layouts[index]
+                    if inference_cache is not None
+                    else None
+                ),
+                radar_cache=(
+                    inference_cache.radar_caches[index]
+                    if inference_cache is not None
+                    else None
+                ),
             )
         velocity = torch.tanh(self.output_head(tensor))
         active_repair = (reconstruction_mask > 0.5) & (valid > 0.5)
@@ -1301,6 +1694,19 @@ class FineDiffusionRefiner(nn.Module):
             self.config.denominator_epsilon
         )
 
+    def configure_inference_bucket(self, bucket_multiple: int | None) -> int:
+        """Round technical crop padding to stable inference-shape buckets."""
+
+        native_multiple = (
+            8 if self.config.fine_backbone == "unet" else self.config.window_size
+        )
+        if bucket_multiple is None or int(bucket_multiple) <= 0:
+            resolved = native_multiple
+        else:
+            resolved = math.lcm(native_multiple, int(bucket_multiple))
+        self.crop_extractor.pad_multiple = resolved
+        return resolved
+
     def _residual_regularization_loss(
         self,
         predicted_residual_physical: torch.Tensor,
@@ -1454,6 +1860,7 @@ class FineDiffusionRefiner(nn.Module):
         crops: ReconstructionCropBatch,
         timestep: torch.Tensor,
         global_embedding: torch.Tensor,
+        transformer_inference_cache: TransformerInferenceCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         values = crops.tensors
         if self.config.fine_backbone == "unet":
@@ -1493,6 +1900,7 @@ class FineDiffusionRefiner(nn.Module):
                 _coordinate_channels(crops),
                 timestep,
                 global_embedding,
+                inference_cache=transformer_inference_cache,
             )
         repair = values["repair"] * crops.valid_mask
         velocity_normalized = self.residual_normalization.normalize(
@@ -1501,6 +1909,26 @@ class FineDiffusionRefiner(nn.Module):
         debug["predicted_velocity_physical"] = velocity_physical
         debug["current_residual"] = residual_t
         return velocity_normalized, condition, debug
+
+    def _prepare_transformer_inference_cache(
+        self,
+        crops: ReconstructionCropBatch,
+    ) -> TransformerInferenceCache | None:
+        if self.config.fine_backbone != "transformer":
+            return None
+        if self.transformer is None:
+            raise RuntimeError("Fine Diffusion Transformer is unavailable")
+        values = crops.tensors
+        return self.transformer.prepare_inference_cache(
+            self.normalization.normalize(values["trusted_faulty"]),
+            values["radar"],
+            values.get("lidar_pillars"),
+            values.get("radar_pillars"),
+            values["repair"],
+            values["halo"],
+            crops.valid_mask,
+            _coordinate_channels(crops),
+        )
 
     def _global_context(
         self,
@@ -1849,12 +2277,19 @@ class FineDiffusionRefiner(nn.Module):
         _trusted_global, global_embedding = self._global_context(
             faulty_lidar_bev, reconstruction_mask
         )
+        transformer_inference_cache = self._prepare_transformer_inference_cache(
+            crops
+        )
         intermediates = []
         residual_x0_normalized = torch.zeros_like(residual_t)
         for scalar_timestep in timesteps:
             timestep = scalar_timestep.expand(coarse_lidar_bev.shape[0])
             velocity_pred, _local_condition, transformer_debug = self._predict_velocity(
-                residual_t, crops, timestep, global_embedding
+                residual_t,
+                crops,
+                timestep,
+                global_embedding,
+                transformer_inference_cache,
             )
             residual_t = self._bounded_residual_update(
                 residual_t,

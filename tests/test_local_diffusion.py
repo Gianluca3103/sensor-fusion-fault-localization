@@ -11,6 +11,7 @@ from models.two_stage_reconstruction_head.diffusion_process.local_diffusion impo
     MaskedNoDegradationLoss,
     ReconstructionCropExtractor,
     WindowAttention2d,
+    _window_layout,
     fine_diffusion_architecture_metadata,
     validate_fine_diffusion_checkpoint_compatibility,
 )
@@ -602,6 +603,109 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertTrue(attention.uses_projected_attention)
 
+    def test_cached_unprojected_attention_matches_reference_path(self):
+        torch.manual_seed(12)
+        attention = WindowAttention2d(
+            hidden_dim=8,
+            num_heads=2,
+            window_size=2,
+            dropout=0.0,
+            key_value_dim=6,
+        ).eval()
+        query = torch.rand(2, 8, 4, 4)
+        radar = torch.rand(2, 6, 4, 4)
+        valid = torch.ones(2, 1, 4, 4)
+        radar_valid = valid.clone()
+        radar_valid[0, :, 0, 0] = 0
+
+        reference = attention(
+            query,
+            radar,
+            valid,
+            shift=1,
+            key_value_valid=radar_valid,
+        )
+        cache = attention.prepare_cross_attention_cache(
+            radar,
+            valid,
+            radar_valid,
+            shift=1,
+        )
+        cached = attention.forward_cross(query, cache)
+
+        torch.testing.assert_close(cached, reference, rtol=1e-5, atol=1e-6)
+
+    def test_cached_projected_self_attention_matches_reference_path(self):
+        torch.manual_seed(13)
+        attention = WindowAttention2d(
+            hidden_dim=8,
+            attention_dim=12,
+            num_heads=3,
+            window_size=2,
+            dropout=0.0,
+        ).eval()
+        query = torch.rand(2, 8, 4, 4)
+        valid = torch.ones(2, 1, 4, 4)
+        valid[1, :, 3, 3] = 0
+
+        reference = attention(query, query, valid, shift=1)
+        cached = attention.forward_self(
+            query,
+            _window_layout(valid, window_size=2, shift=1),
+        )
+
+        torch.testing.assert_close(cached, reference, rtol=1e-5, atol=1e-6)
+
+    def test_refinement_block_normalizes_self_attention_once(self):
+        model = FineDiffusionRefiner(_config()).eval()
+        block = model.transformer.blocks[0]
+        tensor = torch.rand(1, 16, 4, 4)
+        radar = torch.rand(1, 4, 4, 4)
+        condition = torch.rand(1, 16)
+        valid = torch.ones(1, 1, 4, 4)
+
+        with mock.patch.object(
+            block.self_norm,
+            "forward",
+            wraps=block.self_norm.forward,
+        ) as normalization:
+            block(tensor, radar, condition, valid, valid)
+
+        self.assertEqual(normalization.call_count, 1)
+
+    def test_sampling_prepares_radar_key_values_once_per_block(self):
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()
+        patches = [
+            mock.patch.object(
+                block.radar_cross_attention,
+                "prepare_cross_attention_cache_from_windows",
+                wraps=(
+                    block.radar_cross_attention
+                    .prepare_cross_attention_cache_from_windows
+                ),
+            )
+            for block in model.transformer.blocks
+        ]
+        spies = [patch.start() for patch in patches]
+        try:
+            model.sample(coarse, faulty, radar, repair, halo, sampling_steps=3)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+        self.assertTrue(all(spy.call_count == 1 for spy in spies))
+
+    def test_static_inference_bucket_rounds_crop_shape(self):
+        _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(_config()).eval()
+
+        self.assertEqual(model.configure_inference_bucket(32), 32)
+        crops = model._extract(coarse, faulty, radar, repair, halo)
+
+        self.assertEqual(crops.valid_mask.shape[-2] % 32, 0)
+        self.assertEqual(crops.valid_mask.shape[-1] % 32, 0)
+
     def test_projected_attention_metadata_requires_fresh_architecture(self):
         config = FineDiffusionConfig(
             hidden_dim=128,
@@ -686,7 +790,14 @@ class FineDiffusionRefinerTests(unittest.TestCase):
             residual_normalization=normalizer,
         ).eval()
 
-        def fixed_velocity(residual_t, crops, timestep, global_embedding):
+        def fixed_velocity(
+            residual_t,
+            crops,
+            timestep,
+            global_embedding,
+            transformer_inference_cache=None,
+        ):
+            del transformer_inference_cache
             del timestep, global_embedding
             normalized = torch.ones_like(residual_t) * crops.tensors["repair"]
             return normalized, normalized, {}

@@ -10,6 +10,7 @@ Fine Diffusion refinement.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 from pathlib import Path
 import statistics
@@ -67,6 +68,35 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-batches", type=int, default=10)
     parser.add_argument("--benchmark-batches", type=int, default=100)
     parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument(
+        "--inference-bucket-multiple",
+        type=int,
+        default=32,
+        help="Round local crop padding to this fixed shape multiple; 0 disables.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the Fine backbone with torch.compile for inference.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--profile-one-batch",
+        action="store_true",
+        help="Export a torch.profiler Chrome trace after warm-up.",
+    )
+    parser.add_argument(
+        "--require-fine-pointpillars-conditioning",
+        action="store_true",
+        help=(
+            "Reject checkpoints without Fine-stage PointPillars conditioning. "
+            "Use this guard when comparing U-Net and Transformer fairly."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-amp", action="store_true")
     return parser.parse_args()
@@ -228,9 +258,37 @@ def main() -> None:
     checkpoint, diffusion_config, pipeline, use_pointpillars, coarse_path = (
         _load_pipeline(args, device)
     )
+    if (
+        args.require_fine_pointpillars_conditioning
+        and not diffusion_config.use_pointpillars_conditioning
+    ):
+        raise ValueError(
+            "Checkpoint has Fine PointPillars conditioning disabled; it is not "
+            "comparable to PointPillars-conditioned checkpoints"
+        )
+    bucket_multiple = pipeline.diffusion.configure_inference_bucket(
+        args.inference_bucket_multiple
+    )
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("This PyTorch build does not provide torch.compile")
+        if diffusion_config.fine_backbone == "transformer":
+            pipeline.diffusion.transformer = torch.compile(
+                pipeline.diffusion.transformer,
+                mode=args.compile_mode,
+                dynamic=False,
+            )
+        else:
+            pipeline.diffusion.unet = torch.compile(
+                pipeline.diffusion.unet,
+                mode=args.compile_mode,
+                dynamic=False,
+            )
     sampling_steps = args.sampling_steps or diffusion_config.sampling_steps
     requested_samples = (
-        args.warmup_batches + args.benchmark_batches
+        args.warmup_batches
+        + args.benchmark_batches
+        + int(args.profile_one_batch)
     ) * args.batch_size
     sample_paths = _split_paths(
         args.data_root,
@@ -238,9 +296,21 @@ def main() -> None:
         requested_samples,
         args.seed,
     )
-    required_samples = min(requested_samples, len(sample_paths))
-    if required_samples < (args.warmup_batches + 1) * args.batch_size:
-        raise ValueError("Dataset is too small for the requested warm-up and benchmark")
+    if len(sample_paths) < requested_samples:
+        raise ValueError(
+            "Dataset is too small for the requested warm-up, profile, and "
+            "benchmark batches"
+        )
+    measured_start = (
+        args.warmup_batches + int(args.profile_one_batch)
+    ) * args.batch_size
+    measured_paths = sample_paths[
+        measured_start : measured_start
+        + args.benchmark_batches * args.batch_size
+    ]
+    sample_fingerprint = hashlib.sha256(
+        "\n".join(str(path) for path in measured_paths).encode("utf-8")
+    ).hexdigest()
     dataset = CoarseReconstructionDataset(
         sample_paths,
         args.radar_root,
@@ -263,7 +333,8 @@ def main() -> None:
     print(
         f"Benchmarking {diffusion_config.fine_backbone} on {device}; "
         f"batch={args.batch_size}; steps={sampling_steps}; "
-        f"warm-up={args.warmup_batches}; measured={args.benchmark_batches}",
+        f"warm-up={args.warmup_batches}; measured={args.benchmark_batches}; "
+        f"bucket={bucket_multiple}; compiled={args.compile}",
         flush=True,
     )
     with torch.inference_mode():
@@ -278,6 +349,38 @@ def main() -> None:
                 use_amp=use_amp,
             )
             _synchronize(device)
+
+        if args.profile_one_batch:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            batch = next(iterator)
+            inputs = _move_batch(batch, device)
+            args.output_root.mkdir(parents=True, exist_ok=True)
+            with torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=True,
+            ) as profiler:
+                _run_inference(
+                    pipeline,
+                    inputs,
+                    sampling_steps=sampling_steps,
+                    device=device,
+                    use_amp=use_amp,
+                )
+                _synchronize(device)
+            profiler.export_chrome_trace(
+                str(args.output_root / "inference_profile.json")
+            )
+            sort_by = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
+            print(
+                profiler.key_averages().table(
+                    sort_by=sort_by,
+                    row_limit=25,
+                ),
+                flush=True,
+            )
 
         timings = {
             "end_to_end": [],
@@ -406,12 +509,51 @@ def main() -> None:
         ),
         "amp": use_amp,
         "fine_backbone": diffusion_config.fine_backbone,
+        "fine_pointpillars_conditioning": (
+            diffusion_config.use_pointpillars_conditioning
+        ),
+        "transformer_inference_optimizations": (
+            {
+                "single_adaptive_normalization": True,
+                "cached_window_layouts": True,
+                "cached_radar_windows": True,
+                "cached_radar_key_values": True,
+                "fused_self_attention_qkv": True,
+            }
+            if diffusion_config.fine_backbone == "transformer"
+            else None
+        ),
         "architecture": checkpoint.get("fine_diffusion_architecture", {}),
         "sampling_steps": sampling_steps,
+        "inference_bucket_multiple": bucket_multiple,
+        "compiled": args.compile,
+        "compile_mode": args.compile_mode if args.compile else None,
         "batch_size": args.batch_size,
         "warmup_batches": args.warmup_batches,
         "benchmark_batches": args.benchmark_batches,
         "samples_measured": samples_measured,
+        "measured_sample_fingerprint_sha256": sample_fingerprint,
+        "comparison_signature": {
+            "data_root": str(args.data_root.resolve()),
+            "radar_root": str(args.radar_root.resolve()),
+            "coarse_checkpoint": (
+                str(Path(coarse_path).resolve())
+                if coarse_path is not None
+                else None
+            ),
+            "split": args.split,
+            "seed": args.seed,
+            "sample_fingerprint_sha256": sample_fingerprint,
+            "batch_size": args.batch_size,
+            "sampling_steps": sampling_steps,
+            "amp": use_amp,
+            "inference_bucket_multiple": bucket_multiple,
+            "fine_pointpillars_conditioning": (
+                diffusion_config.use_pointpillars_conditioning
+            ),
+            "compiled": args.compile,
+            "compile_mode": args.compile_mode if args.compile else None,
+        },
         "parameters": {
             "fine": sum(parameter.numel() for parameter in pipeline.diffusion.parameters()),
             "coarse": (
