@@ -26,6 +26,7 @@ SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
 FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 11
 FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION = 12
 FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION = 13
+FINE_DIFFUSION_UNET_FAIR_ARCHITECTURE_VERSION = 14
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class FineDiffusionConfig:
     fine_unet_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8)
     fine_unet_num_downsamples: int = 3
     fine_unet_resblocks_per_level: int = 2
+    fine_unet_include_coarse_input: bool = True
+    fine_unet_use_global_faulty_context: bool = False
     fine_min_context_height: int = 1
     fine_min_context_width: int = 1
 
@@ -122,6 +125,12 @@ class FineDiffusionConfig:
             )
         if self.fine_unet_resblocks_per_level < 1:
             raise ValueError("fine_unet_resblocks_per_level must be positive")
+        if not isinstance(self.fine_unet_include_coarse_input, bool):
+            raise ValueError("fine_unet_include_coarse_input must be boolean")
+        if not isinstance(self.fine_unet_use_global_faulty_context, bool):
+            raise ValueError(
+                "fine_unet_use_global_faulty_context must be boolean"
+            )
         if self.fine_min_context_height < 1 or self.fine_min_context_width < 1:
             raise ValueError("Fine minimum context dimensions must be positive")
         if self.fine_backbone == "unet" and (
@@ -664,6 +673,10 @@ def fine_diffusion_architecture_metadata(
         "refinement_feedback": "updated_normalized_residual_each_step",
     }
     if config.fine_backbone == "unet":
+        fair_architecture = (
+            not config.fine_unet_include_coarse_input
+            or config.fine_unet_use_global_faulty_context
+        )
         sensor_channels = (
             config.lidar_pillar_channels + config.radar_pillar_channels
             if config.use_pointpillars_conditioning
@@ -672,9 +685,13 @@ def fine_diffusion_architecture_metadata(
         return {
             **common,
             "version": (
-                FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
-                if config.use_pointpillars_conditioning
-                else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+                FINE_DIFFUSION_UNET_FAIR_ARCHITECTURE_VERSION
+                if fair_architecture
+                else (
+                    FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
+                    if config.use_pointpillars_conditioning
+                    else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+                )
             ),
             "backbone_name": (
                 "basic_diffusion_unet_pointpillars"
@@ -682,7 +699,14 @@ def fine_diffusion_architecture_metadata(
                 else "basic_diffusion_unet"
             ),
             "input_channels": (
-                2 * config.lidar_channels + sensor_channels + 3
+                config.lidar_channels
+                + (
+                    config.lidar_channels
+                    if config.fine_unet_include_coarse_input
+                    else 0
+                )
+                + sensor_channels
+                + 3
             ),
             "channel_hierarchy": [
                 config.fine_unet_base_channels * multiplier
@@ -708,6 +732,10 @@ def fine_diffusion_architecture_metadata(
             "pointpillars_conditioning": config.use_pointpillars_conditioning,
             "lidar_pillar_channels": config.lidar_pillar_channels,
             "radar_pillar_channels": config.radar_pillar_channels,
+            "coarse_visible_to_backbone": config.fine_unet_include_coarse_input,
+            "global_faulty_context": (
+                config.fine_unet_use_global_faulty_context
+            ),
         }
     return {
         **common,
@@ -765,10 +793,18 @@ def validate_fine_diffusion_checkpoint_compatibility(
             "fresh architecture-ablation run."
         )
     if config.fine_backbone == "unet":
+        fair_architecture = (
+            not config.fine_unet_include_coarse_input
+            or config.fine_unet_use_global_faulty_context
+        )
         expected_version = (
-            FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
-            if config.use_pointpillars_conditioning
-            else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+            FINE_DIFFUSION_UNET_FAIR_ARCHITECTURE_VERSION
+            if fair_architecture
+            else (
+                FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
+                if config.use_pointpillars_conditioning
+                else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+            )
         )
         if architecture_version != expected_version:
             raise ValueError("Unsupported Basic Diffusion U-Net checkpoint version")
@@ -777,7 +813,16 @@ def validate_fine_diffusion_checkpoint_compatibility(
             if config.use_pointpillars_conditioning
             else config.radar_channels
         )
-        expected = 2 * config.lidar_channels + sensor_channels + 3
+        expected = (
+            config.lidar_channels
+            + (
+                config.lidar_channels
+                if config.fine_unet_include_coarse_input
+                else 0
+            )
+            + sensor_channels
+            + 3
+        )
         weight = state.get("unet.input_projection.weight")
         actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
         if actual != expected:
@@ -1120,6 +1165,12 @@ class FineDiffusionRefiner(nn.Module):
                 ),
                 lidar_pillar_channels=self.config.lidar_pillar_channels,
                 radar_pillar_channels=self.config.radar_pillar_channels,
+                include_coarse_input=self.config.fine_unet_include_coarse_input,
+                global_context_dim=(
+                    self.config.global_context_dim
+                    if self.config.fine_unet_use_global_faulty_context
+                    else 0
+                ),
                 base_channels=self.config.fine_unet_base_channels,
                 channel_multipliers=tuple(
                     self.config.fine_unet_channel_multipliers
@@ -1127,6 +1178,16 @@ class FineDiffusionRefiner(nn.Module):
                 num_downsamples=self.config.fine_unet_num_downsamples,
                 resblocks_per_level=self.config.fine_unet_resblocks_per_level,
             )
+        self.unet_global_encoder = (
+            GlobalFaultyLidarEncoder(
+                self.config.lidar_channels,
+                self.config.global_context_dim,
+                self.config.hidden_dim,
+            )
+            if self.config.fine_backbone == "unet"
+            and self.config.fine_unet_use_global_faulty_context
+            else None
+        )
         self.diffusion_loss = MaskedFlowMSELoss(
             self.config.denominator_epsilon
         )
@@ -1317,6 +1378,7 @@ class FineDiffusionRefiner(nn.Module):
                 timestep,
                 values.get("lidar_pillars"),
                 values.get("radar_pillars"),
+                global_embedding,
             )
             condition = debug["unet_contextual_input"]
         else:
@@ -1361,9 +1423,12 @@ class FineDiffusionRefiner(nn.Module):
                 faulty_lidar_bev, reconstruction_mask
             )
         trusted = faulty_lidar_bev * (1.0 - reconstruction_mask)
-        embedding = faulty_lidar_bev.new_zeros(
-            (faulty_lidar_bev.shape[0], self.config.global_context_dim)
-        )
+        if self.unet_global_encoder is None:
+            embedding = faulty_lidar_bev.new_zeros(
+                (faulty_lidar_bev.shape[0], self.config.global_context_dim)
+            )
+        else:
+            embedding = self.unet_global_encoder(trusted)
         return trusted, embedding
 
     @staticmethod

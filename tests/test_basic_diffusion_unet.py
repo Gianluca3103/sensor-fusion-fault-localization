@@ -9,6 +9,7 @@ from models.two_stage_reconstruction_head.diffusion_process.basic_diffusion_unet
 from models.two_stage_reconstruction_head.diffusion_process.local_diffusion import (
     FineDiffusionConfig,
     FineDiffusionRefiner,
+    fine_diffusion_architecture_metadata,
 )
 from models.two_stage_reconstruction_head.reconstruction_crop import (
     ReconstructionCropExtractor,
@@ -78,6 +79,73 @@ class BasicDiffusionUNetTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "requires both"):
             model(*self._inputs(80, 80))
+
+    def test_fair_variant_hides_coarse_and_uses_global_context(self):
+        model = BasicDiffusionUNet(
+            use_pointpillars_conditioning=True,
+            lidar_pillar_channels=6,
+            radar_pillar_channels=7,
+            include_coarse_input=False,
+            global_context_dim=16,
+            base_channels=4,
+            channel_multipliers=(1, 2, 4, 8),
+            num_downsamples=3,
+            resblocks_per_level=1,
+        ).eval()
+        inputs = list(self._inputs(80, 80))
+        lidar_pillars = torch.rand(1, 6, 80, 80)
+        radar_pillars = torch.rand(1, 7, 80, 80)
+        global_embedding = torch.rand(1, 16)
+
+        _output, debug = model(
+            *inputs,
+            lidar_pillars,
+            radar_pillars,
+            global_embedding,
+        )
+        first_input = debug["unet_contextual_input"].clone()
+        inputs[1] = torch.rand_like(inputs[1])
+        _output, changed_debug = model(
+            *inputs,
+            lidar_pillars,
+            radar_pillars,
+            global_embedding,
+        )
+
+        self.assertEqual(model.input_channels, 19)
+        self.assertFalse(debug["unet_coarse_visible"])
+        self.assertIs(debug["unet_global_context"], global_embedding)
+        self.assertTrue(
+            torch.equal(first_input, changed_debug["unet_contextual_input"])
+        )
+
+    def test_global_context_is_required_when_enabled(self):
+        model = BasicDiffusionUNet(
+            global_context_dim=16,
+            base_channels=4,
+            channel_multipliers=(1, 2, 4, 8),
+            num_downsamples=3,
+            resblocks_per_level=1,
+        )
+        with self.assertRaisesRegex(ValueError, "requires a global embedding"):
+            model(*self._inputs(80, 80))
+
+    def test_fair_refiner_metadata_records_hidden_coarse_and_global_context(self):
+        config = FineDiffusionConfig(
+            fine_backbone="unet",
+            fine_unet_include_coarse_input=False,
+            fine_unet_use_global_faulty_context=True,
+            fine_min_context_height=80,
+            fine_min_context_width=80,
+        )
+        model = FineDiffusionRefiner(config)
+        metadata = fine_diffusion_architecture_metadata(config)
+
+        self.assertIsNotNone(model.unet_global_encoder)
+        self.assertEqual(metadata["version"], 14)
+        self.assertEqual(metadata["input_channels"], 10)
+        self.assertFalse(metadata["coarse_visible_to_backbone"])
+        self.assertTrue(metadata["global_faulty_context"])
 
     def test_raw_radar_checkpoint_input_shape_remains_unchanged(self):
         model = _small_unet().eval()

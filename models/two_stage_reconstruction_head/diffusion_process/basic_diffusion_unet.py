@@ -106,6 +106,8 @@ class BasicDiffusionUNet(nn.Module):
         use_pointpillars_conditioning: bool = False,
         lidar_pillar_channels: int = 64,
         radar_pillar_channels: int = 64,
+        include_coarse_input: bool = True,
+        global_context_dim: int = 0,
         base_channels: int = 64,
         channel_multipliers: tuple[int, ...] = (1, 2, 4, 8),
         num_downsamples: int = 3,
@@ -125,12 +127,19 @@ class BasicDiffusionUNet(nn.Module):
         self.use_pointpillars_conditioning = bool(use_pointpillars_conditioning)
         self.lidar_pillar_channels = int(lidar_pillar_channels)
         self.radar_pillar_channels = int(radar_pillar_channels)
+        self.include_coarse_input = bool(include_coarse_input)
+        self.global_context_dim = int(global_context_dim)
         sensor_channels = (
             self.lidar_pillar_channels + self.radar_pillar_channels
             if self.use_pointpillars_conditioning
             else self.radar_channels
         )
-        self.input_channels = 2 * lidar_channels + sensor_channels + 3
+        self.input_channels = (
+            lidar_channels
+            + (lidar_channels if self.include_coarse_input else 0)
+            + sensor_channels
+            + 3
+        )
         self.output_channels = int(lidar_channels)
         self.channel_hierarchy = tuple(
             int(base_channels * multiplier) for multiplier in channel_multipliers
@@ -143,6 +152,11 @@ class BasicDiffusionUNet(nn.Module):
             nn.Linear(time_dim, time_dim),
             nn.SiLU(inplace=True),
             nn.Linear(time_dim, time_dim),
+        )
+        self.global_context_projection = (
+            nn.Linear(self.global_context_dim, time_dim)
+            if self.global_context_dim > 0
+            else None
         )
         self.input_projection = nn.Conv2d(
             self.input_channels, self.channel_hierarchy[0], 3, padding=1
@@ -203,6 +217,7 @@ class BasicDiffusionUNet(nn.Module):
         timestep: torch.Tensor,
         lidar_pillars: torch.Tensor | None = None,
         radar_pillars: torch.Tensor | None = None,
+        global_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, object]]:
         if self.use_pointpillars_conditioning:
             if lidar_pillars is None or radar_pillars is None:
@@ -225,23 +240,38 @@ class BasicDiffusionUNet(nn.Module):
                 )
         else:
             sensor_condition = radar_bev * valid_mask
-        spatial_input = torch.cat(
+        spatial_parts = [current_residual * valid_mask]
+        if self.include_coarse_input:
+            spatial_parts.append(coarse_lidar * valid_mask)
+        spatial_parts.extend(
             (
-                current_residual * valid_mask,
-                coarse_lidar * valid_mask,
                 sensor_condition,
                 reconstruction_mask * valid_mask,
                 halo_mask * valid_mask,
                 valid_mask,
-            ),
-            dim=1,
+            )
         )
+        spatial_input = torch.cat(spatial_parts, dim=1)
         if spatial_input.shape[1] != self.input_channels:
             raise ValueError(
                 f"Basic Diffusion U-Net expected {self.input_channels} input "
                 f"channels, received {spatial_input.shape[1]}"
             )
         time_embedding = self.time_embedding(timestep)
+        if self.global_context_projection is not None:
+            if global_embedding is None:
+                raise ValueError(
+                    "Globally conditioned U-Net requires a global embedding"
+                )
+            if global_embedding.shape[1] != self.global_context_dim:
+                raise ValueError(
+                    "Globally conditioned U-Net expected embedding width "
+                    f"{self.global_context_dim}, received "
+                    f"{global_embedding.shape[1]}"
+                )
+            time_embedding = time_embedding + self.global_context_projection(
+                global_embedding
+            ).to(dtype=time_embedding.dtype)
         tensor = self.input_projection(spatial_input) * valid_mask
         encoder_features: list[torch.Tensor] = []
         encoder_shapes: list[tuple[int, ...]] = []
@@ -287,6 +317,8 @@ class BasicDiffusionUNet(nn.Module):
             "unet_output_shape": tuple(velocity.shape),
             "unet_sensor_condition": sensor_condition,
             "unet_pointpillars_conditioning": self.use_pointpillars_conditioning,
+            "unet_coarse_visible": self.include_coarse_input,
+            "unet_global_context": global_embedding,
         }
         if self.training and not self._shape_log_emitted:
             print(

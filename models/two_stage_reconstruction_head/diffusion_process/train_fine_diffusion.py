@@ -977,12 +977,24 @@ def main():
             if config.use_pointpillars_conditioning
             else config.radar_channels
         )
-        input_channels = 2 * config.lidar_channels + sensor_channels + 3
+        input_channels = (
+            config.lidar_channels
+            + (
+                config.lidar_channels
+                if config.fine_unet_include_coarse_input
+                else 0
+            )
+            + sensor_channels
+            + 3
+        )
         print(
             "Fine backbone: basic diffusion U-Net\n"
             f"  input channels: {input_channels}\n"
             "  sensor conditioning: "
             f"{'LiDAR + radar PointPillars' if config.use_pointpillars_conditioning else 'raw radar'}\n"
+            f"  coarse visible to backbone: {config.fine_unet_include_coarse_input}\n"
+            "  global faulty context: "
+            f"{config.fine_unet_use_global_faulty_context}\n"
             f"  channel hierarchy: {hierarchy}\n"
             f"  downsampling count: {config.fine_unet_num_downsamples}\n"
             f"  deepest stride: {2 ** config.fine_unet_num_downsamples}\n"
