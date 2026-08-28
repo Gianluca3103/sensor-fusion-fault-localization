@@ -68,6 +68,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--limit-samples", type=int)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--occupancy-thresholds",
+        type=float,
+        nargs="+",
+        help=(
+            "Evaluate several coarse occupancy thresholds in one inference pass. "
+            "Clean targets and the faulty baseline remain fixed at 0.5."
+        ),
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
         "--visualize-samples-per-fault",
@@ -106,8 +115,10 @@ def _occupancy_counts(
     probability: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    prediction_threshold: float = 0.5,
 ) -> dict[str, int]:
-    predicted = probability >= 0.5
+    predicted = probability >= prediction_threshold
     occupied = target >= 0.5
     valid = mask > 0
     return {
@@ -122,9 +133,11 @@ def _tolerant_occupancy_counts(
     probability: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    prediction_threshold: float = 0.5,
 ) -> dict[str, int]:
     valid = mask > 0
-    predicted = (probability >= 0.5) & valid
+    predicted = (probability >= prediction_threshold) & valid
     occupied = (target >= 0.5) & valid
     target_neighborhood = _dilate_with_metric_disk(
         occupied,
@@ -146,6 +159,66 @@ def _tolerant_occupancy_counts(
         "tolerant_prediction_count": int(predicted.sum()),
         "tolerant_target_count": int(occupied.sum()),
     }
+
+
+def _coarse_threshold_summary(
+    records: list[dict], threshold: float
+) -> dict[str, int | float]:
+    """Convert additive per-sample counts into one global sweep row."""
+
+    summary = summarize_records(records)
+    row: dict[str, int | float] = {
+        "coarse_threshold": threshold,
+        "samples": summary["samples"],
+        "metric_samples": summary["metric_samples"],
+        "excluded_samples": summary["excluded_metric_samples"],
+        "repair_cells": summary["repair_cells"],
+    }
+    for prefix in ("faulty", "coarse"):
+        for metric in ("precision", "recall", "f1", "iou"):
+            row[f"{prefix}_exact_{metric}"] = summary[
+                f"micro/{prefix}_{metric}"
+            ]
+        for metric in ("precision", "recall", "f1", "iou"):
+            row[f"{prefix}_tolerant_0_5m_{metric}"] = summary[
+                f"micro/{prefix}_occupancy_tolerant_0_5m_{metric}"
+            ]
+        fp = int(summary[f"micro/{prefix}_fp"])
+        tn = int(summary[f"micro/{prefix}_tn"])
+        row[f"{prefix}_hallucination_rate"] = _safe_ratio(fp, fp + tn)
+    row["coarse_minus_faulty_exact_iou"] = (
+        float(row["coarse_exact_iou"]) - float(row["faulty_exact_iou"])
+    )
+    row["coarse_minus_faulty_tolerant_0_5m_iou"] = (
+        float(row["coarse_tolerant_0_5m_iou"])
+        - float(row["faulty_tolerant_0_5m_iou"])
+    )
+    return row
+
+
+def _print_coarse_threshold_sweep(rows: list[dict[str, int | float]]) -> None:
+    print()
+    print("COARSE OCCUPANCY THRESHOLD SWEEP (clean and faulty fixed at 0.500)")
+    header = (
+        f"{'Thr':>5} {'Exact IoU':>10} {'Delta':>9} {'F1':>8} "
+        f"{'P':>8} {'R':>8} {'IoU@0.5m':>10} {'F1@0.5m':>10} "
+        f"{'Delta@0.5m':>12} {'Halluc.':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{float(row['coarse_threshold']):5.2f} "
+            f"{float(row['coarse_exact_iou']):9.2%} "
+            f"{float(row['coarse_minus_faulty_exact_iou']):+8.2%} "
+            f"{float(row['coarse_exact_f1']):7.2%} "
+            f"{float(row['coarse_exact_precision']):7.2%} "
+            f"{float(row['coarse_exact_recall']):7.2%} "
+            f"{float(row['coarse_tolerant_0_5m_iou']):9.2%} "
+            f"{float(row['coarse_tolerant_0_5m_f1']):9.2%} "
+            f"{float(row['coarse_minus_faulty_tolerant_0_5m_iou']):+11.2%} "
+            f"{float(row['coarse_hallucination_rate']):8.2%}"
+        )
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -522,6 +595,11 @@ def main() -> None:
         raise ValueError("batch size must be positive and workers non-negative")
     if args.visualize_samples_per_fault < 0:
         raise ValueError("visualization count cannot be negative")
+    occupancy_thresholds = tuple(
+        sorted(set(float(value) for value in (args.occupancy_thresholds or ())))
+    )
+    if any(not 0.0 < threshold < 1.0 for threshold in occupancy_thresholds):
+        raise ValueError("occupancy thresholds must be strictly between 0 and 1")
     seed_everything(args.seed)
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -575,6 +653,9 @@ def main() -> None:
     epsilon = float(checkpoint.get("loss_config", {}).get("epsilon", 1.0e-8))
     use_amp = device.type == "cuda" and not args.no_amp
     records = []
+    threshold_records: dict[float, list[dict]] = {
+        threshold: [] for threshold in occupancy_thresholds
+    }
     visualized = defaultdict(int)
     hrnet_debug_saved = False
     completed = 0
@@ -689,6 +770,51 @@ def main() -> None:
                 record["target_occupied_cells"] = (
                     coarse_counts["tp"] + coarse_counts["fn"]
                 )
+                coarse_probability = torch.sigmoid(
+                    sample_outputs["occupancy_logits"]
+                )
+                for threshold in occupancy_thresholds:
+                    sweep_coarse_counts = _occupancy_counts(
+                        coarse_probability,
+                        inputs["clean_bev"][index : index + 1, 0:1],
+                        sample_outputs["reconstruction_mask"],
+                        prediction_threshold=threshold,
+                    )
+                    sweep_coarse_tolerant_counts = _tolerant_occupancy_counts(
+                        coarse_probability,
+                        inputs["clean_bev"][index : index + 1, 0:1],
+                        sample_outputs["reconstruction_mask"],
+                        prediction_threshold=threshold,
+                    )
+                    sweep_record = {
+                        "sample_path": sample_path,
+                        "fault": fault,
+                        "severity": severity,
+                        "fault_group": record["fault_group"],
+                        "sequence_id": record["sequence_id"],
+                        "frame_id": record["frame_id"],
+                        "repair_cells": record["repair_cells"],
+                        "target_occupied_cells": record[
+                            "target_occupied_cells"
+                        ],
+                        **{
+                            f"coarse_{key}": value
+                            for key, value in sweep_coarse_counts.items()
+                        },
+                        **{
+                            f"coarse_{key}": value
+                            for key, value in sweep_coarse_tolerant_counts.items()
+                        },
+                        **{
+                            f"faulty_{key}": value
+                            for key, value in faulty_counts.items()
+                        },
+                        **{
+                            f"faulty_{key}": value
+                            for key, value in faulty_tolerant_counts.items()
+                        },
+                    }
+                    threshold_records[threshold].append(sweep_record)
                 record["exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]
                     - record["faulty_occupancy_exact_iou"]
@@ -743,11 +869,31 @@ def main() -> None:
     by_fault_severity = _group_summaries(
         records, lambda record: record["fault_group"]
     )
+    threshold_sweep = [
+        _coarse_threshold_summary(threshold_records[threshold], threshold)
+        for threshold in occupancy_thresholds
+    ]
+    threshold_sweep_by_fault = []
+    for threshold in occupancy_thresholds:
+        grouped_records: dict[str, list[dict]] = defaultdict(list)
+        for record in threshold_records[threshold]:
+            grouped_records[str(record["fault_group"])].append(record)
+        for fault_group, group_records in sorted(grouped_records.items()):
+            threshold_sweep_by_fault.append(
+                {
+                    "fault_group": fault_group,
+                    **_coarse_threshold_summary(group_records, threshold),
+                }
+            )
     summary = {
         "checkpoint": str(args.checkpoint),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
         "radar_enabled": radar_enabled,
+        "clean_and_faulty_occupancy_threshold": 0.5,
+        "coarse_occupancy_thresholds": list(occupancy_thresholds),
+        "threshold_sweep": threshold_sweep,
+        "threshold_sweep_by_fault": threshold_sweep_by_fault,
         "overall": summarize_records(records),
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,
@@ -764,10 +910,29 @@ def main() -> None:
                 {"group_type": group_type, "group": group, **values}
             )
     write_csv_rows(args.output_root / "by_fault_metrics.csv", summary_rows)
+    if threshold_sweep:
+        write_csv_rows(
+            args.output_root / "occupancy_threshold_sweep.csv",
+            threshold_sweep,
+        )
+        write_csv_rows(
+            args.output_root / "occupancy_threshold_sweep_by_fault.csv",
+            threshold_sweep_by_fault,
+        )
+        atomic_write_json(
+            args.output_root / "occupancy_threshold_sweep.json",
+            {
+                "clean_and_faulty_threshold": 0.5,
+                "rows": threshold_sweep,
+                "by_fault": threshold_sweep_by_fault,
+            },
+        )
     atomic_write_json(args.output_root / "summary.json", summary)
     print()
     print(f"PER-FAULT {args.split.upper()} RESULTS")
     _print_table(by_fault_severity)
+    if threshold_sweep:
+        _print_coarse_threshold_sweep(threshold_sweep)
     print(f"\nSaved evaluation to {args.output_root}")
 
 

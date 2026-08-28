@@ -5,12 +5,74 @@ from pathlib import Path
 import torch
 
 from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_by_fault import (
+    _coarse_threshold_summary,
+    _occupancy_counts,
     _save_comparison,
     summarize_records,
 )
 
 
 class CoarseFaultEvaluationTests(unittest.TestCase):
+    def test_occupancy_counts_accept_prediction_threshold(self):
+        probability = torch.tensor([[[[0.2, 0.4, 0.6]]]])
+        target = torch.tensor([[[[0.0, 1.0, 1.0]]]])
+        mask = torch.ones_like(target)
+
+        permissive = _occupancy_counts(
+            probability,
+            target,
+            mask,
+            prediction_threshold=0.3,
+        )
+        conservative = _occupancy_counts(
+            probability,
+            target,
+            mask,
+            prediction_threshold=0.5,
+        )
+
+        self.assertEqual(permissive, {"tp": 2, "fp": 0, "fn": 0, "tn": 1})
+        self.assertEqual(conservative, {"tp": 1, "fp": 0, "fn": 1, "tn": 1})
+
+    def test_coarse_threshold_summary_reports_global_metrics(self):
+        record = {
+            "sample_path": "sample.npz",
+            "fault": "fog_sim",
+            "severity": 4,
+            "fault_group": "fog_sim_s4",
+            "sequence_id": "1",
+            "frame_id": "1",
+            "repair_cells": 4,
+            "target_occupied_cells": 2,
+            "coarse_tp": 1,
+            "coarse_fp": 1,
+            "coarse_fn": 1,
+            "coarse_tn": 1,
+            "faulty_tp": 0,
+            "faulty_fp": 0,
+            "faulty_fn": 2,
+            "faulty_tn": 2,
+        }
+        for prefix in ("coarse", "faulty"):
+            record[f"{prefix}_tolerant_matched_predictions"] = record[
+                f"{prefix}_tp"
+            ]
+            record[f"{prefix}_tolerant_matched_targets"] = record[
+                f"{prefix}_tp"
+            ]
+            record[f"{prefix}_tolerant_prediction_count"] = (
+                record[f"{prefix}_tp"] + record[f"{prefix}_fp"]
+            )
+            record[f"{prefix}_tolerant_target_count"] = 2
+
+        summary = _coarse_threshold_summary([record], 0.4)
+
+        self.assertEqual(summary["coarse_threshold"], 0.4)
+        self.assertAlmostEqual(summary["coarse_exact_iou"], 1.0 / 3.0)
+        self.assertAlmostEqual(
+            summary["coarse_minus_faulty_exact_iou"], 1.0 / 3.0
+        )
+
     def test_comparison_visualization_is_written(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "comparison.png"
