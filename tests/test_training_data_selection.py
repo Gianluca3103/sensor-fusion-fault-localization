@@ -17,12 +17,25 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.train_coarse_rec
 from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
     _move_batch as move_diffusion_batch,
     _resolve_amp_dtype,
+    _selector_config_from_payload,
     _split_paths as diffusion_split_paths,
 )
 from models.two_stage_reconstruction_head import MaskedBEVReconstructionLoss
 
 
 class TrainingDataSelectionTests(unittest.TestCase):
+    def test_fine_diffusion_accepts_resolved_selector_configuration(self):
+        config = _selector_config_from_payload(
+            {
+                "selector": {
+                    "max_secondary_repair_boxes": 7,
+                    "min_secondary_box_spatial_density": 0.0001,
+                }
+            }
+        )
+        self.assertEqual(config.max_secondary_repair_boxes, 7)
+        self.assertEqual(config.min_secondary_box_spatial_density, 0.0001)
+
     def test_fine_diffusion_amp_dtype_resolution(self):
         self.assertIs(_resolve_amp_dtype("bfloat16"), torch.bfloat16)
         self.assertIs(_resolve_amp_dtype("bf16"), torch.bfloat16)

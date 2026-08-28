@@ -30,6 +30,7 @@ from models.Fault_Localization.training_utils import (
 from models.two_stage_reconstruction_head import (
     BEVChannelNormalization,
     CoarseReconstructionDataset,
+    FaultSelectorConfig,
     FineDiffusionConfig,
     FineDiffusionRefiner,
     FrozenCoarseFineDiffusionPipeline,
@@ -103,6 +104,19 @@ def _load_components(path):
         source=normalization_payload.get("source", "configured"),
     )
     return payload, config, bev_normalizer
+
+
+def _selector_config_from_payload(payload: dict) -> FaultSelectorConfig:
+    """Load a selector from either a source or resolved run configuration."""
+
+    if "selector" not in payload:
+        return build_selector_config(payload)
+    selector_payload = payload["selector"]
+    if not isinstance(selector_payload, dict):
+        raise ValueError("resolved selector configuration must be an object")
+    config = FaultSelectorConfig(**selector_payload)
+    config.validate()
+    return config
 
 
 def _residual_normalizer(metadata, config):
@@ -662,7 +676,7 @@ def main():
     if args.selector_config:
         with Path(args.selector_config).open("r", encoding="utf-8") as handle:
             selector_payload = json.load(handle)
-    selector = build_selector_config(selector_payload)
+    selector = _selector_config_from_payload(selector_payload)
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 4))
