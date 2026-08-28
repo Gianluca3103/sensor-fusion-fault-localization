@@ -45,6 +45,13 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.evaluate_coarse_
     _safe_ratio,
     _target_occupied_cells,
 )
+from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss import (
+    BEV_RESOLUTION_M,
+    _dilate_with_metric_disk,
+)
+
+
+REFERENCE_OCCUPANCY_THRESHOLD = 0.5
 
 
 def _parse_args() -> argparse.Namespace:
@@ -89,7 +96,19 @@ def _parse_args() -> argparse.Namespace:
         "--occupancy-threshold",
         type=float,
         default=0.5,
-        help="Threshold shared by coarse-to-fine occupancy transition counts.",
+        help=(
+            "Single Fine Diffusion occupancy threshold (default: 0.5). "
+            "Superseded by --fine-occupancy-thresholds when that option is used."
+        ),
+    )
+    parser.add_argument(
+        "--fine-occupancy-thresholds",
+        type=float,
+        nargs="+",
+        help=(
+            "Evaluate several Fine Diffusion occupancy thresholds in one inference "
+            "pass. Clean targets and the coarse baseline remain fixed at 0.5."
+        ),
     )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
@@ -182,11 +201,11 @@ def _occupancy_transition_counts(
     reconstruction_mask: torch.Tensor,
     threshold: float,
 ) -> dict[str, int]:
-    """Classify every coarse-to-fine occupancy change inside repair cells."""
+    """Classify changes while varying only the Fine Diffusion threshold."""
 
     valid = reconstruction_mask > 0.5
-    clean_occupied = clean[:, 0:1] >= threshold
-    coarse_occupied = coarse[:, 0:1] >= threshold
+    clean_occupied = clean[:, 0:1] >= REFERENCE_OCCUPANCY_THRESHOLD
+    coarse_occupied = coarse[:, 0:1] >= REFERENCE_OCCUPANCY_THRESHOLD
     fine_occupied = fine[:, 0:1] >= threshold
     coarse_empty = ~coarse_occupied
     fine_empty = ~fine_occupied
@@ -204,6 +223,232 @@ def _occupancy_transition_counts(
             (valid & clean_occupied & coarse_occupied & fine_empty).sum()
         ),
     }
+
+
+def _threshold_occupancy_counts(
+    probability: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    prediction_threshold: float,
+    tolerance_m: float,
+    resolution_m: float = BEV_RESOLUTION_M,
+) -> dict[str, int]:
+    """Return additive exact and tolerant counts for one decision threshold."""
+
+    valid = mask > 0.5
+    predicted = (probability >= prediction_threshold) & valid
+    occupied = (target >= REFERENCE_OCCUPANCY_THRESHOLD) & valid
+    target_neighborhood = _dilate_with_metric_disk(
+        occupied, tolerance_m, resolution_m
+    )
+    prediction_neighborhood = _dilate_with_metric_disk(
+        predicted, tolerance_m, resolution_m
+    )
+    return {
+        "tp": int((predicted & occupied).sum()),
+        "fp": int((predicted & ~occupied & valid).sum()),
+        "fn": int((~predicted & occupied & valid).sum()),
+        "tn": int((~predicted & ~occupied & valid).sum()),
+        "tolerant_matched_predictions": int(
+            (predicted & target_neighborhood).sum()
+        ),
+        "tolerant_matched_targets": int(
+            (occupied & prediction_neighborhood).sum()
+        ),
+        "tolerant_prediction_count": int(predicted.sum()),
+        "tolerant_target_count": int(occupied.sum()),
+    }
+
+
+def _threshold_sweep_record(
+    clean: torch.Tensor,
+    coarse: torch.Tensor,
+    fine: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    *,
+    fine_threshold: float,
+    tolerance_m: float,
+) -> dict[str, int | float]:
+    """Build the sufficient statistics for one sample and fine threshold."""
+
+    coarse_counts = _threshold_occupancy_counts(
+        coarse[:, 0:1],
+        clean[:, 0:1],
+        reconstruction_mask,
+        prediction_threshold=REFERENCE_OCCUPANCY_THRESHOLD,
+        tolerance_m=tolerance_m,
+    )
+    fine_counts = _threshold_occupancy_counts(
+        fine[:, 0:1],
+        clean[:, 0:1],
+        reconstruction_mask,
+        prediction_threshold=fine_threshold,
+        tolerance_m=tolerance_m,
+    )
+    valid = reconstruction_mask > 0.5
+    clean_occupied = clean[:, 0:1] >= REFERENCE_OCCUPANCY_THRESHOLD
+    coarse_occupied = coarse[:, 0:1] >= REFERENCE_OCCUPANCY_THRESHOLD
+    record: dict[str, int | float] = {
+        "fine_threshold": fine_threshold,
+        "repair_cells": int(valid.sum()),
+        "target_occupied_cells": coarse_counts["tp"] + coarse_counts["fn"],
+        "missing_clean_cells_from_coarse": int(
+            (valid & clean_occupied & ~coarse_occupied).sum()
+        ),
+        "coarse_false_positive_cells": int(
+            (valid & ~clean_occupied & coarse_occupied).sum()
+        ),
+    }
+    for prefix, counts in (("coarse", coarse_counts), ("fine", fine_counts)):
+        record.update({f"{prefix}_{key}": value for key, value in counts.items()})
+    record.update(
+        _occupancy_transition_counts(
+            clean,
+            coarse,
+            fine,
+            reconstruction_mask,
+            fine_threshold,
+        )
+    )
+    return record
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _summarize_threshold_records(
+    records: list[dict[str, int | float]],
+) -> dict[str, int | float]:
+    """Aggregate one threshold using global (micro) occupancy counts."""
+
+    evaluable = [
+        record
+        for record in records
+        if int(record["repair_cells"]) > 0
+        and int(record["target_occupied_cells"]) > 0
+    ]
+    summary: dict[str, int | float] = {
+        "fine_threshold": float(records[0]["fine_threshold"]),
+        "samples": len(records),
+        "metric_samples": len(evaluable),
+        "excluded_samples": len(records) - len(evaluable),
+        "repair_cells": sum(int(record["repair_cells"]) for record in evaluable),
+    }
+    for prefix in ("coarse", "fine"):
+        for key in (
+            "tp",
+            "fp",
+            "fn",
+            "tn",
+            "tolerant_matched_predictions",
+            "tolerant_matched_targets",
+            "tolerant_prediction_count",
+            "tolerant_target_count",
+        ):
+            summary[f"{prefix}_{key}"] = sum(
+                int(record[f"{prefix}_{key}"]) for record in evaluable
+            )
+        tp = int(summary[f"{prefix}_tp"])
+        fp = int(summary[f"{prefix}_fp"])
+        fn = int(summary[f"{prefix}_fn"])
+        precision = _ratio(tp, tp + fp)
+        recall = _ratio(tp, tp + fn)
+        f1 = _ratio(2.0 * precision * recall, precision + recall)
+        tolerant_precision = _ratio(
+            int(summary[f"{prefix}_tolerant_matched_predictions"]),
+            int(summary[f"{prefix}_tolerant_prediction_count"]),
+        )
+        tolerant_recall = _ratio(
+            int(summary[f"{prefix}_tolerant_matched_targets"]),
+            int(summary[f"{prefix}_tolerant_target_count"]),
+        )
+        tolerant_f1 = _ratio(
+            2.0 * tolerant_precision * tolerant_recall,
+            tolerant_precision + tolerant_recall,
+        )
+        summary.update(
+            {
+                f"{prefix}_exact_precision": precision,
+                f"{prefix}_exact_recall": recall,
+                f"{prefix}_exact_f1": f1,
+                f"{prefix}_exact_iou": _ratio(tp, tp + fp + fn),
+                f"{prefix}_tolerant_precision": tolerant_precision,
+                f"{prefix}_tolerant_recall": tolerant_recall,
+                f"{prefix}_tolerant_f1": tolerant_f1,
+                f"{prefix}_tolerant_iou": _ratio(
+                    tolerant_f1, 2.0 - tolerant_f1
+                ),
+            }
+        )
+    for key in (
+        *TRANSITION_KEYS,
+        "missing_clean_cells_from_coarse",
+        "coarse_false_positive_cells",
+    ):
+        summary[key] = sum(int(record[key]) for record in evaluable)
+    changed = sum(int(summary[key]) for key in TRANSITION_KEYS)
+    summary["changed_cells"] = changed
+    summary["addition_precision"] = _ratio(
+        int(summary["beneficial_additions"]),
+        int(summary["beneficial_additions"])
+        + int(summary["harmful_additions"]),
+    )
+    summary["missing_cell_recovery_rate"] = _ratio(
+        int(summary["beneficial_additions"]),
+        int(summary["missing_clean_cells_from_coarse"]),
+    )
+    summary["removal_precision"] = _ratio(
+        int(summary["beneficial_removals"]),
+        int(summary["beneficial_removals"])
+        + int(summary["harmful_removals"]),
+    )
+    summary["coarse_false_positive_removal_rate"] = _ratio(
+        int(summary["beneficial_removals"]),
+        int(summary["coarse_false_positive_cells"]),
+    )
+    summary["fine_minus_coarse_exact_iou"] = (
+        float(summary["fine_exact_iou"])
+        - float(summary["coarse_exact_iou"])
+    )
+    summary["fine_minus_coarse_tolerant_iou"] = (
+        float(summary["fine_tolerant_iou"])
+        - float(summary["coarse_tolerant_iou"])
+    )
+    return summary
+
+
+def _print_threshold_sweep(rows: list[dict[str, int | float]], tolerance_m: float) -> None:
+    tolerance_label = f"{tolerance_m:g}m"
+    print()
+    print("FINE OCCUPANCY THRESHOLD SWEEP (coarse and clean fixed at 0.500)")
+    header = (
+        f"{'Thr':>5} {'Exact IoU':>10} {'Delta':>9} {'F1':>8} {'P':>8} {'R':>8} "
+        f"{f'IoU@{tolerance_label}':>10} {f'F1@{tolerance_label}':>10} "
+        f"{f'Delta@{tolerance_label}':>12} "
+        f"{'Benefit+':>10} {'Harm+':>8} {'Recover':>9} "
+        f"{'Benefit-':>10} {'Harm-':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{float(row['fine_threshold']):5.2f} "
+            f"{float(row['fine_exact_iou']):9.2%} "
+            f"{float(row['fine_minus_coarse_exact_iou']):+8.2%} "
+            f"{float(row['fine_exact_f1']):7.2%} "
+            f"{float(row['fine_exact_precision']):7.2%} "
+            f"{float(row['fine_exact_recall']):7.2%} "
+            f"{float(row['fine_tolerant_iou']):9.2%} "
+            f"{float(row['fine_tolerant_f1']):9.2%} "
+            f"{float(row['fine_minus_coarse_tolerant_iou']):+11.2%} "
+            f"{int(row['beneficial_additions']):10d} "
+            f"{int(row['harmful_additions']):8d} "
+            f"{float(row['missing_cell_recovery_rate']):8.2%} "
+            f"{int(row['beneficial_removals']):10d} "
+            f"{int(row['harmful_removals']):8d}"
+        )
 
 
 def _rename_coarse_metrics(metrics: dict[str, torch.Tensor], target_prefix: str) -> dict[str, torch.Tensor]:
@@ -486,8 +731,14 @@ def main() -> None:
         raise ValueError("batch size must be positive and workers non-negative")
     if args.visualize_samples_per_fault < 0:
         raise ValueError("visualization count cannot be negative")
-    if not 0.0 < args.occupancy_threshold < 1.0:
-        raise ValueError("occupancy threshold must be strictly between 0 and 1")
+    requested_thresholds = (
+        args.fine_occupancy_thresholds
+        if args.fine_occupancy_thresholds is not None
+        else [args.occupancy_threshold]
+    )
+    if any(not 0.0 < threshold < 1.0 for threshold in requested_thresholds):
+        raise ValueError("occupancy thresholds must be strictly between 0 and 1")
+    fine_thresholds = tuple(sorted(set(float(value) for value in requested_thresholds)))
     if args.tolerance_m < 0.0:
         raise ValueError("tolerance must be non-negative")
     seed_everything(args.seed)
@@ -584,6 +835,9 @@ def main() -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     sampling_steps = args.sampling_steps or diffusion_config.sampling_steps
     records = []
+    threshold_records: dict[float, list[dict[str, int | float]]] = {
+        threshold: [] for threshold in fine_thresholds
+    }
     visualized = defaultdict(int)
     completed = 0
 
@@ -690,16 +944,27 @@ def main() -> None:
                     counts = _occupancy_counts(probability, clean[:, 0:1], sample_mask)
                     record.update({f"{prefix}_{key}": value for key, value in counts.items()})
                 record["target_occupied_cells"] = record["fine_tp"] + record["fine_fn"]
-                record["occupancy_threshold"] = args.occupancy_threshold
+                record["occupancy_threshold"] = REFERENCE_OCCUPANCY_THRESHOLD
                 record.update(
                     _occupancy_transition_counts(
                         clean,
                         coarse_sample,
                         fine_sample,
                         sample_mask,
-                        args.occupancy_threshold,
+                        REFERENCE_OCCUPANCY_THRESHOLD,
                     )
                 )
+                for fine_threshold in fine_thresholds:
+                    threshold_records[fine_threshold].append(
+                        _threshold_sweep_record(
+                            clean,
+                            coarse_sample,
+                            fine_sample,
+                            sample_mask,
+                            fine_threshold=fine_threshold,
+                            tolerance_m=args.tolerance_m,
+                        )
+                    )
                 record["coarse_exact_iou_improvement"] = (
                     record["coarse_occupancy_exact_iou"]
                     - record["faulty_occupancy_exact_iou"]
@@ -762,6 +1027,10 @@ def main() -> None:
 
     by_fault = _group_summaries(records, lambda record: record["fault"])
     by_fault_severity = _group_summaries(records, lambda record: record["fault_group"])
+    threshold_sweep = [
+        _summarize_threshold_records(threshold_records[threshold])
+        for threshold in fine_thresholds
+    ]
     summary = {
         "checkpoint": str(args.checkpoint),
         "coarse_checkpoint": (
@@ -776,7 +1045,9 @@ def main() -> None:
         "split": args.split,
         "sampling_steps": sampling_steps,
         "tolerance_m": args.tolerance_m,
-        "occupancy_threshold": args.occupancy_threshold,
+        "standard_metrics_occupancy_threshold": REFERENCE_OCCUPANCY_THRESHOLD,
+        "fine_occupancy_thresholds": list(fine_thresholds),
+        "threshold_sweep": threshold_sweep,
         "overall": summarize_records(records),
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,
@@ -791,6 +1062,17 @@ def main() -> None:
         for group, values in groups.items():
             summary_rows.append({"group_type": group_type, "group": group, **values})
     write_csv_rows(args.output_root / "by_fault_metrics.csv", summary_rows)
+    write_csv_rows(
+        args.output_root / "occupancy_threshold_sweep.csv", threshold_sweep
+    )
+    atomic_write_json(
+        args.output_root / "occupancy_threshold_sweep.json",
+        {
+            "coarse_and_target_threshold": REFERENCE_OCCUPANCY_THRESHOLD,
+            "tolerance_m": args.tolerance_m,
+            "rows": threshold_sweep,
+        },
+    )
     atomic_write_json(args.output_root / "summary.json", summary)
     print()
     print(f"PER-FAULT FINE-DIFFUSION {args.split.upper()} RESULTS")
@@ -803,7 +1085,10 @@ def main() -> None:
         ),
         tolerance_m=args.tolerance_m,
     )
-    _print_transition_table(by_fault_severity, args.occupancy_threshold)
+    _print_transition_table(
+        by_fault_severity, REFERENCE_OCCUPANCY_THRESHOLD
+    )
+    _print_threshold_sweep(threshold_sweep, args.tolerance_m)
     overall = summary["overall"]
     print(
         "\nOverall transitions: "

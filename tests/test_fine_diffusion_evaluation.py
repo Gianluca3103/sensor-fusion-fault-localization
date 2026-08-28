@@ -5,6 +5,8 @@ import torch
 from models.two_stage_reconstruction_head.diffusion_process.evaluate_fine_diffusion_by_fault import (
     _diffusion_config_from_checkpoint,
     _occupancy_transition_counts,
+    _summarize_threshold_records,
+    _threshold_sweep_record,
 )
 
 
@@ -38,6 +40,57 @@ class FineDiffusionEvaluationTests(unittest.TestCase):
                 "harmful_removals": 1,
             },
         )
+
+    def test_threshold_sweep_varies_only_fine_decision_threshold(self):
+        clean = torch.tensor([[[[1.0, 0.0]]]])
+        coarse = torch.tensor([[[[0.6, 0.4]]]])
+        fine = torch.tensor([[[[0.4, 0.4]]]])
+        mask = torch.ones_like(clean)
+
+        permissive = _threshold_sweep_record(
+            clean,
+            coarse,
+            fine,
+            mask,
+            fine_threshold=0.3,
+            tolerance_m=0.0,
+        )
+        conservative = _threshold_sweep_record(
+            clean,
+            coarse,
+            fine,
+            mask,
+            fine_threshold=0.5,
+            tolerance_m=0.0,
+        )
+
+        self.assertEqual(permissive["coarse_tp"], 1)
+        self.assertEqual(conservative["coarse_tp"], 1)
+        self.assertEqual(permissive["fine_tp"], 1)
+        self.assertEqual(permissive["fine_fp"], 1)
+        self.assertEqual(conservative["fine_fn"], 1)
+
+    def test_threshold_summary_uses_global_counts(self):
+        clean = torch.tensor([[[[1.0, 0.0, 1.0, 0.0]]]])
+        coarse = torch.tensor([[[[1.0, 1.0, 0.0, 0.0]]]])
+        fine = clean.clone()
+        mask = torch.ones_like(clean)
+        record = _threshold_sweep_record(
+            clean,
+            coarse,
+            fine,
+            mask,
+            fine_threshold=0.5,
+            tolerance_m=0.0,
+        )
+
+        summary = _summarize_threshold_records([record])
+
+        self.assertAlmostEqual(summary["coarse_exact_iou"], 1.0 / 3.0)
+        self.assertEqual(summary["fine_exact_iou"], 1.0)
+        self.assertEqual(summary["beneficial_additions"], 1)
+        self.assertEqual(summary["beneficial_removals"], 1)
+        self.assertEqual(summary["missing_cell_recovery_rate"], 1.0)
 
 
 if __name__ == "__main__":
