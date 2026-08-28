@@ -43,6 +43,47 @@ class BasicDiffusionUNetTests(unittest.TestCase):
         self.assertEqual(debug["unet_output_shape"], (1, 3, 80, 80))
         self.assertEqual(int(output.count_nonzero()), 0)
 
+    def test_pointpillars_conditioning_uses_both_sensor_feature_maps(self):
+        model = BasicDiffusionUNet(
+            use_pointpillars_conditioning=True,
+            lidar_pillar_channels=6,
+            radar_pillar_channels=7,
+            base_channels=4,
+            channel_multipliers=(1, 2, 4, 8),
+            num_downsamples=3,
+            resblocks_per_level=1,
+        ).eval()
+        inputs = self._inputs(80, 80)
+        lidar_pillars = torch.rand(1, 6, 80, 80)
+        radar_pillars = torch.rand(1, 7, 80, 80)
+
+        output, debug = model(
+            *inputs,
+            lidar_pillars,
+            radar_pillars,
+        )
+
+        self.assertEqual(model.input_channels, 22)
+        self.assertEqual(tuple(output.shape), (1, 3, 80, 80))
+        self.assertEqual(debug["unet_sensor_condition"].shape[1], 13)
+        self.assertTrue(debug["unet_pointpillars_conditioning"])
+
+    def test_pointpillars_conditioning_requires_both_feature_maps(self):
+        model = BasicDiffusionUNet(
+            use_pointpillars_conditioning=True,
+            base_channels=4,
+            channel_multipliers=(1, 2, 4, 8),
+            num_downsamples=3,
+            resblocks_per_level=1,
+        )
+        with self.assertRaisesRegex(ValueError, "requires both"):
+            model(*self._inputs(80, 80))
+
+    def test_raw_radar_checkpoint_input_shape_remains_unchanged(self):
+        model = _small_unet().eval()
+        self.assertFalse(model.use_pointpillars_conditioning)
+        self.assertEqual(model.input_channels, 13)
+
     def test_required_shapes_have_expected_stride_eight_bottleneck(self):
         model = _small_unet().eval()
         cases = {

@@ -25,6 +25,7 @@ from .basic_diffusion_unet import BasicDiffusionUNet, SinusoidalTimeEmbedding
 SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
 FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 11
 FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION = 12
+FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION = 13
 
 
 @dataclass(frozen=True)
@@ -108,11 +109,6 @@ class FineDiffusionConfig:
             raise ValueError(
                 "PointPillars-conditioned fine diffusion cannot bypass the "
                 "frozen coarse model that supplies its encoders"
-            )
-        if self.fine_backbone == "unet" and self.use_pointpillars_conditioning:
-            raise ValueError(
-                "Basic Diffusion U-Net uses raw aligned radar and does not accept "
-                "PointPillars conditioning"
             )
         if self.fine_unet_base_channels < 1:
             raise ValueError("fine_unet_base_channels must be positive")
@@ -668,12 +664,25 @@ def fine_diffusion_architecture_metadata(
         "refinement_feedback": "updated_normalized_residual_each_step",
     }
     if config.fine_backbone == "unet":
+        sensor_channels = (
+            config.lidar_pillar_channels + config.radar_pillar_channels
+            if config.use_pointpillars_conditioning
+            else config.radar_channels
+        )
         return {
             **common,
-            "version": FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION,
-            "backbone_name": "basic_diffusion_unet",
+            "version": (
+                FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
+                if config.use_pointpillars_conditioning
+                else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+            ),
+            "backbone_name": (
+                "basic_diffusion_unet_pointpillars"
+                if config.use_pointpillars_conditioning
+                else "basic_diffusion_unet"
+            ),
             "input_channels": (
-                2 * config.lidar_channels + config.radar_channels + 3
+                2 * config.lidar_channels + sensor_channels + 3
             ),
             "channel_hierarchy": [
                 config.fine_unet_base_channels * multiplier
@@ -686,8 +695,19 @@ def fine_diffusion_architecture_metadata(
                 config.fine_min_context_height,
                 config.fine_min_context_width,
             ],
-            "radar_conditioning": "raw_spatial_concatenation",
-            "pointpillars_conditioning": False,
+            "radar_conditioning": (
+                "radar_pointpillars_spatial_concatenation"
+                if config.use_pointpillars_conditioning
+                else "raw_spatial_concatenation"
+            ),
+            "lidar_conditioning": (
+                "lidar_pointpillars_spatial_concatenation"
+                if config.use_pointpillars_conditioning
+                else "coarse_reconstruction_only"
+            ),
+            "pointpillars_conditioning": config.use_pointpillars_conditioning,
+            "lidar_pillar_channels": config.lidar_pillar_channels,
+            "radar_pillar_channels": config.radar_pillar_channels,
         }
     return {
         **common,
@@ -745,9 +765,19 @@ def validate_fine_diffusion_checkpoint_compatibility(
             "fresh architecture-ablation run."
         )
     if config.fine_backbone == "unet":
-        if architecture_version != FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION:
+        expected_version = (
+            FINE_DIFFUSION_UNET_POINTPILLARS_ARCHITECTURE_VERSION
+            if config.use_pointpillars_conditioning
+            else FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION
+        )
+        if architecture_version != expected_version:
             raise ValueError("Unsupported Basic Diffusion U-Net checkpoint version")
-        expected = 2 * config.lidar_channels + config.radar_channels + 3
+        sensor_channels = (
+            config.lidar_pillar_channels + config.radar_pillar_channels
+            if config.use_pointpillars_conditioning
+            else config.radar_channels
+        )
+        expected = 2 * config.lidar_channels + sensor_channels + 3
         weight = state.get("unet.input_projection.weight")
         actual = int(weight.shape[1]) if torch.is_tensor(weight) else None
         if actual != expected:
@@ -1085,6 +1115,11 @@ class FineDiffusionRefiner(nn.Module):
             self.unet = BasicDiffusionUNet(
                 lidar_channels=self.config.lidar_channels,
                 radar_channels=self.config.radar_channels,
+                use_pointpillars_conditioning=(
+                    self.config.use_pointpillars_conditioning
+                ),
+                lidar_pillar_channels=self.config.lidar_pillar_channels,
+                radar_pillar_channels=self.config.radar_pillar_channels,
                 base_channels=self.config.fine_unet_base_channels,
                 channel_multipliers=tuple(
                     self.config.fine_unet_channel_multipliers
@@ -1280,6 +1315,8 @@ class FineDiffusionRefiner(nn.Module):
                 values["halo"],
                 crops.valid_mask,
                 timestep,
+                values.get("lidar_pillars"),
+                values.get("radar_pillars"),
             )
             condition = debug["unet_contextual_input"]
         else:

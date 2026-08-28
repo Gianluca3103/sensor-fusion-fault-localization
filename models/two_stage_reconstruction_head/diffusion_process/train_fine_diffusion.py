@@ -958,10 +958,17 @@ def main():
             config.fine_unet_base_channels * multiplier
             for multiplier in config.fine_unet_channel_multipliers
         ]
-        input_channels = 2 * config.lidar_channels + config.radar_channels + 3
+        sensor_channels = (
+            config.lidar_pillar_channels + config.radar_pillar_channels
+            if config.use_pointpillars_conditioning
+            else config.radar_channels
+        )
+        input_channels = 2 * config.lidar_channels + sensor_channels + 3
         print(
             "Fine backbone: basic diffusion U-Net\n"
             f"  input channels: {input_channels}\n"
+            "  sensor conditioning: "
+            f"{'LiDAR + radar PointPillars' if config.use_pointpillars_conditioning else 'raw radar'}\n"
             f"  channel hierarchy: {hierarchy}\n"
             f"  downsampling count: {config.fine_unet_num_downsamples}\n"
             f"  deepest stride: {2 ** config.fine_unet_num_downsamples}\n"

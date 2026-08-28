@@ -103,6 +103,9 @@ class BasicDiffusionUNet(nn.Module):
         *,
         lidar_channels: int = 3,
         radar_channels: int = 4,
+        use_pointpillars_conditioning: bool = False,
+        lidar_pillar_channels: int = 64,
+        radar_pillar_channels: int = 64,
         base_channels: int = 64,
         channel_multipliers: tuple[int, ...] = (1, 2, 4, 8),
         num_downsamples: int = 3,
@@ -119,7 +122,15 @@ class BasicDiffusionUNet(nn.Module):
             raise ValueError("resblocks_per_level must be positive")
         self.lidar_channels = int(lidar_channels)
         self.radar_channels = int(radar_channels)
-        self.input_channels = 2 * lidar_channels + radar_channels + 3
+        self.use_pointpillars_conditioning = bool(use_pointpillars_conditioning)
+        self.lidar_pillar_channels = int(lidar_pillar_channels)
+        self.radar_pillar_channels = int(radar_pillar_channels)
+        sensor_channels = (
+            self.lidar_pillar_channels + self.radar_pillar_channels
+            if self.use_pointpillars_conditioning
+            else self.radar_channels
+        )
+        self.input_channels = 2 * lidar_channels + sensor_channels + 3
         self.output_channels = int(lidar_channels)
         self.channel_hierarchy = tuple(
             int(base_channels * multiplier) for multiplier in channel_multipliers
@@ -190,12 +201,35 @@ class BasicDiffusionUNet(nn.Module):
         halo_mask: torch.Tensor,
         valid_mask: torch.Tensor,
         timestep: torch.Tensor,
+        lidar_pillars: torch.Tensor | None = None,
+        radar_pillars: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, object]]:
+        if self.use_pointpillars_conditioning:
+            if lidar_pillars is None or radar_pillars is None:
+                raise ValueError(
+                    "PointPillars-conditioned U-Net requires both LiDAR and "
+                    "radar pillar feature maps"
+                )
+            sensor_condition = torch.cat(
+                (lidar_pillars * valid_mask, radar_pillars * valid_mask),
+                dim=1,
+            )
+            expected_sensor_channels = (
+                self.lidar_pillar_channels + self.radar_pillar_channels
+            )
+            if sensor_condition.shape[1] != expected_sensor_channels:
+                raise ValueError(
+                    "PointPillars-conditioned U-Net expected "
+                    f"{expected_sensor_channels} sensor channels, received "
+                    f"{sensor_condition.shape[1]}"
+                )
+        else:
+            sensor_condition = radar_bev * valid_mask
         spatial_input = torch.cat(
             (
                 current_residual * valid_mask,
                 coarse_lidar * valid_mask,
-                radar_bev * valid_mask,
+                sensor_condition,
                 reconstruction_mask * valid_mask,
                 halo_mask * valid_mask,
                 valid_mask,
@@ -251,6 +285,8 @@ class BasicDiffusionUNet(nn.Module):
             "unet_bottleneck_shape": bottleneck_shape,
             "unet_decoder_shapes": decoder_shapes,
             "unet_output_shape": tuple(velocity.shape),
+            "unet_sensor_condition": sensor_condition,
+            "unet_pointpillars_conditioning": self.use_pointpillars_conditioning,
         }
         if self.training and not self._shape_log_emitted:
             print(

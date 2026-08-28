@@ -1,0 +1,63 @@
+{
+  "fine_diffusion": {
+    "enabled": true,
+    "fine_backbone": "unet",
+    "lidar_channels": 3,
+    "radar_channels": 4,
+    "use_pointpillars_conditioning": true,
+    "lidar_pillar_channels": 64,
+    "radar_pillar_channels": 64,
+    "fine_unet_base_channels": 64,
+    "fine_unet_channel_multipliers": [1, 2, 4, 8],
+    "fine_unet_num_downsamples": 3,
+    "fine_unet_resblocks_per_level": 2,
+    "fine_min_context_height": 80,
+    "fine_min_context_width": 80,
+    "diffusion_prediction_type": "residual_flow",
+    "training_timesteps": 1000,
+    "sampling_steps": 3,
+    "lambda_diffusion": 1.0,
+    "lambda_exact_reconstruction": 1.0,
+    "lambda_degradation": 1.0,
+    "lambda_residual_regularization": 0.05,
+    "residual_regularization_mode": "cumulative_absolute",
+    "residual_regularization_decay_epochs": 0,
+    "occupancy_loss_mode": "standard_bce",
+    "occupancy_threshold": 0.5,
+    "dropout": 0.0,
+    "denominator_epsilon": 1e-8,
+    "minimum_residual_std": 0.0001,
+    "normalization": {
+      "channel_means": [0.0, 0.0, 0.0],
+      "channel_stds": [1.0, 1.0, 1.0],
+      "epsilon": 1e-6,
+      "source": "existing_uint8_div_255_channel_scaling"
+    }
+  },
+  "fault_selector": {
+    "min_lidar_loss_fraction": 0.8,
+    "min_repair_box_cells": 5,
+    "min_repair_fault_fraction": 0.95,
+    "min_halo_healthy_fraction": 0.9,
+    "min_halo_healthy_cells": 64,
+    "min_halo_context_ratio": 0.25,
+    "min_halo_width_cells": 4,
+    "max_halo_dilation_cells": 64
+  },
+  "training": {
+    "epochs": 50,
+    "batch_size": 4,
+    "validation_batch_size": 8,
+    "num_workers": 8,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.001,
+    "grad_clip": 1.0,
+    "mixed_precision": true,
+    "amp_dtype": "bfloat16",
+    "seed": 42,
+    "sampled_validation_interval_epochs": 1
+  },
+  "evaluation": {
+    "max_sampling_samples": 0
+  }
+}
