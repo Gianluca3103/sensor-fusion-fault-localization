@@ -51,6 +51,8 @@
     "mixed_precision": true,
     "amp_dtype": "bfloat16",
     "seed": 42,
+    "crop_size_batching": true,
+    "crop_size_bucket_multiple": 32,
     "sampled_validation_interval_epochs": 1
   },
   "evaluation": {

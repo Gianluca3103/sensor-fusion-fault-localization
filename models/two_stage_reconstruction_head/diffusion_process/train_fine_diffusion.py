@@ -42,6 +42,11 @@ from models.two_stage_reconstruction_head import (
     reconstruction_stage_metrics,
     validate_fine_diffusion_checkpoint_compatibility,
 )
+from models.two_stage_reconstruction_head.diffusion_process.crop_size_batching import (
+    CropSizeBatchSampler,
+    crop_padding_efficiency,
+    dataset_repair_halo_crop_shapes,
+)
 
 
 def _parse_args():
@@ -719,15 +724,75 @@ def main():
         "persistent_workers": workers > 0,
         "collate_fn": coarse_reconstruction_collate,
     }
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, **loader_options
+    use_crop_size_batching = bool(
+        training.get("crop_size_batching", config.fine_backbone == "transformer")
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=validation_batch_size,
-        shuffle=False,
-        **loader_options,
+    crop_size_bucket_multiple = int(
+        training.get("crop_size_bucket_multiple", 32)
     )
+    train_batch_sampler = None
+    val_batch_sampler = None
+    if use_crop_size_batching:
+        crop_pad_multiple = (
+            8 if config.fine_backbone == "unet" else config.window_size
+        )
+        print("Profiling repair+halo crop shapes for size-aware batching...")
+        train_crop_shapes = dataset_repair_halo_crop_shapes(
+            train_dataset,
+            pad_multiple=crop_pad_multiple,
+            minimum_height=config.fine_min_context_height,
+            minimum_width=config.fine_min_context_width,
+        )
+        val_crop_shapes = dataset_repair_halo_crop_shapes(
+            val_dataset,
+            pad_multiple=crop_pad_multiple,
+            minimum_height=config.fine_min_context_height,
+            minimum_width=config.fine_min_context_width,
+        )
+        train_batch_sampler = CropSizeBatchSampler(
+            train_crop_shapes,
+            batch_size,
+            bucket_multiple=crop_size_bucket_multiple,
+            shuffle=True,
+            seed=seed,
+        )
+        val_batch_sampler = CropSizeBatchSampler(
+            val_crop_shapes,
+            validation_batch_size,
+            bucket_multiple=crop_size_bucket_multiple,
+            shuffle=False,
+            seed=seed,
+        )
+        train_efficiency = crop_padding_efficiency(
+            train_batch_sampler, train_crop_shapes
+        )
+        val_efficiency = crop_padding_efficiency(val_batch_sampler, val_crop_shapes)
+        print(
+            "Crop-size batching: enabled; "
+            f"shape bucket={crop_size_bucket_multiple}; "
+            f"estimated padding efficiency train={100.0 * train_efficiency:.1f}%, "
+            f"validation={100.0 * val_efficiency:.1f}%"
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            **loader_options,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=val_batch_sampler,
+            **loader_options,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, **loader_options
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=validation_batch_size,
+            shuffle=False,
+            **loader_options,
+        )
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     resume_checkpoint = (
@@ -918,6 +983,8 @@ def main():
             f"{config.operation_preserve_empty_weight:g}"
         )
     for epoch in range(start_epoch, epochs + 1):
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch)
         started = time.perf_counter()
         residual_regularization_weight = (
             _residual_regularization_weight_for_epoch(config, epoch)
