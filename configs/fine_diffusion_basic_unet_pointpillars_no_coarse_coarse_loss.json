@@ -29,7 +29,7 @@
     "occupancy_threshold": 0.5,
     "coarse_positive_occupancy_weight": 1.1,
     "coarse_min_empty_observability_weight": 0.1,
-    "dropout": 0.0,
+    "dropout": 0.2,
     "denominator_epsilon": 1e-8,
     "minimum_residual_std": 0.0001,
     "normalization": {
@@ -49,13 +49,20 @@
     "min_halo_width_cells": 4,
     "max_halo_dilation_cells": 64
   },
+  "augmentation": {
+    "enabled": true,
+    "horizontal_flip": {"enabled": true, "probability": 0.5},
+    "translation": {"enabled": true, "max_x_m": 0.5, "max_y_m": 0.5},
+    "yaw": {"enabled": true, "max_degrees": 5.0},
+    "scale": {"enabled": true, "min": 0.95, "max": 1.05}
+  },
   "training": {
     "epochs": 50,
     "batch_size": 12,
     "validation_batch_size": 12,
     "num_workers": 16,
     "learning_rate": 0.0002,
-    "weight_decay": 0.001,
+    "weight_decay": 0.005,
     "grad_clip": 1.0,
     "mixed_precision": true,
     "amp_dtype": "bfloat16",

@@ -1725,6 +1725,7 @@ class FineDiffusionRefiner(nn.Module):
                 ),
                 num_downsamples=self.config.fine_unet_num_downsamples,
                 resblocks_per_level=self.config.fine_unet_resblocks_per_level,
+                dropout=self.config.dropout,
             )
         self.unet_global_encoder = (
             GlobalFaultyLidarEncoder(

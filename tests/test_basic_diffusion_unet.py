@@ -44,6 +44,22 @@ class BasicDiffusionUNetTests(unittest.TestCase):
         self.assertEqual(debug["unet_output_shape"], (1, 3, 80, 80))
         self.assertEqual(int(output.count_nonzero()), 0)
 
+    def test_configured_dropout_is_applied_to_residual_blocks(self):
+        model = BasicDiffusionUNet(
+            base_channels=4,
+            channel_multipliers=(1, 2, 4, 8),
+            num_downsamples=3,
+            resblocks_per_level=2,
+            dropout=0.2,
+        )
+        dropouts = [
+            module
+            for module in model.modules()
+            if isinstance(module, torch.nn.Dropout2d)
+        ]
+        self.assertTrue(dropouts)
+        self.assertTrue(all(module.p == 0.2 for module in dropouts))
+
     def test_pointpillars_conditioning_uses_both_sensor_feature_maps(self):
         model = BasicDiffusionUNet(
             use_pointpillars_conditioning=True,

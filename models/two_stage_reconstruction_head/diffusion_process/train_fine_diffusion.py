@@ -36,6 +36,7 @@ from models.two_stage_reconstruction_head import (
     FrozenCoarseFineDiffusionPipeline,
     ResidualChannelNormalization,
     build_selector_config,
+    build_augmentation_config,
     coarse_reconstruction_collate,
     load_frozen_coarse_model,
     estimate_training_residual_statistics,
@@ -684,6 +685,7 @@ def main():
         with Path(args.selector_config).open("r", encoding="utf-8") as handle:
             selector_payload = json.load(handle)
     selector = _selector_config_from_payload(selector_payload)
+    augmentation_config = build_augmentation_config(payload)
     training = dict(payload.get("training", {}))
     epochs = args.epochs or int(training.get("epochs", 50))
     batch_size = args.batch_size or int(training.get("batch_size", 4))
@@ -736,6 +738,7 @@ def main():
     }
     train_dataset = CoarseReconstructionDataset(
         _split_paths(args.data_root, "train", args.limit_train_samples, seed),
+        augmentation_config=augmentation_config,
         **dataset_options,
     )
     val_dataset = CoarseReconstructionDataset(
@@ -978,6 +981,12 @@ def main():
         f"{config.bypass_coarse_reconstruction and config.use_pointpillars_conditioning}; "
         f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"
+    )
+    print(
+        "Training augmentation: "
+        f"{'enabled' if augmentation_config.enabled else 'disabled'}; "
+        f"weight decay: {float(training.get('weight_decay', 1.0e-3)):g}; "
+        f"dropout: {config.dropout:g}"
     )
     if config.fine_backbone == "unet":
         hierarchy = [

@@ -35,7 +35,13 @@ class SinusoidalTimeEmbedding(nn.Module):
 class TimestepResidualBlock(nn.Module):
     """GroupNorm/SiLU residual block conditioned by refinement step."""
 
-    def __init__(self, input_channels: int, output_channels: int, time_dim: int):
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        time_dim: int,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.input_channels = int(input_channels)
         self.output_channels = int(output_channels)
@@ -47,6 +53,7 @@ class TimestepResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(
             _group_count(output_channels), output_channels
         )
+        self.dropout = nn.Dropout2d(dropout) if dropout else nn.Identity()
         self.conv2 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
         self.residual_projection = (
             nn.Conv2d(input_channels, output_channels, 1)
@@ -63,7 +70,7 @@ class TimestepResidualBlock(nn.Module):
         hidden = self.conv1(F.silu(self.norm1(tensor)))
         time_bias = self.time_projection(F.silu(timestep_embedding))
         hidden = hidden + time_bias[:, :, None, None].to(dtype=hidden.dtype)
-        hidden = self.conv2(F.silu(self.norm2(hidden)))
+        hidden = self.conv2(self.dropout(F.silu(self.norm2(hidden))))
         output = self.residual_projection(tensor) + hidden
         return output * valid_mask
 
@@ -112,6 +119,7 @@ class BasicDiffusionUNet(nn.Module):
         channel_multipliers: tuple[int, ...] = (1, 2, 4, 8),
         num_downsamples: int = 3,
         resblocks_per_level: int = 2,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if num_downsamples != 3:
@@ -122,6 +130,8 @@ class BasicDiffusionUNet(nn.Module):
             )
         if resblocks_per_level < 1:
             raise ValueError("resblocks_per_level must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0,1)")
         self.lidar_channels = int(lidar_channels)
         self.radar_channels = int(radar_channels)
         self.use_pointpillars_conditioning = bool(use_pointpillars_conditioning)
@@ -166,7 +176,7 @@ class BasicDiffusionUNet(nn.Module):
         self.downsamples = nn.ModuleList()
         for level, channels in enumerate(self.channel_hierarchy):
             blocks = nn.ModuleList(
-                TimestepResidualBlock(channels, channels, time_dim)
+                TimestepResidualBlock(channels, channels, time_dim, dropout)
                 for _ in range(resblocks_per_level)
             )
             self.encoder_blocks.append(blocks)
@@ -183,10 +193,14 @@ class BasicDiffusionUNet(nn.Module):
             self.upsamples.append(Upsample2d(input_channels, skip_channels))
             blocks = nn.ModuleList()
             blocks.append(
-                TimestepResidualBlock(2 * skip_channels, skip_channels, time_dim)
+                TimestepResidualBlock(
+                    2 * skip_channels, skip_channels, time_dim, dropout
+                )
             )
             blocks.extend(
-                TimestepResidualBlock(skip_channels, skip_channels, time_dim)
+                TimestepResidualBlock(
+                    skip_channels, skip_channels, time_dim, dropout
+                )
                 for _ in range(resblocks_per_level - 1)
             )
             self.decoder_blocks.append(blocks)
