@@ -164,6 +164,10 @@ def _move_batch(batch, device):
     dtype = moved["faulty_lidar_bev"].dtype
     for key in ("reconstruction_mask", "healthy_context_mask", "halo_mask"):
         moved[key] = moved[key].to(dtype=dtype)
+    if "observability_confidence" in batch:
+        moved["observability_confidence"] = batch[
+            "observability_confidence"
+        ].to(device, dtype=dtype, non_blocking=True)
     for key in ("faulty_lidar_points", "radar_points"):
         if key in batch:
             moved[key] = tuple(

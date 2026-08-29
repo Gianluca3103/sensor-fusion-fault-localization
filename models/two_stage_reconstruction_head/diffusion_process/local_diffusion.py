@@ -11,6 +11,11 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..encoders import _group_count
+from ..coarse_reconstruction.coarse_loss import (
+    CoarseLossConfig,
+    MaskedBEVReconstructionLoss,
+    ObservabilityWeightingConfig,
+)
 from ..reconstruction_inputs import ReconstructionInputs
 from ..reconstruction_crop import ReconstructionCropBatch, ReconstructionCropExtractor
 from .diffusion_process import (
@@ -62,6 +67,8 @@ class FineDiffusionConfig:
     residual_regularization_decay_epochs: int = 0
     occupancy_loss_mode: str = "standard_bce"
     occupancy_threshold: float = 0.5
+    coarse_positive_occupancy_weight: float = 1.1
+    coarse_min_empty_observability_weight: float = 0.1
     correction_group_weight: float = 1.0
     preservation_group_weight: float = 0.5
     operation_add_weight: float = 0.21
@@ -177,13 +184,22 @@ class FineDiffusionConfig:
             "standard_bce",
             "operation_balanced",
             "weighted_operation",
+            "coarse_existing",
         ):
             raise ValueError(
                 "occupancy_loss_mode must be standard_bce, operation_balanced, "
-                "or weighted_operation"
+                "weighted_operation, or coarse_existing"
             )
         if not 0.0 < self.occupancy_threshold < 1.0:
             raise ValueError("occupancy_threshold must be strictly between 0 and 1")
+        if self.coarse_positive_occupancy_weight < 1.0:
+            raise ValueError(
+                "coarse_positive_occupancy_weight must be at least 1"
+            )
+        if not 0.0 <= self.coarse_min_empty_observability_weight <= 1.0:
+            raise ValueError(
+                "coarse_min_empty_observability_weight must be in [0,1]"
+            )
         for name in ("correction_group_weight", "preservation_group_weight"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
@@ -1364,6 +1380,8 @@ class MaskedExactReconstructionLoss(nn.Module):
         operation_remove_weight: float = 0.395,
         operation_preserve_occupied_weight: float = 0.395,
         operation_preserve_empty_weight: float = 0.21,
+        coarse_positive_occupancy_weight: float = 1.1,
+        coarse_min_empty_observability_weight: float = 0.1,
     ):
         super().__init__()
         self.epsilon = float(epsilon)
@@ -1381,6 +1399,20 @@ class MaskedExactReconstructionLoss(nn.Module):
             "preserve_occupied": float(operation_preserve_occupied_weight),
             "preserve_empty": float(operation_preserve_empty_weight),
         }
+        self.coarse_existing_loss = MaskedBEVReconstructionLoss(
+            CoarseLossConfig(
+                epsilon=self.epsilon,
+                positive_occupancy_weight=float(
+                    coarse_positive_occupancy_weight
+                ),
+                observability_weighting=ObservabilityWeightingConfig(
+                    enabled=True,
+                    min_empty_weight=float(
+                        coarse_min_empty_observability_weight
+                    ),
+                ),
+            )
+        )
 
     def _occupancy_groups(
         self,
@@ -1404,8 +1436,45 @@ class MaskedExactReconstructionLoss(nn.Module):
         reconstruction_mask: torch.Tensor,
         coarse: torch.Tensor | None = None,
         *,
+        observability_confidence: torch.Tensor | None = None,
         return_components: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.occupancy_loss_mode == "coarse_existing":
+            if observability_confidence is None:
+                raise ValueError(
+                    "coarse_existing Fine Diffusion loss requires "
+                    "observability_confidence"
+                )
+            probability = refined[:, 0:1].float().clamp(1.0e-6, 1.0 - 1.0e-6)
+            replacement_raw = torch.cat(
+                (torch.logit(probability), refined[:, 1:].float()), dim=1
+            )
+            losses = self.coarse_existing_loss(
+                {
+                    "replacement_raw": replacement_raw,
+                    "reconstruction_mask": reconstruction_mask.float(),
+                },
+                clean.float(),
+                observability_confidence.float(),
+            )
+            zero = losses["loss"].new_zeros(())
+            components = {
+                "occupancy_loss": losses["loss_occupancy"],
+                "continuous_loss": (
+                    losses["loss_density"] + losses["loss_height"]
+                ),
+                "coarse_occupancy_bce_loss": losses["loss_occupancy_bce"],
+                "coarse_occupancy_dice_loss": losses["loss_occupancy_dice"],
+                "coarse_density_loss": losses["loss_density"],
+                "coarse_height_loss": losses["loss_height"],
+                **{f"occupancy_{name}_loss": zero for name in self.GROUPS},
+                **{f"num_{name}": zero.detach() for name in self.GROUPS},
+            }
+            return (
+                (losses["loss"], components)
+                if return_components
+                else losses["loss"]
+            )
         with torch.autocast(device_type=refined.device.type, enabled=False):
             refined_float = refined.float()
             clean_float = clean.float()
@@ -1683,6 +1752,12 @@ class FineDiffusionRefiner(nn.Module):
             ),
             operation_preserve_empty_weight=(
                 self.config.operation_preserve_empty_weight
+            ),
+            coarse_positive_occupancy_weight=(
+                self.config.coarse_positive_occupancy_weight
+            ),
+            coarse_min_empty_observability_weight=(
+                self.config.coarse_min_empty_observability_weight
             ),
         )
         self.degradation_loss = MaskedNoDegradationLoss(
@@ -2061,6 +2136,9 @@ class FineDiffusionRefiner(nn.Module):
             crops.tensors["clean"],
             repair,
             crops.tensors["coarse"].detach(),
+            observability_confidence=crops.tensors.get(
+                "observability_confidence"
+            ),
             return_components=True,
         )
         coarse_exact_loss = (
@@ -2069,6 +2147,9 @@ class FineDiffusionRefiner(nn.Module):
                 crops.tensors["clean"],
                 repair,
                 crops.tensors["coarse"].detach(),
+                observability_confidence=crops.tensors.get(
+                    "observability_confidence"
+                ),
             )
             if return_diagnostics
             else diffusion_loss.new_zeros(())

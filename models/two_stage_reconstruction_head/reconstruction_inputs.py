@@ -17,6 +17,7 @@ class ReconstructionInputs:
     reconstruction_mask: torch.Tensor
     healthy_context_mask: torch.Tensor
     halo_mask: torch.Tensor
+    observability_confidence: torch.Tensor | None = None
     faulty_lidar_points: Sequence[torch.Tensor] | None = None
     radar_points: Sequence[torch.Tensor] | None = None
     lidar_pillar_bev: torch.Tensor | None = None
@@ -42,6 +43,11 @@ class ReconstructionInputs:
         ):
             if tuple(tensor.shape) != mask_shape:
                 raise ValueError(f"{name} must match reconstruction_mask")
+        if self.observability_confidence is not None:
+            if tuple(self.observability_confidence.shape) != mask_shape:
+                raise ValueError(
+                    "observability_confidence must match reconstruction_mask"
+                )
         shared = (
             self.faulty_lidar_bev,
             self.radar_bev,
@@ -49,6 +55,8 @@ class ReconstructionInputs:
             self.healthy_context_mask,
             self.halo_mask,
         )
+        if self.observability_confidence is not None:
+            shared = (*shared, self.observability_confidence)
         if any(tensor.device != self.faulty_lidar_bev.device for tensor in shared):
             raise ValueError("Shared reconstruction tensors must use one device")
         if any(tensor.dtype != self.faulty_lidar_bev.dtype for tensor in shared):
@@ -97,6 +105,8 @@ class ReconstructionInputs:
             tensors["clean"] = clean_lidar_bev
         if residual_gt is not None:
             tensors["residual_gt"] = residual_gt
+        if self.observability_confidence is not None:
+            tensors["observability_confidence"] = self.observability_confidence
         if self.lidar_pillar_bev is not None:
             tensors["lidar_pillars"] = self.lidar_pillar_bev
         if self.radar_pillar_bev is not None:

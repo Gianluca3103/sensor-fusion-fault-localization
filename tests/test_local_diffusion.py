@@ -3,6 +3,7 @@ from unittest import mock
 from dataclasses import replace
 
 import torch
+import torch.nn.functional as F
 
 from models.two_stage_reconstruction_head.diffusion_process.local_diffusion import (
     FineDiffusionConfig,
@@ -144,6 +145,59 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_coarse_existing_mode_matches_coarse_loss_components(self):
+        refined = torch.tensor(
+            [[[[0.8, 0.2]], [[0.4, 0.7]], [[0.6, 0.3]]]],
+            dtype=torch.float32,
+        )
+        clean = torch.tensor(
+            [[[[1.0, 0.0]], [[0.5, 0.0]], [[0.8, 0.0]]]],
+            dtype=torch.float32,
+        )
+        mask = torch.ones((1, 1, 1, 2), dtype=torch.float32)
+        observability = torch.tensor([[[[0.75, 0.25]]]], dtype=torch.float32)
+        loss_fn = MaskedExactReconstructionLoss(
+            occupancy_loss_mode="coarse_existing",
+            coarse_positive_occupancy_weight=1.1,
+            coarse_min_empty_observability_weight=0.1,
+        )
+
+        total, components = loss_fn(
+            refined,
+            clean,
+            mask,
+            torch.zeros_like(refined),
+            observability_confidence=observability,
+            return_components=True,
+        )
+
+        occupancy_weight = torch.tensor([1.1, 0.325])
+        bce = F.binary_cross_entropy(
+            refined[:, 0:1].flatten(),
+            clean[:, 0:1].flatten(),
+            reduction="none",
+        )
+        expected_bce = (bce * occupancy_weight).sum() / occupancy_weight.sum()
+        probability = refined[:, 0:1]
+        target = clean[:, 0:1]
+        expected_dice = 1.0 - (
+            2.0 * (probability * target).sum() + 1.0e-8
+        ) / (probability.sum() + target.sum() + 1.0e-8)
+        expected_density = F.smooth_l1_loss(
+            refined[:, 1:2, :, :1], clean[:, 1:2, :, :1]
+        )
+        expected_height = F.smooth_l1_loss(
+            refined[:, 2:3, :, :1], clean[:, 2:3, :, :1]
+        )
+        expected = expected_bce + expected_dice + expected_density + expected_height
+        self.assertTrue(torch.allclose(total, expected))
+        self.assertTrue(
+            torch.allclose(components["coarse_occupancy_bce_loss"], expected_bce)
+        )
+        self.assertTrue(
+            torch.allclose(components["coarse_occupancy_dice_loss"], expected_dice)
+        )
+
     def test_operation_balanced_exact_loss_partitions_all_four_groups(self):
         loss_fn = MaskedExactReconstructionLoss(
             occupancy_loss_mode="operation_balanced",

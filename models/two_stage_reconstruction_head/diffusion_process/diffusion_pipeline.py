@@ -102,6 +102,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         healthy_context_mask,
         halo_mask,
         *,
+        observability_confidence=None,
         faulty_lidar_points=None,
         radar_points=None,
     ) -> ReconstructionInputs:
@@ -111,6 +112,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             reconstruction_mask=reconstruction_mask,
             healthy_context_mask=healthy_context_mask,
             halo_mask=halo_mask,
+            observability_confidence=observability_confidence,
             faulty_lidar_points=faulty_lidar_points,
             radar_points=radar_points,
         )
@@ -223,6 +225,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
         *,
         coarse_lidar_bev=None,
         coarse_output=None,
+        observability_confidence=None,
         faulty_lidar_points=None,
         radar_points=None,
         **diffusion_options,
@@ -233,6 +236,7 @@ class FrozenCoarseFineDiffusionPipeline(nn.Module):
             reconstruction_mask,
             healthy_context_mask,
             halo_mask,
+            observability_confidence=observability_confidence,
             faulty_lidar_points=faulty_lidar_points,
             radar_points=radar_points,
         )
