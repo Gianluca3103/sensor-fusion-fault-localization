@@ -782,7 +782,10 @@ def main() -> None:
         ),
         source=residual_metadata.get("source", "fine_diffusion_checkpoint"),
     )
-    if diffusion_config.bypass_coarse_reconstruction:
+    if (
+        diffusion_config.bypass_coarse_reconstruction
+        and not diffusion_config.use_pointpillars_conditioning
+    ):
         coarse_checkpoint_path = None
         coarse = None
         coarse_checkpoint = {}

@@ -115,11 +115,6 @@ class FineDiffusionConfig:
                 "transformer_spatial_input_mode must be zero_residual or "
                 "current_lidar"
             )
-        if self.use_pointpillars_conditioning and self.bypass_coarse_reconstruction:
-            raise ValueError(
-                "PointPillars-conditioned fine diffusion cannot bypass the "
-                "frozen coarse model that supplies its encoders"
-            )
         if self.fine_unet_base_channels < 1:
             raise ValueError("fine_unet_base_channels must be positive")
         if self.fine_unet_num_downsamples != 3:

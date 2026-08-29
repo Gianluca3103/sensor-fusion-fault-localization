@@ -1265,6 +1265,57 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertTrue(torch.equal(base * (1 - repair), faulty * (1 - repair)))
         self.assertEqual(int((base * repair).count_nonzero()), 0)
 
+    def test_direct_ablation_keeps_frozen_pointpillar_encoders_only(self):
+        class DummyConfig:
+            pointpillars_enabled = True
+            lidar_channels = 6
+            radar_channels = 7
+
+        class EncoderOnlyCoarse(torch.nn.Module):
+            config = DummyConfig()
+
+            def forward(self, *_args, **_kwargs):
+                raise AssertionError("Coarse reconstruction head must be bypassed")
+
+            def _sensor_features(
+                self,
+                faulty_bev,
+                radar_bev,
+                *_args,
+                **_kwargs,
+            ):
+                batch, _channels, height, width = faulty_bev.shape
+                return (
+                    faulty_bev.new_ones(batch, 6, height, width),
+                    radar_bev.new_ones(batch, 7, height, width),
+                    {},
+                    {},
+                )
+
+        clean, _coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        diffusion = FineDiffusionRefiner(
+            _config(bypass_coarse=True, pointpillars=True)
+        )
+        pipeline = FrozenCoarseFineDiffusionPipeline(
+            EncoderOnlyCoarse(), diffusion
+        )
+
+        with mock.patch.object(diffusion, "forward", return_value={}) as forward:
+            pipeline(
+                clean,
+                faulty,
+                radar,
+                repair,
+                torch.zeros_like(repair),
+                halo,
+            )
+
+        erased_base = forward.call_args.args[1]
+        shared = forward.call_args.kwargs["shared_inputs"]
+        self.assertEqual(int((erased_base * repair).count_nonzero()), 0)
+        self.assertEqual(shared.lidar_pillar_bev.shape[1], 6)
+        self.assertEqual(shared.radar_pillar_bev.shape[1], 7)
+
     def test_pointpillars_checkpoint_restores_grid_geometry(self):
         checkpoint = {
             "model_config": {

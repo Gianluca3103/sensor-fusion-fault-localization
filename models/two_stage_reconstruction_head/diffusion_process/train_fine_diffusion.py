@@ -56,7 +56,10 @@ def _parse_args():
     parser.add_argument("--radar-root", required=True)
     parser.add_argument(
         "--coarse-checkpoint",
-        help="Required unless fine_diffusion.bypass_coarse_reconstruction is true.",
+        help=(
+            "Required for normal coarse reconstruction and for encoder-only "
+            "PointPillars conditioning. Optional only when both are disabled."
+        ),
     )
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
@@ -694,15 +697,18 @@ def main():
     )
     seed_everything(seed)
     device = resolve_device(args.device)
-    if config.bypass_coarse_reconstruction:
+    if (
+        config.bypass_coarse_reconstruction
+        and not config.use_pointpillars_conditioning
+    ):
         coarse = None
         coarse_checkpoint = None
         use_pointpillars = False
     else:
         if not args.coarse_checkpoint:
             raise ValueError(
-                "--coarse-checkpoint is required unless coarse reconstruction "
-                "is bypassed"
+                "--coarse-checkpoint is required for coarse reconstruction or "
+                "encoder-only Fine PointPillars conditioning"
             )
         coarse, coarse_checkpoint = load_frozen_coarse_model(
             args.coarse_checkpoint, device, allow_pointpillars=True
@@ -964,6 +970,8 @@ def main():
         f"parameters: {parameters:,}; PointPillars coarse: {use_pointpillars}; "
         f"Fine PointPillars conditioning: {config.use_pointpillars_conditioning}; "
         f"bypass coarse: {config.bypass_coarse_reconstruction}; "
+        "encoder-only PointPillars: "
+        f"{config.bypass_coarse_reconstruction and config.use_pointpillars_conditioning}; "
         f"AMP: {str(amp_dtype).removeprefix('torch.') if use_amp else 'off'}; "
         f"sampled validation every {validation_interval} epoch(s)"
     )
