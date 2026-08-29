@@ -511,6 +511,13 @@ class FineDiffusionRefinerTests(unittest.TestCase):
         self.assertEqual(int(timesteps[-1]), 980)
         self.assertEqual(len(timesteps), 50)
 
+    def test_sampling_timesteps_support_six_step_schedule(self):
+        model = FineDiffusionRefiner(_config(sampling_steps=6))
+        timesteps = model._sampling_timesteps(6, torch.device("cpu"))
+        self.assertEqual(len(timesteps), 6)
+        self.assertEqual(int(timesteps[0]), 0)
+        self.assertTrue(bool(torch.all(timesteps[1:] > timesteps[:-1])))
+
     def test_initial_sampling_state_is_exactly_coarse(self):
         _clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
         model = FineDiffusionRefiner(_config(sampling_steps=3)).eval()

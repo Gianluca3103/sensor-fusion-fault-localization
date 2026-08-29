@@ -27,7 +27,7 @@ from .diffusion_process import (
 from .basic_diffusion_unet import BasicDiffusionUNet, SinusoidalTimeEmbedding
 
 
-SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 10, 25, 50})
+SUPPORTED_SAMPLING_STEPS = frozenset({1, 3, 5, 6, 10, 25, 50})
 FINE_DIFFUSION_TRANSFORMER_ARCHITECTURE_VERSION = 15
 FINE_DIFFUSION_TRANSFORMER_LEGACY_ARCHITECTURE_VERSION = 11
 FINE_DIFFUSION_UNET_ARCHITECTURE_VERSION = 12
@@ -159,7 +159,7 @@ class FineDiffusionConfig:
             raise ValueError("training_timesteps must be at least 2")
         if self.sampling_steps not in SUPPORTED_SAMPLING_STEPS:
             raise ValueError(
-                "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
+                "sampling_steps must be one of 1, 3, 5, 6, 10, 25, or 50"
             )
         for name in (
             "lambda_diffusion",
@@ -2327,7 +2327,7 @@ class FineDiffusionRefiner(nn.Module):
     ) -> torch.Tensor:
         if sampling_steps not in SUPPORTED_SAMPLING_STEPS:
             raise ValueError(
-                "sampling_steps must be one of 1, 3, 5, 10, 25, or 50"
+                "sampling_steps must be one of 1, 3, 5, 6, 10, 25, or 50"
             )
         return torch.linspace(
             0,
