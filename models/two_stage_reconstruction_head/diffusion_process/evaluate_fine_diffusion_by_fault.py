@@ -49,6 +49,10 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss impo
     BEV_RESOLUTION_M,
     _dilate_with_metric_disk,
 )
+from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
+    tolerant_metrics_from_counts,
+    tolerant_occupancy_counts,
+)
 
 
 REFERENCE_OCCUPANCY_THRESHOLD = 0.5
@@ -259,6 +263,38 @@ def _threshold_occupancy_counts(
         "tolerant_prediction_count": int(predicted.sum()),
         "tolerant_target_count": int(occupied.sum()),
     }
+
+
+def _fixed_physical_tolerance_metrics(
+    probability: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    geometry,
+) -> dict[str, int | float]:
+    """Return fixed 0.2 m and 0.5 m metrics using dataset BEV geometry."""
+
+    valid = mask > 0.5
+    predicted = probability >= REFERENCE_OCCUPANCY_THRESHOLD
+    occupied = target >= REFERENCE_OCCUPANCY_THRESHOLD
+    output: dict[str, int | float] = {}
+    for tolerance_m in (0.2, 0.5):
+        label = str(tolerance_m).replace(".", "_") + "m"
+        counts = tolerant_occupancy_counts(
+            predicted,
+            occupied,
+            valid,
+            tolerance_m=tolerance_m,
+            meters_per_cell_x=geometry.pillar_size_x,
+            meters_per_cell_y=geometry.pillar_size_y,
+        )
+        metrics = tolerant_metrics_from_counts(counts)
+        output.update(
+            {
+                f"tolerant_{label}_{name}": value
+                for name, value in (*counts.items(), *metrics.items())
+            }
+        )
+    return output
 
 
 def _threshold_sweep_record(
@@ -522,6 +558,14 @@ def summarize_records(records: list[dict]) -> dict:
         for key, value in records[0].items()
         if key not in ignored
         and not key.endswith(("_tp", "_fp", "_fn", "_tn"))
+        and not key.endswith(
+            (
+                "_matched_predictions",
+                "_matched_targets",
+                "_prediction_count",
+                "_target_count",
+            )
+        )
         and isinstance(value, (int, float))
     ]
     summary = {
@@ -586,6 +630,28 @@ def summarize_records(records: list[dict]) -> dict:
                 f"micro/{prefix}_iou": _safe_ratio(tp, tp + fp + fn),
             }
         )
+        for tolerance_m in (0.2, 0.5):
+            label = str(tolerance_m).replace(".", "_") + "m"
+            count_names = (
+                "matched_predictions",
+                "matched_targets",
+                "prediction_count",
+                "target_count",
+            )
+            counts = {
+                name: sum(
+                    float(
+                        record[
+                            f"{prefix}_tolerant_{label}_{name}"
+                        ]
+                    )
+                    for record in evaluable
+                )
+                for name in count_names
+            }
+            metrics = tolerant_metrics_from_counts(counts)
+            for name, value in metrics.items():
+                summary[f"micro/{prefix}_tolerant_{label}_{name}"] = value
     summary["micro/coarse_iou_improvement"] = (
         summary["micro/coarse_iou"] - summary["micro/faulty_iou"]
     )
@@ -665,6 +731,40 @@ def _print_transition_table(groups: dict[str, dict], threshold: float) -> None:
             f"{summary['transitions/beneficial_removals']:14d} "
             f"{summary['transitions/harmful_removals']:11d} "
             f"{summary['transitions/total_changed_cells']:10d}"
+        )
+
+
+def _print_fixed_metric_summary(summary: dict, baseline_label: str) -> None:
+    """Print exact, 0.2 m, and 0.5 m micro metrics together."""
+
+    print("\nOVERALL FIXED OCCUPANCY METRICS")
+    print(
+        f"  exact IoU/F1     | {baseline_label} "
+        f"{summary['micro/coarse_iou']:.2%} / "
+        f"{summary['micro/coarse_f1']:.2%} -> fine "
+        f"{summary['micro/fine_iou']:.2%} / "
+        f"{summary['micro/fine_f1']:.2%}"
+    )
+    print(
+        "  exact improvement| IoU "
+        f"{summary['micro/fine_minus_coarse_iou']:+.2%} | F1 "
+        f"{summary['micro/fine_minus_coarse_f1']:+.2%}"
+    )
+    for tolerance_m in (0.2, 0.5):
+        label = str(tolerance_m).replace(".", "_") + "m"
+        coarse_iou = summary[f"micro/coarse_tolerant_{label}_iou"]
+        coarse_f1 = summary[f"micro/coarse_tolerant_{label}_f1"]
+        fine_iou = summary[f"micro/fine_tolerant_{label}_iou"]
+        fine_f1 = summary[f"micro/fine_tolerant_{label}_f1"]
+        print(
+            f"  {tolerance_m:g}m IoU/F1      | {baseline_label} "
+            f"{coarse_iou:.2%} / {coarse_f1:.2%} -> fine "
+            f"{fine_iou:.2%} / {fine_f1:.2%}"
+        )
+        print(
+            f"  {tolerance_m:g}m improvement | IoU "
+            f"{fine_iou - coarse_iou:+.2%} | F1 "
+            f"{fine_f1 - coarse_f1:+.2%}"
         )
 
 
@@ -946,6 +1046,18 @@ def main() -> None:
                 ):
                     counts = _occupancy_counts(probability, clean[:, 0:1], sample_mask)
                     record.update({f"{prefix}_{key}": value for key, value in counts.items()})
+                    physical_tolerance = _fixed_physical_tolerance_metrics(
+                        probability,
+                        clean[:, 0:1],
+                        sample_mask,
+                        grid_geometry,
+                    )
+                    record.update(
+                        {
+                            f"{prefix}_{key}": value
+                            for key, value in physical_tolerance.items()
+                        }
+                    )
                 record["target_occupied_cells"] = record["fine_tp"] + record["fine_fn"]
                 record["occupancy_threshold"] = REFERENCE_OCCUPANCY_THRESHOLD
                 record.update(
@@ -1093,6 +1205,12 @@ def main() -> None:
     )
     _print_threshold_sweep(threshold_sweep, args.tolerance_m)
     overall = summary["overall"]
+    _print_fixed_metric_summary(
+        overall,
+        "Erased faulty"
+        if diffusion_config.bypass_coarse_reconstruction
+        else "Coarse",
+    )
     print(
         "\nOverall transitions: "
         f"beneficial additions={overall['transitions/beneficial_additions']}, "

@@ -10,7 +10,6 @@ import sys
 import time
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
@@ -48,6 +47,10 @@ from models.two_stage_reconstruction_head.diffusion_process.crop_size_batching i
     CropSizeBatchSampler,
     crop_padding_efficiency,
     dataset_repair_halo_crop_shapes,
+)
+from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
+    tolerant_metrics_from_counts,
+    tolerant_occupancy_counts,
 )
 
 
@@ -298,6 +301,7 @@ def _run_epoch(
             "occupancy_operation_loss": float(
                 output["occupancy_operation_loss"].detach()
             ),
+            "soft_iou": float(output["soft_iou"].detach()),
             "exact_continuous_loss": float(
                 output["exact_continuous_loss"].detach()
             ),
@@ -370,6 +374,35 @@ def _residual_regularization_weight_for_epoch(
     return base * fraction
 
 
+def _checkpoint_improvements(
+    validation: dict[str, float],
+    best: dict[str, dict[str, float | int]],
+    epoch: int,
+) -> tuple[dict[str, dict[str, float | int]], set[str]]:
+    """Update validation-only checkpoint records and return improved names."""
+
+    candidates = {
+        "validation_loss": ("loss", False),
+        "exact_iou": ("fine_exact_occupancy_iou", True),
+        "iou_0p2m": ("fine_tolerant_0_2m_iou", True),
+        "iou_0p5m": ("fine_tolerant_0_5m_iou", True),
+    }
+    updated = {name: dict(record) for name, record in best.items()}
+    improved: set[str] = set()
+    for name, (metric_key, higher_is_better) in candidates.items():
+        value = float(validation[metric_key])
+        previous = updated.get(name)
+        is_better = previous is None or (
+            value > float(previous["value"])
+            if higher_is_better
+            else value < float(previous["value"])
+        )
+        if is_better:
+            updated[name] = {"epoch": int(epoch), "value": value}
+            improved.add(name)
+    return updated, improved
+
+
 def _operation_error_rates(
     counts: dict[str, float], epsilon: float = 1.0e-8
 ) -> dict[str, float]:
@@ -395,6 +428,8 @@ def _run_sampled_validation(
     device,
     *,
     sampling_steps,
+    meters_per_cell_x,
+    meters_per_cell_y,
     use_amp=False,
     amp_dtype=torch.bfloat16,
     seed=0,
@@ -408,16 +443,9 @@ def _run_sampled_validation(
         "fine_tp": 0.0,
         "fine_fp": 0.0,
         "fine_fn": 0.0,
-        "fine_tolerant_matched_predictions": 0.0,
-        "fine_tolerant_matched_targets": 0.0,
-        "fine_prediction_count": 0.0,
         "coarse_tp": 0.0,
         "coarse_fp": 0.0,
         "coarse_fn": 0.0,
-        "coarse_tolerant_matched_predictions": 0.0,
-        "coarse_tolerant_matched_targets": 0.0,
-        "coarse_prediction_count": 0.0,
-        "target_count": 0.0,
         "beneficial_additions": 0.0,
         "harmful_additions": 0.0,
         "beneficial_removals": 0.0,
@@ -427,12 +455,24 @@ def _run_sampled_validation(
         "preserve_occupied_target": 0.0,
         "preserve_empty_target": 0.0,
     }
+    tolerances = (0.2, 0.5)
+    for prefix in ("coarse", "fine"):
+        for tolerance_m in tolerances:
+            label = str(tolerance_m).replace(".", "_") + "m"
+            for name in (
+                "matched_predictions",
+                "matched_targets",
+                "prediction_count",
+                "target_count",
+            ):
+                counts[f"{prefix}_tolerant_{label}_{name}"] = 0.0
     samples = 0.0
     validation_loss_totals = {
         "loss": 0.0,
         "diffusion_loss": 0.0,
         "exact_reconstruction_loss": 0.0,
         "exact_occupancy_loss": 0.0,
+        "soft_iou": 0.0,
         "exact_continuous_loss": 0.0,
         "degradation_loss": 0.0,
         "residual_regularization_loss": 0.0,
@@ -440,17 +480,6 @@ def _run_sampled_validation(
         "weighted_residual_regularization_loss": 0.0,
     }
     generator = torch.Generator(device=device).manual_seed(seed)
-    offsets = torch.arange(-2, 3, device=device, dtype=torch.float32)
-    rows, columns = torch.meshgrid(offsets, offsets, indexing="ij")
-    tolerance_kernel = (
-        torch.sqrt(rows.square() + columns.square()) * 0.2 <= 0.5 + 1.0e-6
-    ).to(dtype=torch.float32)[None, None]
-
-    def dilate(values):
-        return F.conv2d(
-            values.to(dtype=torch.float32), tolerance_kernel, padding=2
-        ) > 0
-
     progress = _BatchProgress(progress_label, len(loader))
     total_data_seconds = total_step_seconds = 0.0
     previous_batch_finished = time.perf_counter()
@@ -520,8 +549,6 @@ def _run_sampled_validation(
             (preserve_occupied_target & ~fine).sum()
         )
         expected_selected = expected & selected
-        target_neighborhood = dilate(expected_selected)
-        counts["target_count"] += float(expected_selected.sum())
         for prefix, predicted in (("coarse", coarse), ("fine", fine)):
             predicted_selected = predicted & selected
             counts[f"{prefix}_tp"] += float(
@@ -533,16 +560,18 @@ def _run_sampled_validation(
             counts[f"{prefix}_fn"] += float(
                 (~predicted & expected & selected).sum()
             )
-            prediction_neighborhood = dilate(predicted_selected)
-            counts[f"{prefix}_tolerant_matched_predictions"] += float(
-                (predicted_selected & target_neighborhood).sum()
-            )
-            counts[f"{prefix}_tolerant_matched_targets"] += float(
-                (expected_selected & prediction_neighborhood).sum()
-            )
-            counts[f"{prefix}_prediction_count"] += float(
-                predicted_selected.sum()
-            )
+            for tolerance_m in tolerances:
+                label = str(tolerance_m).replace(".", "_") + "m"
+                tolerant_counts = tolerant_occupancy_counts(
+                    predicted_selected,
+                    expected_selected,
+                    selected,
+                    tolerance_m=tolerance_m,
+                    meters_per_cell_x=meters_per_cell_x,
+                    meters_per_cell_y=meters_per_cell_y,
+                )
+                for name, value in tolerant_counts.items():
+                    counts[f"{prefix}_tolerant_{label}_{name}"] += value
         samples += batch_samples
         batch_finished = time.perf_counter()
         total_step_seconds += batch_finished - batch_received
@@ -574,22 +603,22 @@ def _run_sampled_validation(
         result[f"{prefix}_exact_occupancy_recall"] = tp / (
             tp + fn + epsilon
         )
-        tolerant_precision = counts[
-            f"{prefix}_tolerant_matched_predictions"
-        ] / (counts[f"{prefix}_prediction_count"] + epsilon)
-        tolerant_recall = counts[f"{prefix}_tolerant_matched_targets"] / (
-            counts["target_count"] + epsilon
-        )
-        tolerant_f1 = (
-            2.0
-            * tolerant_precision
-            * tolerant_recall
-            / (tolerant_precision + tolerant_recall + epsilon)
-        )
-        result[f"{prefix}_tolerant_0_5m_f1"] = tolerant_f1
-        result[f"{prefix}_tolerant_0_5m_iou"] = tolerant_f1 / (
-            2.0 - tolerant_f1 + epsilon
-        )
+        for tolerance_m in tolerances:
+            label = str(tolerance_m).replace(".", "_") + "m"
+            tolerant = tolerant_metrics_from_counts(
+                {
+                    name: counts[f"{prefix}_tolerant_{label}_{name}"]
+                    for name in (
+                        "matched_predictions",
+                        "matched_targets",
+                        "prediction_count",
+                        "target_count",
+                    )
+                },
+                epsilon,
+            )
+            for name, value in tolerant.items():
+                result[f"{prefix}_tolerant_{label}_{name}"] = value
     result["fine_minus_coarse_exact_iou"] = (
         result["fine_exact_occupancy_iou"]
         - result["coarse_exact_occupancy_iou"]
@@ -597,6 +626,14 @@ def _run_sampled_validation(
     result["fine_minus_coarse_exact_f1"] = (
         result["fine_exact_occupancy_f1"]
         - result["coarse_exact_occupancy_f1"]
+    )
+    result["fine_minus_coarse_tolerant_0_2m_iou"] = (
+        result["fine_tolerant_0_2m_iou"]
+        - result["coarse_tolerant_0_2m_iou"]
+    )
+    result["fine_minus_coarse_tolerant_0_2m_f1"] = (
+        result["fine_tolerant_0_2m_f1"]
+        - result["coarse_tolerant_0_2m_f1"]
     )
     result["fine_minus_coarse_tolerant_0_5m_iou"] = (
         result["fine_tolerant_0_5m_iou"]
@@ -745,6 +782,10 @@ def main():
         _split_paths(args.data_root, "val", args.limit_val_samples, seed),
         **dataset_options,
     )
+    if train_dataset.grid_geometry != val_dataset.grid_geometry:
+        raise ValueError("Training and validation BEV geometries differ")
+    meters_per_cell_x = train_dataset.grid_geometry.pillar_size_x
+    meters_per_cell_y = train_dataset.grid_geometry.pillar_size_y
     loader_options = {
         "num_workers": workers,
         "pin_memory": device.type == "cuda",
@@ -939,7 +980,7 @@ def main():
     scaler = torch.amp.GradScaler(
         "cuda", enabled=use_amp and amp_dtype == torch.float16
     )
-    start_epoch, best, history = 1, float("-inf"), []
+    start_epoch, best_validation_metrics, history = 1, {}, []
     if resume_checkpoint is not None:
         checkpoint = resume_checkpoint
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
@@ -949,10 +990,8 @@ def main():
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         restore_rng_state(checkpoint.get("rng_state"))
         start_epoch = int(checkpoint["epoch"]) + 1
-        best = float(
-            checkpoint.get(
-                "best_sampled_validation_iou_improvement", float("-inf")
-            )
+        best_validation_metrics = dict(
+            checkpoint.get("best_validation_metrics", {})
         )
         history = list(checkpoint.get("history", []))
     atomic_write_json(
@@ -987,6 +1026,11 @@ def main():
         f"{'enabled' if augmentation_config.enabled else 'disabled'}; "
         f"weight decay: {float(training.get('weight_decay', 1.0e-3)):g}; "
         f"dropout: {config.dropout:g}"
+    )
+    print(
+        "BEV geometry: "
+        f"{meters_per_cell_x:g} m/cell x, "
+        f"{meters_per_cell_y:g} m/cell y"
     )
     if config.fine_backbone == "unet":
         hierarchy = [
@@ -1070,6 +1114,8 @@ def main():
                 seed=seed + 10_000,
                 progress_label=f"epoch {epoch:03d}/{epochs:03d} val",
                 residual_regularization_weight=residual_regularization_weight,
+                meters_per_cell_x=meters_per_cell_x,
+                meters_per_cell_y=meters_per_cell_y,
             )
             validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
@@ -1100,26 +1146,39 @@ def main():
             f"weighted "
             f"{train_stats['weighted_residual_regularization_loss']:.6f})"
         )
-        print(
-            f"  exact components | L_occ_operation "
-            f"{train_stats['occupancy_operation_loss']:.6f} | L_continuous "
-            f"{train_stats['exact_continuous_loss']:.6f}\n"
-            f"  occupancy groups | add "
-            f"{train_stats['occupancy_add_loss']:.6f} "
-            f"({int(train_stats['num_add'])}, "
-            f"{train_stats['percent_add']:.2f}%) | remove "
-            f"{train_stats['occupancy_remove_loss']:.6f} "
-            f"({int(train_stats['num_remove'])}, "
-            f"{train_stats['percent_remove']:.2f}%)\n"
-            f"                   | preserve occupied "
-            f"{train_stats['occupancy_preserve_occupied_loss']:.6f} "
-            f"({int(train_stats['num_preserve_occupied'])}, "
-            f"{train_stats['percent_preserve_occupied']:.2f}%) | "
-            f"preserve empty "
-            f"{train_stats['occupancy_preserve_empty_loss']:.6f} "
-            f"({int(train_stats['num_preserve_empty'])}, "
-            f"{train_stats['percent_preserve_empty']:.2f}%)"
-        )
+        if config.occupancy_loss_mode == "soft_iou":
+            print(
+                "  exact components | L_occ_soft_iou "
+                f"{train_stats['exact_occupancy_loss']:.6f} | soft_iou "
+                f"{100.0 * train_stats['soft_iou']:.2f}% | L_continuous "
+                f"{train_stats['exact_continuous_loss']:.6f}\n"
+                "  occupancy groups | diagnostic counts only: add "
+                f"{int(train_stats['num_add'])} | remove "
+                f"{int(train_stats['num_remove'])} | preserve occupied "
+                f"{int(train_stats['num_preserve_occupied'])} | "
+                f"preserve empty {int(train_stats['num_preserve_empty'])}"
+            )
+        else:
+            print(
+                f"  exact components | L_occ_operation "
+                f"{train_stats['occupancy_operation_loss']:.6f} | L_continuous "
+                f"{train_stats['exact_continuous_loss']:.6f}\n"
+                f"  occupancy groups | add "
+                f"{train_stats['occupancy_add_loss']:.6f} "
+                f"({int(train_stats['num_add'])}, "
+                f"{train_stats['percent_add']:.2f}%) | remove "
+                f"{train_stats['occupancy_remove_loss']:.6f} "
+                f"({int(train_stats['num_remove'])}, "
+                f"{train_stats['percent_remove']:.2f}%)\n"
+                f"                   | preserve occupied "
+                f"{train_stats['occupancy_preserve_occupied_loss']:.6f} "
+                f"({int(train_stats['num_preserve_occupied'])}, "
+                f"{train_stats['percent_preserve_occupied']:.2f}%) | "
+                f"preserve empty "
+                f"{train_stats['occupancy_preserve_empty_loss']:.6f} "
+                f"({int(train_stats['num_preserve_empty'])}, "
+                f"{train_stats['percent_preserve_empty']:.2f}%)"
+            )
         if val_stats is not None:
             print(
                 f"  sampled validation | {validation_seconds:.1f}s | "
@@ -1128,6 +1187,7 @@ def main():
                 f"flow {val_stats['diffusion_loss']:.6f} | exact "
                 f"{val_stats['exact_reconstruction_loss']:.6f} | "
                 f"occupancy {val_stats['exact_occupancy_loss']:.6f} | "
+                f"soft IoU {100.0 * val_stats['soft_iou']:.2f}% | "
                 f"continuous {val_stats['exact_continuous_loss']:.6f}\n"
                 f"                     | degradation "
                 f"{val_stats['degradation_loss']:.6f} | residual "
@@ -1149,6 +1209,14 @@ def main():
                 f"-> fine "
                 f"{100.0 * val_stats['fine_exact_occupancy_precision']:.2f}% / "
                 f"{100.0 * val_stats['fine_exact_occupancy_recall']:.2f}%\n"
+                f"    0.2m IoU/F1      | {baseline_label} "
+                f"{100.0 * val_stats['coarse_tolerant_0_2m_iou']:.2f}% "
+                f"/ {100.0 * val_stats['coarse_tolerant_0_2m_f1']:.2f}% "
+                f"-> fine {100.0 * val_stats['fine_tolerant_0_2m_iou']:.2f}% "
+                f"/ {100.0 * val_stats['fine_tolerant_0_2m_f1']:.2f}%\n"
+                f"    0.2m improvement | IoU "
+                f"{100.0 * val_stats['fine_minus_coarse_tolerant_0_2m_iou']:+.2f} pp | "
+                f"F1 {100.0 * val_stats['fine_minus_coarse_tolerant_0_2m_f1']:+.2f} pp\n"
                 f"    0.5m IoU/F1      | {baseline_label} "
                 f"{100.0 * val_stats['coarse_tolerant_0_5m_iou']:.2f}% "
                 f"/ {100.0 * val_stats['coarse_tolerant_0_5m_f1']:.2f}% "
@@ -1175,15 +1243,17 @@ def main():
                 "harmful removal "
                 f"{100.0 * val_stats['harmful_removal_rate']:.2f}%"
             )
-            score = val_stats["fine_minus_coarse_exact_iou"]
-            improved = score > best
-            best = max(best, score)
+            best_validation_metrics, improved_checkpoints = (
+                _checkpoint_improvements(
+                    val_stats, best_validation_metrics, epoch
+                )
+            )
         else:
             print(
                 f"  sampled validation | skipped; next at epoch "
                 f"{min(((epoch // validation_interval) + 1) * validation_interval, epochs)}"
             )
-            improved = False
+            improved_checkpoints = set()
         checkpoint = {
             "epoch": epoch,
             "diffusion_state_dict": diffusion.state_dict(),
@@ -1207,16 +1277,56 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
-            "best_sampled_validation_iou_improvement": best,
+            "best_validation_metrics": best_validation_metrics,
+            "primary_checkpoint_metric": "fine_tolerant_0_2m_iou",
+            "checkpoint_selection_metrics": (
+                {
+                    "validation_loss": val_stats["loss"],
+                    "fine_iou_0p2m": val_stats["fine_tolerant_0_2m_iou"],
+                    "fine_f1_0p2m": val_stats["fine_tolerant_0_2m_f1"],
+                    "fine_exact_iou": val_stats["fine_exact_occupancy_iou"],
+                    "fine_iou_0p5m": val_stats["fine_tolerant_0_5m_iou"],
+                }
+                if val_stats is not None
+                else None
+            ),
             "history": history,
             "rng_state": capture_rng_state(),
         }
         atomic_torch_save(checkpoint, output_root / "latest_checkpoint.pt")
-        if improved:
+        checkpoint_files = {
+            "validation_loss": "best_validation_loss.pt",
+            "exact_iou": "best_exact_iou.pt",
+            "iou_0p2m": "best_iou_0p2m.pt",
+            "iou_0p5m": "best_iou_0p5m.pt",
+        }
+        for name in improved_checkpoints:
+            atomic_torch_save(
+                checkpoint, output_root / checkpoint_files[name]
+            )
+        if "iou_0p2m" in improved_checkpoints:
+            # Compatibility alias; the primary checkpoint is best_iou_0p2m.pt.
             atomic_torch_save(
                 checkpoint, output_root / "best_sampled_validation_iou.pt"
             )
         write_csv_rows(output_root / "history.csv", history)
+    if best_validation_metrics:
+        print("\nBEST VALIDATION CHECKPOINTS")
+        for name, label in (
+            ("validation_loss", "validation loss"),
+            ("exact_iou", "exact IoU"),
+            ("iou_0p2m", "IoU@0.2m (PRIMARY)"),
+            ("iou_0p5m", "IoU@0.5m"),
+        ):
+            record = best_validation_metrics.get(name)
+            if record is not None:
+                suffix = "" if name == "validation_loss" else "%"
+                value = float(record["value"])
+                displayed = value if name == "validation_loss" else 100.0 * value
+                print(
+                    f"  {label:<22} epoch {int(record['epoch']):03d} | "
+                    f"{displayed:.6f}{suffix}"
+                )
     maximum_sampling_samples = int(
         payload.get("evaluation", {}).get("max_sampling_samples", 0)
     )

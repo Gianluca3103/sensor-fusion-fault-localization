@@ -8,9 +8,73 @@ from models.two_stage_reconstruction_head.diffusion_process.evaluate_fine_diffus
     _summarize_threshold_records,
     _threshold_sweep_record,
 )
+from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
+    occupancy_metrics,
+    tolerant_metrics_from_counts,
+    tolerant_occupancy_counts,
+)
+from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss import (
+    _dilate_with_metric_disk,
+)
 
 
 class FineDiffusionEvaluationTests(unittest.TestCase):
+    def test_exact_metric_is_unchanged(self):
+        prediction = torch.tensor([[[[1.0, 1.0, 0.0]]]])
+        target = torch.tensor([[[[1.0, 0.0, 1.0]]]])
+        metrics = occupancy_metrics(
+            prediction, target, torch.ones_like(target)
+        )
+        self.assertAlmostEqual(float(metrics["iou"]), 1.0 / 3.0)
+        self.assertAlmostEqual(float(metrics["f1"]), 0.5)
+
+    def test_physical_0p2m_tolerance_uses_grid_cell_sizes(self):
+        occupied = torch.zeros(1, 1, 5, 5, dtype=torch.bool)
+        predicted = torch.zeros_like(occupied)
+        occupied[:, :, 2, 2] = True
+        predicted[:, :, 2, 3] = True
+        valid = torch.ones_like(occupied)
+        counts = tolerant_occupancy_counts(
+            predicted,
+            occupied,
+            valid,
+            tolerance_m=0.2,
+            meters_per_cell_x=0.1,
+            meters_per_cell_y=0.2,
+        )
+        metrics = tolerant_metrics_from_counts(counts)
+        self.assertAlmostEqual(metrics["iou"], 1.0, places=6)
+
+    def test_physical_0p5m_matches_previous_square_grid_implementation(self):
+        occupied = torch.zeros(1, 1, 8, 8, dtype=torch.bool)
+        predicted = torch.zeros_like(occupied)
+        occupied[:, :, 3, 3] = True
+        occupied[:, :, 6, 6] = True
+        predicted[:, :, 3, 5] = True
+        predicted[:, :, 0, 0] = True
+        valid = torch.ones_like(occupied)
+        counts = tolerant_occupancy_counts(
+            predicted,
+            occupied,
+            valid,
+            tolerance_m=0.5,
+            meters_per_cell_x=0.2,
+            meters_per_cell_y=0.2,
+        )
+        old_target_neighborhood = _dilate_with_metric_disk(
+            occupied, 0.5, 0.2
+        )
+        old_prediction_neighborhood = _dilate_with_metric_disk(
+            predicted, 0.5, 0.2
+        )
+        self.assertEqual(
+            counts["matched_predictions"],
+            float((predicted & old_target_neighborhood).sum()),
+        )
+        self.assertEqual(
+            counts["matched_targets"],
+            float((occupied & old_prediction_neighborhood).sum()),
+        )
     def test_v10_checkpoint_selects_legacy_current_lidar_input_for_evaluation(self):
         config = _diffusion_config_from_checkpoint(
             {"enabled": True}, {"version": 10}

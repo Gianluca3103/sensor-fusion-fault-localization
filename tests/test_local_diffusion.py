@@ -27,6 +27,7 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_pipeline i
     load_frozen_coarse_model,
 )
 from models.two_stage_reconstruction_head.diffusion_process.train_fine_diffusion import (
+    _checkpoint_improvements,
     _operation_error_rates,
     _residual_regularization_weight_for_epoch,
 )
@@ -145,6 +146,101 @@ class ReconstructionCropExtractorTests(unittest.TestCase):
 
 
 class FineDiffusionRefinerTests(unittest.TestCase):
+    def test_soft_iou_loss_numerics_masking_gradients_and_no_threshold(self):
+        loss_fn = MaskedExactReconstructionLoss(
+            occupancy_loss_mode="soft_iou",
+            soft_iou_epsilon=1.0e-6,
+        )
+        mask = torch.ones(1, 1, 1, 2)
+        perfect = torch.tensor([[[[1.0, 0.0]]]], requires_grad=True)
+        target = torch.tensor([[[[1.0, 0.0]]]])
+        perfect_loss, perfect_components = loss_fn(
+            perfect, target, mask, torch.zeros_like(target),
+            return_components=True,
+        )
+        self.assertAlmostEqual(float(perfect_components["soft_iou"]), 1.0)
+        self.assertAlmostEqual(float(perfect_loss), 0.0)
+
+        disjoint = torch.tensor([[[[0.0, 1.0]]]], requires_grad=True)
+        disjoint_loss = loss_fn(
+            disjoint, target, mask, torch.zeros_like(target)
+        )
+        self.assertGreater(float(disjoint_loss), 0.999)
+
+        continuous_probability = torch.tensor(
+            [[[[0.75, 0.0]]]], requires_grad=True
+        )
+        continuous_loss, continuous_components = loss_fn(
+            continuous_probability,
+            target,
+            mask,
+            torch.zeros_like(target),
+            return_components=True,
+        )
+        self.assertAlmostEqual(
+            float(continuous_components["soft_iou"]), 0.75, places=5
+        )
+        self.assertAlmostEqual(float(continuous_loss), 0.25, places=5)
+        continuous_loss.backward()
+        self.assertTrue(torch.isfinite(continuous_probability.grad).all())
+
+        excluded_mask = torch.tensor([[[[1.0, 0.0]]]])
+        masked_loss = loss_fn(
+            torch.tensor([[[[1.0, 1.0]]]]),
+            target,
+            excluded_mask,
+            torch.zeros_like(target),
+        )
+        self.assertAlmostEqual(float(masked_loss), 0.0)
+
+        empty_mask = torch.zeros(2, 1, 3, 5)
+        arbitrary = torch.rand(2, 1, 3, 5, requires_grad=True)
+        empty_loss = loss_fn(
+            arbitrary,
+            torch.zeros_like(arbitrary),
+            empty_mask,
+            torch.zeros_like(arbitrary),
+        )
+        self.assertTrue(torch.isfinite(empty_loss))
+
+    def test_soft_iou_refiner_one_batch_forward_backward_is_finite(self):
+        clean, coarse, faulty, radar, repair, halo = _inputs(batch=1)
+        model = FineDiffusionRefiner(
+            _config(occupancy_loss_mode="soft_iou", sampling_steps=1)
+        ).train()
+        output = model(clean, coarse, faulty, radar, repair, halo)
+        self.assertTrue(torch.isfinite(output["loss"]))
+        self.assertTrue(torch.isfinite(output["soft_iou"]))
+        output["loss"].backward()
+        gradients = [
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertTrue(gradients)
+        self.assertTrue(
+            all(torch.isfinite(gradient).all() for gradient in gradients)
+        )
+
+    def test_checkpoint_primary_updates_only_for_better_validation_iou_0p2m(self):
+        validation = {
+            "loss": 0.4,
+            "fine_exact_occupancy_iou": 0.3,
+            "fine_tolerant_0_2m_iou": 0.5,
+            "fine_tolerant_0_5m_iou": 0.7,
+        }
+        best, improved = _checkpoint_improvements(validation, {}, 1)
+        self.assertIn("iou_0p2m", improved)
+        worse_primary = dict(validation)
+        worse_primary["fine_tolerant_0_2m_iou"] = 0.49
+        worse_primary["loss"] = 0.3
+        updated, improved = _checkpoint_improvements(
+            worse_primary, best, 2
+        )
+        self.assertNotIn("iou_0p2m", improved)
+        self.assertIn("validation_loss", improved)
+        self.assertEqual(updated["iou_0p2m"]["epoch"], 1)
+
     def test_coarse_existing_mode_matches_coarse_loss_components(self):
         refined = torch.tensor(
             [[[[0.8, 0.2]], [[0.4, 0.7]], [[0.6, 0.3]]]],

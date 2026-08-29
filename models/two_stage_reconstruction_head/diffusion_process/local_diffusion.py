@@ -67,6 +67,7 @@ class FineDiffusionConfig:
     residual_regularization_decay_epochs: int = 0
     occupancy_loss_mode: str = "standard_bce"
     occupancy_threshold: float = 0.5
+    soft_iou_epsilon: float = 1.0e-6
     coarse_positive_occupancy_weight: float = 1.1
     coarse_min_empty_observability_weight: float = 0.1
     correction_group_weight: float = 1.0
@@ -185,13 +186,16 @@ class FineDiffusionConfig:
             "operation_balanced",
             "weighted_operation",
             "coarse_existing",
+            "soft_iou",
         ):
             raise ValueError(
                 "occupancy_loss_mode must be standard_bce, operation_balanced, "
-                "weighted_operation, or coarse_existing"
+                "weighted_operation, coarse_existing, or soft_iou"
             )
         if not 0.0 < self.occupancy_threshold < 1.0:
             raise ValueError("occupancy_threshold must be strictly between 0 and 1")
+        if self.soft_iou_epsilon <= 0.0:
+            raise ValueError("soft_iou_epsilon must be positive")
         if self.coarse_positive_occupancy_weight < 1.0:
             raise ValueError(
                 "coarse_positive_occupancy_weight must be at least 1"
@@ -1374,6 +1378,7 @@ class MaskedExactReconstructionLoss(nn.Module):
         *,
         occupancy_loss_mode: str = "standard_bce",
         occupancy_threshold: float = 0.5,
+        soft_iou_epsilon: float = 1.0e-6,
         correction_group_weight: float = 1.0,
         preservation_group_weight: float = 0.5,
         operation_add_weight: float = 0.21,
@@ -1387,6 +1392,7 @@ class MaskedExactReconstructionLoss(nn.Module):
         self.epsilon = float(epsilon)
         self.occupancy_loss_mode = str(occupancy_loss_mode)
         self.occupancy_threshold = float(occupancy_threshold)
+        self.soft_iou_epsilon = float(soft_iou_epsilon)
         self.balanced_group_weights = {
             "add": float(correction_group_weight),
             "remove": float(correction_group_weight),
@@ -1493,6 +1499,7 @@ class MaskedExactReconstructionLoss(nn.Module):
                 zero = refined_float.sum() * 0.0
                 components = {
                     "occupancy_loss": zero,
+                    "soft_iou": zero,
                     "continuous_loss": zero,
                     **{f"occupancy_{name}_loss": zero for name in self.GROUPS},
                     **{
@@ -1501,17 +1508,14 @@ class MaskedExactReconstructionLoss(nn.Module):
                     },
                 }
                 return (zero, components) if return_components else zero
-            per_cell_bce = F.binary_cross_entropy(
-                refined_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
-                target_occupancy,
-                reduction="none",
-            )
+            per_cell_bce = None
             group_losses = {
-                name: per_cell_bce.new_zeros(()) for name in self.GROUPS
+                name: refined_occupancy.new_zeros(()) for name in self.GROUPS
             }
             group_counts = {
-                name: per_cell_bce.new_zeros(()) for name in self.GROUPS
+                name: refined_occupancy.new_zeros(()) for name in self.GROUPS
             }
+            soft_iou = refined_occupancy.new_zeros(())
             if coarse is not None:
                 coarse_occupancy = coarse.detach().float()[:, 0:1]
                 groups = self._occupancy_groups(
@@ -1523,8 +1527,38 @@ class MaskedExactReconstructionLoss(nn.Module):
                 for name, group in selected_groups.items():
                     count = group.sum(dtype=torch.float32)
                     group_counts[name] = count
-                    if bool(count > 0):
-                        group_losses[name] = per_cell_bce[group].sum() / count
+            if self.occupancy_loss_mode == "soft_iou":
+                # Per-sample reduction gives each valid crop equal influence,
+                # independent of its reconstruction-mask area.
+                probability = refined_occupancy_map.clamp(0.0, 1.0)
+                dimensions = tuple(range(1, probability.ndim))
+                intersection = (
+                    mask_float * probability * occupied
+                ).sum(dim=dimensions)
+                union = (
+                    mask_float
+                    * (probability + occupied - probability * occupied)
+                ).sum(dim=dimensions)
+                valid_samples = mask_float.sum(dim=dimensions) > 0
+                per_sample_soft_iou = (
+                    intersection + self.soft_iou_epsilon
+                ) / (union + self.soft_iou_epsilon)
+                soft_iou = (
+                    per_sample_soft_iou * valid_samples
+                ).sum() / valid_samples.sum().clamp_min(1)
+                occupancy_loss = 1.0 - soft_iou
+            else:
+                per_cell_bce = F.binary_cross_entropy(
+                    refined_occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
+                    target_occupancy,
+                    reduction="none",
+                )
+                if coarse is not None:
+                    for name, group in selected_groups.items():
+                        if bool(group_counts[name] > 0):
+                            group_losses[name] = (
+                                per_cell_bce[group].sum() / group_counts[name]
+                            )
             if self.occupancy_loss_mode in (
                 "operation_balanced",
                 "weighted_operation",
@@ -1547,13 +1581,14 @@ class MaskedExactReconstructionLoss(nn.Module):
                         numerator = numerator + weight * group_losses[name]
                         active_weight += weight
                 occupancy_loss = numerator / max(active_weight, self.epsilon)
-            else:
+            elif self.occupancy_loss_mode != "soft_iou":
                 occupancy_loss = per_cell_bce.mean()
         continuous_loss = occupancy_loss.new_zeros(())
         if refined.shape[1] == 1:
             total = occupancy_loss
             components = {
                 "occupancy_loss": occupancy_loss,
+                "soft_iou": soft_iou,
                 "continuous_loss": continuous_loss,
                 **{
                     f"occupancy_{name}_loss": group_losses[name]
@@ -1582,6 +1617,7 @@ class MaskedExactReconstructionLoss(nn.Module):
         total = occupancy_loss + continuous_loss
         components = {
             "occupancy_loss": occupancy_loss,
+            "soft_iou": soft_iou,
             "continuous_loss": continuous_loss,
             **{
                 f"occupancy_{name}_loss": group_losses[name]
@@ -1744,6 +1780,7 @@ class FineDiffusionRefiner(nn.Module):
             self.config.denominator_epsilon,
             occupancy_loss_mode=self.config.occupancy_loss_mode,
             occupancy_threshold=self.config.occupancy_threshold,
+            soft_iou_epsilon=self.config.soft_iou_epsilon,
             correction_group_weight=self.config.correction_group_weight,
             preservation_group_weight=self.config.preservation_group_weight,
             operation_add_weight=self.config.operation_add_weight,
@@ -2243,6 +2280,9 @@ class FineDiffusionRefiner(nn.Module):
             "exact_occupancy_loss": exact_components["occupancy_loss"],
             "occupancy_operation_loss": exact_components["occupancy_loss"],
             "exact_continuous_loss": exact_components["continuous_loss"],
+            "soft_iou": exact_components.get(
+                "soft_iou", exact_loss.new_zeros(())
+            ),
             **{
                 key: value
                 for key, value in exact_components.items()
