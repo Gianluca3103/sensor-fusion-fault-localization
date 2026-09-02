@@ -40,6 +40,7 @@ SPECIAL_CORRUPTIONS = {
     "fov_filter",
     "old_laser_degradation",
     "laser_device_failure",
+    "total_loss",
 }
 SUPPORTED_CORRUPTIONS = ROW_ALIGNED_CORRUPTIONS | SPECIAL_CORRUPTIONS
 
@@ -57,6 +58,8 @@ def validate_fault_spec(fault: str, severity: int) -> tuple[str, int]:
         raise ValueError(
             f"Severity for {fault!r} must be between {minimum} and 5, got {severity}"
         )
+    if fault == "total_loss" and severity != 1:
+        raise ValueError("total_loss has one deterministic severity: 1")
     return fault, severity
 
 

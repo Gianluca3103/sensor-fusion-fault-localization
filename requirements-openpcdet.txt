@@ -1,8 +1,0 @@
-# Optional, isolated downstream detector environment.
-# Install torch first using the wheel matching the host CUDA driver, then run
-# tools/openpcdet/check_openpcdet_environment.py before building OpenPCDet.
-easydict
-pyyaml
-scikit-image
-SharedArray
-tensorboardX

@@ -19,6 +19,29 @@ class FakeLidarCorruptions:
 
 
 class FaultInjectorTests(unittest.TestCase):
+    def test_total_loss_removes_every_lidar_return(self):
+        clean = np.asarray(
+            [[1.0, 2.0, 0.0, 0.5], [3.0, 4.0, 0.2, 0.7]],
+            dtype=np.float32,
+        )
+        result, _metadata = inject_fault(
+            "total_loss",
+            clean,
+            np.asarray([10, 11]),
+            1,
+            Path("."),
+            Path("."),
+            lidar_corruptions=None,
+        )
+        self.assertEqual(result.points.shape, (0, 4))
+        self.assertEqual(result.point_ids.shape, (0,))
+        self.assertEqual(result.source_ids.shape, (0,))
+        self.assertEqual(result.injector_labels.shape, (0,))
+
+    def test_total_loss_rejects_meaningless_severity(self):
+        with self.assertRaisesRegex(ValueError, "deterministic severity"):
+            parse_fault_plan(["total_loss:2"])
+
     def test_parse_fault_plan(self):
         self.assertEqual(parse_fault_plan(["fog_sim:4", "rain_sim:5"]), [("fog_sim", 4), ("rain_sim", 5)])
 

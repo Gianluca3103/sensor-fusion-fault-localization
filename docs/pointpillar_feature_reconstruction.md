@@ -32,11 +32,3 @@ The objective combines full-grid Smooth-L1, extra Smooth-L1 weight on cells
 where the target differs from the faulty tensor, and cosine feature alignment
 on non-empty clean cells. The changed-cell weighting is derived from the target
 only while calculating the loss; it is not visible to HRNet at inference.
-
-## Downstream evaluation
-
-The native lightweight BEV detector can consume the cached post-scatter tensor
-directly. Train it once on `F_clean`, freeze it, then evaluate that identical
-checkpoint on `F_clean`, `F_faulty`, and `F_reconstructed`. PV-RCNN++ is not
-used for this comparison because its standard interface is a raw 3D point
-cloud, not the thesis PointPillars post-scatter tensor.

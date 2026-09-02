@@ -8,14 +8,15 @@ __pycache__/
 
 # Virtual environments and local tooling
 .venv/
+
+# Keep optional local third-party checkouts out of version control.
+third_party/OpenPCDet/
 venv/
 env/
 .idea/
 .vscode/
 .matplotlib/
 
-# Installed upstream detector dependency (bootstrap script pins the revision).
-third_party/OpenPCDet/
 
 # Local raw datasets. Keep only placeholders.
 data/**

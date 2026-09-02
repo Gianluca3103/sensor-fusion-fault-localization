@@ -24,8 +24,6 @@ unchanged.
 - `models/two_stage_reconstruction_head/coarse_reconstruction/evaluate_coarse_by_fault.py`:
   evaluate exact and tolerant reconstruction metrics by fault.
 - `models/two_stage_reconstruction_head/diffusion_process/`: unchanged Stage-II code.
-- `pcdet_integration/`: isolated adapters for official OpenPCDet PV-RCNN++
-  downstream evaluation. See `docs/openpcdet_pvrcnnpp_vod.md`.
 
 ## Canonical configuration
 
@@ -53,7 +51,9 @@ python -m Fault_Localization_Model.create_vod_reconstruction_dataset `
 
 Run the command once per `--split` (`train`, `val`, and `test`), changing
 `--num-samples` when a split limit is required. Use `--help` for the current
-generator options. Fault-selector masks are cached
+generator options. The default fault plan cycles through `fog_sim:4`,
+`fog_sim:5`, `fov_filter:1`, and deterministic `total_loss:1`. Fault-selector
+masks are cached
 separately with:
 
 ```powershell

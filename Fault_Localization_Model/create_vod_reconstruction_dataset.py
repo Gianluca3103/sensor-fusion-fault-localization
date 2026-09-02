@@ -59,8 +59,13 @@ from Fault_Localization_Model.vod_dataset import (
 
 
 LOGGER = logging.getLogger("create_vod_reconstruction_dataset")
-GENERATOR_VERSION = 1
-DEFAULT_FAULT_PLAN = (("fog_sim", 4), ("fog_sim", 5))
+GENERATOR_VERSION = 2
+DEFAULT_FAULT_PLAN = (
+    ("fog_sim", 4),
+    ("fog_sim", 5),
+    ("fov_filter", 1),
+    ("total_loss", 1),
+)
 WORKER_CONFIG: dict | None = None
 LIDAR_CORRUPTIONS = None
 
@@ -111,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fault-plan",
         nargs="*",
-        default=["fog_sim:4", "fog_sim:5"],
+        default=["fog_sim:4", "fog_sim:5", "fov_filter:1", "total_loss:1"],
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)

@@ -238,6 +238,11 @@ def inject_fault(
         "weather_threads": int(weather_threads),
     }
 
+    if fault == "total_loss":
+        faulty_raw = np.empty((0, clean_points.shape[1]), dtype=np.float32)
+        keep_mask = np.zeros(len(clean_points), dtype=bool)
+        return _subset_result(faulty_raw, clean_point_ids, keep_mask), metadata
+
     if fault == "fog_sim":
         faulty_raw, fog_metadata = apply_fog_simulator(
             fog_root,

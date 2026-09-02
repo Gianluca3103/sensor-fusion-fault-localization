@@ -141,7 +141,7 @@ def main() -> None:
     manifest = {
         "format_version": 2,
         "tensor_name": "dense_features",
-        "detector_interface_alias": "post_pillar_scatter",
+        "feature_interface_alias": "post_pillar_scatter",
         "lidar_shape": [
             int(lidar_encoder.scatter.channels),
             feature_geometry.height,

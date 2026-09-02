@@ -97,7 +97,7 @@ class PointPillarFeatureCacheDataset(Dataset):
 
 
 class CoarsePointPillarFeatureReconstructor(nn.Module):
-    """Predict a full-grid residual on the detector's post-scatter tensor."""
+    """Predict a full-grid residual on the LiDAR post-scatter tensor."""
 
     def __init__(self, config: PointPillarFeatureReconstructionConfig):
         super().__init__()
