@@ -11,7 +11,6 @@ import sys
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
@@ -52,6 +51,9 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss impo
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
     tolerant_metrics_from_counts,
     tolerant_occupancy_counts,
+)
+from models.two_stage_reconstruction_head.reconstruction_visualization import (
+    save_three_panel_reconstruction,
 )
 
 
@@ -551,6 +553,7 @@ def summarize_records(records: list[dict]) -> dict:
         "frame_id",
         "target_occupied_cells",
         "occupancy_threshold",
+        "bypassed_coarse_reconstruction",
         *TRANSITION_KEYS,
     }
     metric_keys = [
@@ -772,57 +775,31 @@ def _save_comparison(
     destination: Path,
     clean_bev: torch.Tensor,
     faulty_bev: torch.Tensor,
-    coarse_bev: torch.Tensor,
     fine_bev: torch.Tensor,
+    radar_bev: torch.Tensor,
     reconstruction_mask: torch.Tensor,
     record: dict,
 ) -> None:
-    def occupancy(bev: torch.Tensor):
-        return bev.detach().float().cpu()[0].clamp(0.0, 1.0).numpy()
-
-    clean = occupancy(clean_bev)
-    faulty = occupancy(faulty_bev)
-    coarse = occupancy(coarse_bev)
-    fine = occupancy(fine_bev)
-    mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    figure, axes = plt.subplots(1, 4, figsize=(20, 5.5), facecolor="black")
-    panels = (
-        (clean, "Clean occupancy"),
-        (faulty, "Faulty occupancy"),
-        (coarse, "Coarse occupancy"),
-        (fine, "Fine diffusion occupancy"),
+    baseline_name = (
+        "erased faulty"
+        if record.get("bypassed_coarse_reconstruction", False)
+        else "coarse"
     )
-    for axis, (image, title) in zip(axes.flat, panels):
-        axis.imshow(
-            image,
-            cmap="gray",
-            vmin=0.0,
-            vmax=1.0,
-            interpolation="nearest",
-        )
-        axis.contour(
-            mask.astype("uint8"),
-            levels=(0.5,),
-            colors="cyan",
-            linewidths=0.8,
-        )
-        axis.set_title(title, color="white")
-        axis.axis("off")
-    figure.suptitle(
-        f"{record['fault_group']} | frame {record['frame_id']} | "
-        f"faulty {record['faulty_occupancy_exact_iou']:.2%}, "
-        f"coarse {record['coarse_occupancy_exact_iou']:.2%}, "
-        f"fine {record['fine_occupancy_exact_iou']:.2%}",
-        color="white",
-    )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(
+    save_three_panel_reconstruction(
         destination,
-        dpi=150,
-        bbox_inches="tight",
-        facecolor=figure.get_facecolor(),
+        clean_bev=clean_bev,
+        faulty_bev=faulty_bev,
+        reconstructed_bev=fine_bev,
+        radar_bev=radar_bev,
+        reconstruction_mask=reconstruction_mask,
+        reconstruction_title="Fine reconstruction",
+        figure_title=(
+            f"{record['fault_group']} | frame {record['frame_id']} | "
+            f"faulty {record['faulty_occupancy_exact_iou']:.2%}, "
+            f"{baseline_name} {record['coarse_occupancy_exact_iou']:.2%}, "
+            f"fine {record['fine_occupancy_exact_iou']:.2%}"
+        ),
     )
-    plt.close(figure)
 
 
 def main() -> None:
@@ -1035,6 +1012,9 @@ def main() -> None:
                     "fault": fault,
                     "severity": severity,
                     "fault_group": f"{fault}_s{severity}",
+                    "bypassed_coarse_reconstruction": (
+                        diffusion_config.bypass_coarse_reconstruction
+                    ),
                     "repair_cells": int(sample_mask.sum()),
                     **{key: float(value) for key, value in coarse_metrics.items()},
                     **{key: float(value) for key, value in fine_metrics.items()},
@@ -1130,8 +1110,8 @@ def main() -> None:
                         / f"{visual_index:03d}_{Path(sample_path).stem}.png",
                         clean[0],
                         faulty[0],
-                        coarse_sample[0],
                         fine_sample[0],
+                        inputs["radar_bev"][index],
                         sample_mask[0],
                         record,
                     )

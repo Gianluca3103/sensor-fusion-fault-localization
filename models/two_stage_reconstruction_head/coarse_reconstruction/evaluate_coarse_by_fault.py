@@ -34,6 +34,9 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss impo
     OCCUPANCY_TOLERANCE_M,
     _dilate_with_metric_disk,
 )
+from models.two_stage_reconstruction_head.reconstruction_visualization import (
+    save_three_panel_reconstruction,
+)
 
 
 def _load_selector_config(path: Path) -> FaultSelectorConfig:
@@ -424,91 +427,21 @@ def _save_comparison(
     reconstruction_mask: torch.Tensor,
     record: dict,
 ) -> None:
-    clean = _bev_rgb(clean_bev)
-    coarse = _bev_rgb(coarse_bev)
-    radar = (
-        radar_bev.detach()
-        .to(dtype=torch.float32)
-        .clamp(0.0, 1.0)
-        .cpu()
-        .numpy()
-    )
-    if radar.shape[0] != 4:
-        raise ValueError(
-            f"Expected four radar BEV channels for visualization, got {radar.shape}"
-        )
-    radar_composite = np.stack(
-        (
-            radar[2],
-            radar[3],
-            np.maximum(radar[1], 0.15 * radar[0]),
-        ),
-        axis=-1,
-    ).clip(0.0, 1.0)
-    faulty_support = faulty_bev[0].detach().cpu().numpy() >= 0.5
-    radar_support = (
-        radar_bev.detach()
-        .to(dtype=torch.float32)
-        .abs()
-        .amax(dim=0)
-        .cpu()
-        .numpy()
-        > 0.0
-    )
-    faulty_radar_overlay = np.stack(
-        (
-            radar_support,
-            faulty_support,
-            faulty_support | radar_support,
-        ),
-        axis=-1,
-    ).astype(np.float32)
-    mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
-    figure, axes = plt.subplots(2, 4, figsize=(20, 10), facecolor="black")
-    panels = (
-        (clean, "Clean LiDAR BEV", None),
-        (coarse, "Coarse reconstructed LiDAR BEV", None),
-        (
-            faulty_radar_overlay,
-            "Faulty LiDAR + trusted radar\nCyan: LiDAR | Magenta: radar | White: overlap",
-            None,
-        ),
-        (
-            radar_composite,
-            "Radar composite\nR: speed | G: height | B: power/occupancy",
-            None,
-        ),
-        (radar[0], "Radar 0: Static occupancy", "gray"),
-        (radar[1], "Radar 1: Normalized power", "inferno"),
-        (radar[2], "Radar 2: Dynamic speed", "turbo"),
-        (radar[3], "Radar 3: Robust upper height", "viridis"),
-    )
-    for axis, (image, title, cmap) in zip(axes.flat, panels):
-        axis.imshow(
-            image,
-            cmap=cmap,
-            vmin=0.0 if cmap else None,
-            vmax=1.0 if cmap else None,
-            interpolation="nearest",
-        )
-        axis.contour(mask.astype(np.uint8), levels=(0.5,), colors="cyan", linewidths=0.7)
-        axis.set_title(title, color="white")
-        axis.axis("off")
-    figure.suptitle(
-        f"{record['fault_group']} | sequence {record['sequence_id']} | "
-        f"frame {record['frame_id']} | "
-        f"faulty IoU {record['faulty_occupancy_exact_iou']:.2%} -> "
-        f"coarse IoU {record['coarse_occupancy_exact_iou']:.2%}",
-        color="white",
-    )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(
+    save_three_panel_reconstruction(
         destination,
-        dpi=150,
-        bbox_inches="tight",
-        facecolor=figure.get_facecolor(),
+        clean_bev=clean_bev,
+        faulty_bev=faulty_bev,
+        reconstructed_bev=coarse_bev,
+        radar_bev=radar_bev,
+        reconstruction_mask=reconstruction_mask,
+        reconstruction_title="Coarse reconstruction",
+        figure_title=(
+            f"{record['fault_group']} | sequence {record['sequence_id']} | "
+            f"frame {record['frame_id']} | "
+            f"faulty IoU {record['faulty_occupancy_exact_iou']:.2%} -> "
+            f"coarse IoU {record['coarse_occupancy_exact_iou']:.2%}"
+        ),
     )
-    plt.close(figure)
 
 
 def _save_hrnet_debug(
