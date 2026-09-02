@@ -43,6 +43,7 @@ def _config(
     sampling_steps=3,
     bypass_coarse=False,
     pointpillars=False,
+    occupancy_loss_mode="standard_bce",
 ):
     return FineDiffusionConfig(
         bypass_coarse_reconstruction=bypass_coarse,
@@ -57,6 +58,7 @@ def _config(
         use_pointpillars_conditioning=pointpillars,
         lidar_pillar_channels=6,
         radar_pillar_channels=7,
+        occupancy_loss_mode=occupancy_loss_mode,
     )
 
 
