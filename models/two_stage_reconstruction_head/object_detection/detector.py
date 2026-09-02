@@ -23,6 +23,7 @@ class BEVDetectorConfig:
     nms_iou_threshold: float = 0.1
     match_iou_threshold: float = 0.5
     top_k: int = 200
+    box_regression_channels: int = 6
 
     def validate(self) -> None:
         if self.input_channels < 1 or self.base_channels < 4:
@@ -35,6 +36,8 @@ class BEVDetectorConfig:
                 raise ValueError(f"{name} must be in [0,1]")
         if self.top_k < 1:
             raise ValueError("top_k must be positive")
+        if self.box_regression_channels not in {6, 8}:
+            raise ValueError("box_regression_channels must be 6 (BEV) or 8 (3D)")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -91,7 +94,7 @@ class LightweightBEVDetector(nn.Module):
         self.box_head = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(channels, 6, 1),
+            nn.Conv2d(channels, self.config.box_regression_channels, 1),
         )
         nn.init.constant_(self.heatmap_head[-1].bias, -2.19)
 
@@ -129,11 +132,16 @@ def make_detection_targets(
     output_stride: int,
     *,
     device: torch.device,
+    box_regression_channels: int = 6,
 ) -> dict[str, torch.Tensor]:
+    if box_regression_channels not in {6, 8}:
+        raise ValueError("box_regression_channels must be 6 (BEV) or 8 (3D)")
     batch_size = len(boxes_batch)
     height, width = output_shape
     heatmap = torch.zeros((batch_size, len(class_names), height, width), device=device)
-    regression = torch.zeros((batch_size, 6, height, width), device=device)
+    regression = torch.zeros(
+        (batch_size, box_regression_channels, height, width), device=device
+    )
     regression_mask = torch.zeros((batch_size, 1, height, width), device=device)
     class_to_index = {name: index for index, name in enumerate(class_names)}
     for batch_index, boxes in enumerate(boxes_batch):
@@ -151,16 +159,18 @@ def make_detection_targets(
             )
             _draw_gaussian(heatmap[batch_index, class_index], row, col, radius)
             heatmap[batch_index, class_index, row, col] = 1.0
+            values = [
+                row_float - row,
+                col_float - col,
+                math.log(box.length),
+                math.log(box.width),
+                math.sin(box.yaw),
+                math.cos(box.yaw),
+            ]
+            if box_regression_channels == 8:
+                values.extend((box.z, math.log(max(box.height, 1.0e-3))))
             regression[batch_index, :, row, col] = torch.tensor(
-                [
-                    row_float - row,
-                    col_float - col,
-                    math.log(box.length),
-                    math.log(box.width),
-                    math.sin(box.yaw),
-                    math.cos(box.yaw),
-                ],
-                device=device,
+                values, device=device
             )
             regression_mask[batch_index, 0, row, col] = 1.0
     return {"heatmap": heatmap, "regression": regression, "regression_mask": regression_mask}
@@ -219,6 +229,12 @@ def decode_detections(
             length = float(values[2].clamp(-3.0, 5.0).exp())
             width = float(values[3].clamp(-3.0, 5.0).exp())
             yaw = math.atan2(float(values[4]), float(values[5]))
+            z = float(values[6]) if len(values) >= 8 else 0.0
+            height = (
+                float(values[7].clamp(-3.0, 5.0).exp())
+                if len(values) >= 8
+                else 0.0
+            )
             boxes.append(
                 RotatedBEVBox(
                     class_name=class_names[class_index],
@@ -227,6 +243,8 @@ def decode_detections(
                     length=length,
                     width=width,
                     yaw=yaw,
+                    z=z,
+                    height=height,
                     confidence=score,
                 )
             )

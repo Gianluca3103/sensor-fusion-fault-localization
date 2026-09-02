@@ -43,3 +43,37 @@ validation frames, but not the 2,247 official test frames. Consequently,
 `--split test` intentionally fails unless `--label-root` points to a separate,
 authorized test annotation set. Missing test labels are never interpreted as
 empty scenes.
+
+## Direct fault-robust LiDAR/radar fusion detector
+
+`PointPillarsHRNetFusionDetector` is a separate experiment that does not
+reconstruct LiDAR. It independently pillarizes the faulty LiDAR and accumulated
+radar point clouds on the dataset's shared BEV grid, concatenates the two dense
+feature maps, fuses them with HRNet, and predicts object centres and rotated 3D
+boxes with an anchor-free center head. It does not load a fault selector, repair
+mask, coarse model, fine model, pseudo-LiDAR, or clean LiDAR as an input.
+
+```bash
+python -u -m models.two_stage_reconstruction_head.object_detection.train_fusion_detector \
+  --data-root /workspace/reconstruction_vod_radar3_unique_multibox_selector \
+  --radar-root /workspace/radar20_pointpillars_cache \
+  --vod-root /workspace/view_of_delft_PUBLIC \
+  --output-root /workspace/fault_robust_pointpillars_hrnet_center \
+  --config configs/fault_robust_pointpillars_hrnet_center.json \
+  --device cuda --epochs 80 --batch-size 8 \
+  --validation-batch-size 8 --num-workers 8
+```
+
+Evaluate the frozen best-validation-mAP checkpoint and optionally compare it
+with the same detector after zeroing its radar feature map:
+
+```bash
+python -u -m models.two_stage_reconstruction_head.object_detection.evaluate_fusion_detector \
+  --checkpoint /workspace/fault_robust_pointpillars_hrnet_center/best_model.pt \
+  --data-root /workspace/reconstruction_vod_radar3_unique_multibox_selector \
+  --radar-root /workspace/radar20_pointpillars_cache \
+  --vod-root /workspace/view_of_delft_PUBLIC \
+  --output-root /workspace/fault_robust_pointpillars_hrnet_center_val \
+  --split val --device cuda --batch-size 8 --num-workers 8 \
+  --include-lidar-only-ablation
+```

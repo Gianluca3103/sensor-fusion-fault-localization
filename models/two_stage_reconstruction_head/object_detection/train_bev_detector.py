@@ -117,6 +117,7 @@ def _validate(model, loader, annotations, geometry, config, device, use_amp):
             targets = make_detection_targets(
                 batch["boxes"], model.class_names, geometry, outputs["heatmap_logits"].shape[-2:],
                 config.output_stride, device=device,
+                box_regression_channels=config.box_regression_channels,
             )
             losses.append(float(detector_loss(outputs, targets)["loss"]))
         predictions = decode_detections(outputs, model.class_names, geometry, config)
@@ -189,6 +190,7 @@ def main() -> None:
                 targets = make_detection_targets(
                     batch["boxes"], model.class_names, geometry,
                     outputs["heatmap_logits"].shape[-2:], config.output_stride, device=device,
+                    box_regression_channels=config.box_regression_channels,
                 )
                 losses = detector_loss(outputs, targets)
             scaler.scale(losses["loss"]).backward()
