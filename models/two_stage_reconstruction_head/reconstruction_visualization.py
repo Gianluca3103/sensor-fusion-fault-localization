@@ -58,13 +58,20 @@ def save_three_panel_reconstruction(
     reconstruction_mask: torch.Tensor,
     reconstruction_title: str,
     figure_title: str,
+    occupancy_threshold: float = 0.5,
 ) -> None:
     """Save clean, faulty+radar, and reconstructed+radar occupancy panels."""
 
     clean = occupancy_image(clean_bev)
-    faulty_overlay = radar_lidar_occupancy_overlay(faulty_bev, radar_bev)
+    faulty_overlay = radar_lidar_occupancy_overlay(
+        faulty_bev,
+        radar_bev,
+        occupancy_threshold=occupancy_threshold,
+    )
     reconstructed_overlay = radar_lidar_occupancy_overlay(
-        reconstructed_bev, radar_bev
+        reconstructed_bev,
+        radar_bev,
+        occupancy_threshold=occupancy_threshold,
     )
     mask = reconstruction_mask.detach().bool().squeeze().cpu().numpy()
 
@@ -101,6 +108,7 @@ def save_three_panel_reconstruction(
         axis.axis("off")
     figure.suptitle(
         figure_title
+        + f" | occupancy threshold {occupancy_threshold:.2f}"
         + "\nCyan: LiDAR | Magenta: radar | White: overlap | Yellow: repair mask",
         color="white",
     )

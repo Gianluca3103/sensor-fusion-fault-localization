@@ -95,6 +95,42 @@ def tolerant_metrics_from_counts(
     }
 
 
+def reconstruction_mask_boundary_bands(
+    reconstruction_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Split valid repair cells by inward Chebyshev distance from its boundary.
+
+    The returned bands cover depths 0-1, 2-3, 4-7, and 8+ cells exactly once.
+    Technical image edges are treated as outside the reconstruction mask.
+    """
+
+    if reconstruction_mask.ndim != 4 or reconstruction_mask.shape[1] != 1:
+        raise ValueError(
+            "reconstruction_mask must have shape [B,1,H,W], got "
+            f"{tuple(reconstruction_mask.shape)}"
+        )
+    active = reconstruction_mask > 0.5
+    remaining = active
+    depth = torch.full_like(reconstruction_mask, -1, dtype=torch.int16)
+    kernel = torch.ones(
+        (1, 1, 3, 3),
+        dtype=torch.float32,
+        device=reconstruction_mask.device,
+    )
+    for inward_depth in range(8):
+        padded = F.pad(remaining.float(), (1, 1, 1, 1), value=0.0)
+        eroded = F.conv2d(padded, kernel) >= 9.0
+        layer = remaining & ~eroded
+        depth[layer] = inward_depth
+        remaining = eroded
+    return {
+        "0-1 cells": active & (depth >= 0) & (depth <= 1),
+        "2-3 cells": active & (depth >= 2) & (depth <= 3),
+        "4-7 cells": active & (depth >= 4) & (depth <= 7),
+        "8+ cells": remaining,
+    }
+
+
 def bev_occupancy(bev: torch.Tensor) -> torch.Tensor:
     """Return occupancy from the canonical first LiDAR BEV channel."""
     if bev.ndim != 4 or bev.shape[1] < 1:

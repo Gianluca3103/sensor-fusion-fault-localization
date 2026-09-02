@@ -49,6 +49,7 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss impo
     _dilate_with_metric_disk,
 )
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
+    reconstruction_mask_boundary_bands,
     tolerant_metrics_from_counts,
     tolerant_occupancy_counts,
 )
@@ -122,6 +123,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Comparison PNGs saved for each fault group; 0 disables.",
+    )
+    parser.add_argument(
+        "--boundary-diagnostics",
+        action="store_true",
+        help=(
+            "Measure reconstruction quality in inward repair-boundary bands "
+            "and save visualization variants at thresholds 0.3, 0.4, and 0.5."
+        ),
     )
     return parser.parse_args()
 
@@ -297,6 +306,163 @@ def _fixed_physical_tolerance_metrics(
             }
         )
     return output
+
+
+def _boundary_diagnostic_records(
+    *,
+    clean: torch.Tensor,
+    faulty: torch.Tensor,
+    coarse: torch.Tensor,
+    fine: torch.Tensor,
+    radar: torch.Tensor,
+    reconstruction_mask: torch.Tensor,
+    geometry,
+    sample_path: str,
+    fault_group: str,
+) -> list[dict[str, int | float | str]]:
+    """Collect sufficient statistics for inward repair-boundary bands."""
+
+    clean_occupied = clean[:, 0:1] >= REFERENCE_OCCUPANCY_THRESHOLD
+    radar_support = radar.abs().amax(dim=1, keepdim=True) > 0.0
+    probabilities = {
+        "faulty": faulty[:, 0:1],
+        "coarse": coarse[:, 0:1],
+        "fine": fine[:, 0:1],
+    }
+    rows = []
+    for band, band_mask in reconstruction_mask_boundary_bands(
+        reconstruction_mask
+    ).items():
+        selected = band_mask.bool()
+        target_selected = clean_occupied & selected
+        radar_selected = radar_support & selected
+        row: dict[str, int | float | str] = {
+            "sample_path": sample_path,
+            "fault_group": fault_group,
+            "band": band,
+            "band_cells": int(selected.sum()),
+            "clean_occupied_cells": int(target_selected.sum()),
+            "radar_support_cells": int(radar_selected.sum()),
+            "clean_radar_overlap_cells": int(
+                (target_selected & radar_support).sum()
+            ),
+            "fine_probability_on_clean_sum": float(
+                (fine[:, 0:1] * target_selected).sum()
+            ),
+        }
+        for prefix, probability in probabilities.items():
+            exact = _occupancy_counts(probability, clean[:, 0:1], selected)
+            row.update(
+                {f"{prefix}_{name}": int(value) for name, value in exact.items()}
+            )
+            tolerant = tolerant_occupancy_counts(
+                probability >= REFERENCE_OCCUPANCY_THRESHOLD,
+                clean_occupied,
+                selected,
+                tolerance_m=0.2,
+                meters_per_cell_x=geometry.pillar_size_x,
+                meters_per_cell_y=geometry.pillar_size_y,
+            )
+            row.update(
+                {
+                    f"{prefix}_0p2m_{name}": float(value)
+                    for name, value in tolerant.items()
+                }
+            )
+        rows.append(row)
+    return rows
+
+
+BOUNDARY_BAND_ORDER = ("0-1 cells", "2-3 cells", "4-7 cells", "8+ cells")
+
+
+def _summarize_boundary_diagnostics(
+    records: list[dict[str, int | float | str]],
+) -> list[dict[str, int | float | str]]:
+    """Aggregate exact and 0.2 m metrics from boundary sufficient statistics."""
+
+    rows = []
+    for band in BOUNDARY_BAND_ORDER:
+        selected = [record for record in records if record["band"] == band]
+        if not selected:
+            continue
+
+        def total(name: str) -> float:
+            return sum(float(record[name]) for record in selected)
+
+        target_count = total("clean_occupied_cells")
+        radar_count = total("radar_support_cells")
+        radar_overlap = total("clean_radar_overlap_cells")
+        row: dict[str, int | float | str] = {
+            "band": band,
+            "samples": sum(int(record["band_cells"]) > 0 for record in selected),
+            "band_cells": int(total("band_cells")),
+            "clean_occupied_cells": int(target_count),
+            "radar_support_cells": int(radar_count),
+            "radar_clean_recall": _safe_ratio(radar_overlap, target_count),
+            "radar_clean_precision": _safe_ratio(radar_overlap, radar_count),
+            "fine_mean_probability_on_clean": _safe_ratio(
+                total("fine_probability_on_clean_sum"), target_count
+            ),
+        }
+        for prefix in ("faulty", "coarse", "fine"):
+            tp = total(f"{prefix}_tp")
+            fp = total(f"{prefix}_fp")
+            fn = total(f"{prefix}_fn")
+            precision = _safe_ratio(tp, tp + fp)
+            recall = _safe_ratio(tp, tp + fn)
+            f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
+            row.update(
+                {
+                    f"{prefix}_tp": int(tp),
+                    f"{prefix}_fp": int(fp),
+                    f"{prefix}_fn": int(fn),
+                    f"{prefix}_precision": precision,
+                    f"{prefix}_recall": recall,
+                    f"{prefix}_f1": f1,
+                    f"{prefix}_iou": _safe_ratio(tp, tp + fp + fn),
+                }
+            )
+            tolerant_counts = {
+                name: total(f"{prefix}_0p2m_{name}")
+                for name in (
+                    "matched_predictions",
+                    "matched_targets",
+                    "prediction_count",
+                    "target_count",
+                )
+            }
+            for name, value in tolerant_metrics_from_counts(
+                tolerant_counts
+            ).items():
+                row[f"{prefix}_0p2m_{name}"] = value
+        rows.append(row)
+    return rows
+
+
+def _print_boundary_diagnostics(rows: list[dict[str, int | float | str]]) -> None:
+    print("\nREPAIR-MASK BOUNDARY DIAGNOSTICS")
+    header = (
+        f"{'Inward band':<12} {'Cells':>10} {'Clean occ.':>11} "
+        f"{'Faulty IoU':>11} {'Base IoU':>10} {'Fine IoU':>10} "
+        f"{'Fine R':>9} {'Fine@0.2m':>11} {'Fine FN':>9} "
+        f"{'Mean p(y=1)':>12} {'Radar recall':>13}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row['band']:<12} {int(row['band_cells']):10d} "
+            f"{int(row['clean_occupied_cells']):11d} "
+            f"{float(row['faulty_iou']):10.2%} "
+            f"{float(row['coarse_iou']):9.2%} "
+            f"{float(row['fine_iou']):9.2%} "
+            f"{float(row['fine_recall']):8.2%} "
+            f"{float(row['fine_0p2m_iou']):10.2%} "
+            f"{int(row['fine_fn']):9d} "
+            f"{float(row['fine_mean_probability_on_clean']):11.3f} "
+            f"{float(row['radar_clean_recall']):12.2%}"
+        )
 
 
 def _threshold_sweep_record(
@@ -683,6 +849,13 @@ def _group_summaries(records: list[dict], key) -> dict[str, dict]:
     }
 
 
+def _group_raw_records(records: list[dict], key) -> dict[str, list[dict]]:
+    groups = defaultdict(list)
+    for record in records:
+        groups[str(key(record))].append(record)
+    return dict(groups)
+
+
 def _print_table(
     groups: dict[str, dict], *, baseline_label: str = "Coarse", tolerance_m: float = 0.5
 ) -> None:
@@ -779,6 +952,7 @@ def _save_comparison(
     radar_bev: torch.Tensor,
     reconstruction_mask: torch.Tensor,
     record: dict,
+    occupancy_threshold: float = REFERENCE_OCCUPANCY_THRESHOLD,
 ) -> None:
     baseline_name = (
         "erased faulty"
@@ -799,6 +973,7 @@ def _save_comparison(
             f"{baseline_name} {record['coarse_occupancy_exact_iou']:.2%}, "
             f"fine {record['fine_occupancy_exact_iou']:.2%}"
         ),
+        occupancy_threshold=occupancy_threshold,
     )
 
 
@@ -915,6 +1090,7 @@ def main() -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     sampling_steps = args.sampling_steps or diffusion_config.sampling_steps
     records = []
+    boundary_records: list[dict[str, int | float | str]] = []
     threshold_records: dict[float, list[dict[str, int | float]]] = {
         threshold: [] for threshold in fine_thresholds
     }
@@ -1097,24 +1273,57 @@ def main() -> None:
                         record["fine_occupancy_tolerant_0_5m_iou"]
                         - record["coarse_occupancy_tolerant_0_5m_iou"]
                     )
+                if args.boundary_diagnostics:
+                    boundary_records.extend(
+                        _boundary_diagnostic_records(
+                            clean=clean,
+                            faulty=faulty,
+                            coarse=coarse_sample,
+                            fine=fine_sample,
+                            radar=inputs["radar_bev"][index : index + 1],
+                            reconstruction_mask=sample_mask,
+                            geometry=grid_geometry,
+                            sample_path=sample_path,
+                            fault_group=record["fault_group"],
+                        )
+                    )
                 records.append(record)
                 if (
                     visualized[record["fault_group"]]
                     < args.visualize_samples_per_fault
                 ):
                     visual_index = visualized[record["fault_group"]]
-                    _save_comparison(
+                    destination = (
                         args.output_root
                         / "visualizations"
                         / record["fault_group"]
-                        / f"{visual_index:03d}_{Path(sample_path).stem}.png",
-                        clean[0],
-                        faulty[0],
-                        fine_sample[0],
-                        inputs["radar_bev"][index],
-                        sample_mask[0],
-                        record,
+                        / f"{visual_index:03d}_{Path(sample_path).stem}.png"
                     )
+                    visualization_thresholds = (
+                        (0.3, 0.4, 0.5)
+                        if args.boundary_diagnostics
+                        else (REFERENCE_OCCUPANCY_THRESHOLD,)
+                    )
+                    for visualization_threshold in visualization_thresholds:
+                        threshold_destination = (
+                            destination.with_name(
+                                destination.stem
+                                + f"_threshold_{visualization_threshold:.1f}"
+                                + destination.suffix
+                            )
+                            if args.boundary_diagnostics
+                            else destination
+                        )
+                        _save_comparison(
+                            threshold_destination,
+                            clean[0],
+                            faulty[0],
+                            fine_sample[0],
+                            inputs["radar_bev"][index],
+                            sample_mask[0],
+                            record,
+                            occupancy_threshold=visualization_threshold,
+                        )
                     visualized[record["fault_group"]] += 1
             completed += batch_size
             if completed % 500 < batch_size or completed == len(dataset):
@@ -1147,8 +1356,52 @@ def main() -> None:
         "by_fault": by_fault,
         "by_fault_severity": by_fault_severity,
     }
+    boundary_summary = None
+    if args.boundary_diagnostics:
+        overall_boundary = _summarize_boundary_diagnostics(boundary_records)
+        boundary_by_fault = {
+            fault_group: _summarize_boundary_diagnostics(group_records)
+            for fault_group, group_records in sorted(
+                _group_raw_records(
+                    boundary_records, lambda record: record["fault_group"]
+                ).items()
+            )
+        }
+        boundary_summary = {
+            "distance_definition": (
+                "inward Chebyshev cell distance from the reconstruction-mask "
+                "boundary; image edges count as outside"
+            ),
+            "meters_per_cell_x": grid_geometry.pillar_size_x,
+            "meters_per_cell_y": grid_geometry.pillar_size_y,
+            "occupancy_threshold": REFERENCE_OCCUPANCY_THRESHOLD,
+            "tolerant_metric_m": 0.2,
+            "overall": overall_boundary,
+            "by_fault_severity": boundary_by_fault,
+        }
+        summary["boundary_diagnostics"] = boundary_summary
     args.output_root.mkdir(parents=True, exist_ok=True)
     write_csv_rows(args.output_root / "per_sample_metrics.csv", records)
+    if args.boundary_diagnostics:
+        write_csv_rows(
+            args.output_root / "boundary_diagnostics_per_sample.csv",
+            boundary_records,
+        )
+        boundary_summary_rows = [
+            {"group": "overall", **row}
+            for row in boundary_summary["overall"]
+        ]
+        for fault_group, rows in boundary_summary["by_fault_severity"].items():
+            boundary_summary_rows.extend(
+                {"group": fault_group, **row} for row in rows
+            )
+        write_csv_rows(
+            args.output_root / "boundary_diagnostics_summary.csv",
+            boundary_summary_rows,
+        )
+        atomic_write_json(
+            args.output_root / "boundary_diagnostics.json", boundary_summary
+        )
     summary_rows = []
     for group_type, groups in (
         ("fault", by_fault),
@@ -1191,6 +1444,8 @@ def main() -> None:
         if diffusion_config.bypass_coarse_reconstruction
         else "Coarse",
     )
+    if args.boundary_diagnostics:
+        _print_boundary_diagnostics(boundary_summary["overall"])
     print(
         "\nOverall transitions: "
         f"beneficial additions={overall['transitions/beneficial_additions']}, "

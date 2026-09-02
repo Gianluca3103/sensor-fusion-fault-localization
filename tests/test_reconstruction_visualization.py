@@ -7,6 +7,9 @@ from models.two_stage_reconstruction_head.reconstruction_visualization import (
     occupancy_image,
     radar_lidar_occupancy_overlay,
 )
+from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
+    reconstruction_mask_boundary_bands,
+)
 
 
 class ReconstructionVisualizationTests(unittest.TestCase):
@@ -33,6 +36,29 @@ class ReconstructionVisualizationTests(unittest.TestCase):
         np.testing.assert_array_equal(overlay[0, 1], [1.0, 0.0, 1.0])
         np.testing.assert_array_equal(overlay[1, 1], [1.0, 1.0, 1.0])
         np.testing.assert_array_equal(overlay[1, 0], [0.0, 0.0, 0.0])
+
+    def test_overlay_threshold_reveals_lower_confidence_reconstruction(self):
+        lidar = torch.zeros(3, 1, 1)
+        radar = torch.zeros(4, 1, 1)
+        lidar[0, 0, 0] = 0.4
+        high_threshold = radar_lidar_occupancy_overlay(
+            lidar, radar, occupancy_threshold=0.5
+        )
+        low_threshold = radar_lidar_occupancy_overlay(
+            lidar, radar, occupancy_threshold=0.3
+        )
+        np.testing.assert_array_equal(high_threshold[0, 0], [0.0, 0.0, 0.0])
+        np.testing.assert_array_equal(low_threshold[0, 0], [0.0, 1.0, 1.0])
+
+    def test_boundary_bands_cover_mask_once_at_expected_depths(self):
+        mask = torch.ones(1, 1, 10, 10)
+        bands = reconstruction_mask_boundary_bands(mask)
+        self.assertEqual(int(bands["0-1 cells"].sum()), 64)
+        self.assertEqual(int(bands["2-3 cells"].sum()), 32)
+        self.assertEqual(int(bands["4-7 cells"].sum()), 4)
+        self.assertEqual(int(bands["8+ cells"].sum()), 0)
+        coverage = sum(band.int() for band in bands.values())
+        self.assertTrue(torch.equal(coverage, mask.int()))
 
 
 if __name__ == "__main__":
