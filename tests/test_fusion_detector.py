@@ -12,6 +12,9 @@ from models.two_stage_reconstruction_head.object_detection import (
     RotatedBEVBox,
     make_detection_targets,
 )
+from models.two_stage_reconstruction_head.object_detection.train_fusion_detector import (
+    fusion_detection_collate,
+)
 from models.two_stage_reconstruction_head.pointpillars import (
     BEVGridGeometry,
     PointPillarsConfig,
@@ -116,6 +119,20 @@ class FusionDetectorTests(unittest.TestCase):
         self.assertEqual(restored, _config())
         with self.assertRaisesRegex(ValueError, "Unknown fusion_detector"):
             FusionDetectorConfig.from_dict({"unexpected": True})
+
+    def test_collate_preserves_optional_clean_lidar_for_diagnostics(self):
+        batch = [
+            {
+                "faulty_lidar_points": torch.zeros(2, 4),
+                "clean_lidar_points": torch.ones(3, 4),
+                "radar_points": torch.zeros(4, 5),
+                "frame_id": "00001",
+                "sample_path": "sample.npz",
+                "boxes": [],
+            }
+        ]
+        collated = fusion_detection_collate(batch)
+        self.assertEqual(collated["clean_lidar_points"][0].shape, (3, 4))
 
 
 if __name__ == "__main__":

@@ -40,11 +40,13 @@ class FaultyFusionDetectionDataset(Dataset):
         self,
         paths: list[Path],
         radar_root: Path,
-        annotations: VODAnnotationLoader,
+        annotations: VODAnnotationLoader | None,
+        clean_lidar_root: Path | None = None,
     ) -> None:
         self.paths = tuple(paths)
         self.radar_root = radar_root
         self.annotations = annotations
+        self.clean_lidar_root = clean_lidar_root
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -58,17 +60,27 @@ class FaultyFusionDetectionDataset(Dataset):
         )
         metadata = load_sample_metadata(path)
         frame_id = str(metadata["frame_id"])
-        return {
+        result = {
             "faulty_lidar_points": item["faulty_lidar_points"],
             "radar_points": item["radar_points"],
             "frame_id": frame_id,
             "sample_path": str(path),
-            "boxes": self.annotations.load(frame_id),
+            "boxes": self.annotations.load(frame_id) if self.annotations else [],
         }
+        if self.clean_lidar_root is not None:
+            from Fault_Localization_Model.vod_dataset import load_vod_lidar
+
+            lidar_path = self.clean_lidar_root / f"{int(frame_id):05d}.bin"
+            if not lidar_path.is_file():
+                raise FileNotFoundError(f"Clean VoD LiDAR is missing: {lidar_path}")
+            result["clean_lidar_points"] = torch.from_numpy(
+                load_vod_lidar(lidar_path).astype(np.float32, copy=False)
+            )
+        return result
 
 
 def fusion_detection_collate(batch: list[dict]) -> dict:
-    return {
+    result = {
         "faulty_lidar_points": tuple(
             item["faulty_lidar_points"] for item in batch
         ),
@@ -77,6 +89,11 @@ def fusion_detection_collate(batch: list[dict]) -> dict:
         "sample_path": [item["sample_path"] for item in batch],
         "boxes": [item["boxes"] for item in batch],
     }
+    if "clean_lidar_points" in batch[0]:
+        result["clean_lidar_points"] = tuple(
+            item["clean_lidar_points"] for item in batch
+        )
+    return result
 
 
 def _parse_args() -> argparse.Namespace:
@@ -377,4 +394,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
