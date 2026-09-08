@@ -54,6 +54,7 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics im
     tolerant_occupancy_counts,
 )
 from models.two_stage_reconstruction_head.reconstruction_visualization import (
+    save_clean_reconstruction_comparison,
     save_three_panel_reconstruction,
 )
 
@@ -123,6 +124,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Comparison PNGs saved for each fault group; 0 disables.",
+    )
+    parser.add_argument(
+        "--visualization-layout",
+        choices=("three_panel", "clean_reconstruction"),
+        default="three_panel",
+        help=(
+            "PNG layout: the existing clean/faulty+radar/reconstruction+radar "
+            "view, or an occupancy-only clean/reconstruction comparison."
+        ),
     )
     parser.add_argument(
         "--boundary-diagnostics",
@@ -953,27 +963,34 @@ def _save_comparison(
     reconstruction_mask: torch.Tensor,
     record: dict,
     occupancy_threshold: float = REFERENCE_OCCUPANCY_THRESHOLD,
+    visualization_layout: str = "three_panel",
 ) -> None:
     baseline_name = (
         "erased faulty"
         if record.get("bypassed_coarse_reconstruction", False)
         else "coarse"
     )
-    save_three_panel_reconstruction(
-        destination,
-        clean_bev=clean_bev,
-        faulty_bev=faulty_bev,
-        reconstructed_bev=fine_bev,
-        radar_bev=radar_bev,
-        reconstruction_mask=reconstruction_mask,
-        reconstruction_title="Fine reconstruction",
-        figure_title=(
+    common = {
+        "destination": destination,
+        "clean_bev": clean_bev,
+        "reconstructed_bev": fine_bev,
+        "reconstruction_title": "Fine reconstruction",
+        "figure_title": (
             f"{record['fault_group']} | frame {record['frame_id']} | "
             f"faulty {record['faulty_occupancy_exact_iou']:.2%}, "
             f"{baseline_name} {record['coarse_occupancy_exact_iou']:.2%}, "
             f"fine {record['fine_occupancy_exact_iou']:.2%}"
         ),
-        occupancy_threshold=occupancy_threshold,
+        "occupancy_threshold": occupancy_threshold,
+    }
+    if visualization_layout == "clean_reconstruction":
+        save_clean_reconstruction_comparison(**common)
+        return
+    save_three_panel_reconstruction(
+        **common,
+        faulty_bev=faulty_bev,
+        radar_bev=radar_bev,
+        reconstruction_mask=reconstruction_mask,
     )
 
 
@@ -1323,6 +1340,7 @@ def main() -> None:
                             sample_mask[0],
                             record,
                             occupancy_threshold=visualization_threshold,
+                            visualization_layout=args.visualization_layout,
                         )
                     visualized[record["fault_group"]] += 1
             completed += batch_size

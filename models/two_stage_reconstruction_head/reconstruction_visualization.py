@@ -120,3 +120,48 @@ def save_three_panel_reconstruction(
         facecolor=figure.get_facecolor(),
     )
     plt.close(figure)
+
+
+def save_clean_reconstruction_comparison(
+    destination: Path,
+    *,
+    clean_bev: torch.Tensor,
+    reconstructed_bev: torch.Tensor,
+    reconstruction_title: str,
+    figure_title: str,
+    occupancy_threshold: float = 0.5,
+) -> None:
+    """Save an occupancy-only clean-versus-reconstruction comparison."""
+
+    clean = occupancy_image(clean_bev) >= 0.5
+    reconstructed = occupancy_image(reconstructed_bev) >= occupancy_threshold
+    figure, axes = plt.subplots(1, 2, figsize=(12, 6), facecolor="black")
+    for axis, (image, title) in zip(
+        axes,
+        (
+            (clean, "Clean LiDAR occupancy"),
+            (reconstructed, f"{reconstruction_title} occupancy"),
+        ),
+    ):
+        axis.imshow(
+            image,
+            cmap="gray",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        axis.set_title(title, color="white")
+        axis.axis("off")
+    figure.suptitle(
+        figure_title
+        + f" | reconstruction occupancy threshold {occupancy_threshold:.2f}",
+        color="white",
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(
+        destination,
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=figure.get_facecolor(),
+    )
+    plt.close(figure)

@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import numpy as np
 import torch
@@ -6,6 +8,7 @@ import torch
 from models.two_stage_reconstruction_head.reconstruction_visualization import (
     occupancy_image,
     radar_lidar_occupancy_overlay,
+    save_clean_reconstruction_comparison,
 )
 from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics import (
     reconstruction_mask_boundary_bands,
@@ -49,6 +52,24 @@ class ReconstructionVisualizationTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(high_threshold[0, 0], [0.0, 0.0, 0.0])
         np.testing.assert_array_equal(low_threshold[0, 0], [0.0, 1.0, 1.0])
+
+    def test_clean_reconstruction_comparison_is_written(self):
+        clean = torch.zeros(3, 4, 4)
+        reconstruction = torch.zeros(3, 4, 4)
+        clean[0, 1, 1] = 1.0
+        reconstruction[0, 1, 1] = 0.7
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "comparison.png"
+            save_clean_reconstruction_comparison(
+                destination,
+                clean_bev=clean,
+                reconstructed_bev=reconstruction,
+                reconstruction_title="Fine reconstruction",
+                figure_title="total_loss_s1 | frame 00001",
+                occupancy_threshold=0.5,
+            )
+            self.assertTrue(destination.is_file())
+            self.assertGreater(destination.stat().st_size, 0)
 
     def test_boundary_bands_cover_mask_once_at_expected_depths(self):
         mask = torch.ones(1, 1, 10, 10)
