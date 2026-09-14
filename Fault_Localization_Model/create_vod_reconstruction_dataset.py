@@ -47,6 +47,7 @@ from Fault_Localization_Model.vod_dataset import (
     BEVGeometry,
     ENGINEERED_LIDAR_CHANNELS,
     ENGINEERED_RADAR_CHANNELS,
+    SUPPORTED_RADAR_VARIANTS,
     VODFrame,
     align_radar_to_lidar,
     discover_vod_frames,
@@ -93,13 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radar-variant",
         default="radar_3frames",
-        choices=(
-            "radar",
-            "radar_3frames",
-            "radar_5frames",
-            "radar_10frames",
-            "radar_20frames",
-        ),
+        choices=SUPPORTED_RADAR_VARIANTS,
         help="Use the official accumulated three-scan radar release by default.",
     )
     parser.add_argument(
@@ -229,10 +224,13 @@ def _write_radar_cache(
                 expected_channels = (
                     7 if config["bev_channel_profile"] == "engineered" else 4
                 )
+                metadata = json.loads(str(cached["metadata_json"].item()))
                 if (
                     cached["radar_bev"].shape == (expected_channels, 320, 320)
                     and cached["radar_points"].ndim == 2
                     and cached["radar_points"].shape[1] == 5
+                    and metadata.get("radar_variant") == frame.radar_variant
+                    and metadata.get("radar_source") == str(frame.radar_path)
                 ):
                     return destination
         except Exception:

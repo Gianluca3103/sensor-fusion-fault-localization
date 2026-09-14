@@ -2,16 +2,159 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
 
 import numpy as np
+
+try:
+    from scipy.spatial import cKDTree
+except ImportError:  # pragma: no cover - exercised only in minimal environments.
+    cKDTree = None
 
 from Fault_Localization_Model.vod_dataset.vod_io import (
     VOD_RADAR_FIELDS,
     _named_transform,
     load_vod_radar,
 )
+
+
+@dataclass(frozen=True)
+class RadarTemporalFilterConfig:
+    """Validity and temporal-consistency gates for an aligned radar stack."""
+
+    min_range_m: float = 1.0
+    max_range_m: float = 80.0
+    min_height_m: float = -5.0
+    max_height_m: float = 5.0
+    min_rcs: float | None = None
+    max_abs_compensated_velocity_mps: float | None = None
+    temporal_radius_m: float | None = None
+    temporal_min_scans: int = 2
+    preserve_current_scan: bool = True
+
+    def validate(self) -> None:
+        if self.min_range_m < 0.0:
+            raise ValueError("min_range_m must be non-negative")
+        if self.max_range_m <= self.min_range_m:
+            raise ValueError("max_range_m must exceed min_range_m")
+        if self.max_height_m <= self.min_height_m:
+            raise ValueError("max_height_m must exceed min_height_m")
+        if self.temporal_radius_m is not None and self.temporal_radius_m <= 0.0:
+            raise ValueError("temporal_radius_m must be positive when enabled")
+        if self.temporal_min_scans < 2:
+            raise ValueError("temporal_min_scans must be at least two")
+        if (
+            self.max_abs_compensated_velocity_mps is not None
+            and self.max_abs_compensated_velocity_mps <= 0.0
+        ):
+            raise ValueError(
+                "max_abs_compensated_velocity_mps must be positive when enabled"
+            )
+
+
+def filter_accumulated_radar_points(
+    radar_points: np.ndarray,
+    config: RadarTemporalFilterConfig,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Filter an ego-motion-aligned stack without changing its seven fields.
+
+    Temporal support is measured in XY and must come from distinct scans. The
+    current scan is retained by default so newly visible or moving objects are
+    not erased merely because ego-motion compensation cannot align their motion.
+    """
+
+    config.validate()
+    points = np.asarray(radar_points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != len(VOD_RADAR_FIELDS):
+        raise ValueError(
+            f"radar_points must have shape [N,{len(VOD_RADAR_FIELDS)}], got "
+            f"{points.shape}"
+        )
+
+    initial_count = len(points)
+    finite = np.isfinite(points).all(axis=1)
+    ranges = np.linalg.norm(points[:, :2], axis=1)
+    valid = (
+        finite
+        & (ranges >= config.min_range_m)
+        & (ranges <= config.max_range_m)
+        & (points[:, 2] >= config.min_height_m)
+        & (points[:, 2] <= config.max_height_m)
+    )
+    # Accumulated releases use integer-valued relative scan indices.
+    valid &= np.abs(points[:, 6] - np.rint(points[:, 6])) <= 1.0e-4
+    if config.min_rcs is not None:
+        valid &= points[:, 3] >= config.min_rcs
+    if config.max_abs_compensated_velocity_mps is not None:
+        valid &= (
+            np.abs(points[:, 5]) <= config.max_abs_compensated_velocity_mps
+        )
+
+    points = points[valid]
+    after_validity = len(points)
+    temporal_keep = np.ones(after_validity, dtype=bool)
+    if config.temporal_radius_m is not None and after_validity:
+        time_indices = np.rint(points[:, 6]).astype(np.int32)
+        radius = config.temporal_radius_m
+        if cKDTree is not None:
+            neighborhoods = cKDTree(points[:, :2]).query_ball_point(
+                points[:, :2],
+                r=radius,
+            )
+
+            def has_support(point_index: int) -> bool:
+                return (
+                    len(np.unique(time_indices[neighborhoods[point_index]]))
+                    >= config.temporal_min_scans
+                )
+
+        else:
+            cells = np.floor(points[:, :2] / radius).astype(np.int64)
+            cell_members: dict[tuple[int, int], list[int]] = {}
+            for point_index, cell in enumerate(cells):
+                cell_members.setdefault((int(cell[0]), int(cell[1])), []).append(
+                    point_index
+                )
+            radius_squared = radius * radius
+
+            def has_support(point_index: int) -> bool:
+                cell_x, cell_y = cells[point_index]
+                candidate_indices: list[int] = []
+                for offset_x in (-1, 0, 1):
+                    for offset_y in (-1, 0, 1):
+                        candidate_indices.extend(
+                            cell_members.get(
+                                (int(cell_x + offset_x), int(cell_y + offset_y)),
+                                (),
+                            )
+                        )
+                candidate_array = np.asarray(candidate_indices, dtype=np.int64)
+                offsets = points[candidate_array, :2] - points[point_index, :2]
+                nearby = candidate_array[
+                    np.einsum("ij,ij->i", offsets, offsets) <= radius_squared
+                ]
+                return (
+                    len(np.unique(time_indices[nearby]))
+                    >= config.temporal_min_scans
+                )
+
+        temporal_keep = np.fromiter(
+            (has_support(index) for index in range(after_validity)),
+            dtype=bool,
+            count=after_validity,
+        )
+        if config.preserve_current_scan:
+            temporal_keep |= time_indices == 0
+        points = points[temporal_keep]
+
+    return points, {
+        "input_points": initial_count,
+        "validity_rejected": initial_count - after_validity,
+        "temporal_rejected": after_validity - len(points),
+        "output_points": len(points),
+    }
 
 
 def load_vod_odom_from_camera(path: str | Path) -> np.ndarray:
@@ -84,6 +227,8 @@ def accumulate_vod_radar_scans(
     source_paths: list[str | Path],
     pose_paths: list[str | Path],
     calibration_paths: list[str | Path],
+    *,
+    filter_config: RadarTemporalFilterConfig | None = None,
 ) -> np.ndarray:
     """Align chronological source scans into the final scan's radar frame."""
 
@@ -100,7 +245,10 @@ def accumulate_vod_radar_scans(
         zip(source_paths, pose_paths, calibration_paths)
     ):
         time_index = index - count + 1
-        points = load_vod_radar(radar_path)
+        points = load_vod_radar(
+            radar_path,
+            allow_nonfinite=filter_config is not None,
+        )
         if time_index == 0:
             transform = np.eye(4, dtype=np.float64)
         else:
@@ -111,4 +259,10 @@ def accumulate_vod_radar_scans(
                 current_calibration,
             )
         scans.append(transform_radar_scan(points, transform, time_index))
-    return np.concatenate(scans, axis=0)
+    accumulated = np.concatenate(scans, axis=0)
+    if filter_config is not None:
+        accumulated, _ = filter_accumulated_radar_points(
+            accumulated,
+            filter_config,
+        )
+    return accumulated

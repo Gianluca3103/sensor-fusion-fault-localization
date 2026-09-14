@@ -15,7 +15,9 @@ from .vod_io import (
     resolve_vod_public_root,
 )
 from .radar_accumulation import (
+    RadarTemporalFilterConfig,
     accumulate_vod_radar_scans,
+    filter_accumulated_radar_points,
     load_vod_odom_from_camera,
     radar_current_from_source,
     transform_radar_scan,
@@ -46,6 +48,8 @@ __all__ = [
     "load_vod_radar_to_lidar",
     "resolve_vod_public_root",
     "accumulate_vod_radar_scans",
+    "RadarTemporalFilterConfig",
+    "filter_accumulated_radar_points",
     "load_vod_odom_from_camera",
     "radar_current_from_source",
     "transform_radar_scan",

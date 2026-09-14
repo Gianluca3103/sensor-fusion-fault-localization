@@ -6,7 +6,9 @@ import unittest
 import numpy as np
 
 from Fault_Localization_Model.vod_dataset.radar_accumulation import (
+    RadarTemporalFilterConfig,
     accumulate_vod_radar_scans,
+    filter_accumulated_radar_points,
     radar_current_from_source,
 )
 
@@ -21,6 +23,54 @@ def _write_calibration(path: Path, transform: np.ndarray) -> None:
 
 
 class VoDRadarAccumulationTests(unittest.TestCase):
+    def test_validity_filter_removes_out_of_range_and_non_finite_points(self):
+        points = np.asarray(
+            [
+                [2.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+                [2.0, 0.0, 8.0, 5.0, 0.0, 0.0, 0.0],
+                [np.nan, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        filtered, stats = filter_accumulated_radar_points(
+            points,
+            RadarTemporalFilterConfig(),
+        )
+        self.assertEqual(filtered.shape, (1, 7))
+        self.assertEqual(stats["validity_rejected"], 3)
+
+    def test_temporal_filter_keeps_supported_history_and_current_scan(self):
+        points = np.asarray(
+            [
+                [10.0, 0.0, 0.0, 5.0, 0.0, 0.0, -2.0],
+                [10.2, 0.1, 0.0, 5.0, 0.0, 0.0, -1.0],
+                [20.0, 0.0, 0.0, 5.0, 0.0, 0.0, -2.0],
+                [30.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        filtered, stats = filter_accumulated_radar_points(
+            points,
+            RadarTemporalFilterConfig(temporal_radius_m=0.5),
+        )
+        np.testing.assert_allclose(filtered[:, 0], [10.0, 10.2, 30.0])
+        self.assertEqual(stats["temporal_rejected"], 1)
+
+    def test_same_scan_neighbors_do_not_count_as_temporal_support(self):
+        points = np.asarray(
+            [
+                [10.0, 0.0, 0.0, 5.0, 0.0, 0.0, -1.0],
+                [10.1, 0.0, 0.0, 5.0, 0.0, 0.0, -1.0],
+            ],
+            dtype=np.float32,
+        )
+        filtered, _ = filter_accumulated_radar_points(
+            points,
+            RadarTemporalFilterConfig(temporal_radius_m=0.5),
+        )
+        self.assertEqual(filtered.shape, (0, 7))
+
     def test_source_scan_is_motion_compensated_into_current_radar(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

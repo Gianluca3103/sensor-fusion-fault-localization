@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ import tempfile
 import numpy as np
 
 from Fault_Localization_Model.vod_dataset import (
+    RadarTemporalFilterConfig,
     accumulate_vod_radar_scans,
     load_vod_odom_from_camera,
 )
@@ -29,6 +31,38 @@ def parse_args() -> argparse.Namespace:
         help="Break history at recording boundaries or implausible pose jumps.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        choices=("", "temporal_filtered"),
+        help=(
+            "Optional dataset-directory suffix, for example temporal_filtered "
+            "writes radar_20frames_temporal_filtered."
+        ),
+    )
+    parser.add_argument(
+        "--basic-validity-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--temporal-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--radar-min-range-m", type=float, default=1.0)
+    parser.add_argument("--radar-max-range-m", type=float, default=80.0)
+    parser.add_argument("--radar-min-height-m", type=float, default=-5.0)
+    parser.add_argument("--radar-max-height-m", type=float, default=5.0)
+    parser.add_argument("--radar-min-rcs", type=float)
+    parser.add_argument("--radar-max-abs-velocity-mps", type=float)
+    parser.add_argument("--temporal-support-radius-m", type=float, default=0.75)
+    parser.add_argument("--temporal-min-support-scans", type=int, default=2)
+    parser.add_argument(
+        "--preserve-current-scan",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -104,11 +138,14 @@ def _atomic_tofile(path: Path, points: np.ndarray) -> None:
 
 
 def _generate_one(task: tuple) -> tuple[int, int, int, bool]:
-    public_text, frame_id, history, stack_size, overwrite = task
+    public_text, frame_id, history, stack_size, overwrite, suffix, filter_values = task
     public = Path(public_text)
+    variant = f"radar_{stack_size}frames"
+    if suffix:
+        variant = f"{variant}_{suffix}"
     destination = (
         public
-        / f"radar_{stack_size}frames"
+        / variant
         / "training"
         / "velodyne"
         / f"{frame_id:05d}.bin"
@@ -122,6 +159,11 @@ def _generate_one(task: tuple) -> tuple[int, int, int, bool]:
         [_radar_path(public, item) for item in selected],
         [_pose_path(public, item) for item in selected],
         [_calibration_path(public, item) for item in selected],
+        filter_config=(
+            RadarTemporalFilterConfig(**filter_values)
+            if filter_values is not None
+            else None
+        ),
     )
     _atomic_tofile(destination, points)
     return stack_size, frame_id, len(points), False
@@ -135,6 +177,37 @@ def main() -> None:
         raise ValueError("stack sizes must be positive")
     if args.max_step_translation_m <= 0.0:
         raise ValueError("max-step-translation-m must be positive")
+    suffix = args.output_suffix.strip("_")
+
+    filter_values = None
+    if args.basic_validity_filter or args.temporal_filter:
+        filter_config = RadarTemporalFilterConfig(
+            min_range_m=(
+                args.radar_min_range_m if args.basic_validity_filter else 0.0
+            ),
+            max_range_m=(
+                args.radar_max_range_m if args.basic_validity_filter else 1.0e9
+            ),
+            min_height_m=(
+                args.radar_min_height_m if args.basic_validity_filter else -1.0e9
+            ),
+            max_height_m=(
+                args.radar_max_height_m if args.basic_validity_filter else 1.0e9
+            ),
+            min_rcs=(args.radar_min_rcs if args.basic_validity_filter else None),
+            max_abs_compensated_velocity_mps=(
+                args.radar_max_abs_velocity_mps
+                if args.basic_validity_filter
+                else None
+            ),
+            temporal_radius_m=(
+                args.temporal_support_radius_m if args.temporal_filter else None
+            ),
+            temporal_min_scans=args.temporal_min_support_scans,
+            preserve_current_scan=args.preserve_current_scan,
+        )
+        filter_config.validate()
+        filter_values = filter_config.__dict__
 
     public = _public_root(args.vod_root)
     radar_root = public / "radar" / "training" / "velodyne"
@@ -152,7 +225,15 @@ def main() -> None:
         args.max_step_translation_m,
     )
     tasks = [
-        (str(public), frame_id, histories[frame_id], size, args.overwrite)
+        (
+            str(public),
+            frame_id,
+            histories[frame_id],
+            size,
+            args.overwrite,
+            suffix,
+            filter_values,
+        )
         for size in stack_sizes
         for frame_id in frame_ids
     ]
@@ -173,9 +254,24 @@ def main() -> None:
                 )
 
     for size in stack_sizes:
-        destination = public / f"radar_{size}frames" / "training" / "velodyne"
+        variant = f"radar_{size}frames" + (f"_{suffix}" if suffix else "")
+        destination = public / variant / "training" / "velodyne"
         count = sum(1 for _ in destination.glob("*.bin"))
-        print(f"radar_{size}frames: {count} files in {destination}")
+        print(f"{variant}: {count} files in {destination}")
+        manifest = {
+            "variant": variant,
+            "source": "radar",
+            "stack_size": size,
+            "ego_motion_compensated": True,
+            "basic_validity_filter": args.basic_validity_filter,
+            "temporal_filter": args.temporal_filter,
+            "filter": filter_values,
+            "frames": count,
+        }
+        (destination.parent.parent / "filter_manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

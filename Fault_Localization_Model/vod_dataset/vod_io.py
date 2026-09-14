@@ -25,6 +25,8 @@ SUPPORTED_RADAR_VARIANTS = (
     "radar_5frames",
     "radar_10frames",
     "radar_20frames",
+    "radar_10frames_temporal_filtered",
+    "radar_20frames_temporal_filtered",
 )
 
 
@@ -39,7 +41,13 @@ class VODFrame:
     radar_variant: str
 
 
-def _read_float32_rows(path: str | Path, columns: int, label: str) -> np.ndarray:
+def _read_float32_rows(
+    path: str | Path,
+    columns: int,
+    label: str,
+    *,
+    require_finite: bool = True,
+) -> np.ndarray:
     path = Path(path)
     byte_count = path.stat().st_size
     row_bytes = columns * np.dtype(np.float32).itemsize
@@ -49,7 +57,7 @@ def _read_float32_rows(path: str | Path, columns: int, label: str) -> np.ndarray
             f"divisible by the {row_bytes}-byte row size"
         )
     points = np.fromfile(path, dtype=np.float32).reshape(-1, columns)
-    if not np.isfinite(points).all():
+    if require_finite and not np.isfinite(points).all():
         raise ValueError(f"VoD {label} file contains NaN or Inf: {path}")
     return points
 
@@ -60,10 +68,19 @@ def load_vod_lidar(path: str | Path) -> np.ndarray:
     return _read_float32_rows(path, len(VOD_LIDAR_FIELDS), "LiDAR")
 
 
-def load_vod_radar(path: str | Path) -> np.ndarray:
+def load_vod_radar(
+    path: str | Path,
+    *,
+    allow_nonfinite: bool = False,
+) -> np.ndarray:
     """Return one VoD radar frame using the official seven-column contract."""
 
-    return _read_float32_rows(path, len(VOD_RADAR_FIELDS), "radar")
+    return _read_float32_rows(
+        path,
+        len(VOD_RADAR_FIELDS),
+        "radar",
+        require_finite=not allow_nonfinite,
+    )
 
 
 def _named_transform(path: str | Path, key: str = "Tr_velo_to_cam") -> np.ndarray:
