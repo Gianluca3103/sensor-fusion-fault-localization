@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -185,8 +186,13 @@ def discover_vod_frames(
     split: str,
     *,
     radar_variant: str = "radar_3frames",
+    frame_ids: Sequence[str] | None = None,
 ) -> list[VODFrame]:
-    """Return exact LiDAR/radar pairs from an official VoD ImageSets split."""
+    """Return exact LiDAR/radar pairs from an official VoD ImageSets split.
+
+    ``frame_ids`` may select a subset, but every requested identifier must
+    belong to the named official split and must have a complete sensor pair.
+    """
 
     if split not in {"train", "val", "test", "train_val", "full"}:
         raise ValueError(f"Unsupported VoD split: {split}")
@@ -205,9 +211,19 @@ def discover_vod_frames(
     if not any(radar_calibration_root.glob("*.txt")):
         radar_calibration_root = public_root / "radar" / "training" / "calib"
 
+    split_ids = _split_ids(public_root, split)
+    if frame_ids is not None:
+        requested = [str(frame_id) for frame_id in frame_ids]
+        unknown = sorted(set(requested) - set(split_ids))
+        if unknown:
+            raise ValueError(
+                f"Requested frame IDs are not in VoD split {split}: {unknown[:5]}"
+            )
+        split_ids = requested
+
     frames = []
     missing = []
-    for frame_id in _split_ids(public_root, split):
+    for frame_id in split_ids:
         paths = (
             lidar_root / "velodyne" / f"{frame_id}.bin",
             radar_root / "velodyne" / f"{frame_id}.bin",

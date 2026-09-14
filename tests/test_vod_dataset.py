@@ -87,6 +87,35 @@ class ViewOfDelftDatasetTests(unittest.TestCase):
         self.assertEqual(frame.radar_variant, "radar_3frames")
         self.assertEqual(frame.radar_calibration_path, radar_calibration)
 
+    def test_discovery_can_validate_only_a_requested_split_subset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            public = Path(directory) / "view_of_delft_PUBLIC"
+            (public / "lidar" / "ImageSets").mkdir(parents=True)
+            (public / "lidar" / "ImageSets" / "train.txt").write_text(
+                "00001\n00002\n",
+                encoding="utf-8",
+            )
+            for sensor in ("lidar", "radar_3frames"):
+                point_path = (
+                    public / sensor / "training" / "velodyne" / "00001.bin"
+                )
+                point_path.parent.mkdir(parents=True)
+                point_path.touch()
+            _write_calibration(
+                public / "lidar" / "training" / "calib" / "00001.txt"
+            )
+            _write_calibration(
+                public / "radar" / "training" / "calib" / "00001.txt"
+            )
+
+            frames = discover_vod_frames(
+                directory,
+                "train",
+                frame_ids=["00001"],
+            )
+
+        self.assertEqual([frame.frame_id for frame in frames], ["00001"])
+
     def test_vod_radar_cache_is_indexed_by_split_and_frame(self):
         path = radar_cache_path(
             Path("cache"),

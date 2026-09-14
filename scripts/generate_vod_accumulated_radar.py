@@ -14,6 +14,7 @@ import numpy as np
 from Fault_Localization_Model.vod_dataset import (
     RadarTemporalFilterConfig,
     accumulate_vod_radar_scans,
+    load_vod_split_ids,
     load_vod_odom_from_camera,
 )
 
@@ -24,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stack-sizes", nargs="+", type=int, default=(10, 20))
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "test", "train_val", "full"),
+        help="Generate only target frames from this official VoD split.",
+    )
     parser.add_argument(
         "--max-step-translation-m",
         type=float,
@@ -211,19 +217,30 @@ def main() -> None:
 
     public = _public_root(args.vod_root)
     radar_root = public / "radar" / "training" / "velodyne"
-    frame_ids = sorted(int(path.stem) for path in radar_root.glob("*.bin"))
-    if args.limit is not None:
-        frame_ids = frame_ids[: args.limit]
-    if not frame_ids:
+    all_frame_ids = sorted(int(path.stem) for path in radar_root.glob("*.bin"))
+    if not all_frame_ids:
         raise FileNotFoundError(f"No single-frame VoD radar files found in {radar_root}")
 
     stack_sizes = sorted(set(args.stack_sizes))
     histories = _histories(
         public,
-        frame_ids,
+        all_frame_ids,
         max(stack_sizes),
         args.max_step_translation_m,
     )
+    if args.split is None:
+        frame_ids = all_frame_ids
+    else:
+        requested_ids = set(load_vod_split_ids(public, args.split))
+        frame_ids = [
+            frame_id
+            for frame_id in all_frame_ids
+            if f"{frame_id:05d}" in requested_ids
+        ]
+    if args.limit is not None:
+        frame_ids = frame_ids[: args.limit]
+    if not frame_ids:
+        raise FileNotFoundError("No requested VoD radar target frames were found")
     tasks = [
         (
             str(public),
@@ -267,6 +284,7 @@ def main() -> None:
             "temporal_filter": args.temporal_filter,
             "filter": filter_values,
             "frames": count,
+            "target_split": args.split,
         }
         (destination.parent.parent / "filter_manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n",

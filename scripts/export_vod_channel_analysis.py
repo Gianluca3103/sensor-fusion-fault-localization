@@ -22,6 +22,7 @@ from Fault_Localization_Model.vod_dataset import (
     discover_vod_frames,
     lidar_analysis_channels,
     load_vod_lidar,
+    load_vod_split_ids,
     load_vod_radar,
     load_vod_radar_to_lidar,
     radar_analysis_channels,
@@ -146,12 +147,17 @@ def main() -> None:
         y_range=(args.y_min, args.y_max),
         resolution=args.resolution,
     )
+    split_ids = load_vod_split_ids(args.vod_root, args.split)
+    requested_ids = split_ids[
+        args.start_index : args.start_index + args.limit
+    ]
     frames = discover_vod_frames(
         args.vod_root,
         args.split,
         radar_variant=args.radar_variant,
+        frame_ids=requested_ids,
     )
-    selected = frames[args.start_index : args.start_index + args.limit]
+    selected = frames
     if not selected:
         raise ValueError("The requested frame range is empty")
 
