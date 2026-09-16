@@ -58,8 +58,24 @@ def poses(path):
         raise ValueError(f'Invalid pose sequence: {path}')
     return times, values
 
-def sensor_pose(path, timestamp):
+def sensor_pose(path, timestamp, max_gap_s=.2):
     times, values = poses(str(path))
+    if not np.isfinite(max_gap_s) or max_gap_s <= 0:
+        raise ValueError('Pose interpolation gap limit must be finite and positive')
+    exact = int(np.searchsorted(times, timestamp, side='left'))
+    if exact < len(times) and int(times[exact]) == timestamp:
+        matrix = np.eye(4)
+        matrix[:3, 3] = values[exact, :3]
+        matrix[:3, :3] = Rotation.from_quat(values[exact, 3:]).as_matrix()
+        # Position/orientation need no interpolation. Velocity still requires a
+        # supported measured interval; select the shorter adjacent one.
+        pairs = [(i, i+1) for i in (exact-1, exact) if 0 <= i < len(times)-1]
+        left, right = min(pairs, key=lambda p: int(times[p[1]])-int(times[p[0]]))
+        dt = (int(times[right])-int(times[left])) / 1e9
+        if dt > max_gap_s:
+            raise ValueError(f'Exact pose exists, but velocity interval {dt*1000:.3f} ms '
+                             f'exceeds {max_gap_s*1000:g} ms: {path}, timestamp={timestamp}')
+        return matrix, (values[right, :3]-values[left, :3]) / dt
     right = int(np.searchsorted(times, timestamp, side='right'))
     left = max(0, right - 1)
     right = min(right, len(times) - 1)
@@ -69,8 +85,9 @@ def sensor_pose(path, timestamp):
     if left == right:
         left -= 1
         dt = (int(times[right]) - int(times[left])) / 1e9
-    if dt > .1:
-        raise ValueError('Pose gap exceeds 100 ms')
+    if dt > max_gap_s:
+        raise ValueError(f'Pose interpolation gap {dt*1000:.3f} ms exceeds '
+                         f'{max_gap_s*1000:g} ms: {path}, timestamp={timestamp}')
     alpha = (timestamp - int(times[left])) / 1e9 / dt
     matrix = np.eye(4)
     matrix[:3, 3] = values[left, :3] * (1-alpha) + values[right, :3] * alpha
@@ -131,7 +148,8 @@ def load_frame_radar(frame, config):
     stack.validate()
     tracking.validate()
     radar_gt = unique_file(session, 'Continental_gt.txt')
-    reference, _ = sensor_pose(radar_gt, timestamp)
+    max_pose_gap_s = float(config.get('hercules_max_pose_gap_ms', 200.0)) / 1000
+    reference, _ = sensor_pose(radar_gt, timestamp, max_pose_gap_s)
     selected = []
     for index in range(stop-1, -1, -1):
         if stack.max_frames is not None and len(selected) >= stack.max_frames:
@@ -139,7 +157,7 @@ def load_frame_radar(frame, config):
         age = (timestamp - times[index]) / 1e9
         if age > stack.max_age_s:
             break
-        pose, velocity = sensor_pose(radar_gt, times[index])
+        pose, velocity = sensor_pose(radar_gt, times[index], max_pose_gap_s)
         relative = np.linalg.inv(reference) @ pose
         distance = float(np.linalg.norm(relative[:3, 3]))
         angle = float(np.degrees(Rotation.from_matrix(relative[:3, :3]).magnitude()))
@@ -153,7 +171,7 @@ def load_frame_radar(frame, config):
     lidar_to_imu = _named_transform(frame.lidar_calibration_path, 'Tr_lidar_to_imu')
     radar_to_lidar = np.linalg.inv(_named_transform(frame.radar_calibration_path, 'Tr_lidar_to_radar'))
     imu_from_radar = lidar_to_imu[:3, :3] @ radar_to_lidar[:3, :3]
-    current, _ = sensor_pose(unique_file(session, 'Aeva_gt.txt'), timestamp)
+    current, _ = sensor_pose(unique_file(session, 'Aeva_gt.txt'), timestamp, max_pose_gap_s)
     current[:3, :3] = current[:3, :3] @ lidar_to_imu[:3, :3]
     processed, raw_frames, rotations, alignment_rows = [], [], [], []
     for path, pose, velocity, age, distance, angle, weight in selected:
@@ -210,6 +228,7 @@ def load_frame_radar(frame, config):
         'effective_frame_support': sum(scan.weight for scan in processed),
         'newest_radar_age_ms': newest_age_ms,
         'max_radar_age_ms': max_age_ms,
+        'max_pose_gap_ms': max_pose_gap_s * 1000,
     }
     config['_hercules_point_weights'] = point_weights
     return aligned, aligned, radar_to_lidar

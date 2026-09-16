@@ -29,7 +29,10 @@ gaps still fail. The age and limit are recorded in alignment metadata, and the
 limit participates in the cache-policy hash.
 It
 interpolates poses without extrapolation, and transforms into current Aeva
-coordinates. Pose gaps above 100 ms are rejected. GT pose translations are
+coordinates. Pose gaps above 200 ms are rejected by default, configurable via
+`--hercules-max-pose-gap-ms`. Exact timestamps use recorded poses directly;
+velocity uses the shorter adjacent measured interval, also subject to this
+limit. No velocity is invented across unsupported gaps. GT pose translations are
 treated as sensor positions; extrinsics rotate IMU axes. Doppler sign defaults
 to `auto`, selecting the convention best explaining the static majority;
 `--hercules-doppler-sign 1` or `-1` fixes it after verification. Low-speed auto

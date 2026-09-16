@@ -14,6 +14,22 @@ from Fault_Localization_Model.hercules_tracking import compensate_doppler
 
 
 class HerculesDatasetTests(unittest.TestCase):
+    def test_exact_pose_and_jittered_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'poses.txt'
+            path.write_text('1000000000 1 0 0 0 0 0 1\n'
+                            '1124000000 2 0 0 0 0 0 1\n'
+                            '2024000000 3 0 0 0 0 0 1\n')
+            pose, velocity = sensor_pose(path, 1124000000)
+            self.assertEqual(pose[0, 3], 2)
+            self.assertAlmostEqual(velocity[0], 1/.124)
+            pose, _ = sensor_pose(path, 1062000000)
+            self.assertAlmostEqual(pose[0, 3], 1.5)
+            with self.assertRaisesRegex(ValueError, '900.000 ms'):
+                sensor_pose(path, 1500000000)
+            with self.assertRaisesRegex(ValueError, '124.000 ms'):
+                sensor_pose(path, 1062000000, max_gap_s=.1)
+
     def make_session(self, root):
         session = root / 'day' / 'session'
         aeva = session / 'LiDAR' / 'Aeva'

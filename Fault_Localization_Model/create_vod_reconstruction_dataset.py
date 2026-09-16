@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hercules-temporal-radius", type=float, default=0.75)
     parser.add_argument('--hercules-max-radar-age-ms', type=float, default=30.0,
                         help='Maximum age of newest past radar scan (no future scans).')
+    parser.add_argument('--hercules-max-pose-gap-ms', type=float, default=200.0,
+                        help='Maximum measured pose interval used for interpolation/velocity.')
     parser.add_argument("--hercules-max-history-s", type=float, default=1.0)
     parser.add_argument("--hercules-max-translation-m", type=float, default=4.0)
     parser.add_argument("--hercules-max-rotation-deg", type=float, default=5.0)
@@ -577,7 +579,8 @@ def main() -> None:
             'max_rotation_deg': args.hercules_max_rotation_deg,
         }
         digest = hashlib.sha256(json.dumps([ALIGNMENT_POLICY, policy, args.hercules_doppler_sign,
-            args.hercules_temporal_radius, args.hercules_max_radar_age_ms], sort_keys=True).encode()).hexdigest()[:12]
+            args.hercules_temporal_radius, args.hercules_max_radar_age_ms,
+            args.hercules_max_pose_gap_ms], sort_keys=True).encode()).hexdigest()[:12]
         frames = discover_hercules_frames(args.hercules_root, args.split,
             radar_variant=f"hercules_v2_{digest}")
     else:
@@ -595,6 +598,7 @@ def main() -> None:
         "hercules_radar_frames": args.hercules_radar_frames,
         "hercules_temporal_radius": args.hercules_temporal_radius,
         "hercules_max_radar_age_ms": args.hercules_max_radar_age_ms,
+        "hercules_max_pose_gap_ms": args.hercules_max_pose_gap_ms,
         "hercules_stack": policy if args.hercules_root else {},
         "hercules_tracking": {'doppler_sign': args.hercules_doppler_sign},
         "output_root": str(args.output_root) if args.output_root else "",
