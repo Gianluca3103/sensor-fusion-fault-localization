@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     roots = parser.add_mutually_exclusive_group(required=True)
     roots.add_argument("--vod-root", type=Path)
     roots.add_argument("--hercules-root", type=Path)
+    parser.add_argument('--hercules-split-manifest', type=Path,
+                        help='Optional scene-held-out HeRCULES split manifest')
     parser.add_argument("--hercules-radar-frames", type=int, default=0,
                         help="V2 optional frame cap; 0 uses adaptive pose/history gates only")
     parser.add_argument("--hercules-temporal-radius", type=float, default=0.75)
@@ -580,9 +582,10 @@ def main() -> None:
         }
         digest = hashlib.sha256(json.dumps([ALIGNMENT_POLICY, policy, args.hercules_doppler_sign,
             args.hercules_temporal_radius, args.hercules_max_radar_age_ms,
-            args.hercules_max_pose_gap_ms], sort_keys=True).encode()).hexdigest()[:12]
+            args.hercules_max_pose_gap_ms,
+            args.hercules_split_manifest.read_text() if args.hercules_split_manifest else None], sort_keys=True).encode()).hexdigest()[:12]
         frames = discover_hercules_frames(args.hercules_root, args.split,
-            radar_variant=f"hercules_v2_{digest}")
+            radar_variant=f"hercules_v2_{digest}", split_manifest=args.hercules_split_manifest)
     else:
         frames = discover_vod_frames(args.vod_root, args.split, radar_variant=args.radar_variant)
     rng = random.Random(args.seed)
@@ -599,6 +602,7 @@ def main() -> None:
         "hercules_temporal_radius": args.hercules_temporal_radius,
         "hercules_max_radar_age_ms": args.hercules_max_radar_age_ms,
         "hercules_max_pose_gap_ms": args.hercules_max_pose_gap_ms,
+        "hercules_split_manifest": str(args.hercules_split_manifest) if args.hercules_split_manifest else None,
         "hercules_stack": policy if args.hercules_root else {},
         "hercules_tracking": {'doppler_sign': args.hercules_doppler_sign},
         "output_root": str(args.output_root) if args.output_root else "",

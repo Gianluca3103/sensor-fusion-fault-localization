@@ -7,6 +7,7 @@ from bisect import bisect_right
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
+import json
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -95,8 +96,11 @@ def sensor_pose(path, timestamp, max_gap_s=.2):
     velocity = (values[right, :3] - values[left, :3]) / dt
     return matrix, velocity
 
-def discover_hercules_frames(root, split, radar_variant='radar'):
+def discover_hercules_frames(root, split, radar_variant='radar', split_manifest=None):
     root = Path(root)
+    manifest = json.loads(Path(split_manifest).read_text()) if split_manifest else None
+    if manifest is not None and manifest.get('version') != 1:
+        raise ValueError('Unsupported HeRCULES split manifest version')
     frames = []
     frame_index = 0
     requested = {'train', 'val'} if split == 'train_val' else {'train', 'val', 'test'} if split == 'full' else {split}
@@ -108,10 +112,25 @@ def discover_hercules_frames(root, split, radar_variant='radar'):
         if aeva.parent.name.lower() != 'lidar':
             raise ValueError(f'Expected session/LiDAR/Aeva, got {aeva}')
         session = aeva.parent.parent
+        scene = session.relative_to(root).as_posix()
+        assignment = None
+        if manifest is not None:
+            if scene not in manifest['scenes']:
+                raise ValueError(f'Scene absent from split manifest: {scene}')
+            assignment = manifest['scenes'][scene]
         continental = unique_file(session, 'Continental_LiDAR.txt')
         imu = unique_file(session, 'IMU_LiDAR.txt')
         for index, path in enumerate(paths):
             selected = 'train' if index < int(.7*len(paths)) else 'val' if index < int(.85*len(paths)) else 'test'
+            if assignment is not None:
+                selected = assignment['split']
+                if selected == 'val_test':
+                    timestamp = int(path.stem)
+                    boundary = int(assignment['boundary_ns'])
+                    gap = int(manifest['boundary_buffer_ns'])
+                    selected = 'val' if timestamp < boundary-gap else 'test' if timestamp >= boundary+gap else None
+                elif selected not in {'train', 'val', 'test'}:
+                    raise ValueError(f'Invalid scene split: {selected}')
             if selected in requested:
                 frames.append(VODFrame(str(frame_index), selected, path, session, imu, continental, radar_variant))
             frame_index += 1

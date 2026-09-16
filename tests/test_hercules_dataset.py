@@ -14,6 +14,21 @@ from Fault_Localization_Model.hercules_tracking import compensate_doppler
 
 
 class HerculesDatasetTests(unittest.TestCase):
+    def test_scene_manifest_and_boundary_buffer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_session(root)
+            manifest = root / 'split.json'
+            manifest.write_text(json.dumps({'version': 1, 'boundary_buffer_ns': 10_000_000,
+                'scenes': {'day/session': {'split': 'val_test', 'boundary_ns': 1_050_000_000}}}))
+            val = discover_hercules_frames(root, 'val', split_manifest=manifest)
+            test = discover_hercules_frames(root, 'test', split_manifest=manifest)
+            self.assertEqual([f.frame_id for f in val], ['0', '1', '2', '3'])
+            self.assertEqual([f.frame_id for f in test], ['6', '7', '8', '9'])
+            self.assertTrue(set(f.frame_id for f in val).isdisjoint(f.frame_id for f in test))
+            with self.assertRaises(FileNotFoundError):
+                discover_hercules_frames(root, 'train', split_manifest=manifest)
+
     def test_exact_pose_and_jittered_intervals(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'poses.txt'

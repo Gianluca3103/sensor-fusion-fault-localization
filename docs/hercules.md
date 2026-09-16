@@ -50,6 +50,22 @@ is a starting value, not a tuned optimum; HeRCULES RCS units are not VoD dBsm.
 
 ## University machine: generate
 
+For scene-held-out baseline experiments, create a manifest once using
+`python -m tools.create_hercules_scene_split --hercules-root "$RAW" --output "$SPLITS"`.
+This selects three scenes reproducibly (seed 42): one full validation scene,
+one full test scene and a third divided chronologically at its median frame.
+All other scenes are training-only. One second is excluded on either side of
+the midpoint, preventing the configured one-second causal radar history from
+touching validation frames during testing. Increase the buffer if increasing
+radar history. Half-scenes need not have equal frame counts after exclusion.
+Validation/test still share the divided scene's environment, so they are not
+fully scene-independent. Pass `--hercules-split-manifest "$SPLITS"` to every
+generation command and use fresh artifact roots. Frame IDs remain stable;
+the manifest contents participate in the radar policy hash. Keep the manifest
+with the experiment outputs and never regenerate it for model selection.
+The separate dense-reference builder currently uses the original split policy;
+do not combine it with this manifest until its split handling is integrated.
+
 Run from the repository root in the existing sensor-fusion environment:
 
 ```bash
