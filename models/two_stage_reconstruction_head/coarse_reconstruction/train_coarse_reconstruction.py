@@ -40,6 +40,7 @@ from models.two_stage_reconstruction_head import (
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
+    parser.add_argument('--geometric-config', help='Optional geometry-only configuration overlay')
     parser.add_argument("--radar-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
@@ -275,6 +276,7 @@ def _run_epoch(
     active_fraction_samples=None,
     radar_enabled=True,
     profile_first_batch=False,
+    geometric_loss=None,
 ):
     training = optimizer is not None
     model.train(training)
@@ -339,6 +341,12 @@ def _run_epoch(
                     inputs["clean_bev"],
                     inputs.get("observability_confidence"),
                 )
+                if geometric_loss is not None:
+                    geometric = geometric_loss(outputs['coarse_lidar_bev'],
+                        batch['geometric_reference_points'], inputs['reconstruction_mask'])
+                    losses['legacy_loss'] = losses['loss']
+                    losses['loss'] = geometric_loss.config.legacy_weight*losses['loss']+geometric['geometric_loss']
+                    losses.update(geometric)
             if training:
                 if measure_runtime:
                     _synchronize_device(device)
@@ -426,6 +434,8 @@ def main():
     args = _parse_args()
     radar_enabled = not args.disable_radar
     payload = load_config(args.config)
+    from models.two_stage_reconstruction_head.geometric_reconstruction import merge_geometric_config
+    payload = merge_geometric_config(payload, args.geometric_config)
     model_config, loss_config, selector_config = build_configs(payload)
     augmentation_config = build_augmentation_config(payload)
     training = dict(payload.get("training", {}))
@@ -470,12 +480,18 @@ def main():
         "selector_config": selector_config,
         "use_pointpillars": model_config.pointpillars_enabled,
     }
+    from Fault_Localization_Model.geometric_reference import GeometricReferenceConfig
+    from models.two_stage_reconstruction_head.geometric_reconstruction import configured_geometry_loss
+    reference_config = GeometricReferenceConfig(**payload.get('geometric_reference', {}))
+    dataset_options['geometric_reference_config'] = reference_config
     train_dataset = CoarseReconstructionDataset(
         train_paths,
         augmentation_config=augmentation_config,
+        augmentation_seed=seed,
         **dataset_options,
     )
     val_dataset = CoarseReconstructionDataset(val_paths, **dataset_options)
+    geometric_loss = configured_geometry_loss(payload, train_dataset)
     if train_dataset.grid_geometry != val_dataset.grid_geometry:
         raise ValueError("Training and validation BEV geometry must match")
     loader_options = {
@@ -515,12 +531,14 @@ def main():
             "training": training,
             "args": vars(args),
             "grid_geometry": train_dataset.grid_geometry.to_dict(),
+            "geometric_reference": payload.get('geometric_reference', {}),
+            "geometric_loss": payload.get('geometric_loss', {}),
         },
     )
     print(f"Training samples: {len(train_dataset)}; validation: {len(val_dataset)}")
     print(f"Device: {device}; AMP: {use_amp}")
     print(f"Radar enabled: {radar_enabled}")
-    print(f"Training augmentation enabled: {augmentation_config.enabled}")
+    print(f"Training augmentation enabled: {augmentation_config.enabled}; online epoch-seeded transforms; validation unchanged")
     print(
         "Sensor representation: "
         + (
@@ -589,6 +607,7 @@ def main():
     best_tolerant_iou = float("-inf")
     active_fraction_profile = None
     for epoch in range(1, epochs + 1):
+        train_dataset.set_epoch(epoch)
         train_active_fractions = [] if epoch == 1 else None
         val_active_fractions = [] if epoch == 1 else None
         _synchronize_device(device)
@@ -605,6 +624,7 @@ def main():
             active_fraction_samples=train_active_fractions,
             radar_enabled=radar_enabled,
             profile_first_batch=epoch == 1,
+            geometric_loss=geometric_loss,
         )
         _synchronize_device(device)
         train_seconds = time.perf_counter() - train_started
@@ -626,6 +646,7 @@ def main():
                 active_fraction_samples=val_active_fractions,
                 radar_enabled=radar_enabled,
                 profile_first_batch=epoch == 1,
+                geometric_loss=geometric_loss,
             )
         _synchronize_device(device)
         validation_seconds = time.perf_counter() - validation_started
@@ -829,6 +850,9 @@ def main():
                 "high-observability hallucination="
                 f"{val_stats['hallucination_rate_high_observability']:.3%}"
             )
+        if geometric_loss is not None:
+            summary_lines.append(f"  Geometry val coverage={val_stats['geometric_coverage_loss']:.6f} "
+                f"accuracy={val_stats['geometric_accuracy_loss']:.6f} weighted={val_stats['geometric_loss']:.6f}")
         print("\n".join(summary_lines), flush=True)
         checkpoint = {
             "epoch": epoch,
@@ -838,6 +862,8 @@ def main():
             "model_config": model_config.to_dict(),
             "loss_config": asdict(loss_config),
             "augmentation_config": augmentation_config.to_dict(),
+            "geometric_reference": payload.get('geometric_reference', {}),
+            "geometric_loss": payload.get('geometric_loss', {}),
             "active_fraction_profile": active_fraction_profile,
             "radar_enabled": radar_enabled,
             "grid_geometry": train_dataset.grid_geometry.to_dict(),

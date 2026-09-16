@@ -416,6 +416,11 @@ class ReconstructionGeometricAugmentation:
         for key in ("faulty_lidar_points", "radar_points"):
             if key in output:
                 output[key] = self._transform_points(output[key], transform)
+        # Supervision must follow the same spatial transform but never enter
+        # sensor conditioning or PointPillars feature extraction.
+        if 'geometric_reference_points' in output:
+            output['geometric_reference_points'] = self._transform_points(
+                output['geometric_reference_points'], transform)
 
         repair = output.get("reconstruction_mask")
         halo = output.get("halo_mask")

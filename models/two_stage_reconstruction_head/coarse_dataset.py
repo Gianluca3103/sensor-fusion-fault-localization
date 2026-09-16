@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +25,8 @@ def radar_cache_path(radar_root: str | Path, metadata: dict) -> Path:
     """Resolve the aligned View-of-Delft radar cache for one sample."""
 
     dataset = str(metadata.get("dataset", "")).strip().lower()
-    if dataset not in {"view-of-delft", "view of delft", "vod"}:
-        raise ValueError(f"Unsupported dataset {metadata.get('dataset')!r}; expected VoD")
+    if dataset not in {"view-of-delft", "view of delft", "vod", "hercules"}:
+        raise ValueError(f"Unsupported dataset {metadata.get('dataset')!r}; expected VoD or HeRCULES")
     split = str(metadata.get("split", "")).strip()
     frame_id = str(metadata.get("frame_id", metadata.get("radar_index", ""))).strip()
     if split not in {"train", "val", "test"}:
@@ -172,7 +173,7 @@ def load_bev_grid_geometry(sample_path: str | Path) -> BEVGridGeometry:
 def coarse_reconstruction_collate(batch: list[dict[str, object]]) -> dict[str, object]:
     """Collate dense tensors normally while retaining variable point clouds."""
 
-    point_keys = ("faulty_lidar_points", "radar_points")
+    point_keys = ("faulty_lidar_points", "radar_points", "geometric_reference_points")
     dense_batch = [
         {key: value for key, value in item.items() if key not in point_keys}
         for item in batch
@@ -196,6 +197,8 @@ class CoarseReconstructionDataset(Dataset):
         selector_config: FaultSelectorConfig | None = None,
         use_pointpillars: bool = False,
         augmentation_config: GeometricAugmentationConfig | None = None,
+        augmentation_seed: int = 0,
+        geometric_reference_config=None,
     ):
         self.sample_paths = tuple(Path(path) for path in sample_paths)
         if not self.sample_paths:
@@ -204,6 +207,13 @@ class CoarseReconstructionDataset(Dataset):
         self.data_root = Path(data_root)
         self.selector_config = selector_config or FaultSelectorConfig()
         self.use_pointpillars = bool(use_pointpillars)
+        self.augmentation_seed = int(augmentation_seed)
+        self.geometric_reference_config = geometric_reference_config
+        if geometric_reference_config is not None:
+            geometric_reference_config.validate()
+        # Persistent DataLoader workers retain dataset copies. Shared CPU storage
+        # propagates epoch updates without rebuilding workers or touching caches.
+        self._augmentation_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         self.grid_geometry = load_bev_grid_geometry(self.sample_paths[0])
         self.augmentation = (
             ReconstructionGeometricAugmentation(
@@ -216,6 +226,20 @@ class CoarseReconstructionDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.sample_paths)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select fresh, reproducible per-sample online transforms for this epoch."""
+        if int(epoch) < 0:
+            raise ValueError("augmentation epoch must be nonnegative")
+        self._augmentation_epoch.fill_(int(epoch))
+
+    def _augmentation_generator(self, index: int) -> torch.Generator:
+        # Relative identity stays stable when moving a dataset between machines;
+        # unlike worker RNG streams, it is independent of shuffle and prefetch.
+        identity = self.sample_paths[index].relative_to(self.data_root).as_posix()
+        payload = f"{self.augmentation_seed}:{int(self._augmentation_epoch)}:{identity}"
+        seed = int.from_bytes(hashlib.blake2b(payload.encode(), digest_size=8).digest(), "little")
+        return torch.Generator().manual_seed(seed & ((1 << 63) - 1))
 
     def __getitem__(self, index: int) -> dict[str, object]:
         item = load_bev_triplet(
@@ -244,6 +268,10 @@ class CoarseReconstructionDataset(Dataset):
                 )[None],
             }
         )
+        if self.geometric_reference_config is not None and self.geometric_reference_config.enabled:
+            from Fault_Localization_Model.geometric_reference import load_reference
+            item['geometric_reference_points'] = torch.from_numpy(load_reference(
+                self.sample_paths[index], self.data_root, self.geometric_reference_config))
         if self.augmentation is not None:
-            item = self.augmentation.apply(item)
+            item = self.augmentation.apply(item, generator=self._augmentation_generator(index))
         return item

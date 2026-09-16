@@ -1,5 +1,17 @@
 # View-of-Delft LiDAR fault reconstruction
 
+## HeRCULES support
+
+The same generator also accepts `--hercules-root` instead of `--vod-root`.
+See [HeRCULES dataset setup](docs/hercules.md). Fault injection, artifacts,
+PointPillars and coarse/fine training are shared; VoD remains supported.
+
+When `augmentation.enabled` is true, coarse and fine training use online,
+epoch-seeded geometric augmentation for both VoD and HeRCULES. Each sample
+gets a fresh reproducible transform each epoch, shared across sensor points,
+targets and masks, including with persistent workers. Validation/test remain
+unaugmented. Generated fault severities are not resampled by this mechanism.
+
 This repository now targets one deterministic Stage-I pipeline:
 
 ```text
@@ -94,6 +106,12 @@ python -u -m models.two_stage_reconstruction_head.coarse_reconstruction.evaluate
 ```
 
 ## Tests
+
+## Optional dense geometric supervision
+
+The coarse and fine trainers support a separate, supervision-only multi-frame clean reference and differentiable coverage/accuracy objective. Existing configurations retain their original behavior. See [dense geometric reconstruction](docs/geometric_reconstruction.md) for the exact equations, cache construction, commands and important 2.5D/dynamic-object limitations.
+
+## Test runner
 
 The tests use Python's built-in unittest runner:
 

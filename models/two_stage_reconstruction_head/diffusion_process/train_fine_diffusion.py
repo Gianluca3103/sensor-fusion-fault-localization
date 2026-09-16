@@ -57,6 +57,7 @@ from models.two_stage_reconstruction_head.diffusion_process.diffusion_metrics im
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
+    parser.add_argument('--geometric-config', help='Optional geometry-only configuration overlay')
     parser.add_argument("--radar-root", required=True)
     parser.add_argument(
         "--coarse-checkpoint",
@@ -240,6 +241,7 @@ def _run_epoch(
     amp_dtype=torch.bfloat16,
     progress_label="train",
     residual_regularization_weight=None,
+    geometric_loss=None,
 ):
     training = optimizer is not None
     pipeline.train(training)
@@ -276,6 +278,11 @@ def _run_epoch(
                     ),
                 )
                 loss = output["loss"]
+                if geometric_loss is not None:
+                    geometric = geometric_loss(output['final_lidar_bev'],
+                        raw_batch['geometric_reference_points'], batch['reconstruction_mask'])
+                    loss = geometric_loss.config.legacy_weight*loss+geometric['geometric_loss']
+                    output.update(geometric)
             if training:
                 scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
@@ -321,6 +328,9 @@ def _run_epoch(
         }
         for key, value in values.items():
             totals[key] = totals.get(key, 0.0) + value * count
+        if geometric_loss is not None:
+            for name in ('geometric_loss', 'geometric_coverage_loss', 'geometric_accuracy_loss'):
+                totals[name] = totals.get(name, 0.)+float(output[name].detach())*count
         for name in occupancy_groups:
             group_count = float(output[f"num_{name}"].detach())
             group_loss = float(output[f"occupancy_{name}_loss"].detach())
@@ -435,6 +445,7 @@ def _run_sampled_validation(
     seed=0,
     progress_label="validation",
     residual_regularization_weight=0.0,
+    geometric_loss=None,
 ):
     """Run clean-free sampling, then separately calculate validation losses."""
 
@@ -480,6 +491,10 @@ def _run_sampled_validation(
         "weighted_residual_regularization_loss": 0.0,
     }
     generator = torch.Generator(device=device).manual_seed(seed)
+    geometry_metric_totals, geometry_metric_counts = {}, {}
+    if geometric_loss is not None:
+        validation_loss_totals.update({name: 0. for name in (
+            'geometric_loss', 'geometric_coverage_loss', 'geometric_accuracy_loss')})
     progress = _BatchProgress(progress_label, len(loader))
     total_data_seconds = total_step_seconds = 0.0
     previous_batch_finished = time.perf_counter()
@@ -522,6 +537,20 @@ def _run_sampled_validation(
                 residual_regularization_weight=residual_regularization_weight,
             )
 
+        if geometric_loss is not None:
+            from models.two_stage_reconstruction_head.geometric_reconstruction import bev_geometry_metrics
+            geometric = geometric_loss(sampled['final_lidar_bev'], raw_batch['geometric_reference_points'],
+                batch['reconstruction_mask'])
+            validation_objective['loss'] = (geometric_loss.config.legacy_weight*validation_objective['loss']
+                + geometric['geometric_loss'])
+            validation_objective.update(geometric)
+            for index, reference in enumerate(raw_batch['geometric_reference_points']):
+                metrics = bev_geometry_metrics(sampled['final_lidar_bev'][index], reference,
+                    batch['reconstruction_mask'][index], geometric_loss.geometry, geometric_loss.config)
+                for name, value in metrics.items():
+                    if isinstance(value, (int, float)) and __import__('math').isfinite(value):
+                        geometry_metric_totals[name] = geometry_metric_totals.get(name, 0.)+value
+                        geometry_metric_counts[name] = geometry_metric_counts.get(name, 0)+1
         batch_samples = batch["clean_lidar_bev"].shape[0]
         for name in validation_loss_totals:
             validation_loss_totals[name] += (
@@ -619,6 +648,7 @@ def _run_sampled_validation(
             )
             for name, value in tolerant.items():
                 result[f"{prefix}_tolerant_{label}_{name}"] = value
+    result.update({f'geometry/{key}': value/geometry_metric_counts[key] for key, value in geometry_metric_totals.items()})
     result["fine_minus_coarse_exact_iou"] = (
         result["fine_exact_occupancy_iou"]
         - result["coarse_exact_occupancy_iou"]
@@ -717,6 +747,8 @@ def _sampling_metrics(pipeline, loader, device, maximum, sampling_steps):
 def main():
     args = _parse_args()
     payload, config, bev_normalizer = _load_components(args.config)
+    from models.two_stage_reconstruction_head.geometric_reconstruction import merge_geometric_config
+    payload = merge_geometric_config(payload, args.geometric_config)
     selector_payload = payload
     if args.selector_config:
         with Path(args.selector_config).open("r", encoding="utf-8") as handle:
@@ -773,15 +805,20 @@ def main():
         "selector_config": selector,
         "use_pointpillars": use_pointpillars,
     }
+    from Fault_Localization_Model.geometric_reference import GeometricReferenceConfig
+    from models.two_stage_reconstruction_head.geometric_reconstruction import configured_geometry_loss
+    dataset_options['geometric_reference_config'] = GeometricReferenceConfig(**payload.get('geometric_reference', {}))
     train_dataset = CoarseReconstructionDataset(
         _split_paths(args.data_root, "train", args.limit_train_samples, seed),
         augmentation_config=augmentation_config,
+        augmentation_seed=seed,
         **dataset_options,
     )
     val_dataset = CoarseReconstructionDataset(
         _split_paths(args.data_root, "val", args.limit_val_samples, seed),
         **dataset_options,
     )
+    geometric_loss = configured_geometry_loss(payload, train_dataset)
     if train_dataset.grid_geometry != val_dataset.grid_geometry:
         raise ValueError("Training and validation BEV geometries differ")
     meters_per_cell_x = train_dataset.grid_geometry.pillar_size_x
@@ -1024,6 +1061,7 @@ def main():
     print(
         "Training augmentation: "
         f"{'enabled' if augmentation_config.enabled else 'disabled'}; "
+        "online epoch-seeded transforms; "
         f"weight decay: {float(training.get('weight_decay', 1.0e-3)):g}; "
         f"dropout: {config.dropout:g}"
     )
@@ -1081,6 +1119,7 @@ def main():
             f"{config.operation_preserve_empty_weight:g}"
         )
     for epoch in range(start_epoch, epochs + 1):
+        train_dataset.set_epoch(epoch)
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch)
         started = time.perf_counter()
@@ -1098,6 +1137,7 @@ def main():
             amp_dtype=amp_dtype,
             progress_label=f"epoch {epoch:03d}/{epochs:03d} train",
             residual_regularization_weight=residual_regularization_weight,
+            geometric_loss=geometric_loss,
         )
         run_validation = epoch % validation_interval == 0 or epoch == epochs
         val_stats = None
@@ -1116,6 +1156,7 @@ def main():
                 residual_regularization_weight=residual_regularization_weight,
                 meters_per_cell_x=meters_per_cell_x,
                 meters_per_cell_y=meters_per_cell_y,
+                geometric_loss=geometric_loss,
             )
             validation_seconds = time.perf_counter() - validation_started
         if train_stats.get("optimizer_steps", 0) > 0:
@@ -1256,6 +1297,8 @@ def main():
             improved_checkpoints = set()
         checkpoint = {
             "epoch": epoch,
+            "geometric_reference": payload.get('geometric_reference', {}),
+            "geometric_loss": payload.get('geometric_loss', {}),
             "diffusion_state_dict": diffusion.state_dict(),
             "diffusion_config": config.to_dict(),
             "fine_diffusion_architecture": fine_diffusion_architecture_metadata(

@@ -1,5 +1,10 @@
 import math
 import unittest
+import tempfile
+import json
+from pathlib import Path
+
+import numpy as np
 
 import torch
 
@@ -143,6 +148,88 @@ class GeometricAugmentationTests(unittest.TestCase):
             GeometricAugmentationConfig(), self.geometry
         )
         self.assertTrue(disabled.sample_transform().is_identity)
+
+
+class OnlineDatasetAugmentationTests(unittest.TestCase):
+    def make_dataset(self, root, dataset_name='VoD', enabled=True):
+        from models.two_stage_reconstruction_head.coarse_dataset import CoarseReconstructionDataset
+        from models.two_stage_reconstruction_head.fault_selector import FaultSelectorConfig
+        from models.two_stage_reconstruction_head.fault_selector_cache import (
+            selector_cache_path, CACHE_VERSION, _config_json,
+        )
+        data_root = root / 'data'
+        sample = data_root / 'train' / '00001.npz'
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        rgb = np.zeros((320, 320, 3), dtype=np.uint8)
+        rgb[250, 135] = 255
+        points = np.array([[10., -5., .2, 42.]], dtype=np.float32)
+        np.savez(sample, clean_rgb=rgb, faulty_rgb=rgb, faulty_lidar_points=points,
+                 metadata_json=json.dumps({'dataset': dataset_name, 'split': 'train',
+                     'frame_id': '1', 'x_range': [0., 64.], 'y_range': [-32., 32.], 'resolution': .2}))
+        radar = root / 'radar' / 'train'
+        radar.mkdir(parents=True, exist_ok=True)
+        np.savez(radar / '00001.npz', radar_bev=np.zeros((4, 320, 320), dtype=np.float32),
+                 radar_points=np.array([[10., -5., .2, 30., -2.]], dtype=np.float32))
+        selector = FaultSelectorConfig()
+        cache = selector_cache_path(sample, data_root)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        mask = np.zeros((320, 320), dtype=np.uint8)
+        mask[240:260, 125:145] = 1
+        np.savez(cache, cache_version=CACHE_VERSION, selector_config=_config_json(selector),
+                 reconstruction_mask=mask, halo_mask=np.zeros_like(mask),
+                 healthy_context_mask=np.zeros_like(mask))
+        return CoarseReconstructionDataset([sample], root / 'radar', data_root=data_root,
+            use_pointpillars=True, augmentation_seed=42,
+            augmentation_config=GeometricAugmentationConfig(enabled=True) if enabled else None)
+
+    def test_fresh_epochs_repeatable_and_shared_sensor_transform_for_both_datasets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('VoD', 'HeRCULES'):
+                dataset = self.make_dataset(root / name, name)
+                source = dataset.sample_paths[0].read_bytes()
+                dataset.set_epoch(1)
+                first = dataset[0]
+                dataset.set_epoch(2)
+                second = dataset[0]
+                self.assertNotEqual(first['augmentation_transform'], second['augmentation_transform'])
+                dataset.set_epoch(1)
+                repeated = dataset[0]
+                self.assertEqual(first['augmentation_transform'], repeated['augmentation_transform'])
+                self.assertTrue(torch.equal(first['faulty_lidar_points'], repeated['faulty_lidar_points']))
+                self.assertTrue(torch.equal(first['clean_bev'], first['faulty_bev']))
+                self.assertTrue(torch.equal(first['faulty_lidar_points'][:, :3], first['radar_points'][:, :3]))
+                self.assertEqual(source, dataset.sample_paths[0].read_bytes())
+
+    def test_persistent_workers_observe_epoch_and_match_single_process(self):
+        from torch.utils.data import DataLoader
+        from models.two_stage_reconstruction_head.coarse_dataset import coarse_reconstruction_collate
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self.make_dataset(Path(directory))
+            loader = DataLoader(dataset, batch_size=1, num_workers=1,
+                persistent_workers=True, collate_fn=coarse_reconstruction_collate)
+            try:
+                dataset.set_epoch(3)
+                first = next(iter(loader))['faulty_lidar_points'][0]
+                self.assertTrue(torch.equal(first, dataset[0]['faulty_lidar_points']))
+                dataset.set_epoch(4)
+                second = next(iter(loader))['faulty_lidar_points'][0]
+                self.assertTrue(torch.equal(second, dataset[0]['faulty_lidar_points']))
+                self.assertFalse(torch.equal(first, second))
+            finally:
+                if loader._iterator is not None:
+                    loader._iterator._shutdown_workers()
+
+    def test_no_augmentation_dataset_stays_unchanged_across_epochs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self.make_dataset(Path(directory), enabled=False)
+            dataset.set_epoch(1)
+            first = dataset[0]
+            dataset.set_epoch(2)
+            second = dataset[0]
+            self.assertNotIn('augmentation_transform', second)
+            self.assertTrue(torch.equal(first['faulty_lidar_points'], second['faulty_lidar_points']))
+            self.assertTrue(torch.equal(first['clean_bev'], second['clean_bev']))
 
 
 if __name__ == "__main__":

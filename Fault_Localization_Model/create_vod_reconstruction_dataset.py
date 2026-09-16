@@ -11,6 +11,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
+import hashlib
 from pathlib import Path
 import random
 
@@ -78,7 +79,16 @@ def parse_args() -> argparse.Namespace:
             "for the existing coarse HRNet reconstruction pipeline."
         )
     )
-    parser.add_argument("--vod-root", required=True, type=Path)
+    roots = parser.add_mutually_exclusive_group(required=True)
+    roots.add_argument("--vod-root", type=Path)
+    roots.add_argument("--hercules-root", type=Path)
+    parser.add_argument("--hercules-radar-frames", type=int, default=0,
+                        help="V2 optional frame cap; 0 uses adaptive pose/history gates only")
+    parser.add_argument("--hercules-temporal-radius", type=float, default=0.75)
+    parser.add_argument("--hercules-max-history-s", type=float, default=1.0)
+    parser.add_argument("--hercules-max-translation-m", type=float, default=4.0)
+    parser.add_argument("--hercules-max-rotation-deg", type=float, default=5.0)
+    parser.add_argument("--hercules-doppler-sign", choices=('auto', '1', '-1'), default='auto')
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--radar-cache-root", required=True, type=Path)
     parser.add_argument(
@@ -135,6 +145,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.hercules_radar_frames < 0 or args.hercules_temporal_radius <= 0:
+        raise ValueError("HeRCULES frame cap must be nonnegative and temporal radius positive")
+    if args.hercules_root:
+        from Fault_Localization_Model.hercules_radar_types import AdaptiveStackConfig
+        AdaptiveStackConfig(max_age_s=args.hercules_max_history_s,
+            max_translation_m=args.hercules_max_translation_m,
+            max_rotation_deg=args.hercules_max_rotation_deg).validate()
     if not args.radar_cache_only and args.output_root is None:
         raise ValueError("output-root is required unless --radar-cache-only is used")
     if args.num_samples is not None and args.num_samples < 1:
@@ -190,7 +207,10 @@ def _radar_bev(aligned: np.ndarray, config: dict) -> np.ndarray:
         return output
     source = aligned[valid]
     density = np.zeros((height, width), dtype=np.float32)
-    np.add.at(density, (rows, cols), 1.0)
+    weights = config.get('_hercules_point_weights')
+    np.add.at(density, (rows, cols), weights[valid] if weights is not None else 1.0)
+    if weights is not None:
+        density /= max(config['_hercules_alignment']['effective_frame_support'], 1e-6)
     occupied = density > 0
     output[0] = occupied
     logged = np.log1p(density)
@@ -205,6 +225,17 @@ def _radar_bev(aligned: np.ndarray, config: dict) -> np.ndarray:
     np.maximum.at(rcs, (rows, cols), source[:, 3])
     output[3] = normalize_occupied(rcs, occupied)
     return output
+
+
+def _load_frame_radar(frame, config):
+    if config.get("dataset") == "HeRCULES":
+        from Fault_Localization_Model.hercules_dataset import load_frame_radar
+        return load_frame_radar(frame, config)
+    radar = load_vod_radar(frame.radar_path)
+    transform = load_vod_radar_to_lidar(
+        frame.lidar_calibration_path, frame.radar_calibration_path,
+    )
+    return radar, align_radar_to_lidar(radar, transform), transform
 
 
 def _write_radar_cache(
@@ -243,7 +274,15 @@ def _write_radar_cache(
     ).astype(np.float32, copy=False)
     metadata = {
         "cache_format_version": 1,
-        "dataset": "View-of-Delft",
+        "dataset": config.get("dataset", "View-of-Delft"),
+        "native_sensor": "Continental" if config.get("dataset") == "HeRCULES" else "VoD radar",
+        "hercules_alignment": config.get('_hercules_alignment', {}),
+        "preprocessing": {
+            "stack_frames": config.get("hercules_radar_frames"),
+            "temporal_radius_m": config.get("hercules_temporal_radius"),
+            "alignment": "V2 adaptive pose interpolation and tracked dynamic points, current Aeva axes",
+            "doppler_convention": config.get('hercules_tracking', {}).get('doppler_sign', 'auto'),
+        } if config.get("dataset") == "HeRCULES" else {},
         "frame_id": frame.frame_id,
         "split": frame.split,
         "radar_variant": frame.radar_variant,
@@ -293,6 +332,7 @@ def _write_radar_cache(
         destination,
         radar_bev=radar_bev.astype(np.float16),
         radar_points=pointpillars_points,
+        **({"radar_point_weights": config['_hercules_point_weights']} if config.get('dataset') == 'HeRCULES' else {}),
         metadata_json=np.asarray(json.dumps(metadata)),
     )
     return destination
@@ -321,9 +361,19 @@ def _create_sample(task: dict) -> dict:
     )
     destination = _task_output_path(task, config)
     if destination.is_file():
-        return {"path": str(destination), "cached": True}
+        if config.get('dataset') != 'HeRCULES':
+            return {"path": str(destination), "cached": True}
+        with np.load(destination, allow_pickle=False) as previous:
+            previous_metadata = json.loads(str(previous['metadata_json'].item()))
+        if (previous_metadata.get('radar_variant') == frame.radar_variant
+                and previous_metadata.get('source_relative_path') == str(frame.lidar_path)):
+            return {"path": str(destination), "cached": True}
 
-    lidar = load_vod_lidar(frame.lidar_path)
+    if config.get("dataset") == "HeRCULES":
+        from Fault_Localization_Model.hercules_dataset import load_hercules_lidar
+        lidar = load_hercules_lidar(frame.lidar_path)
+    else:
+        lidar = load_vod_lidar(frame.lidar_path)
     _, range_mask = filter_pointcloud(
         lidar, config["min_range"], config["max_range"], return_mask=True
     )
@@ -392,25 +442,27 @@ def _create_sample(task: dict) -> dict:
         **geometry,
     )
 
-    radar = load_vod_radar(frame.radar_path)
-    lidar_from_radar = load_vod_radar_to_lidar(
-        frame.lidar_calibration_path,
-        frame.radar_calibration_path,
-    )
-    aligned_radar = align_radar_to_lidar(radar, lidar_from_radar)
+    radar, aligned_radar, lidar_from_radar = _load_frame_radar(frame, config)
     _write_radar_cache(frame, radar, aligned_radar, config)
 
     metadata = {
-        "dataset": "View-of-Delft",
+        "dataset": config.get("dataset", "View-of-Delft"),
         "split": frame.split,
         "frame_id": frame.frame_id,
-        "scene": "View-of-Delft",
-        "session": frame.split,
+        "scene": frame.radar_path.parent.name if config.get("dataset") == "HeRCULES" else "View-of-Delft",
+        "session": frame.radar_path.name if config.get("dataset") == "HeRCULES" else frame.split,
         "sequence": "",
         "lidar_index": frame.frame_id,
         "radar_index": frame.frame_id,
-        "timestamp": frame.frame_id,
-        "timestamp_ns": int(frame.frame_id),
+        "timestamp": frame.lidar_path.stem if config.get("dataset") == "HeRCULES" else frame.frame_id,
+        "timestamp_ns": int(frame.lidar_path.stem) if config.get("dataset") == "HeRCULES" else int(frame.frame_id),
+        "sensor_timestamp_ns": int(frame.lidar_path.stem),
+        "source_session": str(frame.radar_path) if config.get("dataset") == "HeRCULES" else frame.split,
+        "radar_preprocessing": {
+            "alignment": config.get('_hercules_alignment', {}),
+            "stack_frames": config.get("hercules_radar_frames"),
+            "temporal_radius_m": config.get("hercules_temporal_radius"),
+        } if config.get("dataset") == "HeRCULES" else {},
         "source_relative_path": str(frame.lidar_path),
         "source_lidar_dir": str(frame.lidar_path.parent),
         "label_relative_path": "",
@@ -485,12 +537,7 @@ def _create_radar_cache(task: dict) -> dict:
             for key, value in task["frame"].items()
         }
     )
-    radar = load_vod_radar(frame.radar_path)
-    lidar_from_radar = load_vod_radar_to_lidar(
-        frame.lidar_calibration_path,
-        frame.radar_calibration_path,
-    )
-    aligned_radar = align_radar_to_lidar(radar, lidar_from_radar)
+    radar, aligned_radar, lidar_from_radar = _load_frame_radar(frame, WORKER_CONFIG)
     destination = _write_radar_cache(
         frame,
         radar,
@@ -519,11 +566,20 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    frames = discover_vod_frames(
-        args.vod_root,
-        args.split,
-        radar_variant=args.radar_variant,
-    )
+    if args.hercules_root:
+        from Fault_Localization_Model.hercules_dataset import discover_hercules_frames, ALIGNMENT_POLICY
+        policy = {
+            'max_frames': args.hercules_radar_frames or None,
+            'max_age_s': args.hercules_max_history_s,
+            'max_translation_m': args.hercules_max_translation_m,
+            'max_rotation_deg': args.hercules_max_rotation_deg,
+        }
+        digest = hashlib.sha256(json.dumps([ALIGNMENT_POLICY, policy, args.hercules_doppler_sign,
+            args.hercules_temporal_radius], sort_keys=True).encode()).hexdigest()[:12]
+        frames = discover_hercules_frames(args.hercules_root, args.split,
+            radar_variant=f"hercules_v2_{digest}")
+    else:
+        frames = discover_vod_frames(args.vod_root, args.split, radar_variant=args.radar_variant)
     rng = random.Random(args.seed)
     rng.shuffle(frames)
     count = len(frames) if args.num_samples is None else args.num_samples
@@ -533,6 +589,11 @@ def main() -> None:
         )
     frames = frames[:count]
     config = {
+        "dataset": "HeRCULES" if args.hercules_root else "View-of-Delft",
+        "hercules_radar_frames": args.hercules_radar_frames,
+        "hercules_temporal_radius": args.hercules_temporal_radius,
+        "hercules_stack": policy if args.hercules_root else {},
+        "hercules_tracking": {'doppler_sign': args.hercules_doppler_sign},
         "output_root": str(args.output_root) if args.output_root else "",
         "radar_cache_root": str(args.radar_cache_root),
         "x_min": args.x_min,

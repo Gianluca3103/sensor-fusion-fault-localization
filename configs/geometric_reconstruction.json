@@ -1,0 +1,26 @@
+{
+  "geometric_reference": {
+    "enabled": true,
+    "cache_root": "/workspace/geometric_reference_cache",
+    "past_frames": 5,
+    "future_frames": 5,
+    "dynamic_handling": "boxes_or_central_only",
+    "dynamic_box_margin_m": 0.5,
+    "voxel_size_m": 0.05
+  },
+  "geometric_loss": {
+    "enabled": true,
+    "lambda_coverage": 1.0,
+    "lambda_accuracy": 0.5,
+    "legacy_weight": 0.0,
+    "distance_type": "huber",
+    "huber_delta_m": 0.10,
+    "max_distance_m": 0.50,
+    "repair_only": true,
+    "halo_m": 0.50,
+    "chunk_size": 1024
+  },
+  "geometric_metrics": {
+    "tolerances_m": [0.10, 0.20, 0.50]
+  }
+}
