@@ -21,7 +21,13 @@ clean LiDAR targets are used for input alignment/filtering.
 V2 takes causal history bounded by 1 second, 4 m translation and 5 degrees
 rotation relative to the radar pose interpolated at the current LiDAR timestamp.
 Frame count is uncapped by default; `--hercules-radar-frames 20` adds a cap.
-It checks the newest scan is within 30 ms,
+It checks the newest scan is within `--hercules-max-radar-age-ms` (default 30 ms).
+For the measured approximately 50 ms radar cadence, use 75 ms for the preview;
+this accepts the observed 59.34 ms maximum age without admitting future scans.
+This is a configurable freshness gate, not a timestamp offset correction. Larger
+gaps still fail. The age and limit are recorded in alignment metadata, and the
+limit participates in the cache-policy hash.
+It
 interpolates poses without extrapolation, and transforms into current Aeva
 coordinates. Pose gaps above 100 ms are rejected. GT pose translations are
 treated as sensor positions; extrinsics rotate IMU axes. Doppler sign defaults

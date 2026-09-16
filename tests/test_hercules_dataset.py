@@ -62,6 +62,23 @@ class HerculesDatasetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sensor_pose(session / 'Aeva_gt.txt', 900_000_000)
 
+    def test_configurable_causal_radar_age(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_session(root)
+            frame = discover_hercules_frames(root, 'train')[6]
+            config = {'hercules_radar_frames': 20, 'hercules_temporal_radius': .75}
+            with self.assertRaisesRegex(ValueError, '50.00 ms old'):
+                load_frame_radar(frame, config)
+            config['hercules_max_radar_age_ms'] = 75
+            load_frame_radar(frame, config)
+            self.assertEqual(config['_hercules_alignment']['newest_radar_age_ms'], 50)
+            self.assertTrue(all(row['timestamp_ns'] <= int(frame.lidar_path.stem)
+                                for row in config['_hercules_alignment']['alignment_rows']))
+            config['hercules_max_radar_age_ms'] = float('nan')
+            with self.assertRaisesRegex(ValueError, 'finite and positive'):
+                load_frame_radar(frame, config)
+
     def test_v2_auto_doppler_sign(self):
         points = np.array([[5., 0., 0., 2.], [6., 0., 0., 2.]])
         residual, sign, _ = compensate_doppler(points, np.array([2., 0., 0.]))

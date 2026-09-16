@@ -115,8 +115,15 @@ def load_frame_radar(frame, config):
     timestamp = int(frame.lidar_path.stem)
     times, paths = radar_paths(str(session))
     stop = bisect_right(times, timestamp)
-    if not stop or timestamp - times[stop-1] > 30_000_000:
-        raise ValueError(f'No radar within 30 ms at/before {timestamp}')
+    max_age_ms = float(config.get('hercules_max_radar_age_ms', 30.0))
+    if not np.isfinite(max_age_ms) or max_age_ms <= 0:
+        raise ValueError('hercules_max_radar_age_ms must be finite and positive')
+    if not stop:
+        raise ValueError(f'No radar at/before {timestamp}')
+    newest_age_ms = (timestamp - times[stop-1]) / 1e6
+    if newest_age_ms > max_age_ms:
+        raise ValueError(f'Newest causal radar is {newest_age_ms:.2f} ms old; '
+                         f'limit is {max_age_ms:g} ms at {timestamp}')
     stack = AdaptiveStackConfig(**config.get('hercules_stack', {
         'max_frames': config['hercules_radar_frames'] or None,
     }))
@@ -201,6 +208,8 @@ def load_frame_radar(frame, config):
         'confirmed_tracks': sum(track.hits >= tracking.min_track_hits for track in tracks.values()),
         'motion_compensated_points': compensated_points,
         'effective_frame_support': sum(scan.weight for scan in processed),
+        'newest_radar_age_ms': newest_age_ms,
+        'max_radar_age_ms': max_age_ms,
     }
     config['_hercules_point_weights'] = point_weights
     return aligned, aligned, radar_to_lidar
