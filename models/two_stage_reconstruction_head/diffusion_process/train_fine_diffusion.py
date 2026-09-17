@@ -83,6 +83,21 @@ def _parse_args():
     parser.add_argument("--limit-val-samples", type=int)
     parser.add_argument("--resume")
     parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop after this many completed validations without improvement; "
+            "0 disables early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--early-stopping-metric",
+        choices=("validation_loss", "exact_iou", "iou_0p2m", "iou_0p5m"),
+        default="iou_0p2m",
+        help="Validation checkpoint metric monitored by early stopping.",
+    )
+    parser.add_argument(
         "--residual-statistics-only",
         action="store_true",
         help="Estimate train-only coarse residual statistics and exit.",
@@ -746,6 +761,8 @@ def _sampling_metrics(pipeline, loader, device, maximum, sampling_steps):
 
 def main():
     args = _parse_args()
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be nonnegative")
     payload, config, bev_normalizer = _load_components(args.config)
     from models.two_stage_reconstruction_head.geometric_reconstruction import merge_geometric_config
     payload = merge_geometric_config(payload, args.geometric_config)
@@ -1018,6 +1035,7 @@ def main():
         "cuda", enabled=use_amp and amp_dtype == torch.float16
     )
     start_epoch, best_validation_metrics, history = 1, {}, []
+    early_stopping_bad_validations = 0
     if resume_checkpoint is not None:
         checkpoint = resume_checkpoint
         diffusion.load_state_dict(checkpoint["diffusion_state_dict"], strict=True)
@@ -1031,6 +1049,14 @@ def main():
             checkpoint.get("best_validation_metrics", {})
         )
         history = list(checkpoint.get("history", []))
+        early_stopping_state = checkpoint.get("early_stopping", {})
+        if (
+            early_stopping_state.get("metric")
+            == args.early_stopping_metric
+        ):
+            early_stopping_bad_validations = int(
+                early_stopping_state.get("bad_validations", 0)
+            )
     atomic_write_json(
         output_root / "resolved_config.json",
         {
@@ -1108,6 +1134,12 @@ def main():
         )
     else:
         print("Fine backbone: local residual diffusion Transformer")
+    if args.early_stopping_patience:
+        print(
+            "Early stopping: "
+            f"metric={args.early_stopping_metric}, "
+            f"patience={args.early_stopping_patience} validation runs"
+        )
     if config.occupancy_loss_mode == "weighted_operation":
         print(
             "Operation weights:\n"
@@ -1119,6 +1151,7 @@ def main():
             f"{config.operation_preserve_empty_weight:g}"
         )
     for epoch in range(start_epoch, epochs + 1):
+        early_stop_requested = False
         train_dataset.set_epoch(epoch)
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch)
@@ -1289,6 +1322,21 @@ def main():
                     val_stats, best_validation_metrics, epoch
                 )
             )
+            if args.early_stopping_patience:
+                if args.early_stopping_metric in improved_checkpoints:
+                    early_stopping_bad_validations = 0
+                else:
+                    early_stopping_bad_validations += 1
+                early_stop_requested = (
+                    early_stopping_bad_validations
+                    >= args.early_stopping_patience
+                )
+                print(
+                    "    early stopping    | "
+                    f"metric {args.early_stopping_metric} | "
+                    f"no improvement {early_stopping_bad_validations}/"
+                    f"{args.early_stopping_patience} validations"
+                )
         else:
             print(
                 f"  sampled validation | skipped; next at epoch "
@@ -1321,6 +1369,11 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "best_validation_metrics": best_validation_metrics,
+            "early_stopping": {
+                "metric": args.early_stopping_metric,
+                "patience": args.early_stopping_patience,
+                "bad_validations": early_stopping_bad_validations,
+            },
             "primary_checkpoint_metric": "fine_tolerant_0_2m_iou",
             "checkpoint_selection_metrics": (
                 {
@@ -1353,6 +1406,13 @@ def main():
                 checkpoint, output_root / "best_sampled_validation_iou.pt"
             )
         write_csv_rows(output_root / "history.csv", history)
+        if early_stop_requested:
+            print(
+                f"Early stopping at epoch {epoch}: "
+                f"{args.early_stopping_metric} did not improve for "
+                f"{early_stopping_bad_validations} validation runs."
+            )
+            break
     if best_validation_metrics:
         print("\nBEST VALIDATION CHECKPOINTS")
         for name, label in (
