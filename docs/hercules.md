@@ -62,6 +62,15 @@ Calibration/pose text paths are indexed once per scene per process, preserving
 missing/ambiguous-file errors and avoiding stats of every raw scan. Restart
 generation after changing files in a scene because the index is cached.
 
+Parallel generation explicitly uses `spawn`, avoiding inherited initialized
+Numba/BLAS state on Linux. At most twice the worker count is submitted at once;
+completed frames are reported without waiting behind an earlier slow frame.
+Seeds, fault assignment and output paths remain fixed before scheduling. Progress
+logs show the first completion and then every approximately five seconds when
+results arrive, including elapsed time and completed samples/second. This is not
+a heartbeat if all workers are blocked. Invalid synchronization still raises;
+pending work is canceled but already running tasks may finish during shutdown.
+
 For scene-held-out baseline experiments, create a manifest once using
 `python -m tools.create_hercules_scene_split --hercules-root "$RAW" --output "$SPLITS"`.
 This selects three scenes reproducibly (seed 42): one full validation scene,

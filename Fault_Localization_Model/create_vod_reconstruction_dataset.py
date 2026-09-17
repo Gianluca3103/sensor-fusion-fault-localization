@@ -8,7 +8,8 @@ the model's two PointPillars encoders create aligned 320x320 pseudo-BEVs.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+import multiprocessing
 import json
 import logging
 import hashlib
@@ -72,6 +73,25 @@ DEFAULT_FAULT_PLAN = (
 )
 WORKER_CONFIG: dict | None = None
 LIDAR_CORRUPTIONS = None
+
+
+def _bounded_results(executor, function, tasks, max_pending):
+    """Report completed work without queuing the entire dataset or blocking
+    behind a slow earlier frame. Per-task seeds/paths are already fixed."""
+    iterator = iter(tasks)
+    pending = set()
+    for _ in range(max_pending):
+        task = next(iterator, None)
+        if task is None:
+            break
+        pending.add(executor.submit(function, task))
+    while pending:
+        ready, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in ready:
+            yield future.result()
+            task = next(iterator, None)
+            if task is not None:
+                pending.add(executor.submit(function, task))
 
 
 def parse_args() -> argparse.Namespace:
@@ -664,36 +684,43 @@ def main() -> None:
         "Caching Radar for" if args.radar_cache_only else "Generating",
         len(tasks),
         args.split,
-        args.radar_variant,
+        'HeRCULES V2 adaptive stack' if args.hercules_root else args.radar_variant,
         args.num_workers,
     )
     created = cached = 0
+    processing_started = last_progress = time.perf_counter()
     if args.num_workers == 1:
         worker_initializer(config)
         results = map(worker_function, tasks)
         executor = None
     else:
+        LOGGER.info('Starting %d workers with spawn (no inherited Numba/BLAS state)...', args.num_workers)
         executor = ProcessPoolExecutor(
             max_workers=args.num_workers,
+            mp_context=multiprocessing.get_context('spawn'),
             initializer=worker_initializer,
             initargs=(config,),
         )
-        results = executor.map(worker_function, tasks, chunksize=1)
+        results = _bounded_results(executor, worker_function, tasks, args.num_workers * 2)
     try:
         for completed, result in enumerate(results, 1):
             cached += int(result["cached"])
             created += int(not result["cached"])
-            if completed % 100 == 0 or completed == len(tasks):
+            now = time.perf_counter()
+            if completed == 1 or now-last_progress >= 5 or completed == len(tasks):
                 LOGGER.info(
-                    "Processed %d/%d; created=%d cached=%d",
+                    "Processed %d/%d; created=%d cached=%d | %.2f samples/s | elapsed %.1fs",
                     completed,
                     len(tasks),
                     created,
                     cached,
+                    completed / max(now-processing_started, 1e-9),
+                    now-processing_started,
                 )
+                last_progress = now
     finally:
         if executor is not None:
-            executor.shutdown()
+            executor.shutdown(cancel_futures=True)
     if not args.radar_cache_only:
         LOGGER.info("Samples: %s", Path(args.output_root) / args.split)
     LOGGER.info("Radar cache: %s", Path(args.radar_cache_root) / args.split)
