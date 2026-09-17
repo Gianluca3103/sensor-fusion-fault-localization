@@ -38,7 +38,7 @@ from Fault_Localization_Model.fault_injector import (
     inject_fault,
     load_fault_injector,
 )
-from Fault_Localization_Model.io_utils import atomic_savez
+from Fault_Localization_Model.io_utils import atomic_savez, atomic_write_json
 from Fault_Localization_Model.lidar_observability import (
     LIDAR_SENSOR_ORIGIN,
     create_observability_map,
@@ -113,6 +113,8 @@ def parse_args() -> argparse.Namespace:
                         help='Lossless ZIP effort: 0 uncompressed, 1 fast (default), 6 standard.')
     parser.add_argument('--hercules-generation-order', choices=('chronological', 'random'),
                         default='chronological', help='Scheduling only; faults/seeds are assigned before ordering.')
+    parser.add_argument('--skip-invalid-synchronization', action='store_true',
+                        help='HeRCULES only: log/skip frames outside measured radar/pose coverage.')
     roots = parser.add_mutually_exclusive_group(required=True)
     roots.add_argument("--vod-root", type=Path)
     roots.add_argument("--hercules-root", type=Path)
@@ -391,7 +393,7 @@ def _task_output_path(task: dict, config: dict) -> Path:
     )
 
 
-def _create_sample(task: dict) -> dict:
+def _create_sample_impl(task: dict) -> dict:
     if WORKER_CONFIG is None or LIDAR_CORRUPTIONS is None:
         raise RuntimeError("VoD worker was not initialized")
     config = WORKER_CONFIG
@@ -422,6 +424,10 @@ def _create_sample(task: dict) -> dict:
     clean = lidar[range_mask & _within_bev(lidar, config)]
     if not len(clean):
         raise ValueError(f"No VoD LiDAR points remain in the BEV for {frame.frame_id}")
+
+    # Validate/load alignment before expensive injection and ray tracing. This
+    # changes no arrays; it only fails unsupported frames earlier.
+    radar, aligned_radar, lidar_from_radar = _load_frame_radar(frame, config)
 
     clean_ids = np.arange(len(clean), dtype=np.int64)
     injection, injection_metadata = inject_fault(
@@ -484,7 +490,6 @@ def _create_sample(task: dict) -> dict:
         **geometry,
     )
 
-    radar, aligned_radar, lidar_from_radar = _load_frame_radar(frame, config)
     _write_radar_cache(frame, radar, aligned_radar, config)
 
     metadata = {
@@ -571,6 +576,23 @@ def _create_sample(task: dict) -> dict:
     return {"path": str(destination), "cached": False}
 
 
+def _create_sample(task: dict) -> dict:
+    try:
+        return _create_sample_impl(task)
+    except Exception as error:
+        if WORKER_CONFIG is None or not WORKER_CONFIG.get('skip_invalid_synchronization'):
+            raise
+        from Fault_Localization_Model.hercules_dataset import HerculesSynchronizationError
+        if not isinstance(error, HerculesSynchronizationError):
+            raise
+        frame = task['frame']
+        return {'skipped': True, 'cached': False, 'path': '',
+                'frame_id': frame['frame_id'], 'split': frame['split'],
+                'lidar_path': frame['lidar_path'], 'scene': frame['radar_path'],
+                'fault': task.get('fault'), 'severity': task.get('severity'),
+                'reason_type': type(error).__name__, 'reason': str(error)}
+
+
 def _create_radar_cache(task: dict) -> dict:
     if WORKER_CONFIG is None:
         raise RuntimeError("VoD Radar-cache worker was not initialized")
@@ -654,6 +676,7 @@ def main() -> None:
     frames = frames[:count]
     config = {
         'npz_compression_level': args.npz_compression_level,
+        'skip_invalid_synchronization': args.skip_invalid_synchronization,
         "dataset": "HeRCULES" if args.hercules_root else "View-of-Delft",
         "hercules_radar_frames": args.hercules_radar_frames,
         "hercules_temporal_radius": args.hercules_temporal_radius,
@@ -713,6 +736,7 @@ def main() -> None:
         args.num_workers,
     )
     created = cached = 0
+    skipped = []
     processing_started = last_progress = time.perf_counter()
     if args.num_workers == 1:
         worker_initializer(config)
@@ -729,6 +753,12 @@ def main() -> None:
         results = _bounded_results(executor, worker_function, tasks, args.num_workers * 2)
     try:
         for completed, result in enumerate(results, 1):
+            if result.get('skipped'):
+                skipped.append(result)
+                now = time.perf_counter()
+                LOGGER.warning('Skipped unsupported synchronization %s/%s: %s',
+                               result['split'], result['frame_id'], result['reason'])
+                continue
             cached += int(result["cached"])
             created += int(not result["cached"])
             now = time.perf_counter()
@@ -748,6 +778,13 @@ def main() -> None:
             executor.shutdown(cancel_futures=True)
     if not args.radar_cache_only:
         LOGGER.info("Samples: %s", Path(args.output_root) / args.split)
+    if skipped:
+        report = Path(args.output_root) / f'skipped_synchronization_{args.split}.json'
+        atomic_write_json(report, {'split': args.split, 'count': len(skipped),
+                                   'strict_no_extrapolation': True, 'frames': skipped})
+        LOGGER.warning('Skipped %d unsupported frames; report: %s', len(skipped), report)
+    LOGGER.info('Finished %s: created=%d cached=%d skipped=%d eligible=%d',
+                args.split, created, cached, len(skipped), created + cached)
     LOGGER.info("Radar cache: %s", Path(args.radar_cache_root) / args.split)
 
 

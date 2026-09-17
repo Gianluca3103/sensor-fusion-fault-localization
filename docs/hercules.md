@@ -68,8 +68,20 @@ completed frames are reported without waiting behind an earlier slow frame.
 Seeds, fault assignment and output paths remain fixed before scheduling. Progress
 logs show the first completion and then every approximately five seconds when
 results arrive, including elapsed time and completed samples/second. This is not
-a heartbeat if all workers are blocked. Invalid synchronization still raises;
-pending work is canceled but already running tasks may finish during shutdown.
+a heartbeat if all workers are blocked. By default invalid synchronization
+still raises; pending work is canceled but already running tasks may finish
+during shutdown.
+
+Full-dataset generation may encounter LiDAR timestamps outside measured radar
+pose coverage. Do not extrapolate them. `--skip-invalid-synchronization` skips
+only typed radar/pose coverage, freshness, interpolation-gap and pose-gate
+failures; unrelated bugs and malformed inputs still terminate the run. Each
+skipped frame is warned immediately and written to
+`<output>/skipped_synchronization_<split>.json` with scene, source, assigned
+fault and exact reason. Radar alignment is attempted before fault injection and
+observability, avoiding expensive work for unsupported frames. Rerunning in the
+same roots reuses completed artifacts. Final split sizes are therefore eligible
+counts and can be smaller than discovered-frame quotas.
 
 HeRCULES generation now defaults to chronological scheduling **after** the
 original seeded selection, fault assignment and per-task seed creation. Use

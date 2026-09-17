@@ -7,7 +7,7 @@ import numpy as np
 
 from Fault_Localization_Model.hercules_dataset import (
     CONTINENTAL_DTYPE, discover_hercules_frames, load_hercules_lidar,
-    load_frame_radar, sensor_pose,
+    load_frame_radar, sensor_pose, HerculesSynchronizationError,
 )
 from models.two_stage_reconstruction_head.coarse_dataset import radar_cache_path
 from Fault_Localization_Model.hercules_tracking import compensate_doppler
@@ -136,6 +136,8 @@ class HerculesDatasetTests(unittest.TestCase):
                 load_hercules_lidar(bad)
             with self.assertRaises(ValueError):
                 sensor_pose(session / 'Aeva_gt.txt', 900_000_000)
+            with self.assertRaises(HerculesSynchronizationError):
+                sensor_pose(session / 'Aeva_gt.txt', 2_000_000_000)
 
     def test_configurable_causal_radar_age(self):
         with tempfile.TemporaryDirectory() as directory:

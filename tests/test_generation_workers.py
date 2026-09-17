@@ -3,6 +3,7 @@ import unittest
 from concurrent.futures import ProcessPoolExecutor
 from Fault_Localization_Model.create_vod_reconstruction_dataset import _bounded_results
 from Fault_Localization_Model.create_vod_reconstruction_dataset import _chronological_tasks
+from unittest.mock import patch
 
 
 def _identity(value):
@@ -10,6 +11,24 @@ def _identity(value):
 
 
 class GenerationWorkerTests(unittest.TestCase):
+    def test_only_typed_synchronization_errors_can_be_skipped(self):
+        import Fault_Localization_Model.create_vod_reconstruction_dataset as generator
+        from Fault_Localization_Model.hercules_dataset import HerculesSynchronizationError
+        task = {'frame': {'frame_id': '7', 'split': 'train', 'lidar_path': '/x/7.bin',
+                          'radar_path': '/scene'}, 'fault': 'fog', 'severity': 4}
+        previous = generator.WORKER_CONFIG
+        generator.WORKER_CONFIG = {'skip_invalid_synchronization': True}
+        try:
+            with patch.object(generator, '_create_sample_impl',
+                              side_effect=HerculesSynchronizationError('outside coverage')):
+                result = generator._create_sample(task)
+            self.assertTrue(result['skipped'])
+            self.assertEqual(result['frame_id'], '7')
+            with patch.object(generator, '_create_sample_impl', side_effect=RuntimeError('bug')):
+                with self.assertRaisesRegex(RuntimeError, 'bug'):
+                    generator._create_sample(task)
+        finally:
+            generator.WORKER_CONFIG = previous
     def test_ordering_preserves_faults_seeds_and_selected_frames(self):
         tasks = [{'frame': {'radar_path': scene, 'lidar_path': f'/lidar/{stamp}.bin'},
                   'fault': fault, 'severity': index+1, 'injection_seed': index*123}

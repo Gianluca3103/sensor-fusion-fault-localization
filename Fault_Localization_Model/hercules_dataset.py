@@ -22,6 +22,10 @@ from .hercules_tracking import compensate_doppler, dbscan_labels, make_observati
 
 ALIGNMENT_POLICY = 'hercules_v2_adaptive_tracked_raw_points_v1'
 
+
+class HerculesSynchronizationError(ValueError):
+    """A frame cannot be aligned from measured sensor/pose coverage."""
+
 CONTINENTAL_DTYPE = np.dtype({
     'names': ['x', 'y', 'z', 'velocity', 'range', 'rcs', 'azimuth', 'elevation'],
     'formats': ['<f4'] * 5 + ['u1', '<f4', '<f4'],
@@ -86,20 +90,22 @@ def sensor_pose(path, timestamp, max_gap_s=.2):
         left, right = min(pairs, key=lambda p: int(times[p[1]])-int(times[p[0]]))
         dt = (int(times[right])-int(times[left])) / 1e9
         if dt > max_gap_s:
-            raise ValueError(f'Exact pose exists, but velocity interval {dt*1000:.3f} ms '
+            raise HerculesSynchronizationError(f'Exact pose exists, but velocity interval {dt*1000:.3f} ms '
                              f'exceeds {max_gap_s*1000:g} ms: {path}, timestamp={timestamp}')
         return matrix, (values[right, :3]-values[left, :3]) / dt
     right = int(np.searchsorted(times, timestamp, side='right'))
     left = max(0, right - 1)
     right = min(right, len(times) - 1)
     if timestamp < times[0] or timestamp > times[-1]:
-        raise ValueError('Pose extrapolation is forbidden')
+        raise HerculesSynchronizationError(
+            f'Pose extrapolation is forbidden: {path}, timestamp={timestamp}, '
+            f'coverage=[{int(times[0])}, {int(times[-1])}]')
     dt = (int(times[right]) - int(times[left])) / 1e9
     if left == right:
         left -= 1
         dt = (int(times[right]) - int(times[left])) / 1e9
     if dt > max_gap_s:
-        raise ValueError(f'Pose interpolation gap {dt*1000:.3f} ms exceeds '
+        raise HerculesSynchronizationError(f'Pose interpolation gap {dt*1000:.3f} ms exceeds '
                          f'{max_gap_s*1000:g} ms: {path}, timestamp={timestamp}')
     alpha = (timestamp - int(times[left])) / 1e9 / dt
     matrix = np.eye(4)
@@ -208,10 +214,10 @@ def load_frame_radar(frame, config):
     if not np.isfinite(max_age_ms) or max_age_ms <= 0:
         raise ValueError('hercules_max_radar_age_ms must be finite and positive')
     if not stop:
-        raise ValueError(f'No radar at/before {timestamp}')
+        raise HerculesSynchronizationError(f'No radar at/before {timestamp}: {session}')
     newest_age_ms = (timestamp - times[stop-1]) / 1e6
     if newest_age_ms > max_age_ms:
-        raise ValueError(f'Newest causal radar is {newest_age_ms:.2f} ms old; '
+        raise HerculesSynchronizationError(f'Newest causal radar is {newest_age_ms:.2f} ms old; '
                          f'limit is {max_age_ms:g} ms at {timestamp}')
     stack = AdaptiveStackConfig(**config.get('hercules_stack', {
         'max_frames': config['hercules_radar_frames'] or None,
@@ -239,7 +245,7 @@ def load_frame_radar(frame, config):
         selected.append((paths[index], pose, velocity, age, distance, angle, weight))
     selected.reverse()
     if not selected:
-        raise ValueError(f'V2 pose gates selected no radar for {timestamp}')
+        raise HerculesSynchronizationError(f'V2 pose gates selected no radar for {timestamp}')
     lidar_to_imu, radar_to_lidar = _sensor_extrinsics(
         str(frame.lidar_calibration_path), str(frame.radar_calibration_path))
     imu_from_radar = lidar_to_imu[:3, :3] @ radar_to_lidar[:3, :3]
