@@ -14,6 +14,25 @@ from Fault_Localization_Model.hercules_tracking import compensate_doppler
 
 
 class HerculesDatasetTests(unittest.TestCase):
+    def test_text_files_indexed_once_and_ambiguity_preserved(self):
+        from Fault_Localization_Model.hercules_dataset import unique_file, _session_text_index
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'Aeva_gt.txt').write_text('fixture')
+            (root / 'Continental_gt.txt').write_text('fixture')
+            import os
+            with patch('Fault_Localization_Model.hercules_dataset.os.walk', wraps=os.walk) as walk:
+                self.assertEqual(unique_file(root, 'AEVA_GT.TXT'), root / 'Aeva_gt.txt')
+                self.assertEqual(unique_file(root, 'Continental_gt.txt'), root / 'Continental_gt.txt')
+                self.assertEqual(walk.call_count, 1)
+            nested = root / 'nested'
+            nested.mkdir()
+            (nested / 'Aeva_gt.txt').write_text('duplicate')
+            unique_file.cache_clear()
+            _session_text_index.cache_clear()
+            with self.assertRaisesRegex(ValueError, 'found 2'):
+                unique_file(root, 'Aeva_gt.txt')
+
     def test_scene_manifest_and_boundary_buffer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

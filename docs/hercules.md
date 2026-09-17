@@ -50,6 +50,18 @@ is a starting value, not a tuned optimum; HeRCULES RCS units are not VoD dBsm.
 
 ## University machine: generate
 
+Generation now warms the exact Numba observability kernel before discovery and
+worker startup and logs the selected backend. Without Numba, it fails with an
+installation instruction instead of silently spending minutes in the Python
+ray-tracing fallback. `--allow-slow-observability` explicitly permits that
+reference backend for diagnostics. Install Numba in the active environment,
+not a different Python environment. Initial compilation is a one-time startup
+cost; the kernel uses disk caching. The reference path remains available for
+array-exact comparison tests. No rays, height bins or confidence rules changed.
+Calibration/pose text paths are indexed once per scene per process, preserving
+missing/ambiguous-file errors and avoiding stats of every raw scan. Restart
+generation after changing files in a scene because the index is cached.
+
 For scene-held-out baseline experiments, create a manifest once using
 `python -m tools.create_hercules_scene_split --hercules-root "$RAW" --output "$SPLITS"`.
 This selects three scenes reproducibly (seed 42): one full validation scene,

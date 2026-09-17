@@ -8,6 +8,7 @@ from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 import json
+import os
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -42,8 +43,19 @@ def load_continental(path):
     return np.column_stack([records[key] for key in CONTINENTAL_DTYPE.names]).astype(np.float32)
 
 @lru_cache(maxsize=128)
+def _session_text_index(root):
+    """Walk directories once; never stat each of the scene's raw bin files."""
+    index = {}
+    for directory, _subdirectories, filenames in os.walk(root):
+        for filename in filenames:
+            if filename.lower().endswith('.txt'):
+                index.setdefault(filename.lower(), []).append(Path(directory) / filename)
+    return index
+
+
+@lru_cache(maxsize=128)
 def unique_file(root, name):
-    matches = [p for p in root.rglob('*') if p.is_file() and p.name.lower() == name.lower()]
+    matches = _session_text_index(str(root)).get(name.lower(), [])
     if len(matches) != 1:
         raise ValueError(f'Expected one {name} in session {root}, found {len(matches)}')
     return matches[0]
@@ -140,7 +152,11 @@ def discover_hercules_frames(root, split, radar_variant='radar', split_manifest=
 
 @lru_cache(maxsize=64)
 def radar_paths(session_text):
-    directories = [p for p in Path(session_text).rglob('*') if p.is_dir() and p.name.lower() == 'continental' and any(p.glob('*.bin'))]
+    directories = []
+    for directory, _subdirectories, filenames in os.walk(session_text):
+        path = Path(directory)
+        if path.name.lower() == 'continental' and any(name.endswith('.bin') for name in filenames):
+            directories.append(path)
     if len(directories) != 1:
         raise ValueError(f'Ambiguous/missing Continental directory: {session_text}')
     paths = sorted(directories[0].glob('*.bin'), key=lambda p: int(p.stem))

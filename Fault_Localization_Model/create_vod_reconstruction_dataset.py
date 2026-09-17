@@ -14,6 +14,7 @@ import logging
 import hashlib
 from pathlib import Path
 import random
+import time
 
 import numpy as np
 
@@ -39,6 +40,7 @@ from Fault_Localization_Model.io_utils import atomic_savez_compressed
 from Fault_Localization_Model.lidar_observability import (
     LIDAR_SENSOR_ORIGIN,
     create_observability_map,
+    warm_observability_backend,
 )
 from Fault_Localization_Model.reliability_maps import (
     canonical_maps_for_storage,
@@ -79,6 +81,8 @@ def parse_args() -> argparse.Namespace:
             "for the existing coarse HRNet reconstruction pipeline."
         )
     )
+    parser.add_argument('--allow-slow-observability', action='store_true',
+                        help='Explicitly permit the Python reference backend when Numba is missing.')
     roots = parser.add_mutually_exclusive_group(required=True)
     roots.add_argument("--vod-root", type=Path)
     roots.add_argument("--hercules-root", type=Path)
@@ -572,6 +576,19 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not args.radar_cache_only:
+        started = time.perf_counter()
+        LOGGER.info('Loading/compiling observability backend...')
+        compiled = warm_observability_backend()
+        if not compiled and not args.allow_slow_observability:
+            raise RuntimeError('Numba observability backend is unavailable. Install it in this '
+                               'Python environment: python -m pip install "numba>=0.60". '
+                               'The Python fallback is extremely slow; explicitly opt in with '
+                               '--allow-slow-observability only for diagnostics.')
+        LOGGER.log(logging.INFO if compiled else logging.WARNING,
+                   'Observability backend: %s | startup %.2fs',
+                   'Numba compiled exact DDA' if compiled else 'SLOW Python reference',
+                   time.perf_counter()-started)
     if args.hercules_root:
         from Fault_Localization_Model.hercules_dataset import discover_hercules_frames, ALIGNMENT_POLICY
         policy = {
