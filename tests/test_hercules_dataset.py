@@ -14,6 +14,31 @@ from Fault_Localization_Model.hercules_tracking import compensate_doppler
 
 
 class HerculesDatasetTests(unittest.TestCase):
+    def test_cached_source_processing_matches_uncached_and_reuses_scans(self):
+        from Fault_Localization_Model.hercules_dataset import _prepare_source_scan, dbscan_labels
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_session(root)
+            frames = discover_hercules_frames(root, 'train')[1:3]
+            expected = []
+            for frame in frames:
+                config = {'hercules_radar_frames': 20, 'hercules_temporal_radius': .75,
+                          '_hercules_cache_source_preprocessing': False}
+                _, points, transform = load_frame_radar(frame, config)
+                expected.append((points.copy(), transform.copy(), config['_hercules_alignment'],
+                                 config['_hercules_point_weights'].copy()))
+            _prepare_source_scan.cache_clear()
+            with patch('Fault_Localization_Model.hercules_dataset.dbscan_labels', wraps=dbscan_labels) as cluster:
+                for frame, reference in zip(frames, expected):
+                    config = {'hercules_radar_frames': 20, 'hercules_temporal_radius': .75}
+                    _, points, transform = load_frame_radar(frame, config)
+                    np.testing.assert_array_equal(points, reference[0])
+                    np.testing.assert_array_equal(transform, reference[1])
+                    self.assertEqual(config['_hercules_alignment'], reference[2])
+                    np.testing.assert_array_equal(config['_hercules_point_weights'], reference[3])
+                self.assertEqual(cluster.call_count, 2)  # two unique scans, not four stack visits
+            self.assertGreaterEqual(_prepare_source_scan.cache_info().hits, 2)
+
     def test_text_files_indexed_once_and_ambiguity_preserved(self):
         from Fault_Localization_Model.hercules_dataset import unique_file, _session_text_index
         with tempfile.TemporaryDirectory() as directory:

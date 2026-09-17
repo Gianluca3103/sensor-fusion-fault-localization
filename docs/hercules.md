@@ -71,6 +71,27 @@ results arrive, including elapsed time and completed samples/second. This is not
 a heartbeat if all workers are blocked. Invalid synchronization still raises;
 pending work is canceled but already running tasks may finish during shutdown.
 
+HeRCULES generation now defaults to chronological scheduling **after** the
+original seeded selection, fault assignment and per-task seed creation. Use
+`--hercules-generation-order random` to restore the old scheduling for an
+A/B check. Training shuffle is unaffected. Per-process bounded caches reuse
+source radar poses, sensor extrinsics, validity-filtered native points, source
+Doppler compensation and native-coordinate dynamic clustering. They never
+reuse current-frame alignment, temporal gates/weights, associations, object
+advancement or final temporal filtering. Cached arrays are read-only. Configuration
+and calibration-path/rotation values participate in the cache keys; restart
+after editing raw/calibration files in place, as with the existing decode cache.
+
+`--npz-compression-level 1` (default) uses fast lossless DEFLATE for samples and
+radar archives. Level 6 restores normal compression effort; level 0 stores
+arrays uncompressed. Values, dtypes and the NumPy reader contract are identical,
+but archive sizes/bytes can differ. Existing artifacts are not recompressed.
+The default HeRCULES worker count is now up to 8 logical CPUs; explicit
+`--num-workers` wins. VoD retains its default of 4. Spawned workers receive
+one-thread numerical-library defaults unless overridden in the environment.
+Set the four thread variables to 1 in the shell for reproducible comparisons.
+Eight workers are a starting point, not a guarantee of faster performance.
+
 For scene-held-out baseline experiments, create a manifest once using
 `python -m tools.create_hercules_scene_split --hercules-root "$RAW" --output "$SPLITS"`.
 This selects three scenes reproducibly (seed 42): one full validation scene,

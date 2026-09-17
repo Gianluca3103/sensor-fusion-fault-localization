@@ -46,6 +46,27 @@ def atomic_savez_compressed(path, **arrays):
     _atomic_replace(path, lambda temporary: np.savez_compressed(temporary, **arrays))
 
 
+def atomic_savez(path, *, compression_level=1, **arrays):
+    """NumPy-compatible, lossless NPZ with explicit ZIP compression effort.
+
+    Level 0 stores arrays verbatim; 1 is fast DEFLATE; 6 matches normal ZIP
+    effort. Only container encoding changes, never array values/dtypes.
+    """
+    import numpy as np
+    import zipfile
+    if not isinstance(compression_level, int) or not 0 <= compression_level <= 9:
+        raise ValueError('compression_level must be an integer from 0 to 9')
+    def write(temporary):
+        compression = zipfile.ZIP_STORED if compression_level == 0 else zipfile.ZIP_DEFLATED
+        with zipfile.ZipFile(temporary, 'w', compression=compression,
+                             compresslevel=compression_level if compression_level else None,
+                             allowZip64=True) as archive:
+            for name, value in arrays.items():
+                with archive.open(name + '.npy', 'w', force_zip64=True) as stream:
+                    np.lib.format.write_array(stream, np.asanyarray(value), allow_pickle=False)
+    _atomic_replace(Path(path), write)
+
+
 def atomic_torch_save(payload, path):
     """Atomically save a trusted PyTorch checkpoint."""
     import torch

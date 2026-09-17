@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing
+import os
 import json
 import logging
 import hashlib
@@ -37,7 +38,7 @@ from Fault_Localization_Model.fault_injector import (
     inject_fault,
     load_fault_injector,
 )
-from Fault_Localization_Model.io_utils import atomic_savez_compressed
+from Fault_Localization_Model.io_utils import atomic_savez
 from Fault_Localization_Model.lidar_observability import (
     LIDAR_SENSOR_ORIGIN,
     create_observability_map,
@@ -94,6 +95,11 @@ def _bounded_results(executor, function, tasks, max_pending):
                 pending.add(executor.submit(function, task))
 
 
+def _chronological_tasks(tasks):
+    return sorted(tasks, key=lambda task: (task['frame']['radar_path'],
+                                           int(Path(task['frame']['lidar_path']).stem)))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -103,6 +109,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--allow-slow-observability', action='store_true',
                         help='Explicitly permit the Python reference backend when Numba is missing.')
+    parser.add_argument('--npz-compression-level', type=int, choices=range(10), default=1,
+                        help='Lossless ZIP effort: 0 uncompressed, 1 fast (default), 6 standard.')
+    parser.add_argument('--hercules-generation-order', choices=('chronological', 'random'),
+                        default='chronological', help='Scheduling only; faults/seeds are assigned before ordering.')
     roots = parser.add_mutually_exclusive_group(required=True)
     roots.add_argument("--vod-root", type=Path)
     roots.add_argument("--hercules-root", type=Path)
@@ -154,7 +164,8 @@ def parse_args() -> argparse.Namespace:
         default=["fog_sim:4", "fog_sim:5", "fov_filter:1", "total_loss:1"],
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int,
+                        help='Default: up to 8 CPU workers for HeRCULES, 4 for VoD.')
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=64.0)
     parser.add_argument("--y-min", type=float, default=-32.0)
@@ -358,8 +369,9 @@ def _write_radar_cache(
         if config["bev_channel_profile"] == "engineered"
         else _radar_bev(aligned, config)
     )
-    atomic_savez_compressed(
+    atomic_savez(
         destination,
+        compression_level=config.get('npz_compression_level', 6),
         radar_bev=radar_bev.astype(np.float16),
         radar_points=pointpillars_points,
         **({"radar_point_weights": config['_hercules_point_weights']} if config.get('dataset') == 'HeRCULES' else {}),
@@ -531,8 +543,9 @@ def _create_sample(task: dict) -> dict:
     sample_arrays = {
         "faulty_lidar_input_bev": engineered_lidar.astype(np.float16)
     } if engineered_lidar is not None else {}
-    atomic_savez_compressed(
+    atomic_savez(
         destination,
+        compression_level=config.get('npz_compression_level', 6),
         **canonical_maps_for_storage(maps),
         clean_rgb=make_rgb_preview(clean_layers),
         clean_density=clean_layers["raw_density"],
@@ -591,6 +604,12 @@ def _serialize_frame(frame: VODFrame) -> dict:
 
 def main() -> None:
     args = parse_args()
+    if args.num_workers is None:
+        args.num_workers = min(8, os.cpu_count() or 1) if args.hercules_root else 4
+    # Spawned interpreters read these before importing NumPy. Explicit user
+    # settings win; single-worker BLAS is best controlled in the shell.
+    for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        os.environ.setdefault(variable, '1')
     _validate_args(args)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -634,6 +653,7 @@ def main() -> None:
         )
     frames = frames[:count]
     config = {
+        'npz_compression_level': args.npz_compression_level,
         "dataset": "HeRCULES" if args.hercules_root else "View-of-Delft",
         "hercules_radar_frames": args.hercules_radar_frames,
         "hercules_temporal_radius": args.hercules_temporal_radius,
@@ -679,6 +699,11 @@ def main() -> None:
             )
         worker_initializer = _worker_init
         worker_function = _create_sample
+    if args.hercules_root and args.hercules_generation_order == 'chronological':
+        tasks = _chronological_tasks(tasks)
+    LOGGER.info('Scheduling: %s | lossless NPZ compression level: %d',
+                args.hercules_generation_order if args.hercules_root else 'random',
+                args.npz_compression_level)
     LOGGER.info(
         "%s %d %s frames using %s and %d workers",
         "Caching Radar for" if args.radar_cache_only else "Generating",

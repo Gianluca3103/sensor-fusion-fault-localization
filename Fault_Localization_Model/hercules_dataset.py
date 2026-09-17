@@ -162,6 +162,43 @@ def radar_paths(session_text):
     paths = sorted(directories[0].glob('*.bin'), key=lambda p: int(p.stem))
     return tuple(int(p.stem) for p in paths), paths
 
+
+@lru_cache(maxsize=4096)
+def _source_pose(path, timestamp, max_gap_s):
+    pose, velocity = sensor_pose(path, timestamp, max_gap_s)
+    pose.setflags(write=False)
+    velocity.setflags(write=False)
+    return pose, velocity
+
+
+@lru_cache(maxsize=128)
+def _sensor_extrinsics(lidar_calibration_path, radar_calibration_path):
+    lidar_to_imu = _named_transform(Path(lidar_calibration_path), 'Tr_lidar_to_imu')
+    radar_to_lidar = np.linalg.inv(_named_transform(Path(radar_calibration_path), 'Tr_lidar_to_radar'))
+    lidar_to_imu.setflags(write=False)
+    radar_to_lidar.setflags(write=False)
+    return lidar_to_imu, radar_to_lidar
+
+
+def _prepare_source_scan_uncached(path, radar_gt, max_pose_gap_s, imu_rotation, tracking_values):
+    """All calculations here depend on the source scan, never central LiDAR."""
+    tracking = DopplerTrackingConfig(**dict(tracking_values))
+    native = load_continental(Path(path))
+    native = native[np.isfinite(native).all(axis=1) & (native[:, 4] > 0)]
+    pose, velocity = _source_pose(radar_gt, int(Path(path).stem), max_pose_gap_s)
+    world = pose.copy()
+    world[:3, :3] = world[:3, :3] @ np.asarray(imu_rotation).reshape(3, 3)
+    compensated, sign, _ = compensate_doppler(native, world[:3, :3].T @ velocity,
+        tracking.doppler_sign, tracking.sign_inference_min_speed_mps)
+    dynamic = np.abs(compensated) > tracking.dynamic_threshold_mps
+    labels = dbscan_labels(native[:, :2], dynamic, tracking.cluster_eps_m, tracking.cluster_min_samples)
+    for array in (native, world, compensated, dynamic, labels):
+        array.setflags(write=False)
+    return native, world, compensated, sign, dynamic, labels
+
+
+_prepare_source_scan = lru_cache(maxsize=256)(_prepare_source_scan_uncached)
+
 def load_frame_radar(frame, config):
     session = frame.radar_path
     timestamp = int(frame.lidar_path.stem)
@@ -192,7 +229,7 @@ def load_frame_radar(frame, config):
         age = (timestamp - times[index]) / 1e9
         if age > stack.max_age_s:
             break
-        pose, velocity = sensor_pose(radar_gt, times[index], max_pose_gap_s)
+        pose, velocity = _source_pose(str(radar_gt), times[index], max_pose_gap_s)
         relative = np.linalg.inv(reference) @ pose
         distance = float(np.linalg.norm(relative[:3, 3]))
         angle = float(np.degrees(Rotation.from_matrix(relative[:3, :3]).magnitude()))
@@ -203,23 +240,20 @@ def load_frame_radar(frame, config):
     selected.reverse()
     if not selected:
         raise ValueError(f'V2 pose gates selected no radar for {timestamp}')
-    lidar_to_imu = _named_transform(frame.lidar_calibration_path, 'Tr_lidar_to_imu')
-    radar_to_lidar = np.linalg.inv(_named_transform(frame.radar_calibration_path, 'Tr_lidar_to_radar'))
+    lidar_to_imu, radar_to_lidar = _sensor_extrinsics(
+        str(frame.lidar_calibration_path), str(frame.radar_calibration_path))
     imu_from_radar = lidar_to_imu[:3, :3] @ radar_to_lidar[:3, :3]
+    imu_rotation = tuple(imu_from_radar.flatten())
+    tracking_values = tuple(sorted(asdict(tracking).items()))
+    prepare = _prepare_source_scan if config.get('_hercules_cache_source_preprocessing', True) else _prepare_source_scan_uncached
     current, _ = sensor_pose(unique_file(session, 'Aeva_gt.txt'), timestamp, max_pose_gap_s)
     current[:3, :3] = current[:3, :3] @ lidar_to_imu[:3, :3]
     processed, raw_frames, rotations, alignment_rows = [], [], [], []
     for path, pose, velocity, age, distance, angle, weight in selected:
-        native = load_continental(path)
-        native = native[np.isfinite(native).all(axis=1) & (native[:, 4] > 0)]
-        world = pose.copy()
-        world[:3, :3] = world[:3, :3] @ imu_from_radar
+        native, world, compensated, sign, dynamic, labels = prepare(
+            str(path), str(radar_gt), max_pose_gap_s, imu_rotation, tracking_values)
         transform = np.linalg.inv(current) @ world
         xyz = native[:, :3] @ transform[:3, :3].T + transform[:3, 3]
-        compensated, sign, _ = compensate_doppler(native, world[:3, :3].T @ velocity,
-            tracking.doppler_sign, tracking.sign_inference_min_speed_mps)
-        dynamic = np.abs(compensated) > tracking.dynamic_threshold_mps
-        labels = dbscan_labels(native[:, :2], dynamic, tracking.cluster_eps_m, tracking.cluster_min_samples)
         aligned_native = native.copy()
         aligned_native[:, :3] = xyz
         processed.append(ProcessedFrame(int(path.stem), aligned_native, compensated, dynamic, labels,
