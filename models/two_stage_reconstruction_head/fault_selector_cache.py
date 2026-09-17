@@ -73,12 +73,7 @@ def load_selector_inputs(sample_path: str | Path) -> dict[str, np.ndarray]:
         stored_support = (
             np.asarray(sample["valid_support_mask"], dtype=np.float32)
             if "valid_support_mask" in sample.files
-            else None
-        )
-    if stored_support is None:
-        raise ValueError(
-            f"{sample_path} does not contain valid_support_mask; regenerate the "
-            "View-of-Delft sample before building selector caches"
+            else np.ones_like(arrays["fault_heatmap"], dtype=np.float32)
         )
     if stored_support.shape != arrays["fault_heatmap"].shape:
         raise ValueError(
@@ -105,8 +100,17 @@ def _resize_binary_mask(mask: np.ndarray) -> np.ndarray:
 
 def _load_faulty_occupancy(sample_path: str | Path) -> np.ndarray:
     with np.load(sample_path, allow_pickle=False) as sample:
-        density = np.asarray(sample["faulty_density"])
-    return density > 0
+        if "faulty_density" in sample.files:
+            return np.asarray(sample["faulty_density"]) > 0
+        # Channel zero of the stored LiDAR RGB representation is the exact
+        # binary occupancy map, so compact artifacts need no duplicate grid.
+        faulty_rgb = np.asarray(sample["faulty_rgb"])
+    if faulty_rgb.ndim != 3 or faulty_rgb.shape[2] < 1:
+        raise ValueError(
+            f"faulty_rgb in {sample_path} must have shape [H,W,>=1], got "
+            f"{faulty_rgb.shape}"
+        )
+    return faulty_rgb[..., 0] > 0
 
 
 def load_selector_cache(

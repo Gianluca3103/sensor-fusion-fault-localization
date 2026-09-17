@@ -15,6 +15,18 @@ LEGACY_DUPLICATE_MAP_KEYS = {
     "wrong_counts",
 }
 
+# These are the only reliability products consumed when building the fault
+# selector cache.  The remaining products are generation diagnostics or
+# per-point provenance and can be omitted from training artifacts.
+TRAINING_RELIABILITY_MAP_KEYS = {
+    "fault_heatmap",
+    "reliability_map",
+    "faulty_counts",
+    "missing_faulty_counts",
+    "moved_faulty_counts",
+    "added_faulty_counts",
+}
+
 
 def point_counts_grid(points, x_min, x_max, y_min, y_max, grid_rows, grid_cols):
     points = np.asarray(points)
@@ -192,3 +204,15 @@ def canonical_maps_for_storage(maps):
         for key, value in maps.items()
         if key not in LEGACY_DUPLICATE_MAP_KEYS
     }
+
+
+def training_maps_for_storage(maps):
+    """Return the lossless subset required to build reconstruction masks."""
+
+    missing = TRAINING_RELIABILITY_MAP_KEYS.difference(maps)
+    if missing:
+        raise KeyError(
+            "Reliability maps are missing training fields: "
+            + ", ".join(sorted(missing))
+        )
+    return {key: maps[key] for key in sorted(TRAINING_RELIABILITY_MAP_KEYS)}

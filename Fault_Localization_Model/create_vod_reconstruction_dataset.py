@@ -47,6 +47,7 @@ from Fault_Localization_Model.lidar_observability import (
 from Fault_Localization_Model.reliability_maps import (
     canonical_maps_for_storage,
     make_reliability_maps,
+    training_maps_for_storage,
 )
 from Fault_Localization_Model.vod_dataset import (
     BEVGeometry,
@@ -109,8 +110,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--allow-slow-observability', action='store_true',
                         help='Explicitly permit the Python reference backend when Numba is missing.')
-    parser.add_argument('--npz-compression-level', type=int, choices=range(10), default=1,
-                        help='Lossless ZIP effort: 0 uncompressed, 1 fast (default), 6 standard.')
+    parser.add_argument('--npz-compression-level', type=int, choices=range(10), default=6,
+                        help='Lossless ZIP effort: 0 uncompressed, 1 fast, 6 standard (default).')
+    parser.add_argument(
+        '--artifact-profile', choices=('training', 'full'), default='training',
+        help=(
+            'training (default) omits unused per-point provenance and dense '
+            'diagnostic arrays; full preserves every generation diagnostic.'
+        ),
+    )
     parser.add_argument('--hercules-generation-order', choices=('chronological', 'random'),
                         default='chronological', help='Scheduling only; faults/seeds are assigned before ordering.')
     parser.add_argument('--skip-invalid-synchronization', action='store_true',
@@ -317,6 +325,8 @@ def _write_radar_cache(
     ).astype(np.float32, copy=False)
     metadata = {
         "cache_format_version": 1,
+        "artifact_profile": "training",
+        "artifact_compression_level": config.get("npz_compression_level", 6),
         "dataset": config.get("dataset", "View-of-Delft"),
         "native_sensor": "Continental" if config.get("dataset") == "HeRCULES" else "VoD radar",
         "hercules_alignment": config.get('_hercules_alignment', {}),
@@ -541,6 +551,8 @@ def _create_sample_impl(task: dict) -> dict:
         ],
         "spatial_support": "shared front 64m x 64m Cartesian BEV",
         "generator_version": GENERATOR_VERSION,
+        "artifact_profile": config.get("artifact_profile", "training"),
+        "artifact_compression_level": config.get("npz_compression_level", 6),
         "remove_added_points": config["remove_added_points"],
         "injection_seed": task["injection_seed"],
         "injection_metadata": injection_metadata,
@@ -548,29 +560,38 @@ def _create_sample_impl(task: dict) -> dict:
     sample_arrays = {
         "faulty_lidar_input_bev": engineered_lidar.astype(np.float16)
     } if engineered_lidar is not None else {}
+    compact = config.get("artifact_profile", "training") == "training"
+    reliability_arrays = (
+        training_maps_for_storage(maps)
+        if compact
+        else canonical_maps_for_storage(maps)
+    )
+    diagnostic_arrays = {} if compact else {
+        "clean_density": clean_layers["raw_density"],
+        "faulty_density": faulty_layers["raw_density"],
+        "clean_point_ids": clean_ids,
+        "faulty_point_ids": faulty_ids,
+        "faulty_source_ids": faulty_source_ids,
+        "faulty_injector_labels": faulty_labels,
+        "observability_ray_count": observability["ray_count"].astype(np.uint32),
+        "observability_vertical_coverage": observability[
+            "vertical_coverage"
+        ].astype(np.float16),
+        "observability_ray_support": observability["ray_support"].astype(np.float16),
+        "valid_support_mask": np.ones((320, 320), dtype=np.uint8),
+    }
     atomic_savez(
         destination,
         compression_level=config.get('npz_compression_level', 6),
-        **canonical_maps_for_storage(maps),
+        **reliability_arrays,
         clean_rgb=make_rgb_preview(clean_layers),
-        clean_density=clean_layers["raw_density"],
         faulty_rgb=make_rgb_preview(faulty_layers),
-        faulty_density=faulty_layers["raw_density"],
-        clean_point_ids=clean_ids,
-        faulty_point_ids=faulty_ids,
-        faulty_source_ids=faulty_source_ids,
-        faulty_injector_labels=faulty_labels,
         faulty_lidar_points=faulty[:, :4].astype(np.float32, copy=False),
         observability_confidence=observability[
             "observability_confidence"
         ].astype(np.float16),
-        observability_ray_count=observability["ray_count"].astype(np.uint32),
-        observability_vertical_coverage=observability[
-            "vertical_coverage"
-        ].astype(np.float16),
-        observability_ray_support=observability["ray_support"].astype(np.float16),
-        valid_support_mask=np.ones((320, 320), dtype=np.uint8),
         metadata_json=np.asarray(json.dumps(metadata)),
+        **diagnostic_arrays,
         **sample_arrays,
     )
     return {"path": str(destination), "cached": False}
@@ -676,6 +697,7 @@ def main() -> None:
     frames = frames[:count]
     config = {
         'npz_compression_level': args.npz_compression_level,
+        'artifact_profile': args.artifact_profile,
         'skip_invalid_synchronization': args.skip_invalid_synchronization,
         "dataset": "HeRCULES" if args.hercules_root else "View-of-Delft",
         "hercules_radar_frames": args.hercules_radar_frames,

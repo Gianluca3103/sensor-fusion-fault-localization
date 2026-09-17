@@ -207,3 +207,23 @@ are constructed without augmentation. Flips, translation up to 0.5 m, yaw up
 to 5 degrees and scale 0.95–1.05 are enabled in the configurations above.
 This does not regenerate weather/FOV/total-loss faults every epoch: fault
 samples remain the controlled generated inputs; geometric augmentation is online.
+# Compact training artifacts
+
+HeRCULES generation defaults to the `training` artifact profile and standard
+lossless ZIP compression (level 6). This profile keeps the LiDAR/radar
+PointPillars inputs, reconstruction target, fault-selector evidence,
+observability confidence, and metadata, but omits generation-only per-point
+provenance and duplicate diagnostic grids. Use `--artifact-profile full` only
+when those low-level generation diagnostics are explicitly required.
+
+Existing datasets can be converted in place, one archive at a time, with:
+
+```bash
+python -u -m tools.compact_reconstruction_artifacts \
+  /path/to/generated_samples /path/to/radar_cache \
+  --compression-level 6
+```
+
+The converter writes and validates an atomic replacement before removing the
+old archive. It therefore requires enough free space for one compact archive,
+not a second copy of the complete dataset.
