@@ -152,6 +152,23 @@ tracks, and motion-compensated point count. Widening the gates makes the cloud
 denser but increases alignment uncertainty; it is therefore explicit rather
 than silently accumulating an entire scene.
 
+Static HeRCULES XY, XZ, and YZ comparisons use the same alignment contract:
+
+```bash
+python -m scripts.visualize_hercules_3d_projections \
+  --hercules-root /path/to/HeRCULES \
+  --split val --frame-index 0 \
+  --radar-frames 0 \
+  --max-history-s 2.0 \
+  --max-translation-m 8.0 \
+  --max-rotation-deg 10.0 \
+  --output-root /path/to/hercules_projection_figures
+```
+
+It saves separate nine-panel figures for raw points and occupied voxel centers.
+Each figure contains LiDAR, stacked radar, and their overlay in all three
+orthographic projections, plus a JSON alignment summary.
+
 ```bash
 python -m scripts.cache_3d_voxels \
   --data-root /path/to/reconstruction_samples \
