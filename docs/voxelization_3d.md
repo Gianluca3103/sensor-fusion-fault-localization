@@ -169,6 +169,28 @@ It saves separate nine-panel figures for raw points and occupied voxel centers.
 Each figure contains LiDAR, stacked radar, and their overlay in all three
 orthographic projections, plus a JSON alignment summary.
 
+### 3D temporal radar-voxel filtering
+
+The maintained accumulation filter uses an XY radius and preserves the newest
+scan. For stricter visualization/preprocessing, the HeRCULES tools optionally
+apply a second filter after ego-motion and tracked-object compensation:
+
+```bash
+--voxel-temporal-filter \
+--voxel-min-scans 3 \
+--voxel-min-scan-fraction 0.15 \
+--voxel-neighbor-radius-cells 1
+```
+
+For each occupied 3D voxel, the filter counts distinct scans with occupancy in
+its local XYZ neighborhood. Required support is the larger of three scans and
+15% of the accepted stack. A one-cell neighborhood allows normal radar spatial
+uncertainty while still enforcing vertical consistency. Newest-scan points are
+not automatically retained; add `--voxel-preserve-current-scan` only when
+retaining newly appearing objects is more important than suppressing clutter.
+The output JSON records input/output points, occupied/rejected voxels, distinct
+scans, and the effective support requirement.
+
 ```bash
 python -m scripts.cache_3d_voxels \
   --data-root /path/to/reconstruction_samples \

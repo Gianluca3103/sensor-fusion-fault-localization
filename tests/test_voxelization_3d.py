@@ -17,6 +17,10 @@ from voxelization.cache import (
     load_voxel_cache,
     write_voxel_cache,
 )
+from voxelization import (
+    VoxelTemporalConsistencyConfig,
+    filter_temporally_consistent_radar_voxels,
+)
 
 
 LIDAR_FIELDS = ("x", "y", "z", "reflectivity")
@@ -160,6 +164,57 @@ class Voxelization3DTests(unittest.TestCase):
         self.assertEqual(result.nonfinite_point_count, 1)
         self.assertEqual(result.out_of_range_point_count, 1)
         self.assertEqual(result.valid_point_count, 1)
+
+    def test_temporal_radar_filter_removes_transient_3d_voxels(self):
+        # Seven fields follow the aligned radar contract; only XYZ and the
+        # final relative scan index are interpreted by this filter.
+        persistent = np.asarray(
+            [
+                [10.01, 1.01, 0.01, 20, 0, 0, -2],
+                [10.02, 1.02, 0.02, 21, 0, 0, -1],
+                [10.03, 1.03, 0.03, 22, 0, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+        transient = np.asarray(
+            [[20.01, 5.01, 2.01, 30, 0, 0, 0]], dtype=np.float32
+        )
+        filtered, statistics = filter_temporally_consistent_radar_voxels(
+            np.concatenate((persistent, transient)),
+            self.grid,
+            VoxelTemporalConsistencyConfig(
+                min_scans=3,
+                min_scan_fraction=0.0,
+                neighbor_radius_cells=1,
+                preserve_current_scan=False,
+            ),
+        )
+        self.assertTrue(np.array_equal(filtered, persistent))
+        self.assertEqual(statistics["distinct_scans"], 3)
+        self.assertEqual(statistics["required_scans"], 3)
+        self.assertEqual(statistics["rejected_points"], 1)
+
+    def test_temporal_radar_filter_can_preserve_newest_scan(self):
+        points = np.asarray(
+            [
+                [10, 0, 0, 1, 0, 0, -1],
+                [20, 0, 2, 2, 0, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+        filtered, statistics = filter_temporally_consistent_radar_voxels(
+            points,
+            self.grid,
+            VoxelTemporalConsistencyConfig(
+                min_scans=2,
+                min_scan_fraction=0.0,
+                neighbor_radius_cells=0,
+                preserve_current_scan=True,
+            ),
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(float(filtered[0, 0]), 20.0)
+        self.assertTrue(statistics["preserve_current_scan"])
 
 
 if __name__ == "__main__":

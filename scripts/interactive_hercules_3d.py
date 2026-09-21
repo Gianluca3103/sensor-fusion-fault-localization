@@ -20,7 +20,12 @@ from Fault_Localization_Model.hercules_dataset import (
     load_hercules_lidar,
 )
 from scripts.interactive_3d_voxels import InteractiveVoxelViewer
-from voxelization import HardVoxelizer, load_voxelization_config
+from voxelization import (
+    HardVoxelizer,
+    VoxelTemporalConsistencyConfig,
+    filter_temporally_consistent_radar_voxels,
+    load_voxelization_config,
+)
 
 
 HERCULES_LIDAR_FIELDS = ("x", "y", "z", "reflectivity")
@@ -62,6 +67,11 @@ def main() -> None:
     parser.add_argument("--max-pose-gap-ms", type=float, default=200.0)
     parser.add_argument("--temporal-radius-m", type=float, default=0.75)
     parser.add_argument("--doppler-sign", choices=("auto", "1", "-1"), default="auto")
+    parser.add_argument("--voxel-temporal-filter", action="store_true")
+    parser.add_argument("--voxel-min-scans", type=int, default=3)
+    parser.add_argument("--voxel-min-scan-fraction", type=float, default=0.15)
+    parser.add_argument("--voxel-neighbor-radius-cells", type=int, default=1)
+    parser.add_argument("--voxel-preserve-current-scan", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-raw-points", type=int, default=20000)
     parser.add_argument("--max-centers", type=int, default=5000)
@@ -90,6 +100,7 @@ def main() -> None:
         raise IndexError(f"frame-index must be in [0, {len(frames) - 1}]")
     frame = frames[args.frame_index]
     lidar = load_hercules_lidar(frame.lidar_path)
+    voxel_config = load_voxelization_config(args.config)
     radar_config = {
         "hercules_radar_frames": args.radar_frames,
         "hercules_temporal_radius": args.temporal_radius_m,
@@ -107,8 +118,19 @@ def main() -> None:
     _, radar, _ = load_frame_radar(frame, radar_config)
     alignment = radar_config["_hercules_alignment"]
     rows = alignment["alignment_rows"]
+    voxel_temporal_stats = None
+    if args.voxel_temporal_filter:
+        radar, voxel_temporal_stats = filter_temporally_consistent_radar_voxels(
+            radar,
+            voxel_config.grid,
+            VoxelTemporalConsistencyConfig(
+                min_scans=args.voxel_min_scans,
+                min_scan_fraction=args.voxel_min_scan_fraction,
+                neighbor_radius_cells=args.voxel_neighbor_radius_cells,
+                preserve_current_scan=args.voxel_preserve_current_scan,
+            ),
+        )
 
-    voxel_config = load_voxelization_config(args.config)
     lidar_voxelizer = HardVoxelizer(
         voxel_config.grid,
         max_points_per_voxel=voxel_config.lidar.max_points_per_voxel,
@@ -159,6 +181,8 @@ def main() -> None:
     print(f"Temporal filter counts: {alignment['filter_counts']}")
     print(f"Confirmed dynamic tracks: {alignment['confirmed_tracks']}")
     print(f"Motion-compensated radar points: {alignment['motion_compensated_points']}")
+    if voxel_temporal_stats is not None:
+        print(f"3D voxel-temporal filter: {voxel_temporal_stats}")
 
     if args.save_snapshot is not None:
         args.save_snapshot.parent.mkdir(parents=True, exist_ok=True)

@@ -23,6 +23,10 @@ from .config import (  # noqa: E402
     load_voxelization_config,
 )
 from .hard_voxelizer import HardVoxelizer, VoxelizedPointCloud  # noqa: E402
+from .temporal_radar_filter import (  # noqa: E402
+    VoxelTemporalConsistencyConfig,
+    filter_temporally_consistent_radar_voxels,
+)
 
 __all__ = (
     "HardVoxelizer",
@@ -30,5 +34,7 @@ __all__ = (
     "VoxelGridConfig",
     "VoxelizationConfig",
     "VoxelizedPointCloud",
+    "VoxelTemporalConsistencyConfig",
+    "filter_temporally_consistent_radar_voxels",
     "load_voxelization_config",
 )
