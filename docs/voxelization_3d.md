@@ -191,6 +191,21 @@ retaining newly appearing objects is more important than suppressing clutter.
 The output JSON records input/output points, occupied/rejected voxels, distinct
 scans, and the effective support requirement.
 
+For a purely spatial ablation with no temporal support requirement:
+
+```bash
+--disable-point-temporal-filter \
+--spatial-voxel-filter \
+--spatial-neighbor-radius-cells 2 \
+--spatial-min-neighbor-voxels 1
+```
+
+This retains the basic finite/range/height validity gates, then removes only
+occupied 3D radar voxels that have no other occupied voxel within the configured
+XYZ neighborhood. It never reads the scan timestamp. A two-cell radius is
+approximately 0.4 m in XY and 0.5 m in Z with the default grid. Increasing the
+minimum neighbor count makes the filter substantially more aggressive.
+
 ```bash
 python -m scripts.cache_3d_voxels \
   --data-root /path/to/reconstruction_samples \

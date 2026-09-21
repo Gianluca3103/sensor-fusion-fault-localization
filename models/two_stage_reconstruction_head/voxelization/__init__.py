@@ -16,6 +16,10 @@ from .temporal_radar_filter import (
     VoxelTemporalConsistencyConfig,
     filter_temporally_consistent_radar_voxels,
 )
+from .spatial_radar_filter import (
+    SpatialRadarVoxelFilterConfig,
+    filter_spatially_isolated_radar_voxels,
+)
 
 __all__ = (
     "HardVoxelizer",
@@ -25,5 +29,7 @@ __all__ = (
     "VoxelizedPointCloud",
     "VoxelTemporalConsistencyConfig",
     "filter_temporally_consistent_radar_voxels",
+    "SpatialRadarVoxelFilterConfig",
+    "filter_spatially_isolated_radar_voxels",
     "load_voxelization_config",
 )

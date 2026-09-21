@@ -22,7 +22,9 @@ from Fault_Localization_Model.hercules_dataset import (
 from scripts.interactive_3d_voxels import InteractiveVoxelViewer
 from voxelization import (
     HardVoxelizer,
+    SpatialRadarVoxelFilterConfig,
     VoxelTemporalConsistencyConfig,
+    filter_spatially_isolated_radar_voxels,
     filter_temporally_consistent_radar_voxels,
     load_voxelization_config,
 )
@@ -66,12 +68,16 @@ def main() -> None:
     parser.add_argument("--max-radar-age-ms", type=float, default=100.0)
     parser.add_argument("--max-pose-gap-ms", type=float, default=200.0)
     parser.add_argument("--temporal-radius-m", type=float, default=0.75)
+    parser.add_argument("--disable-point-temporal-filter", action="store_true")
     parser.add_argument("--doppler-sign", choices=("auto", "1", "-1"), default="auto")
     parser.add_argument("--voxel-temporal-filter", action="store_true")
     parser.add_argument("--voxel-min-scans", type=int, default=3)
     parser.add_argument("--voxel-min-scan-fraction", type=float, default=0.15)
     parser.add_argument("--voxel-neighbor-radius-cells", type=int, default=1)
     parser.add_argument("--voxel-preserve-current-scan", action="store_true")
+    parser.add_argument("--spatial-voxel-filter", action="store_true")
+    parser.add_argument("--spatial-neighbor-radius-cells", type=int, default=2)
+    parser.add_argument("--spatial-min-neighbor-voxels", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-raw-points", type=int, default=20000)
     parser.add_argument("--max-centers", type=int, default=5000)
@@ -103,7 +109,9 @@ def main() -> None:
     voxel_config = load_voxelization_config(args.config)
     radar_config = {
         "hercules_radar_frames": args.radar_frames,
-        "hercules_temporal_radius": args.temporal_radius_m,
+        "hercules_temporal_radius": (
+            None if args.disable_point_temporal_filter else args.temporal_radius_m
+        ),
         "hercules_max_radar_age_ms": args.max_radar_age_ms,
         "hercules_max_pose_gap_ms": args.max_pose_gap_ms,
         "hercules_stack": {
@@ -128,6 +136,16 @@ def main() -> None:
                 min_scan_fraction=args.voxel_min_scan_fraction,
                 neighbor_radius_cells=args.voxel_neighbor_radius_cells,
                 preserve_current_scan=args.voxel_preserve_current_scan,
+            ),
+        )
+    spatial_filter_stats = None
+    if args.spatial_voxel_filter:
+        radar, spatial_filter_stats = filter_spatially_isolated_radar_voxels(
+            radar,
+            voxel_config.grid,
+            SpatialRadarVoxelFilterConfig(
+                neighbor_radius_cells=args.spatial_neighbor_radius_cells,
+                min_neighbor_voxels=args.spatial_min_neighbor_voxels,
             ),
         )
 
@@ -183,6 +201,8 @@ def main() -> None:
     print(f"Motion-compensated radar points: {alignment['motion_compensated_points']}")
     if voxel_temporal_stats is not None:
         print(f"3D voxel-temporal filter: {voxel_temporal_stats}")
+    if spatial_filter_stats is not None:
+        print(f"3D spatial voxel filter: {spatial_filter_stats}")
 
     if args.save_snapshot is not None:
         args.save_snapshot.parent.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,9 @@ from voxelization.cache import (
     write_voxel_cache,
 )
 from voxelization import (
+    SpatialRadarVoxelFilterConfig,
     VoxelTemporalConsistencyConfig,
+    filter_spatially_isolated_radar_voxels,
     filter_temporally_consistent_radar_voxels,
 )
 
@@ -215,6 +217,30 @@ class Voxelization3DTests(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(float(filtered[0, 0]), 20.0)
         self.assertTrue(statistics["preserve_current_scan"])
+
+    def test_spatial_radar_filter_removes_isolated_voxels_without_time(self):
+        connected = np.asarray(
+            [
+                [1.01, 0.01, 0.01, 1, 0, 0, 0],
+                [1.21, 0.01, 0.01, 2, 0, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+        isolated = np.asarray(
+            [[10.01, 10.01, 2.01, 3, 0, 0, 0]], dtype=np.float32
+        )
+        filtered, statistics = filter_spatially_isolated_radar_voxels(
+            np.concatenate((connected, isolated)),
+            self.grid,
+            SpatialRadarVoxelFilterConfig(
+                neighbor_radius_cells=1,
+                min_neighbor_voxels=1,
+            ),
+        )
+        self.assertTrue(np.array_equal(filtered, connected))
+        self.assertEqual(statistics["input_occupied_voxels"], 3)
+        self.assertEqual(statistics["supported_occupied_voxels"], 2)
+        self.assertEqual(statistics["rejected_points"], 1)
 
 
 if __name__ == "__main__":
