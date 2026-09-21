@@ -1,0 +1,19 @@
+{
+  "voxelization_3d": {
+    "grid": {
+      "x_range": [0.0, 64.0],
+      "y_range": [-32.0, 32.0],
+      "z_range": [-3.0, 5.0],
+      "voxel_size": [0.2, 0.2, 0.25],
+      "coordinate_order": "zyx"
+    },
+    "lidar": {
+      "max_points_per_voxel": null
+    },
+    "radar": {
+      "max_points_per_voxel": null
+    },
+    "cache_version": 1,
+    "compression_level": 6
+  }
+}
