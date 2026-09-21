@@ -20,6 +20,7 @@ from .spatial_radar_filter import (
     SpatialRadarVoxelFilterConfig,
     filter_spatially_isolated_radar_voxels,
 )
+from .fault_targets import VoxelFaultTargets, build_voxel_fault_targets
 
 __all__ = (
     "HardVoxelizer",
@@ -32,4 +33,6 @@ __all__ = (
     "SpatialRadarVoxelFilterConfig",
     "filter_spatially_isolated_radar_voxels",
     "load_voxelization_config",
+    "VoxelFaultTargets",
+    "build_voxel_fault_targets",
 )
