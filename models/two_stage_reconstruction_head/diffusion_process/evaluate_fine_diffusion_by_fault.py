@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from dataclasses import fields
+import math
 from pathlib import Path
 import sys
 
@@ -60,6 +61,18 @@ from models.two_stage_reconstruction_head.reconstruction_visualization import (
 
 
 REFERENCE_OCCUPANCY_THRESHOLD = 0.5
+
+
+def _json_safe(value):
+    """Replace undefined floating metrics with JSON ``null`` recursively."""
+
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1418,7 +1431,8 @@ def main() -> None:
             boundary_summary_rows,
         )
         atomic_write_json(
-            args.output_root / "boundary_diagnostics.json", boundary_summary
+            args.output_root / "boundary_diagnostics.json",
+            _json_safe(boundary_summary),
         )
     summary_rows = []
     for group_type, groups in (
@@ -1433,13 +1447,13 @@ def main() -> None:
     )
     atomic_write_json(
         args.output_root / "occupancy_threshold_sweep.json",
-        {
+        _json_safe({
             "coarse_and_target_threshold": REFERENCE_OCCUPANCY_THRESHOLD,
             "tolerance_m": args.tolerance_m,
             "rows": threshold_sweep,
-        },
+        }),
     )
-    atomic_write_json(args.output_root / "summary.json", summary)
+    atomic_write_json(args.output_root / "summary.json", _json_safe(summary))
     print()
     print(f"PER-FAULT FINE-DIFFUSION {args.split.upper()} RESULTS")
     _print_table(

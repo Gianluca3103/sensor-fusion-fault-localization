@@ -1,9 +1,11 @@
 import unittest
+import math
 
 import torch
 
 from models.two_stage_reconstruction_head.diffusion_process.evaluate_fine_diffusion_by_fault import (
     _diffusion_config_from_checkpoint,
+    _json_safe,
     _occupancy_transition_counts,
     _summarize_threshold_records,
     _threshold_sweep_record,
@@ -19,6 +21,21 @@ from models.two_stage_reconstruction_head.coarse_reconstruction.coarse_loss impo
 
 
 class FineDiffusionEvaluationTests(unittest.TestCase):
+    def test_json_safe_replaces_nested_nonfinite_metrics_with_null(self):
+        payload = {
+            "finite": 0.5,
+            "nested": {"nan": float("nan"), "inf": float("inf")},
+            "rows": [1.0, float("-inf")],
+        }
+
+        sanitized = _json_safe(payload)
+
+        self.assertEqual(sanitized["finite"], 0.5)
+        self.assertIsNone(sanitized["nested"]["nan"])
+        self.assertIsNone(sanitized["nested"]["inf"])
+        self.assertIsNone(sanitized["rows"][1])
+        self.assertTrue(math.isfinite(sanitized["finite"]))
+
     def test_exact_metric_is_unchanged(self):
         prediction = torch.tensor([[[[1.0, 1.0, 0.0]]]])
         target = torch.tensor([[[[1.0, 0.0, 1.0]]]])
