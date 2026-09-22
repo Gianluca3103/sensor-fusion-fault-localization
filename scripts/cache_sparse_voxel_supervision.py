@@ -175,6 +175,12 @@ def _cache_one(
         return "cached"
     inputs = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
     with np.load(sample_path, allow_pickle=False) as archive:
+        if "faulty_source_ids" not in archive.files:
+            raise ValueError(
+                f"{sample_path} lacks faulty_source_ids and cannot produce exact "
+                "3D oracle supervision. Regenerate it with generator version 3 "
+                "or later into a new output root."
+            )
         source_ids = np.asarray(archive["faulty_source_ids"], dtype=np.int64)
     # The metadata-aware loader selects the correct binary decoder for VoD or
     # HeRCULES.  This is deliberately the only dataset-specific operation;

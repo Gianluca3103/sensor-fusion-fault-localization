@@ -21,6 +21,7 @@ SAMPLE_KEYS = TRAINING_RELIABILITY_MAP_KEYS | {
     "clean_rgb",
     "faulty_rgb",
     "faulty_lidar_points",
+    "faulty_source_ids",
     "observability_confidence",
     "metadata_json",
     "faulty_lidar_input_bev",

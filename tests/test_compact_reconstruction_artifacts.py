@@ -27,6 +27,7 @@ class CompactReconstructionArtifactsTests(unittest.TestCase):
                 clean_rgb=np.zeros((*shape, 3), dtype=np.uint8),
                 faulty_rgb=np.zeros((*shape, 3), dtype=np.uint8),
                 faulty_lidar_points=np.zeros((2, 4), dtype=np.float32),
+                faulty_source_ids=np.arange(2, dtype=np.int64),
                 observability_confidence=np.ones(shape, dtype=np.float16),
                 metadata_json=np.asarray(json.dumps({"dataset": "HeRCULES"})),
                 clean_point_ids=np.arange(1000, dtype=np.int64),
@@ -40,6 +41,7 @@ class CompactReconstructionArtifactsTests(unittest.TestCase):
                 self.assertNotIn("clean_point_ids", archive.files)
                 self.assertNotIn("observability_ray_count", archive.files)
                 self.assertIn("faulty_lidar_points", archive.files)
+                self.assertIn("faulty_source_ids", archive.files)
                 self.assertEqual(
                     json.loads(str(archive["metadata_json"].item()))[
                         "artifact_profile"

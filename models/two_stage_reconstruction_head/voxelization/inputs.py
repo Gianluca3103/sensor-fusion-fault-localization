@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from Fault_Localization_Model.data_injection_utils import filter_pointcloud
 from Fault_Localization_Model.vod_dataset.vod_io import (
     VOD_LIDAR_FIELDS,
     load_vod_lidar,
@@ -69,14 +70,33 @@ def load_clean_lidar_from_metadata(metadata: dict) -> np.ndarray:
         )
     dataset = str(metadata.get("dataset", "")).strip().lower()
     if dataset in {"view-of-delft", "view of delft", "vod"}:
-        return load_vod_lidar(source).astype(np.float32, copy=False)
-    if dataset == "hercules":
+        points = load_vod_lidar(source).astype(np.float32, copy=False)
+    elif dataset == "hercules":
         # Keep VoD-only preprocessing free of the SciPy dependency used by
         # HeRCULES pose interpolation.
         from Fault_Localization_Model.hercules_dataset import load_hercules_lidar
 
-        return load_hercules_lidar(source).astype(np.float32, copy=False)
-    raise ValueError(f"Unsupported dataset in metadata: {metadata.get('dataset')!r}")
+        points = load_hercules_lidar(source).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unsupported dataset in metadata: {metadata.get('dataset')!r}")
+
+    point_filter = metadata.get("point_filter")
+    if point_filter is None:
+        # Legacy non-3D artifacts are returned unchanged for existing callers.
+        return points
+    try:
+        minimum = float(point_filter["min_range_m"])
+        maximum = float(point_filter["max_range_m"])
+        x_min, x_max = map(float, point_filter["x_range"])
+        y_min, y_max = map(float, point_filter["y_range"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid point_filter in reconstruction metadata") from error
+    _, range_mask = filter_pointcloud(points, minimum, maximum, return_mask=True)
+    within_bev = (
+        (points[:, 0] >= x_min) & (points[:, 0] < x_max)
+        & (points[:, 1] >= y_min) & (points[:, 1] < y_max)
+    )
+    return points[range_mask & within_bev]
 
 
 def load_aligned_point_inputs(

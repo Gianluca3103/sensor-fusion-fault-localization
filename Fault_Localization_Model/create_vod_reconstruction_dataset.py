@@ -66,7 +66,7 @@ from Fault_Localization_Model.vod_dataset import (
 
 
 LOGGER = logging.getLogger("create_vod_reconstruction_dataset")
-GENERATOR_VERSION = 2
+GENERATOR_VERSION = 3
 DEFAULT_FAULT_PLAN = (
     ("fog_sim", 4),
     ("fog_sim", 5),
@@ -415,13 +415,24 @@ def _create_sample_impl(task: dict) -> dict:
     )
     destination = _task_output_path(task, config)
     if destination.is_file():
-        if config.get('dataset') != 'HeRCULES':
-            return {"path": str(destination), "cached": True}
+        # Sparse 3D supervision reconstructs exact targets from this
+        # provenance.  Older compact artifacts omit it and must be rebuilt;
+        # guessing point correspondence would silently corrupt the oracle.
         with np.load(destination, allow_pickle=False) as previous:
-            previous_metadata = json.loads(str(previous['metadata_json'].item()))
-        if (previous_metadata.get('radar_variant') == frame.radar_variant
-                and previous_metadata.get('source_relative_path') == str(frame.lidar_path)):
-            return {"path": str(destination), "cached": True}
+            has_3d_provenance = "faulty_source_ids" in previous.files
+            if config.get('dataset') != 'HeRCULES':
+                if has_3d_provenance:
+                    return {"path": str(destination), "cached": True}
+            else:
+                previous_metadata = json.loads(str(previous['metadata_json'].item()))
+        if config.get('dataset') != 'HeRCULES':
+            # Fall through and replace the legacy artifact in place.
+            pass
+        else:
+            if (has_3d_provenance
+                    and previous_metadata.get('radar_variant') == frame.radar_variant
+                    and previous_metadata.get('source_relative_path') == str(frame.lidar_path)):
+                return {"path": str(destination), "cached": True}
 
     if config.get("dataset") == "HeRCULES":
         from Fault_Localization_Model.hercules_dataset import load_hercules_lidar
@@ -554,12 +565,25 @@ def _create_sample_impl(task: dict) -> dict:
         "artifact_profile": config.get("artifact_profile", "training"),
         "artifact_compression_level": config.get("npz_compression_level", 6),
         "remove_added_points": config["remove_added_points"],
+        # Persist the exact input crop used before fault injection.  The 3D
+        # cache reloads clean LiDAR from disk and must reproduce the same row
+        # order because faulty_source_ids index these filtered clean rows.
+        "point_filter": {
+            "min_range_m": config["min_range"],
+            "max_range_m": config["max_range"],
+            "x_range": [config["x_min"], config["x_max"]],
+            "y_range": [config["y_min"], config["y_max"]],
+        },
         "injection_seed": task["injection_seed"],
         "injection_metadata": injection_metadata,
     }
+    # This compact per-faulty-point vector is required to reproduce the exact
+    # 3D oracle target.  It is intentionally part of the training profile.
     sample_arrays = {
-        "faulty_lidar_input_bev": engineered_lidar.astype(np.float16)
-    } if engineered_lidar is not None else {}
+        "faulty_source_ids": faulty_source_ids.astype(np.int64, copy=False),
+    }
+    if engineered_lidar is not None:
+        sample_arrays["faulty_lidar_input_bev"] = engineered_lidar.astype(np.float16)
     compact = config.get("artifact_profile", "training") == "training"
     reliability_arrays = (
         training_maps_for_storage(maps)
@@ -571,7 +595,6 @@ def _create_sample_impl(task: dict) -> dict:
         "faulty_density": faulty_layers["raw_density"],
         "clean_point_ids": clean_ids,
         "faulty_point_ids": faulty_ids,
-        "faulty_source_ids": faulty_source_ids,
         "faulty_injector_labels": faulty_labels,
         "observability_ray_count": observability["ray_count"].astype(np.uint32),
         "observability_vertical_coverage": observability[
