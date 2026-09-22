@@ -12,7 +12,6 @@ import random
 import numpy as np
 
 from Fault_Localization_Model.io_utils import atomic_savez
-from Fault_Localization_Model.vod_dataset.vod_io import load_vod_lidar
 from models.two_stage_reconstruction_head.diffusion_process import (
     build_sparse_voxel_example,
 )
@@ -23,7 +22,11 @@ from voxelization import (
     load_voxelization_config,
     select_oracle_fault_regions_3d,
 )
-from voxelization.inputs import discover_sample_paths, load_aligned_point_inputs
+from voxelization.inputs import (
+    discover_sample_paths,
+    load_aligned_point_inputs,
+    load_clean_lidar_from_metadata,
+)
 from voxelization.hard_voxelizer import VoxelizedPointCloud
 
 
@@ -173,10 +176,10 @@ def _cache_one(
     inputs = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
     with np.load(sample_path, allow_pickle=False) as archive:
         source_ids = np.asarray(archive["faulty_source_ids"], dtype=np.int64)
-    # Avoid loading the same radar NPZ twice: only the clean LiDAR source is
-    # required for target construction.
-    clean_path = Path(str(inputs.metadata["source_relative_path"]))
-    clean_points = load_vod_lidar(clean_path).astype(np.float32, copy=False)
+    # The metadata-aware loader selects the correct binary decoder for VoD or
+    # HeRCULES.  This is deliberately the only dataset-specific operation;
+    # voxel fault targets and oracle 3D selection remain identical.
+    clean_points = load_clean_lidar_from_metadata(inputs.metadata)
     targets = build_voxel_fault_targets(
         clean_points, inputs.lidar_points, source_ids, config.grid
     )

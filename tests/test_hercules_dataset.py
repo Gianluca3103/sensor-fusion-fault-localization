@@ -10,10 +10,24 @@ from Fault_Localization_Model.hercules_dataset import (
     load_frame_radar, sensor_pose, HerculesSynchronizationError,
 )
 from models.two_stage_reconstruction_head.coarse_dataset import radar_cache_path
+from models.two_stage_reconstruction_head.voxelization.inputs import load_clean_lidar_from_metadata
 from Fault_Localization_Model.hercules_tracking import compensate_doppler
 
 
 class HerculesDatasetTests(unittest.TestCase):
+    def test_dataset_aware_clean_lidar_loader_decodes_hercules_records(self):
+        """3D consumers must not parse 29-byte Aeva records as VoD float rows."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'aeva.bin'
+            expected = np.asarray([[1.0, 2.0, 3.0, 0.5]], dtype=np.float32)
+            record = np.zeros((1, 29), dtype=np.uint8)
+            record[:, :16] = expected.view(np.uint8).reshape(1, 16)
+            record.tofile(path)
+            actual = load_clean_lidar_from_metadata({
+                'dataset': 'HeRCULES', 'source_relative_path': str(path),
+            })
+            np.testing.assert_array_equal(actual, expected)
+
     def test_cached_source_processing_matches_uncached_and_reuses_scans(self):
         from Fault_Localization_Model.hercules_dataset import _prepare_source_scan, dbscan_labels
         with tempfile.TemporaryDirectory() as directory:

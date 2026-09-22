@@ -53,7 +53,14 @@ def radar_cache_path(radar_root: str | Path, metadata: dict) -> Path:
     return Path(radar_root) / split / f"{int(frame_id):05d}.npz"
 
 
-def _load_clean_lidar(metadata: dict) -> np.ndarray:
+def load_clean_lidar_from_metadata(metadata: dict) -> np.ndarray:
+    """Load the clean LiDAR target referenced by one reconstruction artifact.
+
+    VoD and HeRCULES store their raw LiDAR in different binary record layouts,
+    but both generator variants persist the dataset name and absolute source
+    path in ``metadata_json``.  Keeping the choice here ensures every 3D
+    consumer uses the same dataset-aware decoder.
+    """
     source = Path(str(metadata.get("source_relative_path", "")))
     if not source.is_file():
         raise FileNotFoundError(
@@ -97,7 +104,7 @@ def load_aligned_point_inputs(
         else:
             lidar = None
     if lidar is None:
-        lidar = _load_clean_lidar(metadata)
+        lidar = load_clean_lidar_from_metadata(metadata)
     if lidar.ndim != 2 or lidar.shape[1] != len(LIDAR_FIELDS):
         raise ValueError(f"LiDAR points must have shape [N,4], got {lidar.shape}")
 

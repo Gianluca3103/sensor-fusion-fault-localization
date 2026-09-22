@@ -1,4 +1,4 @@
-"""Train the selector-local sparse 3D diffusion baseline on VoD artifacts."""
+"""Train the selector-local sparse 3D diffusion baseline on reconstruction artifacts."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Iterator
 import numpy as np
 import torch
 
-from Fault_Localization_Model.vod_dataset.vod_io import VOD_LIDAR_FIELDS, load_vod_lidar
 from models.two_stage_reconstruction_head.diffusion_process import (
     SparseVoxelDiffusionBaseline,
     SparseVoxelDiffusionConfig,
@@ -19,6 +18,7 @@ from models.two_stage_reconstruction_head.diffusion_process import (
     build_sparse_voxel_example,
     collate_sparse_voxel_examples,
 )
+from voxelization.inputs import LIDAR_FIELDS, load_clean_lidar_from_metadata
 from voxelization import (
     HardVoxelizer,
     OracleFaultSelector3DConfig,
@@ -35,7 +35,14 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples-root", type=Path, required=True)
     parser.add_argument("--radar-root", type=Path, required=True)
-    parser.add_argument("--vod-public-root", type=Path, required=True)
+    parser.add_argument(
+        "--vod-public-root",
+        type=Path,
+        help=(
+            "Deprecated compatibility option. Clean LiDAR is resolved from "
+            "each artifact's metadata, so this is not used."
+        ),
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--supervision-cache-root", type=Path)
     parser.add_argument(
@@ -88,7 +95,6 @@ def _load_examples(
     sample_path: Path,
     *,
     radar_root: Path,
-    vod_public_root: Path,
     lidar_voxelizer: HardVoxelizer,
     radar_voxelizer: HardVoxelizer,
     selector_config: OracleFaultSelector3DConfig,
@@ -122,11 +128,10 @@ def _load_examples(
         source_ids = np.asarray(archive["faulty_source_ids"], dtype=np.int64)
         metadata = json.loads(str(archive["metadata_json"].item()))
     frame_id = str(metadata["frame_id"])
-    lidar_path = vod_public_root / "lidar" / "training" / "velodyne" / f"{frame_id}.bin"
     radar_path = radar_root / f"{int(frame_id):05d}.npz"
-    if not lidar_path.is_file() or not radar_path.is_file():
-        raise FileNotFoundError(f"Missing aligned inputs for {sample_path.name}: {lidar_path}, {radar_path}")
-    clean = load_vod_lidar(lidar_path).astype(np.float32, copy=False)
+    if not radar_path.is_file():
+        raise FileNotFoundError(f"Missing aligned radar input for {sample_path.name}: {radar_path}")
+    clean = load_clean_lidar_from_metadata(metadata)
     with np.load(radar_path, allow_pickle=False) as archive:
         radar = np.asarray(archive["radar_points"], dtype=np.float32)
     targets = build_voxel_fault_targets(clean, faulty, source_ids, lidar_voxelizer.grid)
@@ -135,7 +140,7 @@ def _load_examples(
     )
     if not selection.components:
         return ()
-    faulty_voxels = lidar_voxelizer.voxelize(faulty, VOD_LIDAR_FIELDS)
+    faulty_voxels = lidar_voxelizer.voxelize(faulty, LIDAR_FIELDS)
     radar_voxels = radar_voxelizer.voxelize(radar, _radar_names(radar.shape[1]))
     return tuple(
         build_sparse_voxel_example(
@@ -217,7 +222,7 @@ def main() -> None:
     train_paths = _subset(sorted((args.samples_root / "train").glob("*.npz")), args.train_fraction, args.seed)
     val_paths = _subset(sorted((args.samples_root / "val").glob("*.npz")), args.val_fraction, args.seed + 1)
     if not train_paths or not val_paths:
-        raise FileNotFoundError("Both train and val VoD splits must contain samples")
+        raise FileNotFoundError("Both train and val reconstruction splits must contain samples")
     config = SparseVoxelDiffusionConfig(
         grid_dimensions_zyx=voxelization.grid.dimensions_zyx,
         hidden_dim=args.hidden_dim,
@@ -237,7 +242,6 @@ def main() -> None:
     }, indent=2, default=str), encoding="utf-8")
     loader_kwargs = {
         "radar_root": args.radar_root / "train",
-        "vod_public_root": args.vod_public_root,
         "lidar_voxelizer": lidar_voxelizer,
         "radar_voxelizer": radar_voxelizer,
         "selector_config": selector_config,
