@@ -21,6 +21,12 @@ from .spatial_radar_filter import (
     filter_spatially_isolated_radar_voxels,
 )
 from .fault_targets import VoxelFaultTargets, build_voxel_fault_targets
+from .fault_selector_3d import (
+    OracleFaultComponent3D,
+    OracleFaultSelection3D,
+    OracleFaultSelector3DConfig,
+    select_oracle_fault_regions_3d,
+)
 
 __all__ = (
     "HardVoxelizer",
@@ -35,4 +41,8 @@ __all__ = (
     "load_voxelization_config",
     "VoxelFaultTargets",
     "build_voxel_fault_targets",
+    "OracleFaultComponent3D",
+    "OracleFaultSelection3D",
+    "OracleFaultSelector3DConfig",
+    "select_oracle_fault_regions_3d",
 )

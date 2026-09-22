@@ -25,12 +25,14 @@ class VoxelFaultTargets:
     stable_count: np.ndarray
     damaged_clean_count: np.ndarray
     unreliable_faulty_count: np.ndarray
+    feature_changed_count: np.ndarray
     clean_occupancy: np.ndarray
     faulty_occupancy: np.ndarray
     preserve_mask: np.ndarray
     repair_mask: np.ndarray
     remove_mask: np.ndarray
     change_mask: np.ndarray
+    feature_change_mask: np.ndarray
     repair_fraction: np.ndarray
     removal_fraction: np.ndarray
     clean_points_in_grid: int
@@ -38,6 +40,7 @@ class VoxelFaultTargets:
     stable_points: int
     damaged_clean_points: int
     unreliable_faulty_points: int
+    feature_changed_points: int
 
 
 def _counts(flat_indices: np.ndarray, size: int) -> np.ndarray:
@@ -57,8 +60,9 @@ def build_voxel_fault_targets(
 
     Source IDs must index rows in ``clean_points``; ``-1`` identifies a
     synthetic return.  A clean point is stable only when a derived faulty
-    return remains in the same voxel, moves no farther than the movement
-    tolerance, and preserves its non-XYZ features within ``feature_tolerance``.
+    return remains in the same voxel and moves no farther than the movement
+    tolerance. Non-XYZ changes are reported through a separate feature target;
+    they never turn a spatially correct return into false geometric damage.
     """
 
     clean = np.asarray(clean_points)
@@ -91,6 +95,7 @@ def build_voxel_fault_targets(
     faulty_count = _counts(faulty_flat[faulty_valid], size)
 
     stable_faulty = np.zeros(len(faulty), dtype=bool)
+    feature_changed_faulty = np.zeros(len(faulty), dtype=bool)
     stable_source = np.zeros(len(clean), dtype=bool)
     derived_indices = np.flatnonzero(derived)
     if len(derived_indices):
@@ -108,7 +113,7 @@ def build_voxel_fault_targets(
         )
         shared_features = min(clean.shape[1], faulty.shape[1]) - 3
         if shared_features > 0:
-            feature_stable = np.all(
+            feature_changed_faulty[derived_indices] = spatially_stable & ~np.all(
                 np.abs(
                     clean[sources, 3 : 3 + shared_features]
                     - faulty[derived_indices, 3 : 3 + shared_features]
@@ -116,7 +121,6 @@ def build_voxel_fault_targets(
                 <= feature_tolerance,
                 axis=1,
             )
-            spatially_stable &= feature_stable
         stable_faulty[derived_indices] = spatially_stable
         stable_source[sources[spatially_stable]] = True
 
@@ -126,6 +130,9 @@ def build_voxel_fault_targets(
     stable_count = _counts(faulty_flat[stable_in_grid], size)
     damaged_count = _counts(clean_flat[damaged_clean], size)
     unreliable_count = _counts(faulty_flat[unreliable_faulty], size)
+    feature_changed_count = _counts(
+        faulty_flat[faulty_valid & feature_changed_faulty], size
+    )
 
     shape = grid.dimensions_zyx
     clean_count = clean_count.reshape(shape)
@@ -133,12 +140,14 @@ def build_voxel_fault_targets(
     stable_count = stable_count.reshape(shape)
     damaged_count = damaged_count.reshape(shape)
     unreliable_count = unreliable_count.reshape(shape)
+    feature_changed_count = feature_changed_count.reshape(shape)
     clean_occupancy = clean_count > 0
     faulty_occupancy = faulty_count > 0
     repair_mask = damaged_count > 0
     remove_mask = unreliable_count > 0
     preserve_mask = clean_occupancy & faulty_occupancy & ~repair_mask & ~remove_mask
     change_mask = repair_mask | remove_mask
+    feature_change_mask = feature_changed_count > 0
     repair_fraction = np.divide(
         damaged_count,
         clean_count,
@@ -157,12 +166,14 @@ def build_voxel_fault_targets(
         stable_count=stable_count,
         damaged_clean_count=damaged_count,
         unreliable_faulty_count=unreliable_count,
+        feature_changed_count=feature_changed_count,
         clean_occupancy=clean_occupancy,
         faulty_occupancy=faulty_occupancy,
         preserve_mask=preserve_mask,
         repair_mask=repair_mask,
         remove_mask=remove_mask,
         change_mask=change_mask,
+        feature_change_mask=feature_change_mask,
         repair_fraction=repair_fraction,
         removal_fraction=removal_fraction,
         clean_points_in_grid=int(clean_valid.sum()),
@@ -170,4 +181,5 @@ def build_voxel_fault_targets(
         stable_points=int(stable_in_grid.sum()),
         damaged_clean_points=int(damaged_clean.sum()),
         unreliable_faulty_points=int(unreliable_faulty.sum()),
+        feature_changed_points=int(feature_changed_faulty.sum()),
     )

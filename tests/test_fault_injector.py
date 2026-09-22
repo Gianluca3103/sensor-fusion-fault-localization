@@ -5,10 +5,12 @@ from unittest.mock import patch
 import numpy as np
 
 from Fault_Localization_Model.fault_injector import (
+    FaultInjectionResult,
     build_fault_plan,
     choose_samples,
     inject_fault,
     parse_fault_plan,
+    remove_added_returns,
 )
 
 
@@ -19,6 +21,21 @@ class FakeLidarCorruptions:
 
 
 class FaultInjectorTests(unittest.TestCase):
+    def test_added_return_filter_uses_exact_negative_source_ids(self):
+        result = FaultInjectionResult(
+            points=np.asarray(
+                [[1, 0, 0, 1], [2, 0, 0, 2], [3, 0, 0, 3]],
+                dtype=np.float32,
+            ),
+            point_ids=np.asarray([10, 20, 11]),
+            source_ids=np.asarray([0, -1, 1]),
+            injector_labels=np.asarray([1, 2, 1], dtype=np.int8),
+        )
+        filtered, removed = remove_added_returns(result)
+        self.assertEqual(removed, 1)
+        self.assertTrue(np.array_equal(filtered.source_ids, [0, 1]))
+        self.assertTrue(np.array_equal(filtered.points[:, 0], [1, 3]))
+
     def test_total_loss_removes_every_lidar_return(self):
         clean = np.asarray(
             [[1.0, 2.0, 0.0, 0.5], [3.0, 4.0, 0.2, 0.7]],

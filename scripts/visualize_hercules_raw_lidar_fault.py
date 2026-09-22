@@ -26,7 +26,11 @@ from Fault_Localization_Model.data_injection_utils import (
     SUPPORTED_CORRUPTIONS,
     validate_fault_spec,
 )
-from Fault_Localization_Model.fault_injector import inject_fault, load_fault_injector
+from Fault_Localization_Model.fault_injector import (
+    inject_fault,
+    load_fault_injector,
+    remove_added_returns,
+)
 from Fault_Localization_Model.hercules_dataset import (
     discover_hercules_frames,
     load_hercules_lidar,
@@ -292,7 +296,7 @@ def main() -> None:
 
     injector = load_fault_injector(DEFAULT_INJECTOR_ROOT)
     clean_ids = np.arange(len(clean), dtype=np.int64)
-    faulty, injection_metadata = inject_fault(
+    injected, injection_metadata = inject_fault(
         args.fault,
         clean.copy(),
         clean_ids,
@@ -302,6 +306,8 @@ def main() -> None:
         lidar_corruptions=injector,
         rng_seed=args.seed,
     )
+    injected_point_count = len(injected.points)
+    faulty, added_particles_removed = remove_added_returns(injected)
     changes = _change_sets(clean, faulty, args.movement_tolerance_m)
     config = load_voxelization_config(args.config)
     grid = config.grid
@@ -335,6 +341,7 @@ def main() -> None:
         "severity": args.severity,
         "seed": args.seed,
         "fault_applied_before_voxelization": True,
+        "added_particle_filter": "exact_provenance_source_id_negative",
         "visualization_grid": {
             "x_range": grid.x_range,
             "y_range": grid.y_range,
@@ -343,12 +350,14 @@ def main() -> None:
         "counts": {
             "clean_raw": len(clean),
             "faulty_raw": len(faulty.points),
+            "injected_faulty_before_particle_filter": injected_point_count,
+            "added_particles_removed": added_particles_removed,
             "clean_visible": int(_volume_mask(clean, grid).sum()),
             "faulty_visible": int(_volume_mask(faulty.points, grid).sum()),
-            "retained": len(changes["retained"]),
-            "moved": len(changes["moved"]),
-            "removed": len(changes["removed"]),
-            "synthetic": len(changes["synthetic"]),
+            "source_returns_retained": len(changes["retained"]),
+            "source_returns_moved": len(changes["moved"]),
+            "clean_returns_missing_after_fault": len(changes["removed"]),
+            "synthetic_returns_remaining": len(changes["synthetic"]),
         },
         "movement_tolerance_m": args.movement_tolerance_m,
         "injection_metadata": injection_metadata,

@@ -42,12 +42,14 @@ class VoxelFaultTargetTests(unittest.TestCase):
         self.assertTrue(result.repair_mask[0, 0, 0])
         self.assertTrue(result.remove_mask[1, 1, 1])
 
-    def test_feature_corruption_marks_same_voxel_for_both_operations(self):
+    def test_feature_corruption_is_separate_from_spatial_operations(self):
         clean = np.asarray([[0.2, 0.2, 0.2, 0.5]], dtype=np.float32)
         faulty = np.asarray([[0.2, 0.2, 0.2, 0.9]], dtype=np.float32)
         result = build_voxel_fault_targets(clean, faulty, np.asarray([0]), self.grid)
-        self.assertTrue(result.repair_mask[0, 0, 0])
-        self.assertTrue(result.remove_mask[0, 0, 0])
+        self.assertFalse(result.repair_mask[0, 0, 0])
+        self.assertFalse(result.remove_mask[0, 0, 0])
+        self.assertTrue(result.preserve_mask[0, 0, 0])
+        self.assertTrue(result.feature_change_mask[0, 0, 0])
 
 
 if __name__ == "__main__":

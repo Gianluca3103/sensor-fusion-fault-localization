@@ -241,12 +241,14 @@ def main() -> None:
         stable_count=targets.stable_count,
         damaged_clean_count=targets.damaged_clean_count,
         unreliable_faulty_count=targets.unreliable_faulty_count,
+        feature_changed_count=targets.feature_changed_count,
         clean_occupancy=targets.clean_occupancy,
         faulty_occupancy=targets.faulty_occupancy,
         preserve_mask=targets.preserve_mask,
         repair_mask=targets.repair_mask,
         remove_mask=targets.remove_mask,
         change_mask=targets.change_mask,
+        feature_change_mask=targets.feature_change_mask,
         repair_fraction=targets.repair_fraction.astype(np.float16),
         removal_fraction=targets.removal_fraction.astype(np.float16),
     )
@@ -263,6 +265,7 @@ def main() -> None:
             "stable": targets.stable_points,
             "damaged_clean": targets.damaged_clean_points,
             "unreliable_faulty": targets.unreliable_faulty_points,
+            "feature_changed": targets.feature_changed_points,
         },
         "voxels": {
             "clean_occupied": int(targets.clean_occupancy.sum()),
@@ -272,6 +275,7 @@ def main() -> None:
             "remove": int(targets.remove_mask.sum()),
             "repair_and_remove": int(both.sum()),
             "changed_union": int(targets.change_mask.sum()),
+            "feature_changed": int(targets.feature_change_mask.sum()),
         },
     }
     atomic_write_json(args.output_root / "summary.json", summary)

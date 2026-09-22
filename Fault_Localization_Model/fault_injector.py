@@ -39,6 +39,24 @@ class FaultInjectionResult:
     injector_labels: np.ndarray
 
 
+def remove_added_returns(result: FaultInjectionResult) -> tuple[FaultInjectionResult, int]:
+    """Remove injector-created points while preserving all measured returns.
+
+    Negative source IDs are the authoritative provenance marker for an added
+    particle. Filtering by provenance avoids deleting legitimate points that
+    happen to occupy the same voxel as injected noise.
+    """
+
+    keep = np.asarray(result.source_ids) >= 0
+    removed = int((~keep).sum())
+    return FaultInjectionResult(
+        points=result.points[keep],
+        point_ids=result.point_ids[keep],
+        source_ids=result.source_ids[keep],
+        injector_labels=result.injector_labels[keep],
+    ), removed
+
+
 def _validate_clean_ids(clean_points, clean_point_ids):
     clean_point_ids = np.asarray(clean_point_ids, dtype=np.int64)
     if clean_point_ids.shape != (len(clean_points),):

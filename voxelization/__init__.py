@@ -35,6 +35,12 @@ from .fault_targets import (  # noqa: E402
     VoxelFaultTargets,
     build_voxel_fault_targets,
 )
+from .fault_selector_3d import (  # noqa: E402
+    OracleFaultComponent3D,
+    OracleFaultSelection3D,
+    OracleFaultSelector3DConfig,
+    select_oracle_fault_regions_3d,
+)
 
 __all__ = (
     "HardVoxelizer",
@@ -49,4 +55,8 @@ __all__ = (
     "load_voxelization_config",
     "VoxelFaultTargets",
     "build_voxel_fault_targets",
+    "OracleFaultComponent3D",
+    "OracleFaultSelection3D",
+    "OracleFaultSelector3DConfig",
+    "select_oracle_fault_regions_3d",
 )
