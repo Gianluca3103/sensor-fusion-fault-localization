@@ -13,6 +13,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from scipy.spatial import cKDTree
 
 from .basic_diffusion_unet import SinusoidalTimeEmbedding
 from .sparse_voxel_data import SparseVoxelBatch
@@ -20,7 +21,7 @@ from .sparse_voxel_data import SparseVoxelBatch
 
 @dataclass(frozen=True)
 class SparseVoxelDiffusionConfig:
-    condition_feature_dim: int = 6
+    condition_feature_dim: int = 2
     grid_dimensions_zyx: tuple[int, int, int] = (32, 320, 320)
     hidden_dim: int = 96
     num_blocks: int = 4
@@ -30,6 +31,7 @@ class SparseVoxelDiffusionConfig:
     lambda_chamfer: float = 0.5
     chamfer_temperature_m: float = 0.25
     chamfer_chunk_size: int = 2048
+    chamfer_max_points: int | None = None
     metric_distance_m: float = 0.2
     metric_occupancy_threshold: float = 0.5
 
@@ -48,6 +50,8 @@ class SparseVoxelDiffusionConfig:
             raise ValueError("metric occupancy threshold must be in (0, 1)")
         if self.chamfer_chunk_size < 1:
             raise ValueError("chamfer_chunk_size must be positive")
+        if self.chamfer_max_points is not None and self.chamfer_max_points < 1:
+            raise ValueError("chamfer_max_points must be positive when set")
 
 
 def _cosine_alpha_bars(timesteps: int) -> torch.Tensor:
@@ -188,18 +192,35 @@ class SoftVoxelChamferLoss(nn.Module):
     thresholding or materialising a variable-length predicted point cloud.
     """
 
-    def __init__(self, temperature_m: float = 0.25, chunk_size: int = 2048) -> None:
+    def __init__(
+        self, temperature_m: float = 0.25, chunk_size: int = 2048,
+        max_points: int | None = None,
+    ) -> None:
         super().__init__()
-        if temperature_m <= 0 or chunk_size < 1:
-            raise ValueError("temperature_m and chunk_size must be positive")
+        if temperature_m <= 0 or chunk_size < 1 or (max_points is not None and max_points < 1):
+            raise ValueError("temperature_m, chunk_size, and max_points must be positive")
         self.temperature_m = float(temperature_m)
         self.chunk_size = int(chunk_size)
+        self.max_points = max_points
 
     def _one(self, coords: torch.Tensor, probabilities: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_coords = coords[target > 0.5]
         if target_coords.numel() == 0:
             # Empty target crops are governed by occupancy/diffusion losses.
             return probabilities.new_zeros(())
+        # Chamfer is a soft point-set surrogate.  Large selector components can
+        # contain over 100k candidates, making the full pairwise computation
+        # impractical.  Sample each set independently; diffusion and BCE still
+        # supervise every voxel.  Torch RNG makes the approximation reproducible
+        # for a fixed training seed and varies it across optimization steps.
+        if self.max_points is not None:
+            if len(coords) > self.max_points:
+                chosen = torch.randperm(len(coords), device=coords.device)[:self.max_points]
+                coords = coords[chosen]
+                probabilities = probabilities[chosen]
+            if len(target_coords) > self.max_points:
+                chosen = torch.randperm(len(target_coords), device=coords.device)[:self.max_points]
+                target_coords = target_coords[chosen]
         probabilities = probabilities.clamp(1.0e-6, 1.0 - 1.0e-6)
         weighted_distance = probabilities.new_zeros(())
         probability_sum = probabilities.sum().clamp_min(1.0e-6)
@@ -273,9 +294,10 @@ def voxel_set_metrics_at_distance(
 ) -> dict[str, torch.Tensor]:
     """Compute tolerance-based precision, recall, F1, and IoU for 3D voxels.
 
-    A prediction is correct when a clean occupied voxel centre lies within the
-    requested physical distance.  Nearest-neighbour matching is chunked in
-    both axes, so validation remains bounded for large selector components.
+    Only editable selector voxels are scored; trusted context is excluded. A
+    prediction is correct when a clean occupied voxel centre lies within the
+    requested physical distance.  Small sets use chunked distance matrices;
+    large sets use an exact k-d tree lookup to avoid quadratic validation.
     IoU is derived from the symmetric F1 relation, ``F1 / (2 - F1)``.
     """
 
@@ -287,6 +309,13 @@ def voxel_set_metrics_at_distance(
     def nearest_matches(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if not len(source):
             return torch.empty(0, dtype=torch.bool, device=source.device)
+        if len(source) * len(target) > 1_000_000:
+            # Validation needs exact nearest-neighbour distances, but not a
+            # differentiable N x M CUDA matrix.  A CPU k-d tree bounds the
+            # work for the large selector components present in VoD.
+            tree = cKDTree(target.detach().cpu().numpy())
+            distances, _ = tree.query(source.detach().cpu().numpy(), k=1, workers=1)
+            return torch.as_tensor(distances <= distance_m + 1.0e-6, device=source.device)
         matches = []
         for start in range(0, len(source), chunk_size):
             stop = min(start + chunk_size, len(source))
@@ -303,7 +332,9 @@ def voxel_set_metrics_at_distance(
     f1_values, iou_values = [], []
     precision_values, recall_values = [], []
     for index in range(batch.batch_size):
-        valid = batch.valid_mask[index, :, 0] > 0.5
+        valid = (batch.valid_mask[index, :, 0] > 0.5) & (
+            batch.editable_mask[index, :, 0] > 0.5
+        )
         coords = batch.coords_xyz_m[index, valid].float()
         predicted = coords[occupancy_probability[index, valid, 0] >= occupancy_threshold]
         target = coords[batch.target_occupancy[index, valid, 0] > 0.5]
@@ -337,7 +368,10 @@ class SparseVoxelDiffusionBaseline(nn.Module):
         self.config = config
         self.schedule = SparseGaussianSchedule(config.training_timesteps)
         self.denoiser = SparseVoxelDenoiser(config)
-        self.chamfer_loss = SoftVoxelChamferLoss(config.chamfer_temperature_m, config.chamfer_chunk_size)
+        self.chamfer_loss = SoftVoxelChamferLoss(
+            config.chamfer_temperature_m, config.chamfer_chunk_size,
+            config.chamfer_max_points,
+        )
 
     @staticmethod
     def _target_state(batch: SparseVoxelBatch) -> torch.Tensor:
@@ -368,7 +402,11 @@ class SparseVoxelDiffusionBaseline(nn.Module):
             batch.editable_mask * batch.valid_mask,
         )
         current_diffusion_loss = diffusion_loss
-        chamfer = self.chamfer_loss(occupancy_probability, batch)
+        chamfer = (
+            self.chamfer_loss(occupancy_probability, batch)
+            if self.config.lambda_chamfer > 0
+            else diffusion_loss.new_zeros(())
+        )
         loss = (
             self.config.lambda_diffusion * diffusion_loss
             + self.config.lambda_bce * bce_loss

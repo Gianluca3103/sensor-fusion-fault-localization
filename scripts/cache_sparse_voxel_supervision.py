@@ -30,7 +30,7 @@ from voxelization.inputs import (
 from voxelization.hard_voxelizer import VoxelizedPointCloud
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _parse_args() -> argparse.Namespace:
@@ -85,7 +85,7 @@ def _write(path: Path, examples, *, config_hash: str, sample_path: Path, frame_i
     else:
         coords = np.empty((0, 3), dtype=np.int64)
         xyz = np.empty((0, 3), dtype=np.float32)
-        condition = np.empty((0, 6), dtype=np.float32)
+        condition = np.empty((0, 2), dtype=np.float32)
         target = faulty = editable = np.empty((0, 1), dtype=np.float32)
     metadata = {
         "sample_path": str(sample_path),

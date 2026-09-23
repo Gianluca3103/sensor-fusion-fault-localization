@@ -117,41 +117,26 @@ def build_sparse_voxel_example(
 ) -> SparseVoxelExample:
     """Build a selector-local sparse candidate lattice.
 
-    The context mask supplies empty candidates around faults; unioning the two
-    sensor occupancies means that usable evidence is never discarded when a
-    selector crop is tight.
+    The oracle selector supplies only a coarse rectangular crop. Every voxel
+    in that crop is a candidate edit, including clean-empty negatives. Exact
+    repair/remove masks are supervision and must never enter model inputs.
     """
 
     grid.validate()
     slices = _crop_slices(component)
-    # Sensor evidence comes from the sparse cache rather than from target
-    # arrays, preventing clean-label information from leaking into inference.
     faulty_count = _occupancy_counts_in_crop(faulty_lidar, component)
     radar_count = _occupancy_counts_in_crop(radar, component)
-    repair = np.asarray(selection.repair_core[slices], dtype=bool)
-    remove = np.asarray(selection.remove_core[slices], dtype=bool)
-    halo = np.asarray(selection.context_halo[slices], dtype=bool)
-    context = np.asarray(selection.context_mask[slices], dtype=bool)
     faulty_occupancy = faulty_count > 0
-    # Candidate positions include all selected empty volume and every sensor
-    # return in the crop.  This lets the model generate missing voxels while
-    # retaining radar-only conditioning locations.
-    candidate = context | faulty_occupancy | (radar_count > 0)
-    local_coords = np.argwhere(candidate).astype(np.int64)
+    local_coords = np.argwhere(np.ones(faulty_count.shape, dtype=bool)).astype(np.int64)
     if len(local_coords) == 0:
         raise ValueError("A selected 3D component produced no candidate voxels")
     global_coords = local_coords + np.asarray(component.crop_min_zyx, dtype=np.int64)
     index = tuple(local_coords[:, axis] for axis in range(3))
-    editable = repair[index] | remove[index]
-    trusted = faulty_occupancy[index] & ~editable
+    editable = np.ones(len(local_coords), dtype=bool)
     features = np.stack(
         (
             np.log1p(faulty_count[index]),
             np.log1p(radar_count[index]),
-            repair[index].astype(np.float32),
-            remove[index].astype(np.float32),
-            halo[index].astype(np.float32),
-            trusted.astype(np.float32),
         ),
         axis=1,
     ).astype(np.float32)
