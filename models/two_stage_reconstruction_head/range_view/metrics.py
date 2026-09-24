@@ -53,9 +53,20 @@ def evaluate_xyz(sample: RangeSample, merged: MergeResult, *, tolerance_m: float
     addition_precision = _match_fraction(generated, sample.clean_points, tolerance_m)
     addition_recall = _match_fraction(missing_clean, generated, tolerance_m)
     metrics = {
-        "healthy_original_preservation_rate": float((healthy & ~deleted).sum() / max(healthy_total, 1)),
-        "false_original_delete_rate": float((healthy & deleted).sum() / max(healthy_total, 1)),
-        "corrupted_point_rejection_rate": float((corrupted & deleted).sum() / max(corrupt_total, 1)),
+        # No-original samples have no meaningful preservation/deletion rate.
+        # Mark them undefined so macro averages do not treat them as failures.
+        "healthy_original_preservation_rate": (
+            float((healthy & ~deleted).sum() / healthy_total)
+            if healthy_total else float("nan")
+        ),
+        "false_original_delete_rate": (
+            float((healthy & deleted).sum() / healthy_total)
+            if healthy_total else float("nan")
+        ),
+        "corrupted_point_rejection_rate": (
+            float((corrupted & deleted).sum() / corrupt_total)
+            if corrupt_total else float("nan")
+        ),
         "addition_precision": addition_precision,
         "addition_recall": addition_recall,
         "generated_hallucination_rate": 1 - addition_precision if len(generated) else 0.0,

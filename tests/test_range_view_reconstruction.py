@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from models.two_stage_reconstruction_head.range_view.model import (
     CircularHorizontalConv, RangeModelConfig, RangeViewReconstructor,
 )
 from models.two_stage_reconstruction_head.range_view.loss import range_edit_loss
+from models.two_stage_reconstruction_head.range_view.metrics import evaluate_xyz
 from scripts.visualize_range_view_inputs import _preview_range
 
 
@@ -112,6 +114,27 @@ class RangeViewTests(unittest.TestCase):
         losses = range_edit_loss(result, target)
         self.assertTrue(torch.isfinite(losses["loss"]))
         self.assertEqual(float(losses["range_loss"].detach()), 0.0)
+
+    def test_no_original_points_have_undefined_preservation_rate(self):
+        clean = np.stack([self.point(0, 0, 5)])
+        faulty = np.empty((0, 4), dtype=np.float32)
+        faulty_projection = project_lidar(faulty, self.geometry)
+        targets = build_range_targets(
+            faulty_projection, project_lidar(clean, self.geometry),
+            faulty, clean, np.empty(0, dtype=np.int64),
+        )
+        empty_map = np.zeros(self.geometry.shape, dtype=np.float32)
+        merged = merge_reconstruction(
+            faulty, faulty_projection, self.geometry, empty_map,
+            np.ones_like(empty_map) * 5, empty_map,
+        )
+        sample = SimpleNamespace(
+            targets=targets, faulty_points=faulty, clean_points=clean,
+            faulty_source_ids=np.empty(0, dtype=np.int64),
+        )
+        metrics = evaluate_xyz(sample, merged)
+        self.assertTrue(np.isnan(metrics["healthy_original_preservation_rate"]))
+        self.assertTrue(np.isnan(metrics["false_original_delete_rate"]))
 
     def test_multi_original_ray_cannot_be_deleted_by_ray_score(self):
         original = np.stack([self.point(0, 0, 5), self.point(0, 0, 6)])

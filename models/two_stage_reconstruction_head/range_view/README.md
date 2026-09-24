@@ -91,6 +91,14 @@ python -m scripts.train_range_view_reconstruction \
 Defaults are append-only, LiDAR+radar, and no fault-map conditioning. For
 ablation, add `--allow-original-deletion --delete-threshold 0.999`,
 `--no-radar`, or `--use-fault-map-conditioning --fault-map-root ...`.
+Interactive training shows one progress bar for training and one for validation
+per epoch. When output is redirected (for example with `nohup`), the bars are
+suppressed and `progress.json` records the current epoch, phase, batch count,
+and running loss. Watch a background run with
+`python -m scripts.watch_range_view_training --run-root /path/to/run`.
+Each completed epoch prints a short summary. `summary.csv`
+has one row per epoch, `fault_summary.csv` has one row per fault and epoch,
+and `history.jsonl` plus `val_epoch_*.json` retain the full metrics.
 Fault-map inputs must come from an independent predictor and be saved under
 the same split/name as the sample with key
 `fault_probability_range_view`. The legacy target-derived heatmap and

@@ -63,7 +63,12 @@ def evaluate_range_model(
         if not records:
             return {}
         keys = [key for key, value in records[0].items() if isinstance(value, (int, float))]
-        return {key: float(np.nanmean([record[key] for record in records])) for key in keys}
+        result = {}
+        for key in keys:
+            values = np.asarray([record[key] for record in records], dtype=np.float64)
+            finite = np.isfinite(values)
+            result[key] = float(values[finite].mean()) if finite.any() else float("nan")
+        return result
 
     def target_counts(records: list[dict]) -> dict[str, int]:
         return {key: sum(int(row["targets"][key]) for row in records)
