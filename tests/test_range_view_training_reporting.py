@@ -10,7 +10,7 @@ from scripts.train_range_view_reconstruction import (
     FAULT_FIELDS, SUMMARY_FIELDS, _append_csv, _format_epoch_summary,
     _summary_rows, _write_progress,
 )
-from scripts.watch_range_view_training import _render
+from scripts.watch_range_view_training import _format_summary, _read_summaries, _render
 
 
 class RangeViewTrainingReportingTests(unittest.TestCase):
@@ -60,6 +60,10 @@ class RangeViewTrainingReportingTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(float(rows[0]["val_reconstructed_f1_at_0_2m"]), 0.27)
             self.assertEqual((root / "summary.csv").read_text().count("epoch,seconds"), 1)
+            latest = _read_summaries(root / "summary.csv", None)
+            self.assertEqual(len(latest), 1)
+            self.assertIn("val F1@0.2m 0.2700", _format_summary(latest[0]))
+            self.assertEqual(_read_summaries(root / "summary.csv", 2), [])
             _write_progress(root / "progress.json", epoch=2, phase="train",
                             completed=25, total=1750, loss=12.23)
             progress = json.loads((root / "progress.json").read_text())
