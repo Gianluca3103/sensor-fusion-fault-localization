@@ -9,7 +9,8 @@ matplotlib.use("Agg")
 import numpy as np
 
 from scripts.visualize_range_view_reconstruction import (
-    _display_points, _render_comparison, _save_ply, _shared_bounds,
+    _display_points, _render_comparison, _save_interactive_html, _save_ply,
+    _shared_bounds,
 )
 
 
@@ -40,10 +41,19 @@ class RangeViewVisualizationTests(unittest.TestCase):
             _render_comparison(
                 output, faulty=faulty, clean=clean, original=faulty,
                 generated=generated, sample_name="sample", fault="fog_sim",
-                epoch=15, max_plot_points=2, show=False,
+                epoch=15, max_plot_points=2, show=True,
             )
             self.assertTrue((output / "sample_rotatable_3d.png").is_file())
             self.assertTrue((output / "sample_xy_xz_yz.png").is_file())
+            _save_interactive_html(
+                output / "sample_interactive.html", faulty=faulty, clean=clean,
+                original=faulty, generated=generated, sample_name="sample",
+                fault="fog_sim", epoch=15, max_plot_points=2,
+            )
+            page = (output / "sample_interactive.html").read_text(encoding="utf-8")
+            self.assertIn("pointermove", page)
+            self.assertIn("Reconstructed LiDAR", page)
+            self.assertNotIn("https://", page)
 
 
 if __name__ == "__main__":

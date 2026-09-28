@@ -54,6 +54,134 @@ def _save_ply(path: Path, points: np.ndarray) -> None:
         handle.write(xyz.tobytes())
 
 
+def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
+                           original: np.ndarray, generated: np.ndarray,
+                           sample_name: str, fault: str, epoch: int,
+                           max_plot_points: int) -> None:
+    """Create a self-contained browser viewer with one synchronized 3D camera."""
+    bounds = _shared_bounds(faulty, clean, original, generated)
+
+    def xyz(points: np.ndarray) -> list[list[float]]:
+        return np.round(_display_points(points, max_plot_points), 2).tolist()
+
+    payload = {
+        "sample": sample_name, "fault": fault, "epoch": epoch,
+        "bounds": bounds,
+        "panels": [
+            {"name": "Faulty LiDAR", "count": len(faulty),
+             "layers": [{"color": COLORS["faulty"], "points": xyz(faulty)}]},
+            {"name": "Clean LiDAR", "count": len(clean),
+             "layers": [{"color": COLORS["clean"], "points": xyz(clean)}]},
+            {"name": "Reconstructed LiDAR", "count": len(original) + len(generated),
+             "layers": [{"color": COLORS["original"], "points": xyz(original)},
+                        {"color": COLORS["generated"], "points": xyz(generated)}]},
+        ],
+    }
+    # Escaping '<' prevents a sample name from ending the JSON script element.
+    data = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
+    page = """<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiDAR reconstruction comparison</title>
+<style>
+body{margin:0;padding:20px;font:15px system-ui,sans-serif;background:#10151b;color:#eaf0f6}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:12px}
+h1{font-size:19px;font-weight:600;margin:0}p{margin:3px 0;color:#b8c5d0}
+button{font:inherit;padding:7px 12px;color:#eaf0f6;background:#263340;border:1px solid #5a6d80;border-radius:6px}
+.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+section{min-width:0;background:#19222c;border:1px solid #364756;border-radius:7px;padding:10px}
+h2{font-size:16px;font-weight:600;margin:0 0 8px}canvas{display:block;width:100%;height:440px;touch-action:none;cursor:grab;background:#111a22}
+canvas:active{cursor:grabbing}.note{margin-top:12px}
+@media(max-width:900px){.panels{grid-template-columns:1fr}canvas{height:380px}}
+</style>
+<header><div><h1 id="title"></h1><p>Drag to rotate · wheel to zoom · Shift-drag to pan. All panels share one camera and scale.</p></div><button id="reset" type="button">Reset view</button></header>
+<div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions. Counts are full clouds; display points are capped for speed.</p>
+<script id="cloud-data" type="application/json">__DATA__</script>
+<script>
+(() => {
+  const data = JSON.parse(document.getElementById('cloud-data').textContent);
+  document.getElementById('title').textContent = `${data.sample} · ${data.fault} · checkpoint epoch ${data.epoch}`;
+  const root = document.getElementById('panels');
+  const canvases = data.panels.map((panel) => {
+    const section = document.createElement('section');
+    const heading = document.createElement('h2');
+    heading.textContent = `${panel.name} (${panel.count.toLocaleString()} points)`;
+    const canvas = document.createElement('canvas');
+    canvas.setAttribute('aria-label', `${panel.name} rotatable point cloud`);
+    section.append(heading, canvas); root.append(section);
+    return canvas;
+  });
+  const bounds = data.bounds;
+  const center = bounds.map(pair => (pair[0] + pair[1]) / 2);
+  const spans = bounds.map(pair => pair[1] - pair[0]);
+  const radius = Math.max(Math.hypot(...spans) / 2, 1);
+  const initial = {yaw:-0.85,pitch:0.35,zoom:1,panX:0,panY:0};
+  const view = {...initial};
+  function project(point, width, height, scale) {
+    const x=point[0]-center[0], y=point[1]-center[1], z=point[2]-center[2];
+    const cy=Math.cos(view.yaw), sy=Math.sin(view.yaw);
+    const cp=Math.cos(view.pitch), sp=Math.sin(view.pitch);
+    const u=cy*x-sy*y, v=sy*x+cy*y;
+    return [width/2+view.panX+u*scale,height/2+view.panY-(cp*z-sp*v)*scale];
+  }
+  function draw(canvas, panel) {
+    const dpi=window.devicePixelRatio||1, width=canvas.clientWidth, height=canvas.clientHeight;
+    const pixelWidth=Math.max(1,Math.round(width*dpi)), pixelHeight=Math.max(1,Math.round(height*dpi));
+    if(canvas.width!==pixelWidth||canvas.height!==pixelHeight){canvas.width=pixelWidth;canvas.height=pixelHeight;}
+    const ctx=canvas.getContext('2d'); ctx.setTransform(dpi,0,0,dpi,0,0);
+    ctx.clearRect(0,0,width,height);
+    const scale=0.43*Math.min(width,height)*view.zoom/radius;
+    ctx.lineWidth=1;
+    const axes=[[radius,0,0,'#e08181','X'],[0,radius,0,'#9bd3a9','Y'],[0,0,radius,'#9ebfea','Z']];
+    const origin=project(center,width,height,scale);
+    for(const [dx,dy,dz,color,label] of axes){
+      const end=project([center[0]+dx,center[1]+dy,center[2]+dz],width,height,scale);
+      ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...end);ctx.stroke();
+      ctx.fillStyle=color;ctx.fillText(label,end[0]+3,end[1]-3);
+    }
+    for(const layer of panel.layers){
+      ctx.fillStyle=layer.color;
+      for(const point of layer.points){
+        const [px,py]=project(point,width,height,scale);
+        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px,py,1.7,1.7);
+      }
+    }
+  }
+  function drawAll(){canvases.forEach((canvas,index)=>draw(canvas,data.panels[index]));}
+  let pending=false;
+  function scheduleDraw(){
+    if(pending)return;
+    pending=true;
+    requestAnimationFrame(()=>{pending=false;drawAll();});
+  }
+  const active=new Map();
+  for(const canvas of canvases){
+    canvas.addEventListener('pointerdown',event=>{
+      canvas.setPointerCapture(event.pointerId);
+      active.set(event.pointerId,{x:event.clientX,y:event.clientY});
+    });
+    canvas.addEventListener('pointermove',event=>{
+      const prior=active.get(event.pointerId);if(!prior)return;
+      const dx=event.clientX-prior.x,dy=event.clientY-prior.y;
+      prior.x=event.clientX;prior.y=event.clientY;
+      if(event.shiftKey){view.panX+=dx;view.panY+=dy;}
+      else{view.yaw+=dx*0.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*0.008));}
+      scheduleDraw();
+    });
+    canvas.addEventListener('pointerup',event=>active.delete(event.pointerId));
+    canvas.addEventListener('pointercancel',event=>active.delete(event.pointerId));
+    canvas.addEventListener('wheel',event=>{
+      event.preventDefault();view.zoom=Math.max(0.15,Math.min(15,view.zoom*Math.exp(-event.deltaY*0.001)));
+      scheduleDraw();
+    },{passive:false});
+  }
+  document.getElementById('reset').addEventListener('click',()=>{Object.assign(view,initial);scheduleDraw();});
+  window.addEventListener('resize',scheduleDraw); drawAll();
+})();
+</script></html>
+"""
+    path.write_text(page.replace("__DATA__", data), encoding="utf-8")
+
+
 def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarray,
                        original: np.ndarray, generated: np.ndarray,
                        sample_name: str, fault: str, epoch: int,
@@ -61,10 +189,9 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
     import matplotlib.pyplot as plt
 
     if show and plt.get_backend().lower().endswith("agg"):
-        raise RuntimeError(
-            "No interactive Matplotlib display is available. Use --no-show to "
-            "export PNG/PLY, then open the PLY files in a point-cloud viewer."
-        )
+        print("No interactive Matplotlib display; open the saved _interactive.html "
+              "file in a browser to rotate the clouds.", flush=True)
+        show = False
 
     faulty_plot = _display_points(faulty, max_plot_points)
     clean_plot = _display_points(clean, max_plot_points)
@@ -153,7 +280,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--max-plot-points", type=int, default=10000)
     parser.add_argument("--device", default="cpu", help="CPU avoids competing with GPU training")
     parser.add_argument("--fault-map-root", type=Path)
-    parser.add_argument("--no-show", action="store_true", help="Save PNG and PLY without opening GUI windows")
+    parser.add_argument("--no-show", action="store_true", help="Save HTML, PNG and PLY without GUI windows")
     args = parser.parse_args()
     if args.max_plot_points < 1 or any(index < 0 for index in args.sample_indices):
         parser.error("sample indices and max plot points must be nonnegative/positive")
@@ -215,6 +342,14 @@ def main() -> None:
             "max_plot_points_per_cloud": args.max_plot_points,
         }
         (destination / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        _save_interactive_html(
+            destination / f"{path.stem}_interactive.html",
+            faulty=sample.faulty_points, clean=sample.clean_points,
+            original=sample.faulty_points[merged.retained_original_indices],
+            generated=merged.generated_points, sample_name=path.stem,
+            fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
+            max_plot_points=args.max_plot_points,
+        )
         _render_comparison(
             destination, faulty=sample.faulty_points, clean=sample.clean_points,
             original=sample.faulty_points[merged.retained_original_indices],

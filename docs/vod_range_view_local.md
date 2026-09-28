@@ -40,11 +40,13 @@ To inspect a checkpoint without occupying the training GPU, run
 `scripts.visualize_range_view_reconstruction` with `--device cpu`, the run's
 `last_checkpoint.pt`, and the same sample/radar cache roots used by training.
 By default it opens the first three validation samples in a mouse-rotatable
-Matplotlib 3D viewer with synchronized camera angles. For each sample it also
-saves a fixed-scale XY/XZ/YZ comparison PNG, a 3D PNG, full XYZ PLY clouds,
-and a JSON file with true point counts. `--no-show` exports without GUI
-windows. The PNGs subsample points for responsiveness; the PLY files retain
-the full clouds. Only `last_checkpoint.pt` is retained by the current trainer,
+Matplotlib 3D viewer with synchronized camera angles when a GUI backend is
+available. It also saves a self-contained `_interactive.html` browser viewer
+that works offline without Tk or Qt, a fixed-scale XY/XZ/YZ comparison PNG,
+a 3D PNG, full XYZ PLY clouds, and JSON with true point counts. `--no-show`
+exports without GUI windows. Browser and PNG views subsample points for
+responsiveness; PLY files retain the full clouds. Only `last_checkpoint.pt`
+is retained by the current trainer,
 so an earlier best epoch cannot be re-inferred once that checkpoint has been
 overwritten; its existing validation PNGs remain available.
 
