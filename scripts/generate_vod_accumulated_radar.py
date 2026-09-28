@@ -1,4 +1,4 @@
-"""Generate ego-motion aligned 10- and 20-scan VoD radar releases."""
+"""Generate ego-motion-aligned VoD radar stacks for selected official splits."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from Fault_Localization_Model.vod_dataset import (
     load_vod_split_ids,
     load_vod_odom_from_camera,
 )
+from Fault_Localization_Model.vod_dataset.vod_io import vod_partition_for_split
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,10 +38,12 @@ def parse_args() -> argparse.Namespace:
         help="Break history at recording boundaries or implausible pose jumps.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--isolate-split-history", action="store_true",
+                        help="Stack only radar frames from the requested split")
     parser.add_argument(
         "--output-suffix",
         default="",
-        choices=("", "temporal_filtered"),
+        choices=("", "temporal_filtered", "rangeview"),
         help=(
             "Optional dataset-directory suffix, for example temporal_filtered "
             "writes radar_20frames_temporal_filtered."
@@ -77,24 +80,25 @@ def _public_root(vod_root: Path) -> Path:
     return public if public.is_dir() else vod_root
 
 
-def _calibration_path(public: Path, frame_id: int) -> Path:
-    return public / "radar" / "training" / "calib" / f"{frame_id:05d}.txt"
+def _calibration_path(public: Path, frame_id: int, partition: str) -> Path:
+    return public / "radar" / partition / "calib" / f"{frame_id:05d}.txt"
 
 
-def _pose_path(public: Path, frame_id: int) -> Path:
-    return public / "lidar" / "training" / "pose" / f"{frame_id:05d}.json"
+def _pose_path(public: Path, frame_id: int, partition: str) -> Path:
+    return public / "lidar" / partition / "pose" / f"{frame_id:05d}.json"
 
 
-def _radar_path(public: Path, frame_id: int) -> Path:
-    return public / "radar" / "training" / "velodyne" / f"{frame_id:05d}.bin"
+def _radar_path(public: Path, frame_id: int, partition: str) -> Path:
+    return public / "radar" / partition / "velodyne" / f"{frame_id:05d}.bin"
 
 
-def _same_recording(public: Path, previous: int, current: int, maximum: float) -> bool:
+def _same_recording(public: Path, previous: int, current: int, maximum: float,
+                    partition: str) -> bool:
     if current != previous + 1:
         return False
     try:
-        previous_pose = load_vod_odom_from_camera(_pose_path(public, previous))
-        current_pose = load_vod_odom_from_camera(_pose_path(public, current))
+        previous_pose = load_vod_odom_from_camera(_pose_path(public, previous, partition))
+        current_pose = load_vod_odom_from_camera(_pose_path(public, current, partition))
     except (OSError, ValueError):
         return False
     relative = np.linalg.inv(current_pose) @ previous_pose
@@ -106,12 +110,13 @@ def _histories(
     frame_ids: list[int],
     maximum_stack: int,
     max_step_translation_m: float,
+    partition: str,
 ) -> dict[int, list[int]]:
     histories: dict[int, list[int]] = {}
     active: list[int] = []
     for frame_id in frame_ids:
         if active and not _same_recording(
-            public, active[-1], frame_id, max_step_translation_m
+            public, active[-1], frame_id, max_step_translation_m, partition
         ):
             active = []
         active.append(frame_id)
@@ -144,7 +149,7 @@ def _atomic_tofile(path: Path, points: np.ndarray) -> None:
 
 
 def _generate_one(task: tuple) -> tuple[int, int, int, bool]:
-    public_text, frame_id, history, stack_size, overwrite, suffix, filter_values = task
+    public_text, partition, frame_id, history, stack_size, overwrite, suffix, filter_values = task
     public = Path(public_text)
     variant = f"radar_{stack_size}frames"
     if suffix:
@@ -152,7 +157,7 @@ def _generate_one(task: tuple) -> tuple[int, int, int, bool]:
     destination = (
         public
         / variant
-        / "training"
+        / partition
         / "velodyne"
         / f"{frame_id:05d}.bin"
     )
@@ -162,9 +167,9 @@ def _generate_one(task: tuple) -> tuple[int, int, int, bool]:
 
     selected = history[-stack_size:]
     points = accumulate_vod_radar_scans(
-        [_radar_path(public, item) for item in selected],
-        [_pose_path(public, item) for item in selected],
-        [_calibration_path(public, item) for item in selected],
+        [_radar_path(public, item, partition) for item in selected],
+        [_pose_path(public, item, partition) for item in selected],
+        [_calibration_path(public, item, partition) for item in selected],
         filter_config=(
             RadarTemporalFilterConfig(**filter_values)
             if filter_values is not None
@@ -216,18 +221,13 @@ def main() -> None:
         filter_values = filter_config.__dict__
 
     public = _public_root(args.vod_root)
-    radar_root = public / "radar" / "training" / "velodyne"
+    partition = vod_partition_for_split(public, args.split) if args.split else "training"
+    radar_root = public / "radar" / partition / "velodyne"
     all_frame_ids = sorted(int(path.stem) for path in radar_root.glob("*.bin"))
     if not all_frame_ids:
         raise FileNotFoundError(f"No single-frame VoD radar files found in {radar_root}")
 
     stack_sizes = sorted(set(args.stack_sizes))
-    histories = _histories(
-        public,
-        all_frame_ids,
-        max(stack_sizes),
-        args.max_step_translation_m,
-    )
     if args.split is None:
         frame_ids = all_frame_ids
     else:
@@ -241,9 +241,17 @@ def main() -> None:
         frame_ids = frame_ids[: args.limit]
     if not frame_ids:
         raise FileNotFoundError("No requested VoD radar target frames were found")
+    histories = _histories(
+        public,
+        frame_ids if args.isolate_split_history else all_frame_ids,
+        max(stack_sizes),
+        args.max_step_translation_m,
+        partition,
+    )
     tasks = [
         (
             str(public),
+            partition,
             frame_id,
             histories[frame_id],
             size,
@@ -272,7 +280,7 @@ def main() -> None:
 
     for size in stack_sizes:
         variant = f"radar_{size}frames" + (f"_{suffix}" if suffix else "")
-        destination = public / variant / "training" / "velodyne"
+        destination = public / variant / partition / "velodyne"
         count = sum(1 for _ in destination.glob("*.bin"))
         print(f"{variant}: {count} files in {destination}")
         manifest = {
@@ -285,8 +293,10 @@ def main() -> None:
             "filter": filter_values,
             "frames": count,
             "target_split": args.split,
+            "isolate_split_history": args.isolate_split_history,
         }
-        (destination.parent.parent / "filter_manifest.json").write_text(
+        manifest_name = f"filter_manifest_{args.split}.json" if args.split else "filter_manifest.json"
+        (destination.parent.parent / manifest_name).write_text(
             json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
         )

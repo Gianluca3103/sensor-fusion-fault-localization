@@ -35,3 +35,11 @@ This runs the existing deterministic range-view ADD/range/DELETE model, **not**
 the Cartesian sparse-voxel diffusion model. The default batch size is one and
 hidden width is eight for a laptop GPU. The checkpoint and `summary.csv` in
 each timestamped run directory are the main training outputs.
+
+For the Ubuntu full dataset, `scripts/run_vod_range5_full_cache.sh` builds a
+separate `radar_5frames_rangeview` raw radar variant with history isolated by
+official train/val/test split, then generates full-scan fault samples and lean
+LiDAR-aligned radar caches for every available frame. The stack is capped at
+five scans; the first frames of a recording may contain fewer. Unlike the
+local strict-five smoke test, this preserves those warm-up frames. Generation
+is resumable and writes per-split summaries under `samples/`.

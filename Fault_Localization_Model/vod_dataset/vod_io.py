@@ -24,6 +24,7 @@ SUPPORTED_RADAR_VARIANTS = (
     "radar",
     "radar_3frames",
     "radar_5frames",
+    "radar_5frames_rangeview",
     "radar_10frames",
     "radar_20frames",
     "radar_10frames_temporal_filtered",
@@ -181,6 +182,22 @@ def _split_ids(public_root: Path, split: str) -> list[str]:
     return load_vod_split_ids(public_root, split)
 
 
+def vod_partition_for_split(vod_root: str | Path, split: str,
+                            frame_ids: Sequence[str] | None = None) -> str:
+    """Locate official split files in either VoD's training or testing tree."""
+    public_root = resolve_vod_public_root(vod_root)
+    ids = list(frame_ids) if frame_ids is not None else load_vod_split_ids(public_root, split)
+    if not ids:
+        raise FileNotFoundError(f"VoD {split} split has no frame IDs")
+    for partition in ("training", "testing"):
+        root = public_root / "lidar" / partition / "velodyne"
+        if all((root / f"{frame_id}.bin").is_file() for frame_id in ids):
+            return partition
+    raise FileNotFoundError(
+        f"VoD {split} LiDAR frames are not complete in training or testing under {public_root}"
+    )
+
+
 def discover_vod_frames(
     vod_root: str | Path,
     split: str,
@@ -203,14 +220,6 @@ def discover_vod_frames(
         )
     public_root = resolve_vod_public_root(vod_root)
 
-    lidar_root = public_root / "lidar" / "training"
-    radar_root = public_root / radar_variant / "training"
-    # Accumulated releases may omit duplicate calibration files. Their points
-    # use the same radar frame as the single-scan release.
-    radar_calibration_root = radar_root / "calib"
-    if not any(radar_calibration_root.glob("*.txt")):
-        radar_calibration_root = public_root / "radar" / "training" / "calib"
-
     split_ids = _split_ids(public_root, split)
     if frame_ids is not None:
         requested = [str(frame_id) for frame_id in frame_ids]
@@ -220,6 +229,15 @@ def discover_vod_frames(
                 f"Requested frame IDs are not in VoD split {split}: {unknown[:5]}"
             )
         split_ids = requested
+
+    partition = vod_partition_for_split(public_root, split, split_ids)
+    lidar_root = public_root / "lidar" / partition
+    radar_root = public_root / radar_variant / partition
+    # Accumulated releases may omit duplicate calibration files. Their points
+    # use the same radar frame as the single-scan release.
+    radar_calibration_root = radar_root / "calib"
+    if not any(radar_calibration_root.glob("*.txt")):
+        radar_calibration_root = public_root / "radar" / partition / "calib"
 
     frames = []
     missing = []

@@ -116,6 +116,43 @@ class ViewOfDelftDatasetTests(unittest.TestCase):
 
         self.assertEqual([frame.frame_id for frame in frames], ["00001"])
 
+    def test_test_split_uses_testing_sensor_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            public = Path(directory) / "view_of_delft_PUBLIC"
+            sets = public / "lidar" / "ImageSets"
+            sets.mkdir(parents=True)
+            (sets / "test.txt").write_text("00003\n", encoding="utf-8")
+            for sensor in ("lidar", "radar_5frames"):
+                point_path = public / sensor / "testing" / "velodyne" / "00003.bin"
+                point_path.parent.mkdir(parents=True)
+                point_path.touch()
+            _write_calibration(public / "lidar" / "testing" / "calib" / "00003.txt")
+            _write_calibration(public / "radar" / "testing" / "calib" / "00003.txt")
+
+            frame = discover_vod_frames(directory, "test", radar_variant="radar_5frames")[0]
+
+        self.assertEqual(frame.split, "test")
+        self.assertIn("testing", frame.lidar_path.parts)
+        self.assertIn("testing", frame.radar_path.parts)
+
+    def test_held_out_test_ids_can_reside_in_training_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            public = Path(directory) / "view_of_delft_PUBLIC"
+            sets = public / "lidar" / "ImageSets"
+            sets.mkdir(parents=True)
+            (sets / "test.txt").write_text("00003\n", encoding="utf-8")
+            for sensor in ("lidar", "radar_5frames"):
+                point_path = public / sensor / "training" / "velodyne" / "00003.bin"
+                point_path.parent.mkdir(parents=True)
+                point_path.touch()
+            _write_calibration(public / "lidar" / "training" / "calib" / "00003.txt")
+            _write_calibration(public / "radar" / "training" / "calib" / "00003.txt")
+
+            frame = discover_vod_frames(directory, "test", radar_variant="radar_5frames")[0]
+
+        self.assertIn("training", frame.lidar_path.parts)
+        self.assertIn("training", frame.radar_path.parts)
+
     def test_vod_radar_cache_is_indexed_by_split_and_frame(self):
         path = radar_cache_path(
             Path("cache"),
