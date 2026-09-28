@@ -26,14 +26,16 @@ def _read_summaries(path: Path, last_epoch: int | None) -> list[dict]:
     if not path.is_file():
         return []
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = [row for row in csv.DictReader(handle)
-                if row.get("epoch") and row.get("val_reconstructed_f1_at_0_2m")]
+        rows = [row for row in csv.DictReader(handle) if row.get("epoch")]
     if last_epoch is None:
         return rows[-1:]
     return [row for row in rows if int(row["epoch"]) > last_epoch]
 
 
 def _format_summary(row: dict) -> str:
+    if not row.get("val_reconstructed_f1_at_0_2m"):
+        return (f"Epoch {row['epoch']} result | train loss "
+                f"{float(row['train_loss']):.4f} | validation not scheduled")
     return (
         f"Epoch {row['epoch']} result | train loss {float(row['train_loss']):.4f} | "
         f"val F1@0.2m {float(row['val_reconstructed_f1_at_0_2m']):.4f} "

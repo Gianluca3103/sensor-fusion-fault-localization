@@ -41,23 +41,23 @@ FAULT_FIELDS = (
 
 def _summary_rows(record: dict) -> tuple[dict, list[dict]]:
     train = record["train"]
-    overall = record["val_overall"]
+    overall = record.get("val_overall") or {}
     summary = {
         "epoch": record["epoch"], "seconds": record["seconds"],
         "train_loss": train["loss"], "train_add_loss": train["add_loss"],
         "train_range_loss": train["range_loss"],
         "train_delete_loss": train["delete_loss"],
         "train_free_space_loss": train["free_space_loss"],
-        "val_faulty_f1_at_0_2m": overall["faulty_f1_at_0.2m"],
-        "val_reconstructed_precision_at_0_2m": overall["reconstructed_precision_at_0.2m"],
-        "val_reconstructed_recall_at_0_2m": overall["reconstructed_recall_at_0.2m"],
-        "val_reconstructed_f1_at_0_2m": overall["reconstructed_f1_at_0.2m"],
-        "val_reconstructed_iou_at_0_2m": overall["reconstructed_iou_at_0.2m"],
-        "val_net_f1_improvement": overall["net_f1_improvement"],
-        "val_addition_precision": overall["addition_precision"],
-        "val_addition_recall": overall["addition_recall"],
-        "val_generated_hallucination_rate": overall["generated_hallucination_rate"],
-        "val_generated_count": overall["generated_count"],
+        "val_faulty_f1_at_0_2m": overall.get("faulty_f1_at_0.2m", ""),
+        "val_reconstructed_precision_at_0_2m": overall.get("reconstructed_precision_at_0.2m", ""),
+        "val_reconstructed_recall_at_0_2m": overall.get("reconstructed_recall_at_0.2m", ""),
+        "val_reconstructed_f1_at_0_2m": overall.get("reconstructed_f1_at_0.2m", ""),
+        "val_reconstructed_iou_at_0_2m": overall.get("reconstructed_iou_at_0.2m", ""),
+        "val_net_f1_improvement": overall.get("net_f1_improvement", ""),
+        "val_addition_precision": overall.get("addition_precision", ""),
+        "val_addition_recall": overall.get("addition_recall", ""),
+        "val_generated_hallucination_rate": overall.get("generated_hallucination_rate", ""),
+        "val_generated_count": overall.get("generated_count", ""),
     }
     faults = [
         {
@@ -69,7 +69,7 @@ def _summary_rows(record: dict) -> tuple[dict, list[dict]]:
             "addition_recall": metrics["addition_recall"],
             "generated_count": metrics["generated_count"],
         }
-        for fault, metrics in sorted(record["val_by_fault"].items())
+        for fault, metrics in sorted((record.get("val_by_fault") or {}).items())
     ]
     return summary, faults
 
@@ -102,6 +102,11 @@ def _validation_paths(paths: list[Path], progress_path: Path, epoch: int):
                             completed=index, total=len(paths))
 
 
+def _validation_schedule(epoch: int, validate_every: int, chamfer_every: int) -> tuple[bool, bool]:
+    validate = epoch % validate_every == 0
+    return validate, validate and epoch % chamfer_every == 0
+
+
 def _format_epoch_summary(summary: dict, faults: list[dict], total_epochs: int) -> str:
     lines = [
         f"Epoch {summary['epoch']}/{total_epochs} | {summary['seconds']:.1f}s",
@@ -109,6 +114,11 @@ def _format_epoch_summary(summary: dict, faults: list[dict], total_epochs: int) 
         f"{summary['train_loss']:.4f} (add {summary['train_add_loss']:.4f}, "
         f"range {summary['train_range_loss']:.4f}, "
         f"delete {summary['train_delete_loss']:.4f})",
+    ]
+    if summary["val_reconstructed_f1_at_0_2m"] == "":
+        lines.append("  Validation: not scheduled this epoch")
+        return "\n".join(lines)
+    lines.extend([
         "  Val F1 @ 0.2m: "
         f"{summary['val_reconstructed_f1_at_0_2m']:.4f} "
         f"(faulty {summary['val_faulty_f1_at_0_2m']:.4f}, "
@@ -119,7 +129,7 @@ def _format_epoch_summary(summary: dict, faults: list[dict], total_epochs: int) 
         f"precision {summary['val_addition_precision']:.4f}, "
         f"recall {summary['val_addition_recall']:.4f}, "
         f"generated {summary['val_generated_count']:,.0f} per sample",
-    ]
+    ])
     for fault in faults:
         lines.append(
             f"  {fault['fault']} (n={fault['count']}): "
@@ -151,6 +161,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int, default=50)
+    parser.add_argument("--validate-every", type=int, default=5,
+                        help="Run full validation every N epochs (default: 5)")
     parser.add_argument("--chamfer-every", type=int, default=10,
                         help="Compute validation Chamfer every N epochs (default: 10)")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -168,7 +180,8 @@ def _arguments() -> argparse.Namespace:
     if args.use_fault_map_conditioning and args.fault_map_root is None:
         parser.error("--use-fault-map-conditioning requires independent --fault-map-root")
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
-            or args.learning_rate <= 0 or args.chamfer_every < 1):
+            or args.learning_rate <= 0 or args.validate_every < 1
+            or args.chamfer_every < 1):
         parser.error("invalid training settings")
     return args
 
@@ -254,24 +267,29 @@ def main() -> None:
                 if batches % 25 == 0 or batches == len(loader):
                     _write_progress(progress_path, epoch=epoch, phase="train",
                                     completed=batches, total=len(loader), loss=running_loss)
-        _write_progress(progress_path, epoch=epoch, phase="validation", completed=0,
-                        total=len(val_paths))
-        with tqdm(_validation_paths(val_paths, progress_path, epoch), total=len(val_paths),
-                  desc=f"Epoch {epoch}/{args.epochs} val", unit="sample",
-                  dynamic_ncols=True, mininterval=1.0, disable=not show_bars) as val_bar:
-            validation = evaluate_range_model(
-                model, val_bar, args.radar_root, geometry, device=device,
-                merge_config=merge_config, fault_map_root=fault_root,
-                output_path=args.output_root / f"val_epoch_{epoch}.json",
-                visualization_root=args.output_root / "visualizations" / f"epoch_{epoch}",
-                visualization_limit=3,
-                compute_chamfer=epoch % args.chamfer_every == 0,
-            )
+        validation = None
+        validate, compute_chamfer = _validation_schedule(
+            epoch, args.validate_every, args.chamfer_every)
+        if validate:
+            _write_progress(progress_path, epoch=epoch, phase="validation", completed=0,
+                            total=len(val_paths))
+            with tqdm(_validation_paths(val_paths, progress_path, epoch), total=len(val_paths),
+                      desc=f"Epoch {epoch}/{args.epochs} val", unit="sample",
+                      dynamic_ncols=True, mininterval=1.0, disable=not show_bars) as val_bar:
+                validation = evaluate_range_model(
+                    model, val_bar, args.radar_root, geometry, device=device,
+                    merge_config=merge_config, fault_map_root=fault_root,
+                    output_path=args.output_root / f"val_epoch_{epoch}.json",
+                    visualization_root=args.output_root / "visualizations" / f"epoch_{epoch}",
+                    visualization_limit=3,
+                    compute_chamfer=compute_chamfer,
+                )
         record = {"epoch": epoch, "seconds": time.perf_counter() - start,
-                  "chamfer_evaluated": validation["chamfer_evaluated"],
+                  "validation_evaluated": validation is not None,
+                  "chamfer_evaluated": validation["chamfer_evaluated"] if validation else False,
                   "train": {key: value / batches for key, value in totals.items()},
-                  "val_overall": validation["overall_macro"],
-                  "val_by_fault": validation["by_fault_macro"]}
+                  "val_overall": validation["overall_macro"] if validation else None,
+                  "val_by_fault": validation["by_fault_macro"] if validation else None}
         with (args.output_root / "history.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
         summary, faults = _summary_rows(record)

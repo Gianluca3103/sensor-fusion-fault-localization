@@ -8,12 +8,17 @@ import unittest
 
 from scripts.train_range_view_reconstruction import (
     FAULT_FIELDS, SUMMARY_FIELDS, _append_csv, _format_epoch_summary,
-    _summary_rows, _write_progress,
+    _summary_rows, _validation_schedule, _write_progress,
 )
 from scripts.watch_range_view_training import _format_summary, _read_summaries, _render
 
 
 class RangeViewTrainingReportingTests(unittest.TestCase):
+    def test_validation_schedule(self) -> None:
+        self.assertEqual(_validation_schedule(1, 5, 10), (False, False))
+        self.assertEqual(_validation_schedule(5, 5, 10), (True, False))
+        self.assertEqual(_validation_schedule(10, 5, 10), (True, True))
+
     def test_epoch_summary_and_csv(self) -> None:
         metrics = {
             "faulty_f1_at_0.2m": 0.42,
@@ -64,6 +69,17 @@ class RangeViewTrainingReportingTests(unittest.TestCase):
             self.assertEqual(len(latest), 1)
             self.assertIn("val F1@0.2m 0.2700", _format_summary(latest[0]))
             self.assertEqual(_read_summaries(root / "summary.csv", 2), [])
+            skipped_record = {**record, "epoch": 3, "val_overall": None,
+                              "val_by_fault": None}
+            skipped_summary, skipped_faults = _summary_rows(skipped_record)
+            self.assertEqual(skipped_summary["val_reconstructed_f1_at_0_2m"], "")
+            self.assertEqual(skipped_faults, [])
+            self.assertIn("Validation: not scheduled", _format_epoch_summary(
+                skipped_summary, skipped_faults, 10))
+            _append_csv(root / "summary.csv", SUMMARY_FIELDS, [skipped_summary])
+            latest = _read_summaries(root / "summary.csv", 2)
+            self.assertEqual(len(latest), 1)
+            self.assertIn("validation not scheduled", _format_summary(latest[0]))
             _write_progress(root / "progress.json", epoch=2, phase="train",
                             completed=25, total=1750, loss=12.23)
             progress = json.loads((root / "progress.json").read_text())
