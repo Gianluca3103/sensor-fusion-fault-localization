@@ -151,6 +151,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int, default=50)
+    parser.add_argument("--chamfer-every", type=int, default=10,
+                        help="Compute validation Chamfer every N epochs (default: 10)")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lambda-add", type=float, default=1)
     parser.add_argument("--lambda-range", type=float, default=1)
@@ -165,7 +167,8 @@ def _arguments() -> argparse.Namespace:
     args = parser.parse_args()
     if args.use_fault_map_conditioning and args.fault_map_root is None:
         parser.error("--use-fault-map-conditioning requires independent --fault-map-root")
-    if args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or args.learning_rate <= 0:
+    if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
+            or args.learning_rate <= 0 or args.chamfer_every < 1):
         parser.error("invalid training settings")
     return args
 
@@ -262,8 +265,10 @@ def main() -> None:
                 output_path=args.output_root / f"val_epoch_{epoch}.json",
                 visualization_root=args.output_root / "visualizations" / f"epoch_{epoch}",
                 visualization_limit=3,
+                compute_chamfer=epoch % args.chamfer_every == 0,
             )
         record = {"epoch": epoch, "seconds": time.perf_counter() - start,
+                  "chamfer_evaluated": validation["chamfer_evaluated"],
                   "train": {key: value / batches for key, value in totals.items()},
                   "val_overall": validation["overall_macro"],
                   "val_by_fault": validation["by_fault_macro"]}

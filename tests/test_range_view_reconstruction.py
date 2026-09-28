@@ -135,6 +135,11 @@ class RangeViewTests(unittest.TestCase):
         metrics = evaluate_xyz(sample, merged)
         self.assertTrue(np.isnan(metrics["healthy_original_preservation_rate"]))
         self.assertTrue(np.isnan(metrics["false_original_delete_rate"]))
+        self.assertIn("reconstructed_chamfer_m", metrics)
+        without_chamfer = evaluate_xyz(sample, merged, compute_chamfer=False)
+        self.assertNotIn("faulty_chamfer_m", without_chamfer)
+        self.assertNotIn("reconstructed_chamfer_m", without_chamfer)
+        self.assertIn("reconstructed_f1_at_0.2m", without_chamfer)
 
     def test_multi_original_ray_cannot_be_deleted_by_ray_score(self):
         original = np.stack([self.point(0, 0, 5), self.point(0, 0, 6)])

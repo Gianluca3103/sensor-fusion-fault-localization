@@ -18,26 +18,29 @@ def _match_fraction(source: np.ndarray, target: np.ndarray, tolerance_m: float) 
     return float(np.mean(distance <= tolerance_m))
 
 
-def _point_set_scores(predicted: np.ndarray, clean: np.ndarray, tolerance_m: float, prefix: str) -> dict[str, float]:
+def _point_set_scores(predicted: np.ndarray, clean: np.ndarray, tolerance_m: float,
+                      prefix: str, *, compute_chamfer: bool = True) -> dict[str, float]:
     precision = _match_fraction(predicted, clean, tolerance_m)
     recall = _match_fraction(clean, predicted, tolerance_m)
     f1 = 2 * precision * recall / max(precision + recall, 1e-12)
-    if len(predicted) and len(clean):
-        forward = cKDTree(clean[:, :3]).query(predicted[:, :3], k=1, workers=1)[0].mean()
-        reverse = cKDTree(predicted[:, :3]).query(clean[:, :3], k=1, workers=1)[0].mean()
-        chamfer = float((forward + reverse) / 2)
-    else:
-        chamfer = float("nan")
-    return {
+    scores = {
         f"{prefix}_precision_at_{tolerance_m:g}m": precision,
         f"{prefix}_recall_at_{tolerance_m:g}m": recall,
         f"{prefix}_f1_at_{tolerance_m:g}m": f1,
         f"{prefix}_iou_at_{tolerance_m:g}m": f1 / max(2 - f1, 1e-12),
-        f"{prefix}_chamfer_m": chamfer,
     }
+    if compute_chamfer:
+        if len(predicted) and len(clean):
+            forward = cKDTree(clean[:, :3]).query(predicted[:, :3], k=1, workers=1)[0].mean()
+            reverse = cKDTree(predicted[:, :3]).query(clean[:, :3], k=1, workers=1)[0].mean()
+            scores[f"{prefix}_chamfer_m"] = float((forward + reverse) / 2)
+        else:
+            scores[f"{prefix}_chamfer_m"] = float("nan")
+    return scores
 
 
-def evaluate_xyz(sample: RangeSample, merged: MergeResult, *, tolerance_m: float = 0.2) -> dict[str, float]:
+def evaluate_xyz(sample: RangeSample, merged: MergeResult, *, tolerance_m: float = 0.2,
+                 compute_chamfer: bool = True) -> dict[str, float]:
     healthy = sample.targets.healthy_original
     corrupted = sample.targets.corrupted_original
     deleted = np.zeros(len(sample.faulty_points), dtype=bool)
@@ -75,8 +78,10 @@ def evaluate_xyz(sample: RangeSample, merged: MergeResult, *, tolerance_m: float
         "deleted_original_count": float(len(merged.deleted_original_indices)),
         "same_ray_original_and_generated": float(merged.same_ray_original_and_generated),
     }
-    metrics.update(_point_set_scores(sample.faulty_points, sample.clean_points, tolerance_m, "faulty"))
-    metrics.update(_point_set_scores(merged.points, sample.clean_points, tolerance_m, "reconstructed"))
+    metrics.update(_point_set_scores(sample.faulty_points, sample.clean_points, tolerance_m,
+                                     "faulty", compute_chamfer=compute_chamfer))
+    metrics.update(_point_set_scores(merged.points, sample.clean_points, tolerance_m,
+                                     "reconstructed", compute_chamfer=compute_chamfer))
     metrics["net_f1_improvement"] = (
         metrics[f"reconstructed_f1_at_{tolerance_m:g}m"] - metrics[f"faulty_f1_at_{tolerance_m:g}m"]
     )

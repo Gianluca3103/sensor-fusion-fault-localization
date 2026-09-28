@@ -25,6 +25,7 @@ def evaluate_range_model(
     merge_config: MergeConfig,
     fault_map_root: Path | None = None,
     distance_m: float = 0.2,
+    compute_chamfer: bool = True,
     output_path: Path | None = None,
     visualization_root: Path | None = None,
     visualization_limit: int = 0,
@@ -46,7 +47,8 @@ def evaluate_range_model(
         )
         fault = str(sample.metadata.get("fault", "unknown"))
         record = {"sample": str(path), "fault": fault, "targets": sample.targets.counts()}
-        record.update(evaluate_xyz(sample, merged, tolerance_m=distance_m))
+        record.update(evaluate_xyz(sample, merged, tolerance_m=distance_m,
+                                   compute_chamfer=compute_chamfer))
         rows.append(record)
         if visualization_root is not None and index < visualization_limit:
             from .visualization import save_range_comparison
@@ -76,6 +78,7 @@ def evaluate_range_model(
 
     summary = {
         "count": len(rows),
+        "chamfer_evaluated": compute_chamfer,
         "merge_config": vars(merge_config),
         "overall_macro": summarize(rows),
         "overall_target_counts": target_counts(rows),
