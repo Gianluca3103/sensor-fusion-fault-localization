@@ -1,8 +1,8 @@
 """Export full-scan inputs and visualize clean/faulty LiDAR in angular range space.
 
 Without --geometry, the image uses continuous elevation bins for a diagnostic
-preview, not a claimed LiDAR beam assignment. With a calibrated geometry JSON,
-it displays the exact model range-image cells. The NPZ keeps every point.
+preview. With a geometry JSON, it displays the exact model range-image cells;
+those cells need not be calibrated physical LiDAR beams. The NPZ keeps every point.
 """
 
 from __future__ import annotations
@@ -99,8 +99,8 @@ def _plot_range(figure, axes, clean: np.ndarray, faulty: np.ndarray,
                   -0.5, len(geometry.beam_elevations_rad) - 0.5)
         row, col, _, valid = angular_indices(radar, geometry, require_beam_match=False)
         radar_x, radar_y = col[valid], row[valid]
-        xlabel, ylabel = "azimuth bin", "calibrated LiDAR beam row"
-        mode = "calibrated model range-image cells"
+        xlabel, ylabel = "azimuth bin", "elevation row"
+        mode = "model range-image cells"
     finite_ranges = np.concatenate(tuple(image[np.isfinite(image)] for image in images))
     shared_max = float(np.percentile(finite_ranges, 99)) if len(finite_ranges) else 1.0
     shared_max = max(shared_max, 1.0)
@@ -135,7 +135,7 @@ def main() -> None:
     parser.add_argument("--require-radar-frames", type=int,
                         help="Verify the radar source contains this many distinct scan time indices")
     parser.add_argument("--geometry", type=Path,
-                        help="Measured sensor geometry JSON for exact model beam rows")
+                        help="Angular geometry JSON for the model's range-image cells")
     parser.add_argument("--azimuth-bins", type=int, default=1024,
                         help="Diagnostic preview only when --geometry is absent")
     parser.add_argument("--elevation-bins", type=int, default=256,
