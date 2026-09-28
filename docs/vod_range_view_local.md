@@ -36,6 +36,18 @@ the Cartesian sparse-voxel diffusion model. The default batch size is one and
 hidden width is eight for a laptop GPU. The checkpoint and `summary.csv` in
 each timestamped run directory are the main training outputs.
 
+To inspect a checkpoint without occupying the training GPU, run
+`scripts.visualize_range_view_reconstruction` with `--device cpu`, the run's
+`last_checkpoint.pt`, and the same sample/radar cache roots used by training.
+By default it opens the first three validation samples in a mouse-rotatable
+Matplotlib 3D viewer with synchronized camera angles. For each sample it also
+saves a fixed-scale XY/XZ/YZ comparison PNG, a 3D PNG, full XYZ PLY clouds,
+and a JSON file with true point counts. `--no-show` exports without GUI
+windows. The PNGs subsample points for responsiveness; the PLY files retain
+the full clouds. Only `last_checkpoint.pt` is retained by the current trainer,
+so an earlier best epoch cannot be re-inferred once that checkpoint has been
+overwritten; its existing validation PNGs remain available.
+
 For the Ubuntu full dataset, `scripts/run_vod_range5_full_cache.sh` builds a
 separate `radar_5frames_rangeview` raw radar variant with history isolated by
 official train/val/test split, then generates full-scan fault samples and lean
