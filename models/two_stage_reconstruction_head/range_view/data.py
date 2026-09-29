@@ -18,6 +18,19 @@ from .targets import RangeTargets, build_range_targets
 TARGET_KEYS = ("add", "add_range_m", "delete", "delete_valid", "clean_valid", "clean_range_m")
 
 
+def rotate_points_yaw(points: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate XYZ around the sensor origin while retaining all other channels."""
+    if angle_rad == 0:
+        return points
+    rotated = np.array(points, copy=True)
+    cosine, sine = np.cos(angle_rad), np.sin(angle_rad)
+    x = points[:, 0]
+    y = points[:, 1]
+    rotated[:, 0] = cosine * x - sine * y
+    rotated[:, 1] = sine * x + cosine * y
+    return rotated
+
+
 @dataclass(frozen=True)
 class RangeSample:
     features: np.ndarray
@@ -47,6 +60,7 @@ def load_range_sample(
     range_tolerance_m: float = 0.2,
     point_tolerance_m: float = 0.05,
     forward_only: bool = True,
+    yaw_rotation_rad: float = 0.0,
 ) -> RangeSample:
     sample_path = Path(sample_path)
     aligned = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
@@ -62,6 +76,12 @@ def load_range_sample(
         source_ids = np.asarray(archive["faulty_source_ids"], dtype=np.int64)
     faulty = aligned.lidar_points
     radar = aligned.radar_points
+    if yaw_rotation_rad:
+        # One transform for all modalities and the target, before front-FOV
+        # filtering and angular projection. Preserve provenance row indices.
+        faulty = rotate_points_yaw(faulty, yaw_rotation_rad)
+        clean = rotate_points_yaw(clean, yaw_rotation_rad)
+        radar = rotate_points_yaw(radar, yaw_rotation_rad)
     if forward_only:
         # This is a sensor-FOV selection, not a fault-selector repair box.
         # Reindex raw-clean provenance after the same front-half selection.
@@ -109,16 +129,23 @@ def load_range_sample(
         radar_features,
         fault_map[None],
     ), axis=0).astype(np.float32)
+    metadata = dict(aligned.metadata)
+    if yaw_rotation_rad:
+        metadata["online_yaw_deg"] = float(np.degrees(yaw_rotation_rad))
     return RangeSample(features, targets, faulty_projection, clean_projection,
                        radar_features, faulty, clean, source_ids,
-                       aligned.metadata, sample_path)
+                       metadata, sample_path)
 
 
 class RangeViewDataset(Dataset):
     def __init__(self, paths: list[Path], radar_root: Path, geometry: RangeGeometry,
                  *, fault_map_root: Path | None = None,
                  range_tolerance_m: float = 0.2, point_tolerance_m: float = 0.05,
-                 forward_only: bool = True) -> None:
+                 forward_only: bool = True, online_yaw_deg: float = 0.0) -> None:
+        if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
+            raise ValueError("online_yaw_deg must be finite and nonnegative")
+        if online_yaw_deg and fault_map_root is not None:
+            raise ValueError("online yaw requires no fault-map conditioning")
         self.paths = paths
         self.radar_root = radar_root
         self.geometry = geometry
@@ -126,15 +153,21 @@ class RangeViewDataset(Dataset):
         self.range_tolerance_m = range_tolerance_m
         self.point_tolerance_m = point_tolerance_m
         self.forward_only = forward_only
+        self.online_yaw_deg = online_yaw_deg
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        yaw_rotation_rad = (
+            float(np.deg2rad(np.random.uniform(-self.online_yaw_deg, self.online_yaw_deg)))
+            if self.online_yaw_deg else 0.0
+        )
         return load_range_sample(
             self.paths[index], self.radar_root, self.geometry,
             fault_map_root=self.fault_map_root,
             range_tolerance_m=self.range_tolerance_m,
             point_tolerance_m=self.point_tolerance_m,
             forward_only=self.forward_only,
+            yaw_rotation_rad=yaw_rotation_rad,
         ).tensors()

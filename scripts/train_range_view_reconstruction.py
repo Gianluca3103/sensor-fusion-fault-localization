@@ -175,13 +175,18 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--false-delete-penalty", type=float, default=30)
     parser.add_argument("--missed-delete-penalty", type=float, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--online-yaw-deg", type=float, default=0.0,
+                        help="Train-only per-sample yaw jitter in [-N,+N] degrees; 0 disables it")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.use_fault_map_conditioning and args.fault_map_root is None:
         parser.error("--use-fault-map-conditioning requires independent --fault-map-root")
+    if args.online_yaw_deg and args.use_fault_map_conditioning:
+        parser.error("online yaw cannot be combined with an unrotated fault map")
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.learning_rate <= 0 or args.validate_every < 1
-            or args.chamfer_every < 1):
+            or args.chamfer_every < 1 or not np.isfinite(args.online_yaw_deg)
+            or args.online_yaw_deg < 0):
         parser.error("invalid training settings")
     return args
 
@@ -227,7 +232,8 @@ def main() -> None:
     val_paths = _paths(args.data_root, "val", args.val_limit)
     fault_root = args.fault_map_root if args.use_fault_map_conditioning else None
     dataset = RangeViewDataset(train_paths, args.radar_root, geometry, fault_map_root=fault_root,
-                               forward_only=merge_config.forward_only)
+                               forward_only=merge_config.forward_only,
+                               online_yaw_deg=args.online_yaw_deg)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
     model = RangeViewReconstructor(model_config).to(device)

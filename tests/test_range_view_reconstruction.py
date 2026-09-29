@@ -1,5 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -15,6 +18,9 @@ from models.two_stage_reconstruction_head.range_view.model import (
 )
 from models.two_stage_reconstruction_head.range_view.loss import range_edit_loss
 from models.two_stage_reconstruction_head.range_view.metrics import evaluate_xyz
+from models.two_stage_reconstruction_head.range_view.data import (
+    RangeViewDataset, load_range_sample, rotate_points_yaw,
+)
 from scripts.visualize_range_view_inputs import _preview_range
 
 
@@ -29,6 +35,50 @@ class RangeViewTests(unittest.TestCase):
     def point(self, row, col, distance, intensity=0.5):
         return np.r_[backproject(np.asarray(row), np.asarray(col),
                                  np.asarray(distance), self.geometry), intensity].astype(np.float32)
+
+    def test_online_yaw_rotates_all_modalities_without_changing_provenance(self):
+        clean = np.asarray([[5, 0, -0.5, 0.7]], dtype=np.float32)
+        radar = np.asarray([[5, 0, -0.5, 3.0, 2.0]], dtype=np.float32)
+        angle = np.deg2rad(30)
+        rotated = rotate_points_yaw(radar, angle)
+        np.testing.assert_allclose(rotated[0, :3], [5 * np.cos(angle), 5 * np.sin(angle), -0.5], atol=1e-6)
+        np.testing.assert_array_equal(rotated[:, 3:], radar[:, 3:])
+        np.testing.assert_array_equal(radar[0, :2], [5, 0])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.npz"
+            np.savez(path, faulty_source_ids=np.asarray([0], dtype=np.int64))
+            aligned = SimpleNamespace(
+                lidar_points=clean.copy(), radar_points=radar.copy(),
+                metadata={"range_view_full_scan": True, "dataset": "View-of-Delft"},
+            )
+            with patch("models.two_stage_reconstruction_head.range_view.data.load_aligned_point_inputs",
+                       return_value=aligned), patch(
+                "models.two_stage_reconstruction_head.range_view.data.load_clean_lidar_from_metadata",
+                return_value=clean.copy(),
+            ):
+                sample = load_range_sample(path, Path(temporary), self.geometry,
+                                           yaw_rotation_rad=angle)
+            np.testing.assert_allclose(sample.faulty_points[:, :3],
+                                       rotate_points_yaw(clean, angle)[:, :3], atol=1e-6)
+            np.testing.assert_array_equal(sample.faulty_source_ids, [0])
+            self.assertTrue(bool(sample.targets.healthy_original[0]))
+            self.assertAlmostEqual(sample.metadata["online_yaw_deg"], 30)
+            self.assertEqual(int((sample.radar_features[0] > 0).sum()), 1)
+
+    def test_dataset_draws_new_yaw_only_when_enabled(self):
+        with patch("models.two_stage_reconstruction_head.range_view.data.load_range_sample") as load:
+            load.return_value.tensors.return_value = {}
+            augmented = RangeViewDataset([Path("a.npz")], Path("radar"), self.geometry,
+                                         online_yaw_deg=5)
+            with patch("numpy.random.uniform", side_effect=[-5.0, 5.0]):
+                augmented[0]
+                augmented[0]
+            angles = [call.kwargs["yaw_rotation_rad"] for call in load.call_args_list]
+            np.testing.assert_allclose(angles, np.deg2rad([-5, 5]))
+            load.reset_mock()
+            unaugmented = RangeViewDataset([Path("a.npz")], Path("radar"), self.geometry)
+            unaugmented[0]
+            self.assertEqual(load.call_args.kwargs["yaw_rotation_rad"], 0)
 
     def test_xyz_range_xyz_round_trip_and_nearest_visible_return(self):
         points = np.stack([self.point(0, 0, 8), self.point(1, 15, 12), self.point(0, 0, 4)])

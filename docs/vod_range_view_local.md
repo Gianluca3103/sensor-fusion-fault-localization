@@ -50,6 +50,16 @@ is retained by the current trainer,
 so an earlier best epoch cannot be re-inferred once that checkpoint has been
 overwritten; its existing validation PNGs remain available.
 
+For a train-only online geometric augmentation ablation, pass
+`--online-yaw-deg 5` to `scripts.train_range_view_reconstruction`. Each training
+sample gets a fresh yaw drawn uniformly from -5 to +5 degrees on every load.
+The same rotation is applied to faulty LiDAR, clean LiDAR supervision, and
+aligned radar before the forward-view crop and range projection. Validation
+and test data stay unrotated. No cache regeneration is needed; use a separate
+output directory and keep all other training settings identical to the
+unaugmented baseline. Fault-map conditioning cannot be combined with this
+augmentation unless its predicted map is rotated consistently too.
+
 For the Ubuntu full dataset, `scripts/run_vod_range5_full_cache.sh` builds a
 separate `radar_5frames_rangeview` raw radar variant with history isolated by
 official train/val/test split, then generates full-scan fault samples and lean
