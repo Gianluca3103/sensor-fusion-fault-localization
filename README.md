@@ -1,5 +1,13 @@
 # View-of-Delft LiDAR fault reconstruction
 
+## SVEFusion detector comparison
+
+The adapted LiDAR and radar detector is pinned at
+[`third_party/SVEFusion`](third_party/SVEFusion). After cloning or pulling this
+repository, run `git submodule update --init third_party/SVEFusion` to download
+it. See the [VoD clean, faulty, reconstructed comparison guide](third_party/SVEFusion/docs/vod_fault_comparison.md)
+for export, training, evaluation, and 3D AP_R40 scoring commands.
+
 ## HeRCULES support
 
 The same generator also accepts `--hercules-root` instead of `--vod-root`.
