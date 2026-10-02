@@ -19,6 +19,7 @@ from tqdm import tqdm
 from models.two_stage_reconstruction_head.range_view.data import RangeViewDataset
 from models.two_stage_reconstruction_head.range_view.evaluation import evaluate_range_model
 from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry
+from models.two_stage_reconstruction_head.range_view.input_cache import cache_settings, validate_cache
 from models.two_stage_reconstruction_head.range_view.loss import RangeLossConfig, range_edit_loss
 from models.two_stage_reconstruction_head.range_view.merge import MergeConfig
 from models.two_stage_reconstruction_head.range_view.model import RangeModelConfig, RangeViewReconstructor
@@ -149,6 +150,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--geometry", type=Path, required=True,
                         help="Sensor beam elevations, azimuth bins and physical range bounds JSON")
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--input-cache-root", type=Path,
+                        help="Preprojected training tensor cache built for this geometry and source data")
     parser.add_argument("--fault-map-root", type=Path)
     parser.add_argument("--use-fault-map-conditioning", action="store_true")
     parser.add_argument("--no-radar", action="store_true")
@@ -192,6 +195,8 @@ def _arguments() -> argparse.Namespace:
         parser.error("--use-fault-map-conditioning requires independent --fault-map-root")
     if args.online_yaw_deg and args.use_fault_map_conditioning:
         parser.error("online yaw cannot be combined with an unrotated fault map")
+    if args.input_cache_root and (args.online_yaw_deg or args.use_fault_map_conditioning):
+        parser.error("input cache requires fixed yaw and no fault-map conditioning")
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.learning_rate <= 0 or args.validate_every < 1
             or args.chamfer_every < 1 or not np.isfinite(args.online_yaw_deg)
@@ -244,12 +249,18 @@ def main() -> None:
     train_paths = _paths(args.data_root, "train", args.train_limit)
     val_paths = _paths(args.data_root, "val", args.val_limit)
     fault_root = args.fault_map_root if args.use_fault_map_conditioning else None
+    if args.input_cache_root is not None:
+        validate_cache(args.input_cache_root, train_paths, args.radar_root,
+                       cache_settings(geometry, forward_only=merge_config.forward_only,
+                                      radar_floor_band_m=args.radar_floor_band_m,
+                                      require_lidar_intensity=args.predict_intensity))
     dataset = RangeViewDataset(train_paths, args.radar_root, geometry, fault_map_root=fault_root,
                                forward_only=merge_config.forward_only,
                                online_yaw_deg=args.online_yaw_deg,
                                radar_floor_band_m=args.radar_floor_band_m,
                                require_lidar_intensity=args.predict_intensity,
-                               use_ray_encoding=args.use_ray_encoding)
+                               use_ray_encoding=args.use_ray_encoding,
+                               input_cache_root=args.input_cache_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
     model = RangeViewReconstructor(model_config).to(device)

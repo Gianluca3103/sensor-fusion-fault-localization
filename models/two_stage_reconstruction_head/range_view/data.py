@@ -170,11 +170,14 @@ class RangeViewDataset(Dataset):
                  radar_floor_band_m: float = 0.0,
                  filter_radar_by_lidar_min: bool = True,
                  require_lidar_intensity: bool = False,
-                 use_ray_encoding: bool = False) -> None:
+                 use_ray_encoding: bool = False,
+                 input_cache_root: Path | None = None) -> None:
         if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
             raise ValueError("online_yaw_deg must be finite and nonnegative")
         if online_yaw_deg and fault_map_root is not None:
             raise ValueError("online yaw requires no fault-map conditioning")
+        if input_cache_root is not None and (online_yaw_deg or fault_map_root is not None):
+            raise ValueError("Projected input cache requires fixed yaw and no external fault map")
         if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
             raise ValueError("radar_floor_band_m must be finite and nonnegative")
         self.paths = paths
@@ -189,11 +192,16 @@ class RangeViewDataset(Dataset):
         self.filter_radar_by_lidar_min = filter_radar_by_lidar_min
         self.require_lidar_intensity = require_lidar_intensity
         self.use_ray_encoding = use_ray_encoding
+        self.input_cache_root = input_cache_root
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self.input_cache_root is not None:
+            from .input_cache import load_cached_tensors
+            return load_cached_tensors(self.input_cache_root, self.paths[index], self.geometry,
+                                       use_ray_encoding=self.use_ray_encoding)
         yaw_rotation_rad = (
             float(np.deg2rad(np.random.uniform(-self.online_yaw_deg, self.online_yaw_deg)))
             if self.online_yaw_deg else 0.0

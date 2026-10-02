@@ -56,6 +56,39 @@ geometry. This representation change does **not** by itself enforce
 free-space or surface continuity, nor can it determine hidden ranges from a
 total LiDAR loss; evaluate those separately before claiming physical realism.
 
+### Cache projected training inputs before an 80-epoch run
+
+The full-scan artifacts remain the source of truth. After fitting the new
+geometry, build a separate disk cache of the 10 base feature maps and seven
+training targets. This avoids loading the clean `.bin`, aligned radar `.npz`,
+and recomputing angular projections on every training epoch. The optional
+three ray-direction channels are generated from the geometry at load time.
+The cache is specific to the geometry, source files, forward-view selection,
+radar filter, and intensity setting. The trainer rejects a stale or incomplete
+cache. The builder is resumable and stores only `train` samples; final-epoch
+validation still reads original samples.
+
+```bash
+BASE=/mnt/3D10B36523559581/Gianluca
+REPO="$BASE/sensor-fusion-fault-localization"
+PY="$BASE/svefusion-clean-cu118/bin/python"
+CACHE="$BASE/sensor_fusion_outputs/vod_range5_full_cache"
+GEOM="$BASE/sensor_fusion_outputs/vod_virtual_128x2048_geometry.json"
+INPUT_CACHE="$BASE/sensor_fusion_outputs/vod_virtual_128x2048_train_inputs"
+cd "$REPO"
+"$PY" -u -m scripts.cache_range_view_inputs \
+  --data-root "$CACHE/samples" --radar-root "$CACHE/radar" \
+  --geometry "$GEOM" --output-root "$INPUT_CACHE" \
+  --require-lidar-intensity --workers 4
+```
+
+Resume the same command after an interruption; it reuses valid entries.
+Pass `--input-cache-root "$INPUT_CACHE"` to the 80-epoch trainer, with
+`--predict-intensity --use-ray-encoding` and the same geometry. Do not enable
+`--online-yaw-deg` or external fault-map conditioning with this fixed cache.
+Keep enough free disk space for the compressed cache; the builder prints the
+completed sample count and writes `manifest.json` only after all entries exist.
+
 The fault-selector policy matches the HeRCULES range-view baseline: **there is
 no selector or oracle fault box**. The model receives the whole forward sensor
 view, with fault-map conditioning disabled. The merge is conservative by
