@@ -316,12 +316,21 @@ def main() -> None:
         summary, faults = _summary_rows(record)
         _append_csv(args.output_root / "summary.csv", SUMMARY_FIELDS, [summary])
         _append_csv(args.output_root / "fault_summary.csv", FAULT_FIELDS, faults)
-        torch.save({"epoch": epoch, "model_state_dict": model.state_dict(),
-                    "model_config": asdict(model_config), "geometry": asdict(geometry),
-                    "loss_config": asdict(loss_config), "merge_config": asdict(merge_config),
-                    "radar_floor_band_m": args.radar_floor_band_m,
-                    "filter_radar_by_lidar_min": True,
-                    "representation": "range_view"}, args.output_root / "last_checkpoint.pt")
+        checkpoint = {"epoch": epoch, "model_state_dict": model.state_dict(),
+                      "model_config": asdict(model_config), "geometry": asdict(geometry),
+                      "loss_config": asdict(loss_config), "merge_config": asdict(merge_config),
+                      "radar_floor_band_m": args.radar_floor_band_m,
+                      "filter_radar_by_lidar_min": True,
+                      "representation": "range_view"}
+        latest = args.output_root / "last_checkpoint.pt"
+        temporary = latest.with_suffix(".pt.tmp")
+        torch.save(checkpoint, temporary)
+        temporary.replace(latest)
+        if validation is not None:
+            selected = args.output_root / f"checkpoint_epoch_{epoch}.pt"
+            temporary = selected.with_suffix(".pt.tmp")
+            torch.save(checkpoint, temporary)
+            temporary.replace(selected)
         _write_progress(progress_path, epoch=epoch, phase="complete", completed=len(loader),
                         total=len(loader), loss=summary["train_loss"])
         print(_format_epoch_summary(summary, faults, args.epochs), flush=True)

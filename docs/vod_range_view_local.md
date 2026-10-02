@@ -53,10 +53,9 @@ available. It also saves a self-contained `_interactive.html` browser viewer
 that works offline without Tk or Qt, a fixed-scale XY/XZ/YZ comparison PNG,
 a 3D PNG, full XYZ PLY clouds, and JSON with true point counts. `--no-show`
 exports without GUI windows. Browser and PNG views subsample points for
-responsiveness; PLY files retain the full clouds. Only `last_checkpoint.pt`
-is retained by the current trainer,
-so an earlier best epoch cannot be re-inferred once that checkpoint has been
-overwritten; its existing validation PNGs remain available.
+responsiveness; PLY files retain the full clouds. The trainer retains
+`last_checkpoint.pt` and a separate `checkpoint_epoch_N.pt` at each validation
+epoch, so an earlier model can be re-inferred after training continues.
 
 For a train-only online geometric augmentation ablation, pass
 `--online-yaw-deg 5` to `scripts.train_range_view_reconstruction`. Each training
