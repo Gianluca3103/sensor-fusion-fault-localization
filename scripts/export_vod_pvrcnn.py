@@ -108,7 +108,8 @@ def _reconstruct(path: Path, radar_root: Path, loaded, device: str) -> np.ndarra
     sample = load_range_sample(path, radar_root, geometry,
                                forward_only=merge_config.forward_only,
                                radar_floor_band_m=radar_floor_band_m,
-                               filter_radar_by_lidar_min=filter_radar_by_lidar_min)
+                               filter_radar_by_lidar_min=filter_radar_by_lidar_min,
+                               use_ray_encoding=model.config.use_ray_encoding)
     with torch.inference_mode():
         output = model(torch.from_numpy(sample.features)[None].to(device))
     merged = merge_reconstruction(

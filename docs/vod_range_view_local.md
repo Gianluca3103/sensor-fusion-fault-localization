@@ -23,6 +23,39 @@ points. The elevation rows are uniform angular bins over -25 to +10 degrees,
 not contain ring IDs. The geometry script audits the chosen bounds on training
 LiDAR and refuses to proceed if they retain under 99% of forward points.
 
+## Audited virtual-ray replacement for a new training run
+
+The original 128 x 512 geometry is retained for reproducibility. For a new
+run, `scripts.fit_vod_lidar_rays` fits 128 nonuniform elevation rows from
+**clean training IDs only**, with 2048 front azimuth bins. These are virtual
+angular rays, not claimed factory laser IDs: VoD provides motion-compensated
+XYZI without a ring ID or per-point firing time. The fitter removes exact
+duplicate XYZI rows for geometry statistics, but does not change the training
+or detector data. It writes a held-out-train audit of point assignment,
+same-cell collisions, and XYZ round-trip error, and refuses to save a geometry
+that fails the configured thresholds.
+
+On the local VoD copy, 128 fit and 32 held-out training frames produced 99.94%
+assignment, 1.75% collisions among unique points, and 0.040 m 95th-percentile
+XYZ round-trip error. The old 128 x 512 grid has about 43% collisions on the
+same held-out frames. The local files also contain two exact copies of every
+XYZI point tested; the fitter reports this separately instead of counting
+duplicates as ray collisions. Check the professor machine's audit before
+assuming its dataset has the same duplication.
+
+```bash
+python -m scripts.fit_vod_lidar_rays \
+  --vod-public /path/to/view_of_delft_PUBLIC \
+  --output /path/to/vod_virtual_128x2048_geometry.json
+```
+
+Train from scratch with the new geometry and `--use-ray-encoding`. The optional
+three unit-vector channels tell the network the direction of each nonuniform
+virtual ray. Older checkpoints keep their original ten-channel input and
+geometry. This representation change does **not** by itself enforce
+free-space or surface continuity, nor can it determine hidden ranges from a
+total LiDAR loss; evaluate those separately before claiming physical realism.
+
 The fault-selector policy matches the HeRCULES range-view baseline: **there is
 no selector or oracle fault box**. The model receives the whole forward sensor
 view, with fault-map conditioning disabled. The merge is conservative by

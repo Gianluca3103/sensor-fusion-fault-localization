@@ -154,6 +154,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--no-radar", action="store_true")
     parser.add_argument("--predict-intensity", action="store_true",
                         help="Predict VoD LiDAR intensity for generated points")
+    parser.add_argument("--use-ray-encoding", action="store_true",
+                        help="Append each ray's unit XYZ direction as three input channels")
     parser.add_argument("--radar-floor-band-m", type=float, default=0.0,
                         help="Opt-in: remove radar returns within this height above each frame's minimum radar z; 0 disables")
     parser.add_argument("--include-rear", action="store_true",
@@ -223,6 +225,7 @@ def main() -> None:
         use_fault_map_conditioning=args.use_fault_map_conditioning,
         circular_azimuth=geometry.azimuth_span_rad >= 2 * np.pi - 1e-8,
         predict_intensity=args.predict_intensity,
+        use_ray_encoding=args.use_ray_encoding,
     )
     loss_config = RangeLossConfig(
         lambda_add=args.lambda_add, lambda_range=args.lambda_range,
@@ -245,7 +248,8 @@ def main() -> None:
                                forward_only=merge_config.forward_only,
                                online_yaw_deg=args.online_yaw_deg,
                                radar_floor_band_m=args.radar_floor_band_m,
-                               require_lidar_intensity=args.predict_intensity)
+                               require_lidar_intensity=args.predict_intensity,
+                               use_ray_encoding=args.use_ray_encoding)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
     model = RangeViewReconstructor(model_config).to(device)

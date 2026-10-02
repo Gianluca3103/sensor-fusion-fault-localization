@@ -159,12 +159,27 @@ class RangeViewTests(unittest.TestCase):
                 return_value=clean.copy(),
             ):
                 sample = load_range_sample(path, Path(temporary), self.geometry,
-                                           radar_floor_band_m=0.10)
+                                           radar_floor_band_m=0.10,
+                                           use_ray_encoding=True)
             np.testing.assert_array_equal(sample.faulty_points, clean)
             np.testing.assert_array_equal(sample.clean_points, clean)
+            self.assertEqual(sample.features.shape[0], 13)
+            np.testing.assert_allclose(np.moveaxis(sample.features[-3:], 0, -1),
+                                       self.geometry.ray_directions())
             self.assertEqual(sample.metadata["radar_floor_removed_points"], 2)
             self.assertAlmostEqual(sample.metadata["radar_floor_reference_z_m"], -1.0)
             np.testing.assert_array_equal(sample.radar_points, radar[2:])
+
+    def test_model_uses_optional_ray_encoding_without_changing_legacy_inputs(self):
+        encoded = RangeViewReconstructor(RangeModelConfig(
+            hidden_channels=8, max_range_m=50, use_ray_encoding=True))
+        legacy = RangeViewReconstructor(RangeModelConfig(
+            hidden_channels=8, max_range_m=50))
+        self.assertEqual(encoded.input_channels, 13)
+        self.assertEqual(legacy.input_channels, 10)
+        with torch.no_grad():
+            output = encoded(torch.zeros(1, 13, 2, 16))
+        self.assertEqual(tuple(output["add_range_m"].shape), (1, 2, 16))
 
     def test_loaded_sample_uses_faulty_not_clean_lidar_for_radar_cutoff(self):
         clean = np.asarray([[5, 0, -1.5, 0.7], [5, 0, -0.5, 0.7]], dtype=np.float32)

@@ -8,6 +8,7 @@ range: the existing four-column point files contain no ring identifier.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from pathlib import Path
 
@@ -61,17 +62,20 @@ class RangeGeometry:
                                 else float(payload["max_beam_error_rad"])),
         )
 
+    @lru_cache(maxsize=16)
     def ray_directions(self) -> np.ndarray:
         azimuth = self.azimuth_offset_rad + (
             np.arange(self.azimuth_bins, dtype=np.float64) + 0.5
         ) * (self.azimuth_span_rad / self.azimuth_bins)
         elevation = np.asarray(self.beam_elevations_rad, dtype=np.float64)
         cos_elevation = np.cos(elevation)[:, None]
-        return np.stack(np.broadcast_arrays(
+        directions = np.stack(np.broadcast_arrays(
             cos_elevation * np.cos(azimuth)[None, :],
             cos_elevation * np.sin(azimuth)[None, :],
             np.sin(elevation)[:, None],
         ), axis=-1).astype(np.float32)
+        directions.setflags(write=False)
+        return directions
 
 
 @dataclass(frozen=True)

@@ -38,7 +38,8 @@ def evaluate_range_model(
         sample = load_range_sample(path, radar_root, geometry, fault_map_root=fault_map_root,
                                    forward_only=merge_config.forward_only,
                                    radar_floor_band_m=radar_floor_band_m,
-                                   filter_radar_by_lidar_min=filter_radar_by_lidar_min)
+                                   filter_radar_by_lidar_min=filter_radar_by_lidar_min,
+                                   use_ray_encoding=bool(getattr(model.config, "use_ray_encoding", False)))
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(device))
         add_probability = prediction["add_probability"][0].cpu().numpy()

@@ -65,6 +65,7 @@ def load_range_sample(
     radar_floor_band_m: float = 0.0,
     filter_radar_by_lidar_min: bool = True,
     require_lidar_intensity: bool = False,
+    use_ray_encoding: bool = False,
 ) -> RangeSample:
     sample_path = Path(sample_path)
     aligned = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
@@ -141,6 +142,12 @@ def load_range_sample(
         radar_features,
         fault_map[None],
     ), axis=0).astype(np.float32)
+    if use_ray_encoding:
+        # Unit vectors encode each virtual ray's true angular direction. The
+        # elevation rows need not be uniformly spaced after training-only fit.
+        features = np.concatenate((
+            features, np.moveaxis(geometry.ray_directions(), -1, 0)
+        ), axis=0)
     metadata = dict(aligned.metadata)
     metadata["radar_below_lidar_filter_enabled"] = bool(filter_radar_by_lidar_min)
     metadata["radar_lidar_min_z_m"] = lidar_min_z
@@ -162,7 +169,8 @@ class RangeViewDataset(Dataset):
                  forward_only: bool = True, online_yaw_deg: float = 0.0,
                  radar_floor_band_m: float = 0.0,
                  filter_radar_by_lidar_min: bool = True,
-                 require_lidar_intensity: bool = False) -> None:
+                 require_lidar_intensity: bool = False,
+                 use_ray_encoding: bool = False) -> None:
         if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
             raise ValueError("online_yaw_deg must be finite and nonnegative")
         if online_yaw_deg and fault_map_root is not None:
@@ -180,6 +188,7 @@ class RangeViewDataset(Dataset):
         self.radar_floor_band_m = radar_floor_band_m
         self.filter_radar_by_lidar_min = filter_radar_by_lidar_min
         self.require_lidar_intensity = require_lidar_intensity
+        self.use_ray_encoding = use_ray_encoding
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -199,4 +208,5 @@ class RangeViewDataset(Dataset):
             radar_floor_band_m=self.radar_floor_band_m,
             filter_radar_by_lidar_min=self.filter_radar_by_lidar_min,
             require_lidar_intensity=self.require_lidar_intensity,
+            use_ray_encoding=self.use_ray_encoding,
         ).tensors()

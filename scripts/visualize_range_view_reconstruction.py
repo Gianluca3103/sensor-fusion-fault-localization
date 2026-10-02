@@ -400,7 +400,8 @@ def main() -> None:
             path, args.radar_root, geometry, fault_map_root=args.fault_map_root,
             forward_only=merge_config.forward_only,
             radar_floor_band_m=radar_floor_band_m,
-            filter_radar_by_lidar_min=bool(checkpoint.get("filter_radar_by_lidar_min", False)))
+            filter_radar_by_lidar_min=bool(checkpoint.get("filter_radar_by_lidar_min", False)),
+            use_ray_encoding=model_config.use_ray_encoding)
         _, _, _, radar_valid = angular_indices(
             sample.radar_points, geometry, require_beam_match=False)
         radar_points = sample.radar_points[radar_valid]

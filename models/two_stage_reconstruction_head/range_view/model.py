@@ -18,6 +18,7 @@ class RangeModelConfig:
     use_fault_map_conditioning: bool = False
     circular_azimuth: bool = True
     predict_intensity: bool = False
+    use_ray_encoding: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_channels < 4 or self.hidden_channels % 4 or not 0 < self.min_range_m < self.max_range_m:
@@ -50,11 +51,12 @@ def _block(incoming: int, outgoing: int, dilation: int = 1,
 class RangeViewReconstructor(nn.Module):
     """No vertical pooling; two horizontal scales with circular azimuth seams."""
 
-    input_channels = 10  # LiDAR range/valid/reflectivity, six radar, one predicted fault map.
+    base_input_channels = 10  # LiDAR range/valid/reflectivity, six radar, one predicted fault map.
 
     def __init__(self, config: RangeModelConfig = RangeModelConfig()) -> None:
         super().__init__()
         self.config = config
+        self.input_channels = self.base_input_channels + (3 if config.use_ray_encoding else 0)
         width = config.hidden_channels
         self.stem = _block(self.input_channels, width, circular_azimuth=config.circular_azimuth)
         self.down = _block(width, width * 2, circular_azimuth=config.circular_azimuth)
@@ -66,7 +68,7 @@ class RangeViewReconstructor(nn.Module):
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         if features.ndim != 4 or features.shape[1] != self.input_channels:
-            raise ValueError("expected [batch,10,beam,azimuth] range-view features")
+            raise ValueError(f"expected [batch,{self.input_channels},beam,azimuth] range-view features")
         features = features.clone()
         if not self.config.use_radar:
             features[:, 3:9] = 0
