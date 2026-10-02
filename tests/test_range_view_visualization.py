@@ -36,8 +36,8 @@ class RangeViewVisualizationTests(unittest.TestCase):
             data = (output / "cloud.ply").read_bytes()
             header, payload = data.split(b"end_header\n", 1)
             self.assertIn(b"element vertex 2", header)
-            np.testing.assert_allclose(np.frombuffer(payload, dtype="<f4").reshape(-1, 3),
-                                       faulty[:, :3])
+            np.testing.assert_allclose(np.frombuffer(payload, dtype="<f4").reshape(-1, 4),
+                                       faulty)
             _render_comparison(
                 output, faulty=faulty, clean=clean, original=faulty,
                 generated=generated, sample_name="sample", fault="fog_sim",
@@ -49,10 +49,13 @@ class RangeViewVisualizationTests(unittest.TestCase):
                 output / "sample_interactive.html", faulty=faulty, clean=clean,
                 original=faulty, generated=generated, sample_name="sample",
                 fault="fog_sim", epoch=15, max_plot_points=2,
+                radar=np.asarray([[6, 1, 0, 4, 0]], dtype=np.float32),
             )
             page = (output / "sample_interactive.html").read_text(encoding="utf-8")
             self.assertIn("pointermove", page)
             self.assertIn("Reconstructed LiDAR", page)
+            self.assertIn('id="show-radar"', page)
+            self.assertIn('"radar":{"color":"#ffbf47","count":1', page)
             self.assertNotIn("https://", page)
 
 

@@ -15,13 +15,14 @@ import numpy as np
 import torch
 
 from models.two_stage_reconstruction_head.range_view.data import load_range_sample
-from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry
+from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry, angular_indices
 from models.two_stage_reconstruction_head.range_view.merge import MergeConfig, merge_reconstruction
 from models.two_stage_reconstruction_head.range_view.model import RangeModelConfig, RangeViewReconstructor
 
 
 COLORS = {"faulty": "#bb3434", "clean": "#2b8f58",
-          "original": "#8051a7", "generated": "#167bbb"}
+          "original": "#8051a7", "generated": "#167bbb",
+          "radar": "#ffbf47"}
 
 
 def _display_points(points: np.ndarray, maximum: int) -> np.ndarray:
@@ -60,9 +61,11 @@ def _save_ply(path: Path, points: np.ndarray) -> None:
 def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
                            original: np.ndarray, generated: np.ndarray,
                            sample_name: str, fault: str, epoch: int,
-                           max_plot_points: int) -> None:
+                           max_plot_points: int,
+                           radar: np.ndarray | None = None) -> None:
     """Create a self-contained browser viewer with one synchronized 3D camera."""
     bounds = _shared_bounds(faulty, clean, original, generated)
+    radar = np.empty((0, 3), dtype=np.float32) if radar is None else radar
 
     def xyz(points: np.ndarray) -> list[list[float]]:
         return np.round(_display_points(points, max_plot_points), 2).tolist()
@@ -70,6 +73,8 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
     payload = {
         "sample": sample_name, "fault": fault, "epoch": epoch,
         "bounds": bounds,
+        "radar": {"color": COLORS["radar"], "count": len(radar),
+                  "points": xyz(radar)},
         "panels": [
             {"name": "Faulty LiDAR", "count": len(faulty),
              "layers": [{"color": COLORS["faulty"], "points": xyz(faulty)}]},
@@ -90,19 +95,22 @@ body{margin:0;padding:20px;font:15px system-ui,sans-serif;background:#10151b;col
 header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:12px}
 h1{font-size:19px;font-weight:600;margin:0}p{margin:3px 0;color:#b8c5d0}
 button{font:inherit;padding:7px 12px;color:#eaf0f6;background:#263340;border:1px solid #5a6d80;border-radius:6px}
+.controls{display:flex;align-items:center;gap:16px}.controls label{cursor:pointer;white-space:nowrap}
 .panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 section{min-width:0;background:#19222c;border:1px solid #364756;border-radius:7px;padding:10px}
 h2{font-size:16px;font-weight:600;margin:0 0 8px}canvas{display:block;width:100%;height:440px;touch-action:none;cursor:grab;background:#111a22}
 canvas:active{cursor:grabbing}.note{margin-top:12px}
 @media(max-width:900px){.panels{grid-template-columns:1fr}canvas{height:380px}}
 </style>
-<header><div><h1 id="title"></h1><p>Drag to rotate · wheel to zoom · Shift-drag to pan. All panels share one camera and scale.</p></div><button id="reset" type="button">Reset view</button></header>
-<div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions. Counts are full clouds; display points are capped for speed.</p>
+<header><div><h1 id="title"></h1><p>Drag to rotate · wheel to zoom · Shift-drag to pan. All panels share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Show radar (<span id="radar-count"></span> points)</label><button id="reset" type="button">Reset view</button></div></header>
+<div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions; amber = aligned radar used by the model. Counts are full clouds; display points are capped for speed.</p>
 <script id="cloud-data" type="application/json">__DATA__</script>
 <script>
 (() => {
   const data = JSON.parse(document.getElementById('cloud-data').textContent);
   document.getElementById('title').textContent = `${data.sample} · ${data.fault} · checkpoint epoch ${data.epoch}`;
+  document.getElementById('radar-count').textContent = data.radar.count.toLocaleString();
+  const radarToggle = document.getElementById('show-radar');
   const root = document.getElementById('panels');
   const canvases = data.panels.map((panel) => {
     const section = document.createElement('section');
@@ -148,6 +156,13 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
         if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px,py,1.7,1.7);
       }
     }
+    if(radarToggle.checked){
+      ctx.fillStyle=data.radar.color;
+      for(const point of data.radar.points){
+        const [px,py]=project(point,width,height,scale);
+        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px-1,py-1,3,3);
+      }
+    }
   }
   function drawAll(){canvases.forEach((canvas,index)=>draw(canvas,data.panels[index]));}
   let pending=false;
@@ -178,6 +193,7 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
     },{passive:false});
   }
   document.getElementById('reset').addEventListener('click',()=>{Object.assign(view,initial);scheduleDraw();});
+  radarToggle.addEventListener('change',scheduleDraw);
   window.addEventListener('resize',scheduleDraw); drawAll();
 })();
 </script></html>
@@ -188,7 +204,8 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
 def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarray,
                        original: np.ndarray, generated: np.ndarray,
                        sample_name: str, fault: str, epoch: int,
-                       max_plot_points: int, show: bool) -> None:
+                       max_plot_points: int, show: bool,
+                       radar: np.ndarray | None = None) -> None:
     import matplotlib.pyplot as plt
 
     if show and plt.get_backend().lower().endswith("agg"):
@@ -200,6 +217,8 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
     clean_plot = _display_points(clean, max_plot_points)
     original_plot = _display_points(original, max_plot_points)
     generated_plot = _display_points(generated, max_plot_points)
+    radar_plot = (_display_points(radar, max_plot_points)
+                  if radar is not None else np.empty((0, 3), dtype=np.float32))
     bounds = _shared_bounds(faulty, clean, original, generated)
     panels = (
         ((faulty_plot, COLORS["faulty"]),),
@@ -218,6 +237,9 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
             if len(points):
                 axis.scatter(points[:, 0], points[:, 1], points[:, 2],
                              s=0.35, c=color, depthshade=False, rasterized=True)
+        if len(radar_plot):
+            axis.scatter(radar_plot[:, 0], radar_plot[:, 1], radar_plot[:, 2],
+                         s=2.5, c=COLORS["radar"], depthshade=False, rasterized=True)
         axis.set_title(name)
         axis.set_xlabel("X (m)")
         axis.set_ylabel("Y (m)")
@@ -254,6 +276,9 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
                 if len(points):
                     axis.scatter(points[:, horizontal], points[:, vertical],
                                  s=0.35, c=color, alpha=0.75, rasterized=True)
+            if len(radar_plot):
+                axis.scatter(radar_plot[:, horizontal], radar_plot[:, vertical],
+                             s=2.5, c=COLORS["radar"], alpha=0.9, rasterized=True)
             axis.set_xlim(*bounds[horizontal])
             axis.set_ylim(*bounds[vertical])
             axis.set_aspect("equal", adjustable="box")
@@ -325,6 +350,9 @@ def main() -> None:
             forward_only=merge_config.forward_only,
             radar_floor_band_m=radar_floor_band_m,
             filter_radar_by_lidar_min=bool(checkpoint.get("filter_radar_by_lidar_min", False)))
+        _, _, _, radar_valid = angular_indices(
+            sample.radar_points, geometry, require_beam_match=False)
+        radar_points = sample.radar_points[radar_valid]
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(args.device))
         merged = merge_reconstruction(
@@ -341,6 +369,7 @@ def main() -> None:
         for label, points in (
             ("faulty", sample.faulty_points), ("clean", sample.clean_points),
             ("generated", merged.generated_points), ("reconstructed", merged.points),
+            ("radar", radar_points[:, :3]),
         ):
             _save_ply(destination / f"{label}.ply", points)
         metadata = {
@@ -351,6 +380,7 @@ def main() -> None:
             "clean_points": len(sample.clean_points),
             "generated_points": len(merged.generated_points),
             "reconstructed_points": len(merged.points),
+            "radar_points": len(radar_points),
             "deleted_original_points": len(merged.deleted_original_indices),
             "radar_floor_band_m": radar_floor_band_m,
             "radar_floor_removed_points": sample.metadata["radar_floor_removed_points"],
@@ -366,6 +396,7 @@ def main() -> None:
             generated=merged.generated_points, sample_name=path.stem,
             fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
             max_plot_points=args.max_plot_points,
+            radar=radar_points,
         )
         _render_comparison(
             destination, faulty=sample.faulty_points, clean=sample.clean_points,
@@ -373,6 +404,7 @@ def main() -> None:
             generated=merged.generated_points, sample_name=path.stem,
             fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
             max_plot_points=args.max_plot_points, show=not args.no_show,
+            radar=radar_points,
         )
         print(f"{path.name}: {metadata['fault']} | faulty {metadata['faulty_points']:,} | "
               f"clean {metadata['clean_points']:,} | reconstructed "

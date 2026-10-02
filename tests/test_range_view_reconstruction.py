@@ -164,6 +164,7 @@ class RangeViewTests(unittest.TestCase):
             np.testing.assert_array_equal(sample.clean_points, clean)
             self.assertEqual(sample.metadata["radar_floor_removed_points"], 2)
             self.assertAlmostEqual(sample.metadata["radar_floor_reference_z_m"], -1.0)
+            np.testing.assert_array_equal(sample.radar_points, radar[2:])
 
     def test_loaded_sample_uses_faulty_not_clean_lidar_for_radar_cutoff(self):
         clean = np.asarray([[5, 0, -1.5, 0.7], [5, 0, -0.5, 0.7]], dtype=np.float32)

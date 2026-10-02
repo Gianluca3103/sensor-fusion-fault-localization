@@ -43,6 +43,7 @@ class RangeSample:
     faulty_source_ids: np.ndarray
     metadata: dict
     sample_path: Path
+    radar_points: np.ndarray
 
     def tensors(self) -> dict[str, torch.Tensor]:
         result = {"features": torch.from_numpy(self.features)}
@@ -151,7 +152,7 @@ def load_range_sample(
         metadata["online_yaw_deg"] = float(np.degrees(yaw_rotation_rad))
     return RangeSample(features, targets, faulty_projection, clean_projection,
                        radar_features, faulty, clean, source_ids,
-                       metadata, sample_path)
+                       metadata, sample_path, radar)
 
 
 class RangeViewDataset(Dataset):
