@@ -94,15 +94,26 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
 body{margin:0;padding:20px;font:15px system-ui,sans-serif;background:#10151b;color:#eaf0f6}
 header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:12px}
 h1{font-size:19px;font-weight:600;margin:0}p{margin:3px 0;color:#b8c5d0}
-button{font:inherit;padding:7px 12px;color:#eaf0f6;background:#263340;border:1px solid #5a6d80;border-radius:6px}
-.controls{display:flex;align-items:center;gap:16px}.controls label{cursor:pointer;white-space:nowrap}
+button{font:inherit;padding:8px 13px;color:#eaf0f6;background:#263340;border:1px solid #5a6d80;border-radius:6px;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid #ffbf47;outline-offset:2px}
+.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.controls label{cursor:pointer;white-space:nowrap;margin-right:8px}
+.zoom{font-size:20px;font-weight:700;line-height:1;min-width:42px;min-height:42px}
+.view-tabs{display:none}
 .panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 section{min-width:0;background:#19222c;border:1px solid #364756;border-radius:7px;padding:10px}
 h2{font-size:16px;font-weight:600;margin:0 0 8px}canvas{display:block;width:100%;height:440px;touch-action:none;cursor:grab;background:#111a22}
 canvas:active{cursor:grabbing}.note{margin-top:12px}
-@media(max-width:900px){.panels{grid-template-columns:1fr}canvas{height:380px}}
+@media(max-width:900px){
+  body{padding:8px}header{gap:8px}h1{font-size:16px}
+  .view-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-bottom:8px}
+  .view-tabs button{padding:10px 3px;font-size:13px;min-height:44px}
+  .view-tabs button[aria-selected="true"]{background:#31536b;border-color:#71b5e1}
+  .panels{display:block}section{display:none;padding:6px}section.active{display:block}
+  canvas{height:min(70dvh,700px)}.note{font-size:13px}
+}
 </style>
-<header><div><h1 id="title"></h1><p>Drag to rotate · wheel to zoom · Shift-drag to pan. All panels share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Show radar (<span id="radar-count"></span> points)</label><button id="reset" type="button">Reset view</button></div></header>
+<header><div><h1 id="title"></h1><p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All views share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Radar (<span id="radar-count"></span>)</label><button id="zoom-out" class="zoom" type="button" aria-label="Zoom out">−</button><button id="zoom-in" class="zoom" type="button" aria-label="Zoom in">+</button><button id="reset" type="button">Reset view</button></div></header>
+<div id="view-tabs" class="view-tabs" role="tablist" aria-label="LiDAR condition"></div>
 <div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions; amber = aligned radar used by the model. Counts are full clouds; display points are capped for speed.</p>
 <script id="cloud-data" type="application/json">__DATA__</script>
 <script>
@@ -112,13 +123,27 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   document.getElementById('radar-count').textContent = data.radar.count.toLocaleString();
   const radarToggle = document.getElementById('show-radar');
   const root = document.getElementById('panels');
-  const canvases = data.panels.map((panel) => {
+  const tabs = document.getElementById('view-tabs');
+  const sections = [];
+  const canvases = data.panels.map((panel,index) => {
     const section = document.createElement('section');
+    section.classList.toggle('active',index===2);
+    sections.push(section);
     const heading = document.createElement('h2');
     heading.textContent = `${panel.name} (${panel.count.toLocaleString()} points)`;
     const canvas = document.createElement('canvas');
     canvas.setAttribute('aria-label', `${panel.name} rotatable point cloud`);
     section.append(heading, canvas); root.append(section);
+    const tab = document.createElement('button');
+    tab.type='button'; tab.setAttribute('role','tab');
+    tab.textContent=panel.name.replace(' LiDAR','');
+    tab.setAttribute('aria-selected',String(index===2));
+    tab.addEventListener('click',()=>{
+      sections.forEach((item,i)=>item.classList.toggle('active',i===index));
+      [...tabs.children].forEach((item,i)=>item.setAttribute('aria-selected',String(i===index)));
+      scheduleDraw();
+    });
+    tabs.append(tab);
     return canvas;
   });
   const bounds = data.bounds;
@@ -127,6 +152,13 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   const radius = Math.max(Math.hypot(...spans) / 2, 1);
   const initial = {yaw:-0.85,pitch:0.35,zoom:1,panX:0,panY:0};
   const view = {...initial};
+  function zoomAt(multiplier,x,y,width,height){
+    const next=Math.max(0.1,Math.min(80,view.zoom*multiplier));
+    const ratio=next/view.zoom;
+    view.panX=x-width/2-(x-width/2-view.panX)*ratio;
+    view.panY=y-height/2-(y-height/2-view.panY)*ratio;
+    view.zoom=next;
+  }
   function project(point, width, height, scale) {
     const x=point[0]-center[0], y=point[1]-center[1], z=point[2]-center[2];
     const cy=Math.cos(view.yaw), sy=Math.sin(view.yaw);
@@ -136,6 +168,7 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   }
   function draw(canvas, panel) {
     const dpi=window.devicePixelRatio||1, width=canvas.clientWidth, height=canvas.clientHeight;
+    if(width===0||height===0)return;
     const pixelWidth=Math.max(1,Math.round(width*dpi)), pixelHeight=Math.max(1,Math.round(height*dpi));
     if(canvas.width!==pixelWidth||canvas.height!==pixelHeight){canvas.width=pixelWidth;canvas.height=pixelHeight;}
     const ctx=canvas.getContext('2d'); ctx.setTransform(dpi,0,0,dpi,0,0);
@@ -153,14 +186,14 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
       ctx.fillStyle=layer.color;
       for(const point of layer.points){
         const [px,py]=project(point,width,height,scale);
-        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px,py,1.7,1.7);
+        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px-1,py-1,2.2,2.2);
       }
     }
     if(radarToggle.checked){
       ctx.fillStyle=data.radar.color;
       for(const point of data.radar.points){
         const [px,py]=project(point,width,height,scale);
-        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px-1,py-1,3,3);
+        if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px-1.6,py-1.6,3.4,3.4);
       }
     }
   }
@@ -175,22 +208,40 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   for(const canvas of canvases){
     canvas.addEventListener('pointerdown',event=>{
       canvas.setPointerCapture(event.pointerId);
-      active.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      active.set(event.pointerId,{x:event.clientX,y:event.clientY,canvas});
     });
     canvas.addEventListener('pointermove',event=>{
       const prior=active.get(event.pointerId);if(!prior)return;
+      const peers=[...active.values()].filter(pointer=>pointer.canvas===canvas);
+      const previous=peers.map(pointer=>({x:pointer.x,y:pointer.y}));
       const dx=event.clientX-prior.x,dy=event.clientY-prior.y;
       prior.x=event.clientX;prior.y=event.clientY;
-      if(event.shiftKey){view.panX+=dx;view.panY+=dy;}
+      if(peers.length===2){
+        const oldMid={x:(previous[0].x+previous[1].x)/2,y:(previous[0].y+previous[1].y)/2};
+        const newMid={x:(peers[0].x+peers[1].x)/2,y:(peers[0].y+peers[1].y)/2};
+        const oldDistance=Math.hypot(previous[0].x-previous[1].x,previous[0].y-previous[1].y);
+        const newDistance=Math.hypot(peers[0].x-peers[1].x,peers[0].y-peers[1].y);
+        const bounds=canvas.getBoundingClientRect();
+        if(oldDistance>0)zoomAt(newDistance/oldDistance,oldMid.x-bounds.left,oldMid.y-bounds.top,canvas.clientWidth,canvas.clientHeight);
+        view.panX+=newMid.x-oldMid.x;view.panY+=newMid.y-oldMid.y;
+      }else if(event.shiftKey){view.panX+=dx;view.panY+=dy;}
       else{view.yaw+=dx*0.008;view.pitch=Math.max(-1.55,Math.min(1.55,view.pitch+dy*0.008));}
       scheduleDraw();
     });
     canvas.addEventListener('pointerup',event=>active.delete(event.pointerId));
     canvas.addEventListener('pointercancel',event=>active.delete(event.pointerId));
     canvas.addEventListener('wheel',event=>{
-      event.preventDefault();view.zoom=Math.max(0.15,Math.min(15,view.zoom*Math.exp(-event.deltaY*0.001)));
+      event.preventDefault();zoomAt(Math.exp(-event.deltaY*0.001),event.offsetX,event.offsetY,canvas.clientWidth,canvas.clientHeight);
       scheduleDraw();
     },{passive:false});
+  }
+  for(const [id,multiplier] of [['zoom-in',1.6],['zoom-out',1/1.6]]){
+    document.getElementById(id).addEventListener('click',()=>{
+      const canvas=canvases.find(item=>item.clientWidth>0);
+      if(!canvas)return;
+      zoomAt(multiplier,canvas.clientWidth/2,canvas.clientHeight/2,canvas.clientWidth,canvas.clientHeight);
+      scheduleDraw();
+    });
   }
   document.getElementById('reset').addEventListener('click',()=>{Object.assign(view,initial);scheduleDraw();});
   radarToggle.addEventListener('change',scheduleDraw);

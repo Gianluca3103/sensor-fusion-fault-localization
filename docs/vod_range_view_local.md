@@ -56,6 +56,10 @@ exports without GUI windows. Browser and PNG views subsample points for
 responsiveness; PLY files retain the full clouds. The trainer retains
 `last_checkpoint.pt` and a separate `checkpoint_epoch_N.pt` at each validation
 epoch, so an earlier model can be re-inferred after training continues.
+On phones, the HTML viewer shows one condition at a time with tabs while
+keeping the same camera angle and scale. One finger rotates; two fingers pan
+and pinch to zoom. The `+` and `−` buttons also zoom, and the radar checkbox
+overlays the aligned radar returns used by the model in amber.
 
 For a train-only online geometric augmentation ablation, pass
 `--online-yaw-deg 5` to `scripts.train_range_view_reconstruction`. Each training

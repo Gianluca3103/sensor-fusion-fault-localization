@@ -55,6 +55,9 @@ class RangeViewVisualizationTests(unittest.TestCase):
             self.assertIn("pointermove", page)
             self.assertIn("Reconstructed LiDAR", page)
             self.assertIn('id="show-radar"', page)
+            self.assertIn('id="view-tabs"', page)
+            self.assertIn("zoomAt(newDistance/oldDistance", page)
+            self.assertIn("two fingers to pan", page)
             self.assertIn('"radar":{"color":"#ffbf47","count":1', page)
             self.assertNotIn("https://", page)
 
