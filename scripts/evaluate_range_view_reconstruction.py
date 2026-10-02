@@ -7,6 +7,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from models.two_stage_reconstruction_head.range_view.evaluation import evaluate_range_model
@@ -25,6 +26,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--fault-map-root", type=Path)
     parser.add_argument("--disable-radar", action="store_true")
+    parser.add_argument("--radar-floor-band-m", type=float,
+                        help="Override the checkpoint's radar floor band; 0 disables it")
     parser.add_argument("--disable-fault-map", action="store_true")
     parser.add_argument("--add-threshold", type=float, default=0.5)
     parser.add_argument("--delete-thresholds", type=float, nargs="+", default=(0.95, 0.99, 0.995, 0.999))
@@ -34,6 +37,10 @@ def main() -> None:
     if checkpoint.get("representation") != "range_view":
         raise ValueError("checkpoint is not a range-view reconstruction model")
     geometry = RangeGeometry(**checkpoint["geometry"])
+    radar_floor_band_m = (checkpoint.get("radar_floor_band_m", 0.0)
+                          if args.radar_floor_band_m is None else args.radar_floor_band_m)
+    if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
+        parser.error("radar floor band must be finite and nonnegative")
     forward_only = bool(checkpoint["merge_config"].get("forward_only", False))
     config = RangeModelConfig(**checkpoint["model_config"])
     if args.disable_radar or args.disable_fault_map:
@@ -64,6 +71,8 @@ def main() -> None:
                 output_path=args.output_root / f"{name}.json",
                 visualization_root=args.output_root / name / "visualizations",
                 visualization_limit=3 if allow_delete else 0,
+                radar_floor_band_m=radar_floor_band_m,
+                filter_radar_by_lidar_min=bool(checkpoint.get("filter_radar_by_lidar_min", False)),
             )
             results[name] = {"overall": summary["overall_macro"], "by_fault": summary["by_fault_macro"]}
             print(json.dumps({"ablation": name, **results[name]}), flush=True)

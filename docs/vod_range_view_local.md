@@ -31,6 +31,14 @@ forward LiDAR points, regardless of its DELETE-head score. Rear points are
 outside this experiment's `x >= 0` field of view, as in the HeRCULES setup.
 The launcher audits the saved config and validation output for this policy.
 
+After aligning radar into the LiDAR frame and applying the same forward-view
+selection, the model drops radar returns below the minimum `z` of the
+available **faulty LiDAR input**. The clean target is never used for this
+filter. If a total-loss fault leaves no LiDAR points, radar is left unchanged.
+This happens when samples are loaded, so existing radar caches need not be
+rebuilt. New checkpoints record this preprocessing rule; older checkpoints
+continue to evaluate with their original radar preprocessing.
+
 This runs the existing deterministic range-view ADD/range/DELETE model, **not**
 the Cartesian sparse-voxel diffusion model. The default batch size is one and
 hidden width is eight for a laptop GPU. The checkpoint and `summary.csv` in
@@ -60,6 +68,17 @@ output directory and keep all other training settings identical to the
 unaugmented baseline. Fault-map conditioning cannot be combined with this
 augmentation unless its predicted map is rotated consistently too.
 
+For an opt-in radar minimum-height ablation, pass
+`--radar-floor-band-m 0.1` to `scripts.train_range_view_reconstruction` and
+use a fresh output directory. After the forward-FOV crop, each sample uses
+its minimum radar `z` as the floor proxy and drops returns with
+`z <= min_z + 0.1 m`. LiDAR and supervision are unchanged; the radar cache
+is not rewritten. The band is saved in the checkpoint and reused by evaluation
+and reconstruction visualization. Validation JSON records removed radar
+points per sample. Use 0 to disable only this extra band (the minimum-LiDAR
+filter remains active). This is **not** a
+slope-aware ground model: one low outlier can cause it to remove almost nothing.
+
 For the Ubuntu full dataset, `scripts/run_vod_range5_full_cache.sh` builds a
 separate `radar_5frames_rangeview` raw radar variant with history isolated by
 official train/val/test split, then generates full-scan fault samples and lean
@@ -67,3 +86,14 @@ LiDAR-aligned radar caches for every available frame. The stack is capped at
 five scans; the first frames of a recording may contain fewer. Unlike the
 local strict-five smoke test, this preserves those warm-up frames. Generation
 is resumable and writes per-split summaries under `samples/`.
+
+For VoD detector experiments, add `--predict-intensity --lambda-intensity 0.1`
+to a new `scripts.train_range_view_reconstruction` run. The optional head
+predicts LiDAR reflectivity for ADD points. Its Smooth L1 loss compares
+`log1p` intensity only on clean, valid ADD rays, keeping the scale manageable
+without assuming a particular raw intensity range. Retained original points
+keep their measured fourth channel; generated points receive the model's
+predicted fourth channel in evaluation, visualization, and detector export.
+HeRCULES' fourth LiDAR channel is radial velocity and is rejected as an
+intensity training target. Checkpoints without the optional head continue to
+load and produce the earlier zero-intensity generated points.

@@ -15,7 +15,7 @@ from .radar import filter_radar_below_lidar, filter_radar_floor_band, project_al
 from .targets import RangeTargets, build_range_targets
 
 
-TARGET_KEYS = ("add", "add_range_m", "delete", "delete_valid", "clean_valid", "clean_range_m")
+TARGET_KEYS = ("add", "add_range_m", "add_intensity", "delete", "delete_valid", "clean_valid", "clean_range_m")
 
 
 def rotate_points_yaw(points: np.ndarray, angle_rad: float) -> np.ndarray:
@@ -63,6 +63,7 @@ def load_range_sample(
     yaw_rotation_rad: float = 0.0,
     radar_floor_band_m: float = 0.0,
     filter_radar_by_lidar_min: bool = True,
+    require_lidar_intensity: bool = False,
 ) -> RangeSample:
     sample_path = Path(sample_path)
     aligned = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
@@ -125,6 +126,8 @@ def load_range_sample(
     dataset_name = str(aligned.metadata.get("dataset", "")).strip().lower()
     # VoD's fourth LiDAR field is reflectivity; the HeRCULES Aeva loader's
     # fourth field is radial velocity. Do not silently call that intensity.
+    if require_lidar_intensity and dataset_name not in {"view-of-delft", "view of delft", "vod"}:
+        raise ValueError("Intensity supervision requires VoD LiDAR reflectivity targets")
     lidar_reflectivity = (
         np.tanh(faulty_projection.reflectivity)
         if dataset_name in {"view-of-delft", "view of delft", "vod"}
@@ -157,7 +160,8 @@ class RangeViewDataset(Dataset):
                  range_tolerance_m: float = 0.2, point_tolerance_m: float = 0.05,
                  forward_only: bool = True, online_yaw_deg: float = 0.0,
                  radar_floor_band_m: float = 0.0,
-                 filter_radar_by_lidar_min: bool = True) -> None:
+                 filter_radar_by_lidar_min: bool = True,
+                 require_lidar_intensity: bool = False) -> None:
         if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
             raise ValueError("online_yaw_deg must be finite and nonnegative")
         if online_yaw_deg and fault_map_root is not None:
@@ -174,6 +178,7 @@ class RangeViewDataset(Dataset):
         self.online_yaw_deg = online_yaw_deg
         self.radar_floor_band_m = radar_floor_band_m
         self.filter_radar_by_lidar_min = filter_radar_by_lidar_min
+        self.require_lidar_intensity = require_lidar_intensity
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -192,4 +197,5 @@ class RangeViewDataset(Dataset):
             yaw_rotation_rad=yaw_rotation_rad,
             radar_floor_band_m=self.radar_floor_band_m,
             filter_radar_by_lidar_min=self.filter_radar_by_lidar_min,
+            require_lidar_intensity=self.require_lidar_intensity,
         ).tensors()

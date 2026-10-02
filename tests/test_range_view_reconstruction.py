@@ -10,7 +10,9 @@ import torch
 from models.two_stage_reconstruction_head.range_view.geometry import (
     RangeGeometry, angular_indices, backproject, project_lidar, transform_points, transform_radar_to_lidar,
 )
-from models.two_stage_reconstruction_head.range_view.radar import project_aligned_radar
+from models.two_stage_reconstruction_head.range_view.radar import (
+    filter_radar_below_lidar, filter_radar_floor_band, project_aligned_radar,
+)
 from models.two_stage_reconstruction_head.range_view.targets import build_range_targets
 from models.two_stage_reconstruction_head.range_view.merge import MergeConfig, merge_reconstruction
 from models.two_stage_reconstruction_head.range_view.model import (
@@ -112,6 +114,82 @@ class RangeViewTests(unittest.TestCase):
         self.assertAlmostEqual(float(features[3, row[0], col[0]]), 6)
         self.assertAlmostEqual(float(features[4, row[0], col[0]]), 2)
 
+    def test_radar_floor_band_removes_points_within_ten_centimeters_of_minimum(self):
+        radar = np.asarray([
+            [4, 0, -1.00, 5, 0],
+            [5, 0, -0.94, 6, 0],
+            [6, 0, -0.89, 7, 0],
+            [7, 0, -0.50, 8, 0],
+        ], dtype=np.float32)
+        filtered, floor = filter_radar_floor_band(radar, 0.10)
+        self.assertAlmostEqual(floor, -1.0)
+        np.testing.assert_array_equal(filtered, radar[2:])
+        unchanged, no_floor = filter_radar_floor_band(radar, 0.0)
+        np.testing.assert_array_equal(unchanged, radar)
+        self.assertIsNone(no_floor)
+
+    def test_radar_below_lidar_uses_faulty_input_and_keeps_equal_height(self):
+        radar = np.asarray([
+            [4, 0, -1.8, 5, 0], [5, 0, -1.65, 6, 0], [6, 0, -1.4, 7, 0],
+        ], dtype=np.float32)
+        faulty = np.asarray([[5, 0, -1.65, 0.5], [8, 0, -0.5, 0.4]], dtype=np.float32)
+        filtered, minimum = filter_radar_below_lidar(radar, faulty)
+        self.assertAlmostEqual(minimum, float(faulty[0, 2]))
+        np.testing.assert_array_equal(filtered, radar[1:])
+        unchanged, no_minimum = filter_radar_below_lidar(
+            radar, np.empty((0, 4), dtype=np.float32),
+        )
+        np.testing.assert_array_equal(unchanged, radar)
+        self.assertIsNone(no_minimum)
+
+    def test_loaded_sample_records_radar_floor_filter_without_changing_lidar(self):
+        clean = np.asarray([[5, 0, -1.5, 0.7]], dtype=np.float32)
+        radar = np.asarray([[5, 0, -1.0, 3, 0], [5, 0, -0.95, 4, 0],
+                            [5, 0, -0.5, 5, 0]], dtype=np.float32)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.npz"
+            np.savez(path, faulty_source_ids=np.asarray([0], dtype=np.int64))
+            aligned = SimpleNamespace(
+                lidar_points=clean.copy(), radar_points=radar.copy(),
+                metadata={"range_view_full_scan": True, "dataset": "View-of-Delft"},
+            )
+            with patch("models.two_stage_reconstruction_head.range_view.data.load_aligned_point_inputs",
+                       return_value=aligned), patch(
+                "models.two_stage_reconstruction_head.range_view.data.load_clean_lidar_from_metadata",
+                return_value=clean.copy(),
+            ):
+                sample = load_range_sample(path, Path(temporary), self.geometry,
+                                           radar_floor_band_m=0.10)
+            np.testing.assert_array_equal(sample.faulty_points, clean)
+            np.testing.assert_array_equal(sample.clean_points, clean)
+            self.assertEqual(sample.metadata["radar_floor_removed_points"], 2)
+            self.assertAlmostEqual(sample.metadata["radar_floor_reference_z_m"], -1.0)
+
+    def test_loaded_sample_uses_faulty_not_clean_lidar_for_radar_cutoff(self):
+        clean = np.asarray([[5, 0, -1.5, 0.7], [5, 0, -0.5, 0.7]], dtype=np.float32)
+        faulty = clean[1:].copy()
+        radar = np.asarray([[5, 0, -1.0, 3, 0], [5, 0, -0.5, 4, 0]], dtype=np.float32)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.npz"
+            np.savez(path, faulty_source_ids=np.asarray([1], dtype=np.int64))
+            aligned = SimpleNamespace(
+                lidar_points=faulty, radar_points=radar,
+                metadata={"range_view_full_scan": True, "dataset": "View-of-Delft"},
+            )
+            with patch("models.two_stage_reconstruction_head.range_view.data.load_aligned_point_inputs",
+                       return_value=aligned), patch(
+                "models.two_stage_reconstruction_head.range_view.data.load_clean_lidar_from_metadata",
+                return_value=clean,
+            ):
+                sample = load_range_sample(path, Path(temporary), self.geometry)
+                legacy = load_range_sample(path, Path(temporary), self.geometry,
+                                           filter_radar_by_lidar_min=False)
+        self.assertAlmostEqual(sample.metadata["radar_lidar_min_z_m"], -0.5)
+        self.assertEqual(sample.metadata["radar_below_lidar_removed_points"], 1)
+        self.assertEqual(legacy.metadata["radar_below_lidar_removed_points"], 0)
+        self.assertGreater(float(legacy.radar_features[1].sum()),
+                           float(sample.radar_features[1].sum()))
+
     def test_add_keep_delete_replace_targets(self):
         clean = np.stack([self.point(0, 0, 5), self.point(0, 2, 8), self.point(0, 4, 10)])
         faulty = np.stack([self.point(0, 0, 5), self.point(0, 3, 7), self.point(0, 4, 15)])
@@ -120,6 +198,8 @@ class RangeViewTests(unittest.TestCase):
                                       faulty, clean, np.asarray([0, -1, 2]))
         self.assertTrue(targets.keep[0, 0])
         self.assertTrue(targets.add[0, 2])
+        self.assertAlmostEqual(float(targets.add_intensity[0, 2]), 0.5)
+        self.assertEqual(float(targets.add_intensity[0, 0]), 0.0)
         self.assertTrue(targets.delete[0, 3])
         self.assertTrue(targets.replace[0, 4])
         self.assertTrue(targets.add[0, 4] and targets.delete[0, 4])
@@ -164,6 +244,42 @@ class RangeViewTests(unittest.TestCase):
         losses = range_edit_loss(result, target)
         self.assertTrue(torch.isfinite(losses["loss"]))
         self.assertEqual(float(losses["range_loss"].detach()), 0.0)
+
+    def test_intensity_head_is_masked_to_add_targets(self):
+        model = RangeViewReconstructor(RangeModelConfig(
+            hidden_channels=8, max_range_m=50, predict_intensity=True,
+        ))
+        result = model(torch.zeros(1, 10, 2, 16))
+        self.assertEqual(result["add_intensity"].shape, (1, 2, 16))
+        self.assertTrue(bool(torch.all(result["add_intensity"] >= 0)))
+        target = {key: torch.zeros(1, 2, 16) for key in (
+            "add", "add_range_m", "add_intensity", "delete", "delete_valid",
+            "clean_valid", "clean_range_m",
+        )}
+        target["add"][0, 0, 3] = 1
+        target["add_intensity"][0, 0, 3] = 2
+        loss = range_edit_loss(result, target)
+        self.assertTrue(bool(torch.isfinite(loss["intensity_loss"])))
+        self.assertGreater(float(loss["intensity_loss"].detach()), 0)
+        loss["loss"].backward()
+        self.assertIsNotNone(model.intensity_head.weight.grad)
+        self.assertGreater(float(model.intensity_head.weight.grad.abs().sum()), 0)
+        target["add"].zero_()
+        self.assertEqual(float(range_edit_loss(result, target)["intensity_loss"]), 0)
+
+    def test_generated_intensity_preserves_original_intensity(self):
+        original = np.stack([self.point(0, 0, 5, intensity=0.8)])
+        projection = project_lidar(original, self.geometry)
+        add = np.zeros(self.geometry.shape, dtype=np.float32)
+        add[0, 2] = 1
+        intensity = np.zeros_like(add)
+        intensity[0, 2] = 0.35
+        merged = merge_reconstruction(
+            original, projection, self.geometry, add,
+            np.full_like(add, 7), np.zeros_like(add), add_intensity=intensity,
+        )
+        self.assertAlmostEqual(float(merged.points[0, 3]), 0.8)
+        self.assertAlmostEqual(float(merged.generated_points[0, 3]), 0.35)
 
     def test_no_original_points_have_undefined_preservation_rate(self):
         clean = np.stack([self.point(0, 0, 5)])

@@ -117,6 +117,8 @@ def _reconstruct(path: Path, radar_root: Path, loaded, device: str) -> np.ndarra
         output["add_range_m"][0].cpu().numpy(),
         output["delete_probability"][0].cpu().numpy(),
         config=merge_config, radar_support=sample.radar_features[0],
+        add_intensity=(output["add_intensity"][0].cpu().numpy()
+                       if "add_intensity" in output else None),
     )
     return merged.points
 

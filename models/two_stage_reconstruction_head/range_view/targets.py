@@ -13,6 +13,7 @@ from .geometry import RangeProjection
 class RangeTargets:
     add: np.ndarray
     add_range_m: np.ndarray
+    add_intensity: np.ndarray
     delete: np.ndarray
     delete_valid: np.ndarray
     keep: np.ndarray
@@ -75,6 +76,7 @@ def build_range_targets(
     delete_valid = faulty.valid & (faulty.collision_count == 1)
     return RangeTargets(
         add=add, add_range_m=np.where(add, clean.range_m, 0).astype(np.float32),
+        add_intensity=np.where(add, clean.reflectivity, 0).astype(np.float32),
         delete=delete, delete_valid=delete_valid, keep=supported,
         replace=replace, clean_valid=clean.valid,
         clean_range_m=clean.range_m, healthy_original=healthy,

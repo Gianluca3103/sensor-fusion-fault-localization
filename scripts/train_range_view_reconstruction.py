@@ -26,7 +26,7 @@ from models.two_stage_reconstruction_head.range_view.model import RangeModelConf
 
 SUMMARY_FIELDS = (
     "epoch", "seconds", "train_loss", "train_add_loss", "train_range_loss",
-    "train_delete_loss", "train_free_space_loss", "val_faulty_f1_at_0_2m",
+    "train_delete_loss", "train_free_space_loss", "train_intensity_loss", "val_faulty_f1_at_0_2m",
     "val_reconstructed_precision_at_0_2m", "val_reconstructed_recall_at_0_2m",
     "val_reconstructed_f1_at_0_2m", "val_reconstructed_iou_at_0_2m",
     "val_net_f1_improvement", "val_addition_precision", "val_addition_recall",
@@ -48,6 +48,7 @@ def _summary_rows(record: dict) -> tuple[dict, list[dict]]:
         "train_range_loss": train["range_loss"],
         "train_delete_loss": train["delete_loss"],
         "train_free_space_loss": train["free_space_loss"],
+        "train_intensity_loss": train.get("intensity_loss", 0.0),
         "val_faulty_f1_at_0_2m": overall.get("faulty_f1_at_0.2m", ""),
         "val_reconstructed_precision_at_0_2m": overall.get("reconstructed_precision_at_0.2m", ""),
         "val_reconstructed_recall_at_0_2m": overall.get("reconstructed_recall_at_0.2m", ""),
@@ -113,7 +114,8 @@ def _format_epoch_summary(summary: dict, faults: list[dict], total_epochs: int) 
         "  Train loss: "
         f"{summary['train_loss']:.4f} (add {summary['train_add_loss']:.4f}, "
         f"range {summary['train_range_loss']:.4f}, "
-        f"delete {summary['train_delete_loss']:.4f})",
+        f"delete {summary['train_delete_loss']:.4f}, "
+        f"intensity {summary['train_intensity_loss']:.4f})",
     ]
     if summary["val_reconstructed_f1_at_0_2m"] == "":
         lines.append("  Validation: not scheduled this epoch")
@@ -150,6 +152,10 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--fault-map-root", type=Path)
     parser.add_argument("--use-fault-map-conditioning", action="store_true")
     parser.add_argument("--no-radar", action="store_true")
+    parser.add_argument("--predict-intensity", action="store_true",
+                        help="Predict VoD LiDAR intensity for generated points")
+    parser.add_argument("--radar-floor-band-m", type=float, default=0.0,
+                        help="Opt-in: remove radar returns within this height above each frame's minimum radar z; 0 disables")
     parser.add_argument("--include-rear", action="store_true",
                         help="Experimental full-azimuth mode; default uses x >= 0 LiDAR/radar only")
     parser.add_argument("--allow-original-deletion", action="store_true")
@@ -171,6 +177,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--lambda-delete", type=float, default=1)
     parser.add_argument("--lambda-geometry", type=float, default=0)
     parser.add_argument("--lambda-free-space", type=float, default=0.1)
+    parser.add_argument("--lambda-intensity", type=float, default=0.1)
     parser.add_argument("--add-positive-weight", type=float, default=10)
     parser.add_argument("--false-delete-penalty", type=float, default=30)
     parser.add_argument("--missed-delete-penalty", type=float, default=1)
@@ -186,7 +193,8 @@ def _arguments() -> argparse.Namespace:
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.learning_rate <= 0 or args.validate_every < 1
             or args.chamfer_every < 1 or not np.isfinite(args.online_yaw_deg)
-            or args.online_yaw_deg < 0):
+            or args.online_yaw_deg < 0 or not np.isfinite(args.radar_floor_band_m)
+            or args.radar_floor_band_m < 0):
         parser.error("invalid training settings")
     return args
 
@@ -214,11 +222,13 @@ def main() -> None:
         max_range_m=geometry.max_range_m, use_radar=not args.no_radar,
         use_fault_map_conditioning=args.use_fault_map_conditioning,
         circular_azimuth=geometry.azimuth_span_rad >= 2 * np.pi - 1e-8,
+        predict_intensity=args.predict_intensity,
     )
     loss_config = RangeLossConfig(
         lambda_add=args.lambda_add, lambda_range=args.lambda_range,
         lambda_delete=args.lambda_delete, lambda_geometry=args.lambda_geometry,
         lambda_free_space=args.lambda_free_space,
+        lambda_intensity=args.lambda_intensity,
         add_positive_weight=args.add_positive_weight,
         false_delete_penalty=args.false_delete_penalty,
         missed_delete_penalty=args.missed_delete_penalty,
@@ -233,7 +243,9 @@ def main() -> None:
     fault_root = args.fault_map_root if args.use_fault_map_conditioning else None
     dataset = RangeViewDataset(train_paths, args.radar_root, geometry, fault_map_root=fault_root,
                                forward_only=merge_config.forward_only,
-                               online_yaw_deg=args.online_yaw_deg)
+                               online_yaw_deg=args.online_yaw_deg,
+                               radar_floor_band_m=args.radar_floor_band_m,
+                               require_lidar_intensity=args.predict_intensity)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
     model = RangeViewReconstructor(model_config).to(device)
@@ -244,6 +256,7 @@ def main() -> None:
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "geometry": asdict(geometry), "model": asdict(model_config),
         "loss": asdict(loss_config), "merge": asdict(merge_config),
+        "filter_radar_by_lidar_min": True,
     }, indent=2), encoding="utf-8")
     progress_path = args.output_root / "progress.json"
     show_bars = sys.stderr.isatty()
@@ -289,6 +302,8 @@ def main() -> None:
                     visualization_root=args.output_root / "visualizations" / f"epoch_{epoch}",
                     visualization_limit=3,
                     compute_chamfer=compute_chamfer,
+                    radar_floor_band_m=args.radar_floor_band_m,
+                    filter_radar_by_lidar_min=True,
                 )
         record = {"epoch": epoch, "seconds": time.perf_counter() - start,
                   "validation_evaluated": validation is not None,
@@ -304,6 +319,8 @@ def main() -> None:
         torch.save({"epoch": epoch, "model_state_dict": model.state_dict(),
                     "model_config": asdict(model_config), "geometry": asdict(geometry),
                     "loss_config": asdict(loss_config), "merge_config": asdict(merge_config),
+                    "radar_floor_band_m": args.radar_floor_band_m,
+                    "filter_radar_by_lidar_min": True,
                     "representation": "range_view"}, args.output_root / "last_checkpoint.pt")
         _write_progress(progress_path, epoch=epoch, phase="complete", completed=len(loader),
                         total=len(loader), loss=summary["train_loss"])

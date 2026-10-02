@@ -44,14 +44,17 @@ def _shared_bounds(*clouds: np.ndarray) -> tuple[tuple[float, float], ...]:
 
 
 def _save_ply(path: Path, points: np.ndarray) -> None:
-    """Write the full XYZ cloud as a portable binary PLY, not the plot subsample."""
-    xyz = np.ascontiguousarray(points[:, :3], dtype="<f4")
+    """Write the full cloud, including measured or predicted intensity when present."""
+    columns = 4 if points.shape[1] >= 4 else 3
+    cloud = np.ascontiguousarray(points[:, :columns], dtype="<f4")
     header = ("ply\nformat binary_little_endian 1.0\n"
-              f"element vertex {len(xyz)}\n"
-              "property float x\nproperty float y\nproperty float z\nend_header\n")
+              f"element vertex {len(cloud)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              + ("property float intensity\n" if columns == 4 else "")
+              + "end_header\n")
     with path.open("wb") as handle:
         handle.write(header.encode("ascii"))
-        handle.write(xyz.tobytes())
+        handle.write(cloud.tobytes())
 
 
 def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
@@ -280,6 +283,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--max-plot-points", type=int, default=10000)
     parser.add_argument("--device", default="cpu", help="CPU avoids competing with GPU training")
     parser.add_argument("--fault-map-root", type=Path)
+    parser.add_argument("--radar-floor-band-m", type=float,
+                        help="Override checkpoint radar floor band; 0 disables it")
     parser.add_argument("--no-show", action="store_true", help="Save HTML, PNG and PLY without GUI windows")
     args = parser.parse_args()
     if args.max_plot_points < 1 or any(index < 0 for index in args.sample_indices):
@@ -298,6 +303,10 @@ def main() -> None:
     geometry = RangeGeometry(**checkpoint["geometry"])
     model_config = RangeModelConfig(**checkpoint["model_config"])
     merge_config = MergeConfig(**checkpoint["merge_config"])
+    radar_floor_band_m = (checkpoint.get("radar_floor_band_m", 0.0)
+                          if args.radar_floor_band_m is None else args.radar_floor_band_m)
+    if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
+        raise ValueError("radar floor band must be finite and nonnegative")
     if model_config.use_fault_map_conditioning and args.fault_map_root is None:
         raise ValueError("Checkpoint uses fault-map conditioning; supply --fault-map-root")
     model = RangeViewReconstructor(model_config).to(args.device)
@@ -313,7 +322,9 @@ def main() -> None:
         path = paths[index]
         sample = load_range_sample(
             path, args.radar_root, geometry, fault_map_root=args.fault_map_root,
-            forward_only=merge_config.forward_only)
+            forward_only=merge_config.forward_only,
+            radar_floor_band_m=radar_floor_band_m,
+            filter_radar_by_lidar_min=bool(checkpoint.get("filter_radar_by_lidar_min", False)))
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(args.device))
         merged = merge_reconstruction(
@@ -322,6 +333,8 @@ def main() -> None:
             prediction["add_range_m"][0].cpu().numpy(),
             prediction["delete_probability"][0].cpu().numpy(),
             config=merge_config, radar_support=sample.radar_features[0],
+            add_intensity=(prediction["add_intensity"][0].cpu().numpy()
+                           if "add_intensity" in prediction else None),
         )
         destination = args.output_root / path.stem
         destination.mkdir(parents=True, exist_ok=True)
@@ -339,6 +352,10 @@ def main() -> None:
             "generated_points": len(merged.generated_points),
             "reconstructed_points": len(merged.points),
             "deleted_original_points": len(merged.deleted_original_indices),
+            "radar_floor_band_m": radar_floor_band_m,
+            "radar_floor_removed_points": sample.metadata["radar_floor_removed_points"],
+            "radar_lidar_min_z_m": sample.metadata["radar_lidar_min_z_m"],
+            "radar_below_lidar_removed_points": sample.metadata["radar_below_lidar_removed_points"],
             "max_plot_points_per_cloud": args.max_plot_points,
         }
         (destination / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")

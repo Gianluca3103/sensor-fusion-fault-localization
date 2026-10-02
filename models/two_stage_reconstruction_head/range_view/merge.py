@@ -49,6 +49,7 @@ def merge_reconstruction(
     *,
     config: MergeConfig = MergeConfig(),
     radar_support: np.ndarray | None = None,
+    add_intensity: np.ndarray | None = None,
 ) -> MergeResult:
     original = np.asarray(original_points, dtype=np.float32)
     if original.ndim != 2 or original.shape[1] < 3 or len(original) != len(original_projection.point_row):
@@ -63,6 +64,9 @@ def merge_reconstruction(
     support = np.zeros(geometry.shape, dtype=np.float32) if radar_support is None else np.asarray(radar_support, dtype=np.float32)
     if support.shape != geometry.shape:
         raise ValueError("radar_support must match sensor geometry")
+    intensity = None if add_intensity is None else np.asarray(add_intensity, dtype=np.float32)
+    if intensity is not None and (intensity.shape != geometry.shape or not np.isfinite(intensity).all()):
+        raise ValueError("add_intensity must be a finite sensor-geometry map")
     point_valid = original_projection.point_valid
     point_rows = original_projection.point_row
     point_cols = original_projection.point_col
@@ -86,6 +90,8 @@ def merge_reconstruction(
     generated_xyz = backproject(rows, cols, add_r[rows, cols], geometry)
     generated = np.zeros((len(rows), original.shape[1]), dtype=np.float32)
     generated[:, :3] = generated_xyz
+    if intensity is not None and generated.shape[1] > 3:
+        generated[:, 3] = np.maximum(intensity[rows, cols], 0)
     points = np.concatenate((original[retained], generated), axis=0)
     retained_ray_count = np.zeros(geometry.shape, dtype=np.int32)
     retained_valid = retained[point_valid[retained]]

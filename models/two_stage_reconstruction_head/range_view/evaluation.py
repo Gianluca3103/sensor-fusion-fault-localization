@@ -29,12 +29,16 @@ def evaluate_range_model(
     output_path: Path | None = None,
     visualization_root: Path | None = None,
     visualization_limit: int = 0,
+    radar_floor_band_m: float = 0.0,
+    filter_radar_by_lidar_min: bool = True,
 ) -> dict:
     model.eval()
     rows = []
     for index, path in enumerate(paths):
         sample = load_range_sample(path, radar_root, geometry, fault_map_root=fault_map_root,
-                                   forward_only=merge_config.forward_only)
+                                   forward_only=merge_config.forward_only,
+                                   radar_floor_band_m=radar_floor_band_m,
+                                   filter_radar_by_lidar_min=filter_radar_by_lidar_min)
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(device))
         add_probability = prediction["add_probability"][0].cpu().numpy()
@@ -44,9 +48,13 @@ def evaluate_range_model(
             sample.faulty_points, sample.faulty_projection, geometry,
             add_probability, add_range, delete_probability,
             config=merge_config, radar_support=sample.radar_features[0],
+            add_intensity=(prediction["add_intensity"][0].cpu().numpy()
+                           if "add_intensity" in prediction else None),
         )
         fault = str(sample.metadata.get("fault", "unknown"))
         record = {"sample": str(path), "fault": fault, "targets": sample.targets.counts()}
+        record["radar_floor_removed_points"] = sample.metadata["radar_floor_removed_points"]
+        record["radar_below_lidar_removed_points"] = sample.metadata["radar_below_lidar_removed_points"]
         record.update(evaluate_xyz(sample, merged, tolerance_m=distance_m,
                                    compute_chamfer=compute_chamfer))
         rows.append(record)
@@ -80,6 +88,8 @@ def evaluate_range_model(
         "count": len(rows),
         "chamfer_evaluated": compute_chamfer,
         "merge_config": vars(merge_config),
+        "radar_floor_band_m": radar_floor_band_m,
+        "filter_radar_by_lidar_min": filter_radar_by_lidar_min,
         "overall_macro": summarize(rows),
         "overall_target_counts": target_counts(rows),
         "by_fault_macro": {fault: {"count": len(group), "target_counts": target_counts(group), **summarize(group)}

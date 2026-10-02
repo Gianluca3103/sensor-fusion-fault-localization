@@ -17,6 +17,7 @@ class RangeModelConfig:
     use_radar: bool = True
     use_fault_map_conditioning: bool = False
     circular_azimuth: bool = True
+    predict_intensity: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_channels < 4 or self.hidden_channels % 4 or not 0 < self.min_range_m < self.max_range_m:
@@ -61,6 +62,7 @@ class RangeViewReconstructor(nn.Module):
                                  circular_azimuth=config.circular_azimuth)
         self.up = _block(width * 3, width, circular_azimuth=config.circular_azimuth)
         self.head = nn.Conv2d(width, 3, 1)
+        self.intensity_head = nn.Conv2d(width, 1, 1) if config.predict_intensity else None
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         if features.ndim != 4 or features.shape[1] != self.input_channels:
@@ -74,15 +76,22 @@ class RangeViewReconstructor(nn.Module):
         coarse = self.down(F.avg_pool2d(fine, kernel_size=(1, 2), stride=(1, 2)))
         coarse = self.bottleneck(coarse)
         resized = F.interpolate(coarse, size=fine.shape[-2:], mode="bilinear", align_corners=False)
-        logits = self.head(self.up(torch.cat((fine, resized), dim=1)))
+        decoded = self.up(torch.cat((fine, resized), dim=1))
+        logits = self.head(decoded)
         add_logit, range_logit, delete_logit = logits[:, 0], logits[:, 1], logits[:, 2]
         add_range = self.config.min_range_m + (
             self.config.max_range_m - self.config.min_range_m
         ) * torch.sigmoid(range_logit)
-        return {
+        result = {
             "add_logit": add_logit,
             "delete_logit": delete_logit,
             "add_probability": torch.sigmoid(add_logit),
             "delete_probability": torch.sigmoid(delete_logit),
             "add_range_m": add_range,
         }
+        if self.intensity_head is not None:
+            # Predict log(1 + intensity) for a stable loss across LiDAR scales.
+            log_intensity = F.softplus(self.intensity_head(decoded)[:, 0])
+            result["add_log_intensity"] = log_intensity
+            result["add_intensity"] = torch.expm1(log_intensity.clamp(max=8.0))
+        return result

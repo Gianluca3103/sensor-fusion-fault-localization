@@ -15,6 +15,7 @@ class RangeLossConfig:
     lambda_delete: float = 1.0
     lambda_geometry: float = 0.0
     lambda_free_space: float = 0.1
+    lambda_intensity: float = 0.1
     add_positive_weight: float = 10.0
     false_delete_penalty: float = 30.0
     missed_delete_penalty: float = 1.0
@@ -54,11 +55,21 @@ def range_edit_loss(
             + (1.0 - clean_valid)
         )
     ).mean()
+    intensity_loss = add_loss.new_zeros(())
+    if "add_log_intensity" in prediction:
+        if "add_intensity" not in target:
+            raise KeyError("Intensity prediction requires add_intensity targets")
+        intensity_target = torch.log1p(target["add_intensity"].float().clamp_min(0))
+        intensity_error = F.smooth_l1_loss(
+            prediction["add_log_intensity"], intensity_target, reduction="none"
+        )
+        intensity_loss = (intensity_error * add).sum() / add.sum().clamp_min(1)
     total = (
         config.lambda_add * add_loss + config.lambda_range * range_loss
         + config.lambda_delete * delete_loss + config.lambda_geometry * geometry_loss
         + config.lambda_free_space * free_space_loss
+        + config.lambda_intensity * intensity_loss
     )
     return {"loss": total, "add_loss": add_loss, "range_loss": range_loss,
             "delete_loss": delete_loss, "geometry_loss": geometry_loss,
-            "free_space_loss": free_space_loss}
+            "free_space_loss": free_space_loss, "intensity_loss": intensity_loss}
