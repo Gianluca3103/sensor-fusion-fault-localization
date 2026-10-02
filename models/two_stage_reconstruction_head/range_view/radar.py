@@ -13,6 +13,48 @@ RADAR_FEATURE_NAMES = (
 )
 
 
+def filter_radar_below_lidar(
+    points_lidar_frame: np.ndarray, lidar_points: np.ndarray,
+) -> tuple[np.ndarray, float | None]:
+    """Keep radar at or above the lowest observed LiDAR return in this frame.
+
+    The LiDAR argument must be the available, faulty input, never the clean
+    supervision target. An empty LiDAR scan provides no safe threshold.
+    """
+    radar = np.asarray(points_lidar_frame, dtype=np.float32)
+    lidar = np.asarray(lidar_points, dtype=np.float32)
+    if radar.ndim != 2 or radar.shape[1] != 5:
+        raise ValueError("aligned radar must contain [x,y,z,rcs,compensated_velocity]")
+    if lidar.ndim != 2 or lidar.shape[1] < 3:
+        raise ValueError("LiDAR input must contain XYZ columns")
+    finite_lidar_z = lidar[np.isfinite(lidar[:, 2]), 2]
+    if len(finite_lidar_z) == 0:
+        return radar, None
+    minimum_z = float(finite_lidar_z.min())
+    return radar[radar[:, 2] >= minimum_z], minimum_z
+
+
+def filter_radar_floor_band(points_lidar_frame: np.ndarray, band_m: float) -> tuple[np.ndarray, float | None]:
+    """Drop radar points within ``band_m`` above this frame's minimum radar z.
+
+    The floor proxy is deliberately the minimum *radar* height, not a clean
+    LiDAR-derived plane. A zero band disables the ablation entirely.
+    """
+    points = np.asarray(points_lidar_frame, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 5:
+        raise ValueError("aligned radar cache must contain [x,y,z,rcs,compensated_velocity]")
+    if not np.isfinite(band_m) or band_m < 0:
+        raise ValueError("radar floor band must be finite and nonnegative")
+    if band_m == 0 or len(points) == 0:
+        return points, None
+    finite_z = np.isfinite(points[:, 2])
+    if not finite_z.any():
+        return points, None
+    floor_z = float(points[finite_z, 2].min())
+    keep = ~finite_z | (points[:, 2] > floor_z + band_m)
+    return points[keep], floor_z
+
+
 def project_aligned_radar(points_lidar_frame: np.ndarray, geometry: RangeGeometry) -> np.ndarray:
     """Aggregate all returns; input fields are xyz, RCS, compensated Doppler."""
     points = np.asarray(points_lidar_frame, dtype=np.float32)

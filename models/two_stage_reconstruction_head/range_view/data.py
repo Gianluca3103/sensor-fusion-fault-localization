@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from ..voxelization.inputs import load_aligned_point_inputs, load_clean_lidar_from_metadata
 from .geometry import RangeGeometry, RangeProjection, project_lidar
-from .radar import project_aligned_radar
+from .radar import filter_radar_below_lidar, filter_radar_floor_band, project_aligned_radar
 from .targets import RangeTargets, build_range_targets
 
 
@@ -61,6 +61,8 @@ def load_range_sample(
     point_tolerance_m: float = 0.05,
     forward_only: bool = True,
     yaw_rotation_rad: float = 0.0,
+    radar_floor_band_m: float = 0.0,
+    filter_radar_by_lidar_min: bool = True,
 ) -> RangeSample:
     sample_path = Path(sample_path)
     aligned = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
@@ -95,6 +97,12 @@ def load_range_sample(
         source_ids[original_id] = clean_index[source_ids[original_id]]
         clean = clean[keep_clean]
         radar = radar[radar[:, 0] >= 0]
+    radar_before_lidar_filter = len(radar)
+    lidar_min_z = None
+    if filter_radar_by_lidar_min:
+        radar, lidar_min_z = filter_radar_below_lidar(radar, faulty)
+    radar_before_floor_filter = len(radar)
+    radar, floor_z = filter_radar_floor_band(radar, radar_floor_band_m)
     faulty_projection = project_lidar(faulty, geometry)
     clean_projection = project_lidar(clean, geometry)
     radar_features = project_aligned_radar(radar, geometry)
@@ -130,6 +138,12 @@ def load_range_sample(
         fault_map[None],
     ), axis=0).astype(np.float32)
     metadata = dict(aligned.metadata)
+    metadata["radar_below_lidar_filter_enabled"] = bool(filter_radar_by_lidar_min)
+    metadata["radar_lidar_min_z_m"] = lidar_min_z
+    metadata["radar_below_lidar_removed_points"] = radar_before_lidar_filter - radar_before_floor_filter
+    metadata["radar_floor_band_m"] = float(radar_floor_band_m)
+    metadata["radar_floor_reference_z_m"] = floor_z
+    metadata["radar_floor_removed_points"] = radar_before_floor_filter - len(radar)
     if yaw_rotation_rad:
         metadata["online_yaw_deg"] = float(np.degrees(yaw_rotation_rad))
     return RangeSample(features, targets, faulty_projection, clean_projection,
@@ -141,11 +155,15 @@ class RangeViewDataset(Dataset):
     def __init__(self, paths: list[Path], radar_root: Path, geometry: RangeGeometry,
                  *, fault_map_root: Path | None = None,
                  range_tolerance_m: float = 0.2, point_tolerance_m: float = 0.05,
-                 forward_only: bool = True, online_yaw_deg: float = 0.0) -> None:
+                 forward_only: bool = True, online_yaw_deg: float = 0.0,
+                 radar_floor_band_m: float = 0.0,
+                 filter_radar_by_lidar_min: bool = True) -> None:
         if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
             raise ValueError("online_yaw_deg must be finite and nonnegative")
         if online_yaw_deg and fault_map_root is not None:
             raise ValueError("online yaw requires no fault-map conditioning")
+        if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
+            raise ValueError("radar_floor_band_m must be finite and nonnegative")
         self.paths = paths
         self.radar_root = radar_root
         self.geometry = geometry
@@ -154,6 +172,8 @@ class RangeViewDataset(Dataset):
         self.point_tolerance_m = point_tolerance_m
         self.forward_only = forward_only
         self.online_yaw_deg = online_yaw_deg
+        self.radar_floor_band_m = radar_floor_band_m
+        self.filter_radar_by_lidar_min = filter_radar_by_lidar_min
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -170,4 +190,6 @@ class RangeViewDataset(Dataset):
             point_tolerance_m=self.point_tolerance_m,
             forward_only=self.forward_only,
             yaw_rotation_rad=yaw_rotation_rad,
+            radar_floor_band_m=self.radar_floor_band_m,
+            filter_radar_by_lidar_min=self.filter_radar_by_lidar_min,
         ).tensors()
