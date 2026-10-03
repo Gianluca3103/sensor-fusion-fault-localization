@@ -160,6 +160,40 @@ def _image_placeholder(source_root: Path, destination: Path, frame_id: str) -> N
     Image.new("L", size, color=0).save(destination, format="PNG", optimize=True)
 
 
+def export_sve_reconstructed_validation(args: argparse.Namespace, public: Path, loaded) -> None:
+    """Write only the reconstructed validation clouds needed by SVEFusion.
+
+    prepare_vod_official_faults.py obtains labels, radar and clean/faulty
+    LiDAR from its existing official and fault roots. Copying thousands of
+    clean training scans into a separate detector export is unnecessary here.
+    """
+    selected = _sample_index(args.samples_root, "val")
+    official = (public / "lidar" / "ImageSets" / "val.txt").read_text(encoding="utf-8").split()
+    if set(selected) != set(official) or len(selected) != len(official):
+        raise ValueError("SVE validation export requires every official VoD validation frame exactly once")
+    root = args.output_root / "lidar" / "reconstructed"
+    for index, frame_id in enumerate(official, start=1):
+        points = _reconstruct(selected[frame_id], args.radar_root, loaded, args.device)
+        destination = root / "training" / "velodyne" / f"{frame_id}.bin"
+        _write_bin(destination, detector_points(points, None, forward_only=loaded[2].forward_only))
+        if index % 25 == 0 or index == len(official):
+            print(f"Reconstructed validation LiDAR: {index}/{len(official)}", flush=True)
+    manifest = {
+        "mode": "lidar", "condition": "reconstructed", "splits": {"train": 0, "val": len(official)},
+        "forward_only": loaded[2].forward_only, "checkpoint": str(args.checkpoint),
+        "checkpoint_epoch": loaded[3],
+        "reconstruction_radar_floor_band_m": loaded[4],
+        "reconstruction_filter_radar_by_lidar_min": loaded[5],
+        "reconstruction_first_return_filter": loaded[2].enforce_single_return_per_cell,
+        "reconstruction_radar_anchor_radius_m": loaded[2].radar_anchor_radius_m,
+        "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0],
+        "export_type": "sve_reconstructed_validation_only",
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "export_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"SVE validation export complete: {root}", flush=True)
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
@@ -175,6 +209,8 @@ def _arguments() -> argparse.Namespace:
                         help="Retain generated points only within this 3D distance of aligned radar returns")
     parser.add_argument("--with-radar", action="store_true",
                         help="Also export an early-fusion LiDAR+radar detector experiment")
+    parser.add_argument("--sve-val-only", action="store_true",
+                        help="Export only reconstructed validation LiDAR for prepare_vod_official_faults.py")
     parser.add_argument("--limit", type=int, help="Smoke-test frames per split")
     return parser.parse_args()
 
@@ -185,6 +221,11 @@ def main() -> None:
         raise ValueError("--limit must be positive")
     public = resolve_vod_public_root(args.vod_root)
     loaded = _checkpoint(args)
+    if args.sve_val_only:
+        if loaded is None or args.with_radar or args.limit is not None:
+            raise ValueError("--sve-val-only requires a checkpoint and cannot use --with-radar or --limit")
+        export_sve_reconstructed_validation(args, public, loaded)
+        return
     forward_only = loaded[2].forward_only if loaded else True
     modes = ("lidar", "lidar_radar") if args.with_radar else ("lidar",)
     selected: dict[str, dict[str, Path]] = {}
