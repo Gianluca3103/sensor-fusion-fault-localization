@@ -49,6 +49,7 @@ def evaluate_range_model(
             sample.faulty_points, sample.faulty_projection, geometry,
             add_probability, add_range, delete_probability,
             config=merge_config, radar_support=sample.radar_features[0],
+            radar_points=sample.radar_points,
             add_intensity=(prediction["add_intensity"][0].cpu().numpy()
                            if "add_intensity" in prediction else None),
         )

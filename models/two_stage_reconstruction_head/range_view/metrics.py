@@ -78,6 +78,7 @@ def evaluate_xyz(sample: RangeSample, merged: MergeResult, *, tolerance_m: float
         "deleted_original_count": float(len(merged.deleted_original_indices)),
         "same_ray_original_and_generated": float(merged.same_ray_original_and_generated),
         "blocked_generated_occupied_cells": float(merged.blocked_generated_occupied_cells),
+        "blocked_generated_radar_distance": float(merged.blocked_generated_radar_distance),
     }
     metrics.update(_point_set_scores(sample.faulty_points, sample.clean_points, tolerance_m,
                                      "faulty", compute_chamfer=compute_chamfer))

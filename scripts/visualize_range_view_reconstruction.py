@@ -365,6 +365,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--no-show", action="store_true", help="Save HTML, PNG and PLY without GUI windows")
     parser.add_argument("--enforce-first-return", action="store_true",
                         help="Reject generated points in cells containing a retained LiDAR return")
+    parser.add_argument("--radar-anchor-radius-m", type=float,
+                        help="Retain generated points only within this 3D distance of aligned radar returns")
     args = parser.parse_args()
     if args.max_plot_points < 1 or any(index < 0 for index in args.sample_indices):
         parser.error("sample indices and max plot points must be nonnegative/positive")
@@ -384,6 +386,8 @@ def main() -> None:
     merge_config = MergeConfig(**checkpoint["merge_config"])
     if args.enforce_first_return:
         merge_config = replace(merge_config, enforce_single_return_per_cell=True)
+    if args.radar_anchor_radius_m is not None:
+        merge_config = replace(merge_config, radar_anchor_radius_m=args.radar_anchor_radius_m)
     radar_floor_band_m = (checkpoint.get("radar_floor_band_m", 0.0)
                           if args.radar_floor_band_m is None else args.radar_floor_band_m)
     if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
@@ -418,6 +422,7 @@ def main() -> None:
             prediction["add_range_m"][0].cpu().numpy(),
             prediction["delete_probability"][0].cpu().numpy(),
             config=merge_config, radar_support=sample.radar_features[0],
+            radar_points=sample.radar_points,
             add_intensity=(prediction["add_intensity"][0].cpu().numpy()
                            if "add_intensity" in prediction else None),
         )
@@ -441,6 +446,8 @@ def main() -> None:
             "deleted_original_points": len(merged.deleted_original_indices),
             "first_return_filter": merge_config.enforce_single_return_per_cell,
             "blocked_generated_occupied_cells": merged.blocked_generated_occupied_cells,
+            "radar_anchor_radius_m": merge_config.radar_anchor_radius_m,
+            "blocked_generated_radar_distance": merged.blocked_generated_radar_distance,
             "radar_floor_band_m": radar_floor_band_m,
             "radar_floor_removed_points": sample.metadata["radar_floor_removed_points"],
             "radar_lidar_min_z_m": sample.metadata["radar_lidar_min_z_m"],

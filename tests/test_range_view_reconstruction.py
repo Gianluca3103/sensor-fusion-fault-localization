@@ -366,6 +366,34 @@ class RangeViewTests(unittest.TestCase):
         self.assertEqual(len(total_loss.generated_points), 3)
         self.assertEqual(total_loss.blocked_generated_occupied_cells, 0)
 
+    def test_radar_anchor_gate_keeps_only_nearby_generated_geometry(self):
+        empty_points = np.empty((0, 4), dtype=np.float32)
+        projection = project_lidar(empty_points, self.geometry)
+        add = np.zeros(self.geometry.shape, dtype=np.float32)
+        add[0, 0] = add[0, 4] = 1
+        distances = np.full_like(add, 5)
+        radar = np.asarray([self.point(0, 0, 5)[:3]], dtype=np.float32)
+        result = merge_reconstruction(
+            empty_points, projection, self.geometry, add, distances,
+            np.zeros_like(add),
+            config=MergeConfig(radar_anchor_radius_m=2.0),
+            radar_points=radar,
+        )
+        self.assertEqual(len(result.generated_points), 1)
+        np.testing.assert_array_equal(result.generated_cols, [0])
+        self.assertEqual(result.blocked_generated_radar_distance, 1)
+        with self.assertRaisesRegex(ValueError, "requires aligned radar_points"):
+            merge_reconstruction(
+                empty_points, projection, self.geometry, add, distances,
+                np.zeros_like(add), config=MergeConfig(radar_anchor_radius_m=2.0),
+            )
+        no_radar = merge_reconstruction(
+            empty_points, projection, self.geometry, add, distances,
+            np.zeros_like(add), config=MergeConfig(radar_anchor_radius_m=2.0),
+            radar_points=np.empty((0, 5), dtype=np.float32),
+        )
+        self.assertEqual(len(no_radar.generated_points), 0)
+
     def test_forward_only_merge_blocks_rear_additions(self):
         original = np.stack([self.point(0, 0, 5)])
         projection = project_lidar(original, self.geometry)

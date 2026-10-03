@@ -42,6 +42,25 @@ there are no retained points to block, so this filter alone cannot improve
 surface continuity. That requires a range-consistency model/loss and new
 training. Re-evaluate detector AP for any export made with the filter.
 
+### Radar-anchored reconstruction ablation
+
+Pass `--radar-anchor-radius-m 3` to the viewer, evaluator, or detector exporter
+to retain generated points only if their predicted XYZ lies within 3 m of an
+aligned radar return. This is a **3D** neighborhood, not an exact shared
+range-image cell: radar is sparse and its angular placement differs from
+LiDAR. Retained measured LiDAR points are never gated. Use a new output root
+for every radius; viewer metadata reports the number of generated candidates
+removed by the gate. On 20 local VoD preview scans, mean fractions of clean
+forward LiDAR points within 1, 2, 3 and 5 m of an aligned radar return were
+0.388, 0.651, 0.805 and 0.949 respectively. These are diagnostic coverage
+figures, not validation AP. Choose the radius with held-out validation and
+detector AP; a large radius approaches an almost-global reconstruction.
+
+This gate can inspect an existing checkpoint without retraining. It does not
+teach the network to form a car or pedestrian, so the next training objective
+must prioritize coherent surfaces and useful geometry inside radar-supported
+regions. The gate uses only radar available at inference, not clean LiDAR.
+
 ## Audited virtual-ray replacement for a new training run
 
 The original 128 x 512 geometry is retained for reproducibility. For a new
