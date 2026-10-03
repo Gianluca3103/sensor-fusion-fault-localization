@@ -16,6 +16,7 @@ class MergeConfig:
     add_threshold: float = 0.5
     generated_min_radar_support: float = 0.0
     forward_only: bool = False
+    enforce_single_return_per_cell: bool = False
 
     def __post_init__(self) -> None:
         if not (0 < self.delete_threshold <= 1 and 0 < self.add_threshold <= 1):
@@ -37,6 +38,7 @@ class MergeResult:
     generated_radar_support: np.ndarray
     output_is_generated: np.ndarray
     same_ray_original_and_generated: int
+    blocked_generated_occupied_cells: int
 
 
 def merge_reconstruction(
@@ -78,6 +80,11 @@ def merge_reconstruction(
         delete[safe] = delete_p[point_rows[safe], point_cols[safe]] >= config.delete_threshold
     retained = np.flatnonzero(~delete)
     deleted = np.flatnonzero(delete)
+    retained_ray_count = np.zeros(geometry.shape, dtype=np.int32)
+    retained_valid = retained[point_valid[retained]]
+    if len(retained_valid):
+        np.add.at(retained_ray_count,
+                  (point_rows[retained_valid], point_cols[retained_valid]), 1)
     generate = (
         np.isfinite(add_p) & np.isfinite(add_r)
         & (add_p >= config.add_threshold)
@@ -86,6 +93,12 @@ def merge_reconstruction(
     )
     if config.forward_only:
         generate &= geometry.ray_directions()[:, :, 0] >= 0
+    blocked = int(np.sum(generate & (retained_ray_count > 0)))
+    if config.enforce_single_return_per_cell:
+        # The model predicts one range per virtual cell. If an original return
+        # survives there, appending either a nearer or farther point would
+        # create two first returns for the same represented ray.
+        generate &= retained_ray_count == 0
     rows, cols = np.nonzero(generate)
     generated_xyz = backproject(rows, cols, add_r[rows, cols], geometry)
     generated = np.zeros((len(rows), original.shape[1]), dtype=np.float32)
@@ -93,11 +106,6 @@ def merge_reconstruction(
     if intensity is not None and generated.shape[1] > 3:
         generated[:, 3] = np.maximum(intensity[rows, cols], 0)
     points = np.concatenate((original[retained], generated), axis=0)
-    retained_ray_count = np.zeros(geometry.shape, dtype=np.int32)
-    retained_valid = retained[point_valid[retained]]
-    if len(retained_valid):
-        np.add.at(retained_ray_count,
-                  (point_rows[retained_valid], point_cols[retained_valid]), 1)
     same_ray = int(np.sum(retained_ray_count[rows, cols] > 0))
     return MergeResult(
         points=points, retained_original_indices=retained,
@@ -107,4 +115,5 @@ def merge_reconstruction(
         generated_radar_support=support[rows, cols],
         output_is_generated=np.r_[np.zeros(len(retained), dtype=bool), np.ones(len(rows), dtype=bool)],
         same_ray_original_and_generated=same_ray,
+        blocked_generated_occupied_cells=blocked if config.enforce_single_return_per_cell else 0,
     )

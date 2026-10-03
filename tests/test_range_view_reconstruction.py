@@ -333,6 +333,39 @@ class RangeViewTests(unittest.TestCase):
                                       config=MergeConfig(True, 0.999, 0.5))
         np.testing.assert_array_equal(merged.points, original)
 
+    def test_first_return_filter_rejects_generated_point_on_retained_ray(self):
+        original = np.stack([self.point(0, 0, 5)])
+        projection = project_lidar(original, self.geometry)
+        add = np.zeros(self.geometry.shape, dtype=np.float32)
+        add[0, 0] = 1  # Behind the measured point.
+        add[0, 1] = 1  # Empty virtual ray remains eligible.
+        add[0, 2] = 1  # Another empty ray remains eligible.
+        distances = np.full_like(add, 7)
+        merged = merge_reconstruction(
+            original, projection, self.geometry, add, distances,
+            np.zeros_like(add), config=MergeConfig(enforce_single_return_per_cell=True),
+        )
+        np.testing.assert_array_equal(merged.points[0], original[0])
+        self.assertEqual(len(merged.generated_points), 2)
+        self.assertEqual(merged.blocked_generated_occupied_cells, 1)
+        self.assertEqual(merged.same_ray_original_and_generated, 0)
+        self.assertFalse(np.any((merged.generated_rows == 0) & (merged.generated_cols == 0)))
+        distances[0, 0] = 3  # A nearer addition also leaves the measured return behind.
+        nearer = merge_reconstruction(
+            original, projection, self.geometry, add, distances,
+            np.zeros_like(add), config=MergeConfig(enforce_single_return_per_cell=True),
+        )
+        self.assertEqual(nearer.blocked_generated_occupied_cells, 1)
+        self.assertEqual(nearer.same_ray_original_and_generated, 0)
+        empty = project_lidar(np.empty((0, 4), dtype=np.float32), self.geometry)
+        total_loss = merge_reconstruction(
+            np.empty((0, 4), dtype=np.float32), empty, self.geometry,
+            add, distances, np.zeros_like(add),
+            config=MergeConfig(enforce_single_return_per_cell=True),
+        )
+        self.assertEqual(len(total_loss.generated_points), 3)
+        self.assertEqual(total_loss.blocked_generated_occupied_cells, 0)
+
     def test_forward_only_merge_blocks_rear_additions(self):
         original = np.stack([self.point(0, 0, 5)])
         projection = project_lidar(original, self.geometry)

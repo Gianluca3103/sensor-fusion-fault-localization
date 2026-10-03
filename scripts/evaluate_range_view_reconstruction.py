@@ -30,6 +30,8 @@ def main() -> None:
                         help="Override the checkpoint's radar floor band; 0 disables it")
     parser.add_argument("--disable-fault-map", action="store_true")
     parser.add_argument("--add-threshold", type=float, default=0.5)
+    parser.add_argument("--enforce-first-return", action="store_true",
+                        help="Reject generated points in cells containing retained LiDAR returns")
     parser.add_argument("--delete-thresholds", type=float, nargs="+", default=(0.95, 0.99, 0.995, 0.999))
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -66,7 +68,8 @@ def main() -> None:
                 merge_config=MergeConfig(allow_original_deletion=allow_delete,
                                          delete_threshold=threshold,
                                          add_threshold=args.add_threshold,
-                                         forward_only=forward_only),
+                                         forward_only=forward_only,
+                                         enforce_single_return_per_cell=args.enforce_first_return),
                 fault_map_root=(args.fault_map_root if config.use_fault_map_conditioning else None),
                 output_path=args.output_root / f"{name}.json",
                 visualization_root=args.output_root / name / "visualizations",

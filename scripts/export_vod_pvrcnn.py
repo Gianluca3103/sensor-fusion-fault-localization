@@ -7,6 +7,7 @@ All three conditions use identical frame IDs, labels, and forward-FOV policy.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -87,6 +88,8 @@ def _checkpoint(args: argparse.Namespace):
         raise ValueError("Expected range-view reconstruction checkpoint")
     geometry = RangeGeometry(**checkpoint["geometry"])
     merge_config = MergeConfig(**checkpoint["merge_config"])
+    if args.enforce_first_return:
+        merge_config = replace(merge_config, enforce_single_return_per_cell=True)
     if merge_config.allow_original_deletion:
         raise ValueError("This benchmark expects conservative, original-preserving reconstruction")
     model_config = RangeModelConfig(**checkpoint["model_config"])
@@ -163,6 +166,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path,
                         help="Range-view checkpoint; omit to export clean/faulty only")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--enforce-first-return", action="store_true",
+                        help="Reject generated points in cells containing retained LiDAR returns")
     parser.add_argument("--with-radar", action="store_true",
                         help="Also export an early-fusion LiDAR+radar detector experiment")
     parser.add_argument("--limit", type=int, help="Smoke-test frames per split")
@@ -253,6 +258,7 @@ def main() -> None:
                 "checkpoint_epoch": loaded[3] if loaded else None,
                 "reconstruction_radar_floor_band_m": loaded[4] if loaded else 0.0,
                 "reconstruction_filter_radar_by_lidar_min": loaded[5] if loaded else False,
+                "reconstruction_first_return_filter": loaded[2].enforce_single_return_per_cell if loaded else False,
                 "radar_policy": "aligned_xyz_plus_rcs_as_intensity" if mode == "lidar_radar" else None,
                 "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0]}
             (root / "export_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

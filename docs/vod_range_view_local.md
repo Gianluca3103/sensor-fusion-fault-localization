@@ -23,6 +23,25 @@ points. The elevation rows are uniform angular bins over -25 to +10 degrees,
 not contain ring IDs. The geometry script audits the chosen bounds on training
 LiDAR and refuses to proceed if they retain under 99% of forward points.
 
+### First-return filter for generated points
+
+The model predicts at most one generated range per virtual angular cell. The
+original merge could also append that prediction to a cell already containing
+a retained LiDAR point, leaving two apparent first returns. Pass
+`--enforce-first-return` to the reconstruction viewer, detector exporter, or
+range-view evaluator to suppress generated points in those occupied cells.
+This is an inference-time filter and works with an existing checkpoint; no
+training or cache rebuild is required. The default remains unchanged so prior
+evaluation numbers stay reproducible. Viewer `metadata.json` reports how many
+candidate additions were blocked, and the evaluator reports the same metric.
+
+The filter does not alter measured points. Because VoD lacks ring IDs, two
+measured points in one virtual cell may belong to distinct physical firings;
+deleting one would not be justified by this grid. On total-LiDAR-loss frames
+there are no retained points to block, so this filter alone cannot improve
+surface continuity. That requires a range-consistency model/loss and new
+training. Re-evaluate detector AP for any export made with the filter.
+
 ## Audited virtual-ray replacement for a new training run
 
 The original 128 x 512 geometry is retained for reproducibility. For a new
