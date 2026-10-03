@@ -27,7 +27,7 @@ from models.two_stage_reconstruction_head.range_view.model import RangeModelConf
 
 SUMMARY_FIELDS = (
     "epoch", "seconds", "train_loss", "train_add_loss", "train_range_loss",
-    "train_delete_loss", "train_free_space_loss", "train_intensity_loss", "val_faulty_f1_at_0_2m",
+    "train_delete_loss", "train_free_space_loss", "train_intensity_loss", "train_scanline_loss", "val_faulty_f1_at_0_2m",
     "val_reconstructed_precision_at_0_2m", "val_reconstructed_recall_at_0_2m",
     "val_reconstructed_f1_at_0_2m", "val_reconstructed_iou_at_0_2m",
     "val_net_f1_improvement", "val_addition_precision", "val_addition_recall",
@@ -50,6 +50,7 @@ def _summary_rows(record: dict) -> tuple[dict, list[dict]]:
         "train_delete_loss": train["delete_loss"],
         "train_free_space_loss": train["free_space_loss"],
         "train_intensity_loss": train.get("intensity_loss", 0.0),
+        "train_scanline_loss": train.get("scanline_loss", 0.0),
         "val_faulty_f1_at_0_2m": overall.get("faulty_f1_at_0.2m", ""),
         "val_reconstructed_precision_at_0_2m": overall.get("reconstructed_precision_at_0.2m", ""),
         "val_reconstructed_recall_at_0_2m": overall.get("reconstructed_recall_at_0.2m", ""),
@@ -159,6 +160,15 @@ def _arguments() -> argparse.Namespace:
                         help="Predict VoD LiDAR intensity for generated points")
     parser.add_argument("--use-ray-encoding", action="store_true",
                         help="Append each ray's unit XYZ direction as three input channels")
+    parser.add_argument("--radar-focused-objective", action="store_true",
+                        help="Train only in radar-supported regions and weight annotated VoD object returns")
+    parser.add_argument("--radar-region-row-radius", type=int, default=8)
+    parser.add_argument("--radar-region-col-radius", type=int, default=32)
+    parser.add_argument("--object-class-weights", type=float, nargs=3, default=(2.0, 4.0, 4.0),
+                        metavar=("CAR", "PEDESTRIAN", "CYCLIST"))
+    parser.add_argument("--lambda-scanline", type=float, default=0.2)
+    parser.add_argument("--radar-anchor-radius-m", type=float,
+                        help="Optional 3D radar gate at validation; leave unset for the first focused experiment")
     parser.add_argument("--radar-floor-band-m", type=float, default=0.0,
                         help="Opt-in: remove radar returns within this height above each frame's minimum radar z; 0 disables")
     parser.add_argument("--include-rear", action="store_true",
@@ -197,6 +207,16 @@ def _arguments() -> argparse.Namespace:
         parser.error("online yaw cannot be combined with an unrotated fault map")
     if args.input_cache_root and (args.online_yaw_deg or args.use_fault_map_conditioning):
         parser.error("input cache requires fixed yaw and no fault-map conditioning")
+    if args.radar_focused_objective and args.online_yaw_deg:
+        parser.error("radar-focused object targets require fixed yaw in this version")
+    if args.radar_focused_objective and args.no_radar:
+        parser.error("radar-focused object targets require radar input")
+    if args.radar_focused_objective and args.use_fault_map_conditioning:
+        parser.error("radar-focused object targets do not support fault-map conditioning in this version")
+    if (args.radar_region_row_radius < 0 or args.radar_region_col_radius < 0
+            or args.lambda_scanline < 0 or (args.radar_anchor_radius_m is not None
+                                            and args.radar_anchor_radius_m <= 0)):
+        parser.error("object target radii and scanline weight are invalid")
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
             or args.learning_rate <= 0 or args.validate_every < 1
             or args.chamfer_every < 1 or not np.isfinite(args.online_yaw_deg)
@@ -237,6 +257,9 @@ def main() -> None:
         lambda_delete=args.lambda_delete, lambda_geometry=args.lambda_geometry,
         lambda_free_space=args.lambda_free_space,
         lambda_intensity=args.lambda_intensity,
+        radar_focused_objective=args.radar_focused_objective,
+        object_class_weights=tuple(args.object_class_weights),
+        lambda_scanline=args.lambda_scanline if args.radar_focused_objective else 0.0,
         add_positive_weight=args.add_positive_weight,
         false_delete_penalty=args.false_delete_penalty,
         missed_delete_penalty=args.missed_delete_penalty,
@@ -245,6 +268,10 @@ def main() -> None:
         allow_original_deletion=args.allow_original_deletion,
         delete_threshold=args.delete_threshold, add_threshold=args.add_threshold,
         forward_only=not args.include_rear,
+        enforce_single_return_per_cell=args.radar_focused_objective,
+        radar_anchor_radius_m=(args.radar_anchor_radius_m if args.radar_focused_objective else None),
+        radar_region_row_radius=(args.radar_region_row_radius if args.radar_focused_objective else None),
+        radar_region_col_radius=(args.radar_region_col_radius if args.radar_focused_objective else None),
     )
     train_paths = _paths(args.data_root, "train", args.train_limit)
     val_paths = _paths(args.data_root, "val", args.val_limit)
@@ -253,13 +280,19 @@ def main() -> None:
         validate_cache(args.input_cache_root, train_paths, args.radar_root,
                        cache_settings(geometry, forward_only=merge_config.forward_only,
                                       radar_floor_band_m=args.radar_floor_band_m,
-                                      require_lidar_intensity=args.predict_intensity))
+                                      require_lidar_intensity=args.predict_intensity,
+                                      include_object_targets=args.radar_focused_objective,
+                                      radar_region_row_radius=args.radar_region_row_radius,
+                                      radar_region_col_radius=args.radar_region_col_radius))
     dataset = RangeViewDataset(train_paths, args.radar_root, geometry, fault_map_root=fault_root,
                                forward_only=merge_config.forward_only,
                                online_yaw_deg=args.online_yaw_deg,
                                radar_floor_band_m=args.radar_floor_band_m,
                                require_lidar_intensity=args.predict_intensity,
                                use_ray_encoding=args.use_ray_encoding,
+                               include_object_targets=args.radar_focused_objective,
+                               radar_region_row_radius=args.radar_region_row_radius,
+                               radar_region_col_radius=args.radar_region_col_radius,
                                input_cache_root=args.input_cache_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")

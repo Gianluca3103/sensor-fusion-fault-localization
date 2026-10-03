@@ -34,6 +34,10 @@ def main() -> None:
     parser.add_argument("--include-rear", action="store_true")
     parser.add_argument("--radar-floor-band-m", type=float, default=0.0)
     parser.add_argument("--require-lidar-intensity", action="store_true")
+    parser.add_argument("--object-targets", action="store_true",
+                        help="Cache clean VoD box classes and radar-supported regions for object-focused training")
+    parser.add_argument("--radar-region-row-radius", type=int, default=8)
+    parser.add_argument("--radar-region-col-radius", type=int, default=32)
     parser.add_argument("--rebuild", action="store_true", help="Recompute entries even when valid")
     args = parser.parse_args()
     if args.workers < 1 or args.radar_floor_band_m < 0:
@@ -44,7 +48,10 @@ def main() -> None:
     geometry = RangeGeometry.from_json(args.geometry)
     settings = cache_settings(geometry, forward_only=not args.include_rear,
                               radar_floor_band_m=args.radar_floor_band_m,
-                              require_lidar_intensity=args.require_lidar_intensity)
+                              require_lidar_intensity=args.require_lidar_intensity,
+                              include_object_targets=args.object_targets,
+                              radar_region_row_radius=args.radar_region_row_radius,
+                              radar_region_col_radius=args.radar_region_col_radius)
     args.output_root.mkdir(parents=True, exist_ok=True)
     tasks = ((path, args.radar_root, geometry, args.output_root, settings, not args.rebuild)
              for path in paths)

@@ -13,6 +13,18 @@ RADAR_FEATURE_NAMES = (
 )
 
 
+def radar_region_mask(radar_valid: np.ndarray, *, row_radius: int, col_radius: int) -> np.ndarray:
+    """Expand observed radar cells into a conservative angular training region."""
+    if row_radius < 0 or col_radius < 0:
+        raise ValueError("radar region radii must be nonnegative")
+    from scipy.ndimage import maximum_filter
+    valid = np.asarray(radar_valid) > 0
+    if valid.ndim != 2:
+        raise ValueError("radar_valid must be a 2D range image")
+    return maximum_filter(valid, size=(2 * row_radius + 1, 2 * col_radius + 1),
+                          mode="constant").astype(np.float32)
+
+
 def filter_radar_below_lidar(
     points_lidar_frame: np.ndarray, lidar_points: np.ndarray,
 ) -> tuple[np.ndarray, float | None]:

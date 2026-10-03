@@ -394,6 +394,20 @@ class RangeViewTests(unittest.TestCase):
         )
         self.assertEqual(len(no_radar.generated_points), 0)
 
+    def test_radar_region_gate_matches_focused_training_region(self):
+        empty_points = np.empty((0, 4), dtype=np.float32)
+        projection = project_lidar(empty_points, self.geometry)
+        add = np.ones(self.geometry.shape, dtype=np.float32)
+        support = np.zeros_like(add)
+        support[0, 4] = 1
+        result = merge_reconstruction(
+            empty_points, projection, self.geometry, add, np.full_like(add, 5),
+            np.zeros_like(add), radar_support=support,
+            config=MergeConfig(radar_region_row_radius=0, radar_region_col_radius=1),
+        )
+        np.testing.assert_array_equal(result.generated_rows, [0, 0, 0])
+        np.testing.assert_array_equal(result.generated_cols, [3, 4, 5])
+
     def test_forward_only_merge_blocks_rear_additions(self):
         original = np.stack([self.point(0, 0, 5)])
         projection = project_lidar(original, self.geometry)

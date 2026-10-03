@@ -18,6 +18,8 @@ class MergeConfig:
     forward_only: bool = False
     enforce_single_return_per_cell: bool = False
     radar_anchor_radius_m: float | None = None
+    radar_region_row_radius: int | None = None
+    radar_region_col_radius: int | None = None
 
     def __post_init__(self) -> None:
         if not (0 < self.delete_threshold <= 1 and 0 < self.add_threshold <= 1):
@@ -28,6 +30,12 @@ class MergeConfig:
             not np.isfinite(self.radar_anchor_radius_m) or self.radar_anchor_radius_m <= 0
         ):
             raise ValueError("radar_anchor_radius_m must be finite and positive")
+        if (self.radar_region_row_radius is None) != (self.radar_region_col_radius is None):
+            raise ValueError("both radar region radii are required together")
+        if self.radar_region_row_radius is not None and (
+            self.radar_region_row_radius < 0 or self.radar_region_col_radius < 0
+        ):
+            raise ValueError("radar region radii must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,11 @@ def merge_reconstruction(
         & (add_r >= geometry.min_range_m) & (add_r <= geometry.max_range_m)
         & (support >= config.generated_min_radar_support)
     )
+    if config.radar_region_row_radius is not None:
+        from .radar import radar_region_mask
+        generate &= radar_region_mask(
+            support, row_radius=config.radar_region_row_radius,
+            col_radius=config.radar_region_col_radius) > 0
     if config.forward_only:
         generate &= geometry.ray_directions()[:, :, 0] >= 0
     blocked = int(np.sum(generate & (retained_ray_count > 0)))

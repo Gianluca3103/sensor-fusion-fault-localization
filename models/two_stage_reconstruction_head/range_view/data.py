@@ -11,11 +11,12 @@ from torch.utils.data import Dataset
 
 from ..voxelization.inputs import load_aligned_point_inputs, load_clean_lidar_from_metadata
 from .geometry import RangeGeometry, RangeProjection, project_lidar
-from .radar import filter_radar_below_lidar, filter_radar_floor_band, project_aligned_radar
+from .radar import filter_radar_below_lidar, filter_radar_floor_band, project_aligned_radar, radar_region_mask
 from .targets import RangeTargets, build_range_targets
 
 
-TARGET_KEYS = ("add", "add_range_m", "add_intensity", "delete", "delete_valid", "clean_valid", "clean_range_m")
+TARGET_KEYS = ("add", "add_range_m", "add_intensity", "delete", "delete_valid", "clean_valid",
+               "clean_range_m", "object_class", "radar_region")
 
 
 def rotate_points_yaw(points: np.ndarray, angle_rad: float) -> np.ndarray:
@@ -66,6 +67,9 @@ def load_range_sample(
     filter_radar_by_lidar_min: bool = True,
     require_lidar_intensity: bool = False,
     use_ray_encoding: bool = False,
+    include_object_targets: bool = False,
+    radar_region_row_radius: int = 8,
+    radar_region_col_radius: int = 32,
 ) -> RangeSample:
     sample_path = Path(sample_path)
     aligned = load_aligned_point_inputs(sample_path, radar_root, lidar_source="faulty")
@@ -109,10 +113,20 @@ def load_range_sample(
     faulty_projection = project_lidar(faulty, geometry)
     clean_projection = project_lidar(clean, geometry)
     radar_features = project_aligned_radar(radar, geometry)
+    object_classes = None
+    radar_region = None
+    if include_object_targets:
+        if str(aligned.metadata.get("dataset", "")).strip().lower() not in {"view-of-delft", "view of delft", "vod"}:
+            raise ValueError("Object-focused targets require labeled VoD training samples")
+        from .object_targets import object_class_map
+        object_classes = object_class_map(clean, clean_projection, aligned.metadata)
+        radar_region = radar_region_mask(radar_features[0], row_radius=radar_region_row_radius,
+                                         col_radius=radar_region_col_radius)
     targets = build_range_targets(
         faulty_projection, clean_projection, faulty, clean, source_ids,
         range_tolerance_m=range_tolerance_m,
         point_tolerance_m=point_tolerance_m,
+        object_class=object_classes, radar_region=radar_region,
     )
     fault_map = np.zeros(geometry.shape, dtype=np.float32)
     if fault_map_root is not None:
@@ -171,6 +185,9 @@ class RangeViewDataset(Dataset):
                  filter_radar_by_lidar_min: bool = True,
                  require_lidar_intensity: bool = False,
                  use_ray_encoding: bool = False,
+                 include_object_targets: bool = False,
+                 radar_region_row_radius: int = 8,
+                 radar_region_col_radius: int = 32,
                  input_cache_root: Path | None = None) -> None:
         if not np.isfinite(online_yaw_deg) or online_yaw_deg < 0:
             raise ValueError("online_yaw_deg must be finite and nonnegative")
@@ -192,6 +209,9 @@ class RangeViewDataset(Dataset):
         self.filter_radar_by_lidar_min = filter_radar_by_lidar_min
         self.require_lidar_intensity = require_lidar_intensity
         self.use_ray_encoding = use_ray_encoding
+        self.include_object_targets = include_object_targets
+        self.radar_region_row_radius = radar_region_row_radius
+        self.radar_region_col_radius = radar_region_col_radius
         self.input_cache_root = input_cache_root
 
     def __len__(self) -> int:
@@ -217,4 +237,7 @@ class RangeViewDataset(Dataset):
             filter_radar_by_lidar_min=self.filter_radar_by_lidar_min,
             require_lidar_intensity=self.require_lidar_intensity,
             use_ray_encoding=self.use_ray_encoding,
+            include_object_targets=self.include_object_targets,
+            radar_region_row_radius=self.radar_region_row_radius,
+            radar_region_col_radius=self.radar_region_col_radius,
         ).tensors()
