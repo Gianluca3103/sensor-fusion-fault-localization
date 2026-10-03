@@ -9,11 +9,16 @@ are **not** called positive returns. The box outlines in the preview are for
 inspection, not masks used by the model.
 
 The focused loss weights missing object returns (Car 2x, Pedestrian 4x,
-Cyclist 4x), applies ADD/DELETE loss in the radar region, and adds a horizontal
-scanline consistency term where adjacent clean ranges belong to the same
-surface. The 3D nearest-radar gate is optional; leave it unset on the first
-run so training and validation use the same angular region. The first-return
-filter prevents an addition to an occupied virtual ray.
+Cyclist 4x), downweights missing unboxed structure to 0.1x, and treats missing
+estimated road returns as no-add examples. A robust low-height plane fitted to
+the clean training scan identifies likely road returns; annotated objects
+override the road label. Positive and negative ADD losses are normalized
+separately so the broad radar region cannot swamp the few missing object rays.
+The horizontal scanline consistency term applies to positively weighted
+returns on clean same-surface pairs. The 3D nearest-radar gate is optional;
+leave it unset on the first run so training and validation use the same
+angular region. The first-return filter prevents an addition to an occupied
+virtual ray.
 
 On the professor machine, from `sensor-fusion-fault-localization`:
 
@@ -52,3 +57,5 @@ against the same clean/faulty matched validation IDs and official detector
 checkpoint before deciding whether to redesign the network around sparse 3D
 features. The range-view grid is a fitted virtual ray grid because the VoD
 point files do not include physical LiDAR ring IDs.
+The cache command automatically replaces older object-target entries because
+the target format changed; rerunning it resumes completed entries.

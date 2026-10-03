@@ -41,7 +41,7 @@ def main() -> None:
     clean = np.where(sample.clean_projection.valid, sample.clean_projection.range_m, np.nan)
     faulty = np.where(sample.faulty_projection.valid, sample.faulty_projection.range_m, np.nan)
     scale = float(np.nanpercentile(clean, 99)) if np.isfinite(clean).any() else 1.0
-    fig, axes = plt.subplots(3, 1, figsize=(19, 10), sharex=True, sharey=True,
+    fig, axes = plt.subplots(4, 1, figsize=(19, 13), sharex=True, sharey=True,
                              layout="constrained")
     for axis, image, title in zip(axes[:2], (clean, faulty),
                                   ("Clean range + visible object returns", "Faulty range + projected 3D boxes")):
@@ -68,13 +68,18 @@ def main() -> None:
         axes[2].legend(loc="upper right", markerscale=6)
     axes[2].set(title="Radar-supported training region (green) and radar cells (orange)",
                 xlabel="Azimuth bin", ylabel="Elevation row")
-    axes[2].set_xlim(-0.5, geometry.azimuth_bins - 0.5)
-    axes[2].set_ylim(-0.5, geometry.shape[0] - 0.5)
+    axes[3].imshow(sample.targets.ground_mask, origin="lower", aspect="auto",
+                   interpolation="nearest", cmap="Reds", vmin=0, vmax=1)
+    axes[3].set(title="Estimated road returns excluded from positive reconstruction reward",
+                xlabel="Azimuth bin", ylabel="Elevation row")
+    axes[3].set_xlim(-0.5, geometry.azimuth_bins - 0.5)
+    axes[3].set_ylim(-0.5, geometry.shape[0] - 0.5)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=170)
     plt.close(fig)
     print(f"Saved {args.output}; boxes={len(projected_box_rectangles(sample.metadata, geometry))}; "
-          f"object returns={int((classes > 0).sum())}; radar region cells={int(sample.targets.radar_region.sum())}")
+          f"object returns={int((classes > 0).sum())}; radar region cells={int(sample.targets.radar_region.sum())}; "
+          f"estimated ground cells={int(sample.targets.ground_mask.sum())}")
 
 
 if __name__ == "__main__":

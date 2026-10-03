@@ -22,6 +22,7 @@ class RangeTargets:
     clean_range_m: np.ndarray
     object_class: np.ndarray
     radar_region: np.ndarray
+    ground_mask: np.ndarray
     healthy_original: np.ndarray
     corrupted_original: np.ndarray
 
@@ -41,6 +42,7 @@ def build_range_targets(
     point_tolerance_m: float = 0.05,
     object_class: np.ndarray | None = None,
     radar_region: np.ndarray | None = None,
+    ground_mask: np.ndarray | None = None,
 ) -> RangeTargets:
     if faulty.valid.shape != clean.valid.shape:
         raise ValueError("faulty and clean projections require the same geometry")
@@ -48,8 +50,10 @@ def build_range_targets(
         object_class = np.zeros(clean.valid.shape, dtype=np.float32)
     if radar_region is None:
         radar_region = np.ones(clean.valid.shape, dtype=np.float32)
-    if object_class.shape != clean.valid.shape or radar_region.shape != clean.valid.shape:
-        raise ValueError("object and radar target maps must match sensor geometry")
+    if ground_mask is None:
+        ground_mask = np.zeros(clean.valid.shape, dtype=np.float32)
+    if any(value.shape != clean.valid.shape for value in (object_class, radar_region, ground_mask)):
+        raise ValueError("object, radar and ground target maps must match sensor geometry")
     if range_tolerance_m <= 0 or point_tolerance_m < 0:
         raise ValueError("geometric tolerances must be nonnegative")
     faulty_points = np.asarray(faulty_points)
@@ -90,6 +94,7 @@ def build_range_targets(
         delete=delete, delete_valid=delete_valid, keep=supported,
         replace=replace, clean_valid=clean.valid,
         clean_range_m=clean.range_m, object_class=np.asarray(object_class, dtype=np.float32),
-        radar_region=np.asarray(radar_region, dtype=np.float32), healthy_original=healthy,
+        radar_region=np.asarray(radar_region, dtype=np.float32),
+        ground_mask=np.asarray(ground_mask, dtype=np.float32), healthy_original=healthy,
         corrupted_original=corrupted,
     )

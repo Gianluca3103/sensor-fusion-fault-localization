@@ -7,11 +7,49 @@ import torch
 
 from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry, project_lidar
 from models.two_stage_reconstruction_head.range_view.loss import RangeLossConfig, range_edit_loss
-from models.two_stage_reconstruction_head.range_view.object_targets import object_class_map
+from models.two_stage_reconstruction_head.range_view.object_targets import ground_return_mask, object_class_map
 from models.two_stage_reconstruction_head.range_view.radar import radar_region_mask
 
 
 class ObjectFocusedTargetsTests(unittest.TestCase):
+    def test_ground_plane_target_excludes_raised_and_annotated_returns(self):
+        x, y = np.meshgrid(np.linspace(2, 30, 30), np.linspace(-10, 10, 30))
+        road = np.column_stack((x.ravel(), y.ravel(),
+                                (-1.5 + 0.01 * x + 0.002 * y).ravel(),
+                                np.ones(x.size))).astype(np.float32)
+        raised = np.asarray([[8, 0, 1, 1]], dtype=np.float32)
+        points = np.concatenate((road, raised))
+        geometry = RangeGeometry(tuple(np.linspace(-0.7, 0.4, 128)), 512, 0.1, 50,
+                                 2 * np.pi, max_beam_error_rad=0.02)
+        projection = project_lidar(points, geometry)
+        classes = np.zeros(geometry.shape, dtype=np.uint8)
+        classes[projection.point_row[0], projection.point_col[0]] = 1
+        ground = ground_return_mask(points, projection, classes)
+        self.assertGreater(int(ground.sum()), 10)
+        self.assertEqual(ground[projection.point_row[0], projection.point_col[0]], 0)
+        self.assertEqual(ground[projection.point_row[-1], projection.point_col[-1]], 0)
+
+    def test_missing_road_is_no_add_target_while_object_is_positive(self):
+        logits = torch.zeros(1, 1, 3, requires_grad=True)
+        prediction = {"add_logit": logits, "add_probability": torch.sigmoid(logits),
+                      "add_range_m": torch.full((1, 1, 3), 5.0),
+                      "delete_logit": torch.zeros(1, 1, 3)}
+        target = {key: torch.zeros(1, 1, 3) for key in (
+            "add", "add_range_m", "delete", "delete_valid", "clean_valid",
+            "clean_range_m", "object_class", "radar_region", "ground_mask")}
+        target["add"][:] = 1
+        target["radar_region"][:] = 1
+        target["object_class"][0, 0, 0] = 2
+        target["ground_mask"][0, 0, 1] = 1
+        loss = range_edit_loss(prediction, target, RangeLossConfig(
+            radar_focused_objective=True, lambda_range=0, lambda_delete=0,
+            lambda_free_space=0, lambda_intensity=0))
+        loss["loss"].backward()
+        self.assertGreater(abs(float(logits.grad[0, 0, 0])),
+                           abs(float(logits.grad[0, 0, 2])))
+        self.assertLess(float(logits.grad[0, 0, 0]), 0)
+        self.assertGreater(float(logits.grad[0, 0, 1]), 0)
+
     def test_vod_3d_boxes_label_clean_first_returns_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             partition = Path(temporary) / "lidar" / "training"

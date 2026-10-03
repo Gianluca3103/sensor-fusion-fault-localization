@@ -54,6 +54,49 @@ def object_class_map(clean_points: np.ndarray, projection: RangeProjection,
     return result
 
 
+def ground_return_mask(clean_points: np.ndarray, projection: RangeProjection,
+                       object_class: np.ndarray, *, residual_m: float = 0.25) -> np.ndarray:
+    """Estimate the local road plane from clean training returns only.
+
+    The dominant low-height band seeds a robust plane fit. Uncertain frames
+    return an empty mask, which avoids suppressing possible objects or walls.
+    Annotated object returns are never called ground.
+    """
+    xyz = np.asarray(clean_points[:, :3], dtype=np.float64)
+    result = np.zeros(projection.valid.shape, dtype=np.float32)
+    if len(xyz) < 100:
+        return result
+    radius = np.linalg.norm(xyz, axis=1)
+    usable = (np.isfinite(xyz).all(axis=1) & (xyz[:, 0] > 0)
+              & (radius > 1) & (radius < 60))
+    if usable.sum() < 100:
+        return result
+    low, high = np.quantile(xyz[usable, 2], [0.02, 0.50])
+    if high - low < 0.1:
+        return result
+    edges = np.arange(low, high + 0.11, 0.1)
+    counts, edges = np.histogram(xyz[usable, 2], bins=edges)
+    mode_z = (edges[np.argmax(counts)] + edges[np.argmax(counts) + 1]) / 2
+    inlier = usable & (np.abs(xyz[:, 2] - mode_z) < 0.3)
+    if inlier.sum() < 100:
+        return result
+    coefficients = None
+    for _ in range(3):
+        design = np.column_stack((xyz[inlier, 0], xyz[inlier, 1], np.ones(inlier.sum())))
+        coefficients = np.linalg.lstsq(design, xyz[inlier, 2], rcond=None)[0]
+        estimated_z = xyz[:, 0] * coefficients[0] + xyz[:, 1] * coefficients[1] + coefficients[2]
+        inlier = usable & (np.abs(xyz[:, 2] - estimated_z) < residual_m)
+        if inlier.sum() < 100:
+            return result
+    if np.linalg.norm(coefficients[:2]) > 0.2:
+        return result
+    used = projection.valid
+    winners = projection.nearest_original_index[used]
+    result[used] = (np.abs(xyz[winners, 2] - estimated_z[winners]) < residual_m)
+    result[object_class > 0] = 0
+    return result
+
+
 def projected_box_rectangles(metadata: dict, geometry: RangeGeometry) -> list[tuple[str, int, int, int, int]]:
     """Visualization-only angular envelopes of annotated 3D box corners."""
     labels_path, calib_path = vod_label_paths(metadata)

@@ -16,7 +16,7 @@ from .targets import RangeTargets, build_range_targets
 
 
 TARGET_KEYS = ("add", "add_range_m", "add_intensity", "delete", "delete_valid", "clean_valid",
-               "clean_range_m", "object_class", "radar_region")
+               "clean_range_m", "object_class", "radar_region", "ground_mask")
 
 
 def rotate_points_yaw(points: np.ndarray, angle_rad: float) -> np.ndarray:
@@ -115,18 +115,20 @@ def load_range_sample(
     radar_features = project_aligned_radar(radar, geometry)
     object_classes = None
     radar_region = None
+    ground_mask = None
     if include_object_targets:
         if str(aligned.metadata.get("dataset", "")).strip().lower() not in {"view-of-delft", "view of delft", "vod"}:
             raise ValueError("Object-focused targets require labeled VoD training samples")
-        from .object_targets import object_class_map
+        from .object_targets import ground_return_mask, object_class_map
         object_classes = object_class_map(clean, clean_projection, aligned.metadata)
+        ground_mask = ground_return_mask(clean, clean_projection, object_classes)
         radar_region = radar_region_mask(radar_features[0], row_radius=radar_region_row_radius,
                                          col_radius=radar_region_col_radius)
     targets = build_range_targets(
         faulty_projection, clean_projection, faulty, clean, source_ids,
         range_tolerance_m=range_tolerance_m,
         point_tolerance_m=point_tolerance_m,
-        object_class=object_classes, radar_region=radar_region,
+        object_class=object_classes, radar_region=radar_region, ground_mask=ground_mask,
     )
     fault_map = np.zeros(geometry.shape, dtype=np.float32)
     if fault_map_root is not None:

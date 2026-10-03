@@ -17,7 +17,7 @@ from .geometry import RangeGeometry
 
 CACHE_VERSION = 1
 CACHE_KEYS = ("features",) + TARGET_KEYS
-BASE_CACHE_KEYS = CACHE_KEYS[:-2]
+BASE_CACHE_KEYS = CACHE_KEYS[:-3]
 
 
 def _digest(value: object) -> str:
@@ -45,7 +45,7 @@ def cache_settings(geometry: RangeGeometry, *, forward_only: bool = True,
     if include_object_targets:
         if radar_region_row_radius < 0 or radar_region_col_radius < 0:
             raise ValueError("radar region radii must be nonnegative")
-        settings.update(version=2, include_object_targets=True,
+        settings.update(version=3, include_object_targets=True,
                         radar_region_row_radius=int(radar_region_row_radius),
                         radar_region_col_radius=int(radar_region_col_radius))
     return settings
@@ -153,6 +153,7 @@ def load_cached_tensors(root: Path, sample_path: Path, geometry: RangeGeometry, 
             raise KeyError(f"Cached sample lacks {key}: {sample_path}")
     arrays.setdefault("object_class", np.zeros(geometry.shape, dtype=np.float32))
     arrays.setdefault("radar_region", np.ones(geometry.shape, dtype=np.float32))
+    arrays.setdefault("ground_mask", np.zeros(geometry.shape, dtype=np.float32))
     if arrays["features"].shape != (10, *geometry.shape):
         raise ValueError(f"Cached feature shape does not match geometry: {sample_path}")
     if any(arrays[key].shape != geometry.shape for key in TARGET_KEYS):

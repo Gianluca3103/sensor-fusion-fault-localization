@@ -166,6 +166,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--radar-region-col-radius", type=int, default=32)
     parser.add_argument("--object-class-weights", type=float, nargs=3, default=(2.0, 4.0, 4.0),
                         metavar=("CAR", "PEDESTRIAN", "CYCLIST"))
+    parser.add_argument("--background-positive-weight", type=float, default=0.1,
+                        help="Weight for missing unboxed structures, such as walls")
     parser.add_argument("--lambda-scanline", type=float, default=0.2)
     parser.add_argument("--radar-anchor-radius-m", type=float,
                         help="Optional 3D radar gate at validation; leave unset for the first focused experiment")
@@ -214,7 +216,8 @@ def _arguments() -> argparse.Namespace:
     if args.radar_focused_objective and args.use_fault_map_conditioning:
         parser.error("radar-focused object targets do not support fault-map conditioning in this version")
     if (args.radar_region_row_radius < 0 or args.radar_region_col_radius < 0
-            or args.lambda_scanline < 0 or (args.radar_anchor_radius_m is not None
+            or args.lambda_scanline < 0 or args.background_positive_weight < 0
+            or (args.radar_anchor_radius_m is not None
                                             and args.radar_anchor_radius_m <= 0)):
         parser.error("object target radii and scanline weight are invalid")
     if (args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0
@@ -259,6 +262,7 @@ def main() -> None:
         lambda_intensity=args.lambda_intensity,
         radar_focused_objective=args.radar_focused_objective,
         object_class_weights=tuple(args.object_class_weights),
+        background_positive_weight=args.background_positive_weight,
         lambda_scanline=args.lambda_scanline if args.radar_focused_objective else 0.0,
         add_positive_weight=args.add_positive_weight,
         false_delete_penalty=args.false_delete_penalty,

@@ -22,6 +22,7 @@ class RangeLossConfig:
     free_space_margin_m: float = 0.1
     radar_focused_objective: bool = False
     object_class_weights: tuple[float, float, float] = (2.0, 4.0, 4.0)
+    background_positive_weight: float = 0.1
     lambda_scanline: float = 0.0
     scanline_edge_threshold_m: float = 0.75
 
@@ -46,14 +47,28 @@ def range_edit_loss(
     region = (target.get("radar_region", torch.ones_like(add)).float().clamp(0, 1)
               if config.radar_focused_objective else torch.ones_like(add))
     classes = target.get("object_class", torch.zeros_like(add)).float()
+    desired_add = add
     class_weight = torch.ones_like(add)
     if config.radar_focused_objective:
+        ground = target.get("ground_mask", torch.zeros_like(add)).float() > 0.5
+        # In this task a missing road return is intentionally a no-add target.
+        # Object labels override the ground estimate at target construction.
+        desired_add = add * (~ground).float()
+        class_weight = torch.full_like(add, config.background_positive_weight)
         for class_id, weight in enumerate(config.object_class_weights, start=1):
             class_weight = torch.where(classes == class_id, weight, class_weight)
-    positive = add * region * class_weight
-    add_bce = F.binary_cross_entropy_with_logits(prediction["add_logit"], add, reduction="none")
-    add_weight = torch.where(add > 0.5, config.add_positive_weight * class_weight, 1.0)
-    add_loss = (add_bce * add_weight * region).sum() / region.sum().clamp_min(1)
+    positive = desired_add * region * class_weight
+    add_bce = F.binary_cross_entropy_with_logits(prediction["add_logit"], desired_add, reduction="none")
+    if config.radar_focused_objective:
+        negative = (1 - desired_add) * region
+        # Normalize positives and negatives separately: a large radar/road
+        # region must not drown out the comparatively few missing object rays.
+        add_loss = (config.add_positive_weight * (add_bce * positive).sum()
+                    / positive.sum().clamp_min(1)
+                    + (add_bce * negative).sum() / negative.sum().clamp_min(1))
+    else:
+        add_weight = torch.where(add > 0.5, config.add_positive_weight, 1.0)
+        add_loss = (add_bce * add_weight).mean()
     range_error = F.smooth_l1_loss(prediction["add_range_m"], target["add_range_m"], reduction="none")
     range_loss = (range_error * positive).sum() / positive.sum().clamp_min(1)
     delete_bce = F.binary_cross_entropy_with_logits(prediction["delete_logit"], delete, reduction="none")
@@ -77,9 +92,10 @@ def range_edit_loss(
         predicted_or_clean = torch.where(add > 0.5, prediction["add_range_m"], clean_range)
         clean_delta = clean_range[..., 1:] - clean_range[..., :-1]
         predicted_delta = predicted_or_clean[..., 1:] - predicted_or_clean[..., :-1]
+        pair_interest = torch.maximum(positive[..., 1:], positive[..., :-1])
         pair = (clean_valid[..., 1:] * clean_valid[..., :-1]
                 * region[..., 1:] * region[..., :-1]
-                * ((add[..., 1:] + add[..., :-1]) > 0).float()
+                * pair_interest
                 * (clean_delta.abs() <= config.scanline_edge_threshold_m).float())
         scanline_loss = (F.smooth_l1_loss(predicted_delta, clean_delta, reduction="none")
                          * pair).sum() / pair.sum().clamp_min(1)
