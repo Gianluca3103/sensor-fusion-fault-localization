@@ -8,6 +8,7 @@ saved PNGs from earlier validation epochs do not contain recoverable XYZ points.
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -67,6 +68,28 @@ def _load_annotated_boxes(metadata: dict) -> list[dict]:
     return boxes
 
 
+def _radar_box_stats(radar_points: np.ndarray, boxes: list[dict]) -> dict:
+    """Count radar returns in the union of oriented ground-truth 3D boxes."""
+    inside = np.zeros(len(radar_points), dtype=bool)
+    for box in boxes:
+        corners = np.asarray(box["corners"], dtype=np.float64)
+        origin = corners[0]
+        axes = corners[[4, 2, 1]] - origin
+        squared_lengths = np.sum(axes * axes, axis=1)
+        coordinates = (radar_points[:, :3] - origin) @ axes.T / squared_lengths
+        inside |= np.all((coordinates >= -1e-6) & (coordinates <= 1 + 1e-6), axis=1)
+    total = len(radar_points)
+    inside_count = int(inside.sum())
+    outside_count = total - inside_count
+    return {
+        "radar_returns": total, "inside_boxes": inside_count,
+        "outside_boxes": outside_count,
+        "inside_percent": 100 * inside_count / total if total else 0.0,
+        "outside_percent": 100 * outside_count / total if total else 0.0,
+        "box_count": len(boxes),
+    }
+
+
 def _display_points(points: np.ndarray, maximum: int) -> np.ndarray:
     if len(points) <= maximum:
         return points[:, :3]
@@ -105,7 +128,8 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
                            sample_name: str, fault: str, epoch: int,
                            max_plot_points: int,
                            radar: np.ndarray | None = None,
-                           boxes: list[dict] | None = None) -> None:
+                           boxes: list[dict] | None = None,
+                           radar_stats: dict | None = None) -> None:
     """Create a self-contained browser viewer with one synchronized 3D camera."""
     bounds = _shared_bounds(faulty, clean, original, generated)
     radar = np.empty((0, 3), dtype=np.float32) if radar is None else radar
@@ -119,6 +143,7 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
         "boxes": [{"name": box["name"], "color": box["color"],
                    "corners": np.round(box["corners"], 3).tolist()}
                   for box in (boxes or [])],
+        "radar_stats": radar_stats,
         "radar": {"color": COLORS["radar"], "count": len(radar),
                   "points": xyz(radar)},
         "panels": [
@@ -158,7 +183,7 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   canvas{height:min(70dvh,700px)}.note{font-size:13px}
 }
 </style>
-<header><div><h1 id="title"></h1><p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All views share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Radar (<span id="radar-count"></span>)</label><label><input id="show-boxes" type="checkbox" checked> Ground-truth boxes (<span id="box-count"></span>)</label><button id="zoom-out" class="zoom" type="button" aria-label="Zoom out">−</button><button id="zoom-in" class="zoom" type="button" aria-label="Zoom in">+</button><button id="reset" type="button">Reset view</button></div></header>
+<header><div><h1 id="title"></h1><p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All views share one camera and scale.</p><p id="radar-coverage"></p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Radar (<span id="radar-count"></span>)</label><label><input id="show-boxes" type="checkbox" checked> Ground-truth boxes (<span id="box-count"></span>)</label><button id="zoom-out" class="zoom" type="button" aria-label="Zoom out">−</button><button id="zoom-in" class="zoom" type="button" aria-label="Zoom in">+</button><button id="reset" type="button">Reset view</button></div></header>
 <div id="view-tabs" class="view-tabs" role="tablist" aria-label="LiDAR condition"></div>
 <div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions; amber = aligned radar. Box outlines: cyan Car, pink Pedestrian, lime Cyclist. Counts are full clouds; display points are capped for speed.</p>
 <script id="cloud-data" type="application/json">__DATA__</script>
@@ -168,6 +193,12 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   document.getElementById('title').textContent = `${data.sample} · ${data.fault} · checkpoint epoch ${data.epoch}`;
   document.getElementById('radar-count').textContent = data.radar.count.toLocaleString();
   document.getElementById('box-count').textContent = data.boxes.length.toLocaleString();
+  if (data.radar_stats) {
+    const stats = data.radar_stats;
+    document.getElementById('radar-coverage').textContent = stats.radar_returns
+      ? `Radar returns in any GT 3D box: ${stats.inside_boxes.toLocaleString()} (${stats.inside_percent.toFixed(2)}%); outside: ${stats.outside_boxes.toLocaleString()} (${stats.outside_percent.toFixed(2)}%).`
+      : 'No radar returns after viewer filtering.';
+  }
   const radarToggle = document.getElementById('show-radar');
   const boxToggle = document.getElementById('show-boxes');
   const root = document.getElementById('panels');
@@ -475,6 +506,7 @@ def main() -> None:
     if not paths:
         raise FileNotFoundError(f"No samples in {args.data_root / args.split}")
     args.output_root.mkdir(parents=True, exist_ok=True)
+    coverage_rows = []
     for index in args.sample_indices:
         if index >= len(paths):
             raise IndexError(f"sample index {index} is outside 0..{len(paths) - 1}")
@@ -489,6 +521,10 @@ def main() -> None:
             sample.radar_points, geometry, require_beam_match=False)
         radar_points = sample.radar_points[radar_valid]
         boxes = _load_annotated_boxes(sample.metadata)
+        is_vod = str(sample.metadata.get("dataset", "")).strip().lower() in {
+            "view-of-delft", "view of delft", "vod"
+        }
+        radar_stats = _radar_box_stats(radar_points, boxes) if is_vod else None
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(args.device))
         merged = merge_reconstruction(
@@ -519,6 +555,8 @@ def main() -> None:
             "reconstructed_points": len(merged.points),
             "radar_points": len(radar_points),
             "ground_truth_boxes": len(boxes),
+            "radar_box_coverage": radar_stats,
+            "radar_coverage_basis": "aligned radar after reconstruction input filters and range-view selection",
             "deleted_original_points": len(merged.deleted_original_indices),
             "first_return_filter": merge_config.enforce_single_return_per_cell,
             "blocked_generated_occupied_cells": merged.blocked_generated_occupied_cells,
@@ -538,7 +576,7 @@ def main() -> None:
             generated=merged.generated_points, sample_name=path.stem,
             fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
             max_plot_points=args.max_plot_points,
-            radar=radar_points, boxes=boxes,
+            radar=radar_points, boxes=boxes, radar_stats=radar_stats,
         )
         _render_comparison(
             destination, faulty=sample.faulty_points, clean=sample.clean_points,
@@ -551,6 +589,31 @@ def main() -> None:
         print(f"{path.name}: {metadata['fault']} | faulty {metadata['faulty_points']:,} | "
               f"clean {metadata['clean_points']:,} | reconstructed "
               f"{metadata['reconstructed_points']:,} | {destination}", flush=True)
+        if radar_stats is not None:
+            coverage_rows.append({"sample": path.stem, "fault": str(metadata["fault"]),
+                                  **radar_stats})
+            print(f"  radar inside GT boxes: {radar_stats['inside_boxes']:,}/"
+                  f"{radar_stats['radar_returns']:,} ({radar_stats['inside_percent']:.2f}%); "
+                  f"outside: {radar_stats['outside_boxes']:,} "
+                  f"({radar_stats['outside_percent']:.2f}%)", flush=True)
+    if coverage_rows:
+        total = sum(row["radar_returns"] for row in coverage_rows)
+        inside = sum(row["inside_boxes"] for row in coverage_rows)
+        pooled = {
+            "sample": "ALL_SELECTED", "fault": "all",
+            "radar_returns": total, "inside_boxes": inside,
+            "outside_boxes": total - inside,
+            "inside_percent": 100 * inside / total if total else 0.0,
+            "outside_percent": 100 * (total - inside) / total if total else 0.0,
+            "box_count": sum(row["box_count"] for row in coverage_rows),
+        }
+        output_csv = args.output_root / "radar_box_coverage.csv"
+        with output_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(coverage_rows[0]))
+            writer.writeheader()
+            writer.writerows(coverage_rows)
+            writer.writerow(pooled)
+        print(f"Radar box coverage: {output_csv}", flush=True)
 
 
 if __name__ == "__main__":

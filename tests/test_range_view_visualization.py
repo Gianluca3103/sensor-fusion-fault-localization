@@ -9,7 +9,8 @@ matplotlib.use("Agg")
 import numpy as np
 
 from scripts.visualize_range_view_reconstruction import (
-    _display_points, _load_annotated_boxes, _render_comparison, _save_interactive_html, _save_ply,
+    _display_points, _load_annotated_boxes, _radar_box_stats, _render_comparison,
+    _save_interactive_html, _save_ply,
     _shared_bounds,
 )
 
@@ -82,14 +83,32 @@ class RangeViewVisualizationTests(unittest.TestCase):
             np.testing.assert_allclose(boxes[0]["corners"].min(axis=0), [4, -1.5, -1])
             np.testing.assert_allclose(boxes[0]["corners"].max(axis=0), [6, 0.5, 1])
 
+            radar = np.asarray([[5, 0, 0, 0], [4, -1.5, -1, 0],
+                                [7, 0, 0, 0]], dtype=np.float32)
+            stats = _radar_box_stats(radar, boxes + boxes)
+            self.assertEqual((stats["radar_returns"], stats["inside_boxes"],
+                              stats["outside_boxes"]), (3, 2, 1))
+            self.assertAlmostEqual(stats["inside_percent"], 200 / 3)
+            self.assertAlmostEqual(stats["outside_percent"], 100 / 3)
+
+            theta = np.pi / 4
+            rotation = np.asarray([[np.cos(theta), -np.sin(theta), 0],
+                                   [np.sin(theta), np.cos(theta), 0],
+                                   [0, 0, 1]])
+            rotated = {**boxes[0], "corners": boxes[0]["corners"] @ rotation.T}
+            rotated_radar = np.asarray([[5, 0, 0], [7, 0, 0]]) @ rotation.T
+            self.assertEqual(_radar_box_stats(rotated_radar, [rotated])["inside_boxes"], 1)
+
             cloud = np.asarray([[5, 0, 0, 0.5]], dtype=np.float32)
             html = Path(temporary) / "boxes.html"
             _save_interactive_html(
                 html, faulty=cloud, clean=cloud, original=cloud,
                 generated=cloud[:0], sample_name="00001", fault="fog_sim",
-                epoch=80, max_plot_points=10, boxes=boxes)
+                epoch=80, max_plot_points=10, boxes=boxes, radar_stats=stats)
             page = html.read_text(encoding="utf-8")
             self.assertIn('"boxes":[{"name":"Car","color":"#4ce0ed"', page)
+            self.assertIn('"radar_stats":{"radar_returns":3,"inside_boxes":2', page)
+            self.assertIn('id="radar-coverage"', page)
             self.assertNotIn("__BOX_EDGES__", page)
 
 
