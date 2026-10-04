@@ -8,11 +8,12 @@ targets. The optional clean feature teacher is **not** active in this run.
 
 ## Stage 1: blueprint only
 
-These are starting hyperparameters, not a VoD optimum. Batch size one matters:
-each training example receives a tile selected around radar evidence on
-currently unobserved LiDAR rays. The `4 × 64` tile makes 1,280 ray-depth
-candidates, below the cross-attention limit of 2,048. The chosen tile never
-uses the clean scan to pick a position.
+These are starting hyperparameters, not a VoD optimum. Keep batch size one:
+each scene needs its own tile selected around radar evidence on currently
+unobserved LiDAR rays. Four gradient accumulation steps combine four
+independently selected scene tiles in each optimizer update. The `4 × 64` tile
+makes 1,280 ray-depth candidates, below the cross-attention limit of 2,048.
+The chosen tile never uses the clean scan to pick a position.
 
 ```bash
 set -e
@@ -21,7 +22,7 @@ REPO="$BASE/sensor-fusion-fault-localization"
 PY="$BASE/svefusion-clean-cu118/bin/python"
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 CACHE="$BASE/sensor_fusion_outputs/vod_range5_full_cache"
-RUN="$BASE/sensor_fusion_outputs/vod_ray_depth_blueprint_30ep"
+RUN="$BASE/sensor_fusion_outputs/vod_ray_depth_blueprint"
 
 test -s "$CACHE/angular_geometry.json"
 test -d "$CACHE/samples/train"
@@ -34,11 +35,20 @@ cd "$REPO"
   --vod-root "$VOD" \
   --geometry "$CACHE/angular_geometry.json" \
   --output-root "$RUN" \
-  --epochs 30 --batch-size 1 \
+  --epochs 10 --batch-size 1 --grad-accum-steps 4 \
   --tile-rows 4 --tile-cols 64 --width 32 \
   --learning-rate 0.0002 --validate-every 5 \
   --num-workers 4 --device cuda
 ```
+
+Start with 10 epochs and inspect validation after epochs 5 and 10. Continue
+to 30 or 50 only while validation improves. To continue the same run, use the
+same command with `--epochs 30` or `--epochs 50` and
+`--resume "$RUN/last_checkpoint.pt"`; keep all other settings the same.
+Gradient accumulation changes update frequency, not the number of scenes
+processed per epoch. A single `4 × 64` training tile took about 5.4 seconds
+on a local RTX 5060 Laptop GPU in a one-frame smoke test; measure several
+real frames on the training machine before committing to a long run.
 
 The selected radar variant and observed-faulty-LiDAR height filter are on by
 default. Before a long run, add `--train-limit 2 --val-limit 2 --epochs 1

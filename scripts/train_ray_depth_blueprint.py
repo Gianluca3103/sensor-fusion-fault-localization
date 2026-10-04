@@ -42,6 +42,7 @@ from scripts.train_radar_gated_ray_diffusion import choose_radar_tile, _paths
 class BlueprintSettings:
     epochs: int
     batch_size: int
+    grad_accum_steps: int
     tile_rows: int
     tile_cols: int
     width: int
@@ -135,7 +136,10 @@ def _run_epoch(
     )}
     loss_total = classification_total = depth_total = coverage_total = 0.0
     progress = tqdm(loader, desc=f"{label} {epoch}/{settings.epochs}", leave=False)
-    for batch in progress:
+    if training:
+        assert optimizer is not None
+        optimizer.zero_grad(set_to_none=True)
+    for batch_index, batch in enumerate(progress):
         batch = {
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
@@ -163,10 +167,15 @@ def _run_epoch(
             )
             if training:
                 assert optimizer is not None
-                optimizer.zero_grad(set_to_none=True)
-                losses["loss"].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                window_start = (
+                    batch_index // settings.grad_accum_steps
+                ) * settings.grad_accum_steps
+                window_size = min(settings.grad_accum_steps, len(loader) - window_start)
+                (losses["loss"] / window_size).backward()
+                if batch_index - window_start + 1 == window_size:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             counts = _ray_counts(
                 blueprint, geometry, batch["observed_lidar"],
@@ -215,6 +224,8 @@ def _arguments() -> argparse.Namespace:
                         default=True)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Optimizer update after this many independent scene tiles")
     parser.add_argument("--tile-rows", type=int, default=4)
     parser.add_argument("--tile-cols", type=int, default=64)
     parser.add_argument("--width", type=int, default=32)
@@ -226,13 +237,16 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    if (args.epochs < 1 or args.batch_size < 1 or args.tile_rows < 1 or
+    if (args.epochs < 1 or args.batch_size != 1 or
+            args.grad_accum_steps < 1 or args.tile_rows < 1 or
             args.tile_cols < 4 or args.width < 8 or args.width % 4 or
             args.learning_rate <= 0 or args.validate_every < 1 or
             args.num_workers < 0 or
             (args.train_limit is not None and args.train_limit < 1) or
             (args.val_limit is not None and args.val_limit < 1)):
-        parser.error("Invalid blueprint training settings")
+        parser.error(
+            "Use batch size 1 with positive gradient accumulation and valid settings"
+        )
     return args
 
 
@@ -247,7 +261,8 @@ def main() -> None:
             args.tile_rows * args.tile_cols * 5 > 2048):
         raise ValueError("Tile exceeds the calibrated scan or 2048-candidate limit")
     settings = BlueprintSettings(
-        args.epochs, args.batch_size, args.tile_rows, args.tile_cols,
+        args.epochs, args.batch_size, args.grad_accum_steps,
+        args.tile_rows, args.tile_cols,
         args.width, args.learning_rate, args.validate_every, args.seed,
     )
     torch.manual_seed(args.seed)
@@ -285,8 +300,8 @@ def main() -> None:
             raise ValueError("Resume checkpoint is not blueprint pretraining")
         if saved.get("geometry_parameters") != asdict(geometry):
             raise ValueError("Resume checkpoint uses different calibrated geometry")
-        for key in ("tile_rows", "tile_cols", "width"):
-            if saved["settings"][key] != getattr(settings, key):
+        for key in ("tile_rows", "tile_cols", "width", "grad_accum_steps"):
+            if saved["settings"].get(key, 1) != getattr(settings, key):
                 raise ValueError(f"Resume checkpoint disagrees on {key}")
         if (saved["radar_variant"] != args.radar_variant or
                 saved["radar_height_filter"] != args.radar_height_filter):

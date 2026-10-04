@@ -32,14 +32,17 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
                 np.cos(3 * np.pi / 8), np.sin(3 * np.pi / 8), 0,
             ], dtype=np.float32)
             identity = "Tr_velo_to_cam: 1 0 0 0 0 1 0 0 0 0 1 0\n"
-            for split, frame_id in (("train", "00001"), ("val", "00002")):
+            for split, frame_id in (("train", "00001"),
+                                    ("train", "00003"),
+                                    ("train", "00004"), ("val", "00002")):
                 for relative in (
                     "lidar/ImageSets", "lidar/training/velodyne",
                     "lidar/training/calib", "radar/training/calib",
                     "radar_20frames_verified_doppler_radial/training/velodyne",
                 ):
                     (vod / relative).mkdir(parents=True, exist_ok=True)
-                (vod / "lidar/ImageSets" / f"{split}.txt").write_text(frame_id + "\n")
+                with (vod / "lidar/ImageSets" / f"{split}.txt").open("a") as ids:
+                    ids.write(frame_id + "\n")
                 for sensor in ("lidar", "radar"):
                     (vod / sensor / "training/calib" / f"{frame_id}.txt").write_text(identity)
                 np.asarray([
@@ -52,7 +55,7 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
                 ], dtype=np.float32).tofile(
                     vod / "radar_20frames_verified_doppler_radial/training/velodyne" /
                     f"{frame_id}.bin")
-                (samples / split).mkdir(parents=True)
+                (samples / split).mkdir(parents=True, exist_ok=True)
                 np.savez(samples / split / f"{frame_id}_fault.npz",
                     faulty_lidar_points=np.asarray([
                         [*(direction_lidar * 4.0), 7.0],
@@ -68,13 +71,16 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
                       "--train-limit", "1", "--val-limit", "1",
                       "--tile-rows", "1", "--tile-cols", "4", "--width", "8",
                       "--num-workers", "0", "--device", "cpu"]
-            with patch.object(sys, "argv", ["blueprint", *shared,
-                    "--output-root", str(blueprint_root), "--validate-every", "1"]), \
+            blueprint_args = ["blueprint", *shared, "--output-root", str(blueprint_root),
+                              "--validate-every", "1", "--grad-accum-steps", "2"]
+            blueprint_args[blueprint_args.index("--train-limit") + 1] = "3"
+            with patch.object(sys, "argv", blueprint_args), \
                     contextlib.redirect_stdout(io.StringIO()):
                 blueprint_main()
             stage1 = torch.load(blueprint_root / "best_checkpoint.pt",
                                 map_location="cpu", weights_only=False)
             self.assertEqual(stage1["stage"], "blueprint_pretraining")
+            self.assertEqual(stage1["settings"]["grad_accum_steps"], 2)
             self.assertGreater(stage1["validation"]["clean_hits"], 0)
             diffusion_root = root / "diffusion_run"
             diffusion_args = ["diffusion", *shared, "--output-root", str(diffusion_root),
