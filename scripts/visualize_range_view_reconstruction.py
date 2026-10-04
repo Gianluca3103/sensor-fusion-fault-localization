@@ -15,15 +15,56 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from Fault_Localization_Model.vod_dataset.vod_io import load_vod_lidar_to_camera
 from models.two_stage_reconstruction_head.range_view.data import load_range_sample
 from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry, angular_indices
 from models.two_stage_reconstruction_head.range_view.merge import MergeConfig, merge_reconstruction
 from models.two_stage_reconstruction_head.range_view.model import RangeModelConfig, RangeViewReconstructor
+from models.two_stage_reconstruction_head.range_view.object_targets import vod_label_paths
 
 
 COLORS = {"faulty": "#bb3434", "clean": "#2b8f58",
           "original": "#8051a7", "generated": "#167bbb",
           "radar": "#ffbf47"}
+BOX_COLORS = {"Car": "#4ce0ed", "Pedestrian": "#ff77be", "Cyclist": "#d6eb62"}
+BOX_EDGES = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+             (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
+
+
+def _load_annotated_boxes(metadata: dict) -> list[dict]:
+    """Read VoD ground-truth boxes and transform their corners into LiDAR XYZ."""
+    if str(metadata.get("dataset", "")).strip().lower() not in {
+        "view-of-delft", "view of delft", "vod"
+    }:
+        return []
+    labels_path, calibration_path = vod_label_paths(metadata)
+    lidar_from_camera = np.linalg.inv(load_vod_lidar_to_camera(calibration_path))
+    boxes = []
+    for line in labels_path.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        name = "Cyclist" if fields[0] == "bicycle" else fields[0]
+        if name not in BOX_COLORS:
+            continue
+        if len(fields) < 15:
+            raise ValueError(f"Malformed VoD box in {labels_path}: {line!r}")
+        height, width, length, x, y, z, yaw = map(float, fields[8:15])
+        values = np.asarray((height, width, length, x, y, z, yaw))
+        if not np.isfinite(values).all() or min(height, width, length) <= 0:
+            raise ValueError(f"Invalid VoD box in {labels_path}: {line!r}")
+        # VoD/KITTI boxes use camera Y as the bottom and yaw around camera Y.
+        local = np.asarray([(sx * width / 2, sy * height, sz * length / 2)
+                            for sx in (-1, 1) for sy in (-1, 0) for sz in (-1, 1)])
+        camera = np.empty_like(local)
+        camera[:, 0] = x + np.cos(yaw) * local[:, 0] + np.sin(yaw) * local[:, 2]
+        camera[:, 1] = y + local[:, 1]
+        camera[:, 2] = z - np.sin(yaw) * local[:, 0] + np.cos(yaw) * local[:, 2]
+        lidar = camera @ lidar_from_camera[:3, :3].T + lidar_from_camera[:3, 3]
+        if np.max(lidar[:, 0]) < 0:
+            continue  # This viewer displays forward LiDAR and radar only.
+        boxes.append({"name": name, "color": BOX_COLORS[name], "corners": lidar})
+    return boxes
 
 
 def _display_points(points: np.ndarray, maximum: int) -> np.ndarray:
@@ -63,7 +104,8 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
                            original: np.ndarray, generated: np.ndarray,
                            sample_name: str, fault: str, epoch: int,
                            max_plot_points: int,
-                           radar: np.ndarray | None = None) -> None:
+                           radar: np.ndarray | None = None,
+                           boxes: list[dict] | None = None) -> None:
     """Create a self-contained browser viewer with one synchronized 3D camera."""
     bounds = _shared_bounds(faulty, clean, original, generated)
     radar = np.empty((0, 3), dtype=np.float32) if radar is None else radar
@@ -74,6 +116,9 @@ def _save_interactive_html(path: Path, *, faulty: np.ndarray, clean: np.ndarray,
     payload = {
         "sample": sample_name, "fault": fault, "epoch": epoch,
         "bounds": bounds,
+        "boxes": [{"name": box["name"], "color": box["color"],
+                   "corners": np.round(box["corners"], 3).tolist()}
+                  for box in (boxes or [])],
         "radar": {"color": COLORS["radar"], "count": len(radar),
                   "points": xyz(radar)},
         "panels": [
@@ -113,16 +158,18 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   canvas{height:min(70dvh,700px)}.note{font-size:13px}
 }
 </style>
-<header><div><h1 id="title"></h1><p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All views share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Radar (<span id="radar-count"></span>)</label><button id="zoom-out" class="zoom" type="button" aria-label="Zoom out">−</button><button id="zoom-in" class="zoom" type="button" aria-label="Zoom in">+</button><button id="reset" type="button">Reset view</button></div></header>
+<header><div><h1 id="title"></h1><p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All views share one camera and scale.</p></div><div class="controls"><label><input id="show-radar" type="checkbox" checked> Radar (<span id="radar-count"></span>)</label><label><input id="show-boxes" type="checkbox" checked> Ground-truth boxes (<span id="box-count"></span>)</label><button id="zoom-out" class="zoom" type="button" aria-label="Zoom out">−</button><button id="zoom-in" class="zoom" type="button" aria-label="Zoom in">+</button><button id="reset" type="button">Reset view</button></div></header>
 <div id="view-tabs" class="view-tabs" role="tablist" aria-label="LiDAR condition"></div>
-<div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions; amber = aligned radar used by the model. Counts are full clouds; display points are capped for speed.</p>
+<div id="panels" class="panels"></div><p class="note">Purple = retained LiDAR; blue = generated additions; amber = aligned radar. Box outlines: cyan Car, pink Pedestrian, lime Cyclist. Counts are full clouds; display points are capped for speed.</p>
 <script id="cloud-data" type="application/json">__DATA__</script>
 <script>
 (() => {
   const data = JSON.parse(document.getElementById('cloud-data').textContent);
   document.getElementById('title').textContent = `${data.sample} · ${data.fault} · checkpoint epoch ${data.epoch}`;
   document.getElementById('radar-count').textContent = data.radar.count.toLocaleString();
+  document.getElementById('box-count').textContent = data.boxes.length.toLocaleString();
   const radarToggle = document.getElementById('show-radar');
+  const boxToggle = document.getElementById('show-boxes');
   const root = document.getElementById('panels');
   const tabs = document.getElementById('view-tabs');
   const sections = [];
@@ -197,6 +244,19 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
         if(px>=0&&px<width&&py>=0&&py<height) ctx.fillRect(px-1.6,py-1.6,3.4,3.4);
       }
     }
+    if(boxToggle.checked){
+      ctx.lineWidth=2;
+      ctx.font='12px system-ui,sans-serif';
+      for(const box of data.boxes){
+        const corners=box.corners.map(point=>project(point,width,height,scale));
+        ctx.strokeStyle=box.color;
+        for(const [start,end] of __BOX_EDGES__){
+          ctx.beginPath();ctx.moveTo(...corners[start]);ctx.lineTo(...corners[end]);ctx.stroke();
+        }
+        const label=corners.reduce((best,point)=>point[1]<best[1]?point:best);
+        ctx.fillStyle=box.color;ctx.fillText(box.name,label[0]+4,label[1]-4);
+      }
+    }
   }
   function drawAll(){canvases.forEach((canvas,index)=>draw(canvas,data.panels[index]));}
   let pending=false;
@@ -246,18 +306,21 @@ canvas:active{cursor:grabbing}.note{margin-top:12px}
   }
   document.getElementById('reset').addEventListener('click',()=>{Object.assign(view,initial);scheduleDraw();});
   radarToggle.addEventListener('change',scheduleDraw);
+  boxToggle.addEventListener('change',scheduleDraw);
   window.addEventListener('resize',scheduleDraw); drawAll();
 })();
 </script></html>
 """
-    path.write_text(page.replace("__DATA__", data), encoding="utf-8")
+    path.write_text(page.replace("__DATA__", data).replace("__BOX_EDGES__", json.dumps(BOX_EDGES)),
+                    encoding="utf-8")
 
 
 def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarray,
                        original: np.ndarray, generated: np.ndarray,
                        sample_name: str, fault: str, epoch: int,
                        max_plot_points: int, show: bool,
-                       radar: np.ndarray | None = None) -> None:
+                       radar: np.ndarray | None = None,
+                       boxes: list[dict] | None = None) -> None:
     import matplotlib.pyplot as plt
 
     if show and plt.get_backend().lower().endswith("agg"):
@@ -292,6 +355,11 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
         if len(radar_plot):
             axis.scatter(radar_plot[:, 0], radar_plot[:, 1], radar_plot[:, 2],
                          s=2.5, c=COLORS["radar"], depthshade=False, rasterized=True)
+        for box in boxes or []:
+            corners = box["corners"]
+            for start, end in BOX_EDGES:
+                axis.plot(corners[[start, end], 0], corners[[start, end], 1],
+                          corners[[start, end], 2], c=box["color"], linewidth=0.8)
         axis.set_title(name)
         axis.set_xlabel("X (m)")
         axis.set_ylabel("Y (m)")
@@ -331,6 +399,12 @@ def _render_comparison(output_root: Path, *, faulty: np.ndarray, clean: np.ndarr
             if len(radar_plot):
                 axis.scatter(radar_plot[:, horizontal], radar_plot[:, vertical],
                              s=2.5, c=COLORS["radar"], alpha=0.9, rasterized=True)
+            for box in boxes or []:
+                corners = box["corners"]
+                for start, end in BOX_EDGES:
+                    axis.plot(corners[[start, end], horizontal],
+                              corners[[start, end], vertical],
+                              c=box["color"], linewidth=0.7)
             axis.set_xlim(*bounds[horizontal])
             axis.set_ylim(*bounds[vertical])
             axis.set_aspect("equal", adjustable="box")
@@ -414,6 +488,7 @@ def main() -> None:
         _, _, _, radar_valid = angular_indices(
             sample.radar_points, geometry, require_beam_match=False)
         radar_points = sample.radar_points[radar_valid]
+        boxes = _load_annotated_boxes(sample.metadata)
         with torch.inference_mode():
             prediction = model(torch.from_numpy(sample.features)[None].to(args.device))
         merged = merge_reconstruction(
@@ -443,6 +518,7 @@ def main() -> None:
             "generated_points": len(merged.generated_points),
             "reconstructed_points": len(merged.points),
             "radar_points": len(radar_points),
+            "ground_truth_boxes": len(boxes),
             "deleted_original_points": len(merged.deleted_original_indices),
             "first_return_filter": merge_config.enforce_single_return_per_cell,
             "blocked_generated_occupied_cells": merged.blocked_generated_occupied_cells,
@@ -462,7 +538,7 @@ def main() -> None:
             generated=merged.generated_points, sample_name=path.stem,
             fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
             max_plot_points=args.max_plot_points,
-            radar=radar_points,
+            radar=radar_points, boxes=boxes,
         )
         _render_comparison(
             destination, faulty=sample.faulty_points, clean=sample.clean_points,
@@ -470,7 +546,7 @@ def main() -> None:
             generated=merged.generated_points, sample_name=path.stem,
             fault=str(metadata["fault"]), epoch=int(checkpoint["epoch"]),
             max_plot_points=args.max_plot_points, show=not args.no_show,
-            radar=radar_points,
+            radar=radar_points, boxes=boxes,
         )
         print(f"{path.name}: {metadata['fault']} | faulty {metadata['faulty_points']:,} | "
               f"clean {metadata['clean_points']:,} | reconstructed "

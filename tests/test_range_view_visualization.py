@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import numpy as np
 
 from scripts.visualize_range_view_reconstruction import (
-    _display_points, _render_comparison, _save_interactive_html, _save_ply,
+    _display_points, _load_annotated_boxes, _render_comparison, _save_interactive_html, _save_ply,
     _shared_bounds,
 )
 
@@ -55,11 +55,42 @@ class RangeViewVisualizationTests(unittest.TestCase):
             self.assertIn("pointermove", page)
             self.assertIn("Reconstructed LiDAR", page)
             self.assertIn('id="show-radar"', page)
+            self.assertIn('id="show-boxes"', page)
             self.assertIn('id="view-tabs"', page)
             self.assertIn("zoomAt(newDistance/oldDistance", page)
             self.assertIn("two fingers to pan", page)
             self.assertIn('"radar":{"color":"#ffbf47","count":1', page)
             self.assertNotIn("https://", page)
+
+    def test_vod_box_corners_align_with_lidar_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            partition = Path(temporary) / "lidar" / "training"
+            for name in ("velodyne", "label_2", "calib"):
+                (partition / name).mkdir(parents=True)
+            source = partition / "velodyne" / "00001.bin"
+            source.touch()
+            (partition / "calib" / "00001.txt").write_text(
+                "Tr_velo_to_cam: 1 0 0 0 0 1 0 0 0 0 1 0\n", encoding="utf-8")
+            (partition / "label_2" / "00001.txt").write_text(
+                "Car 0 0 0 0 0 0 0 2 2 2 5 0.5 0 0\n"
+                "Pedestrian 0 0 0 0 0 0 0 2 1 1 -8 0 0 0\n",
+                encoding="utf-8")
+            boxes = _load_annotated_boxes({
+                "dataset": "View-of-Delft", "source_relative_path": str(source)})
+            self.assertEqual(len(boxes), 1)  # The rear box is outside this forward viewer.
+            self.assertEqual(boxes[0]["name"], "Car")
+            np.testing.assert_allclose(boxes[0]["corners"].min(axis=0), [4, -1.5, -1])
+            np.testing.assert_allclose(boxes[0]["corners"].max(axis=0), [6, 0.5, 1])
+
+            cloud = np.asarray([[5, 0, 0, 0.5]], dtype=np.float32)
+            html = Path(temporary) / "boxes.html"
+            _save_interactive_html(
+                html, faulty=cloud, clean=cloud, original=cloud,
+                generated=cloud[:0], sample_name="00001", fault="fog_sim",
+                epoch=80, max_plot_points=10, boxes=boxes)
+            page = html.read_text(encoding="utf-8")
+            self.assertIn('"boxes":[{"name":"Car","color":"#4ce0ed"', page)
+            self.assertNotIn("__BOX_EDGES__", page)
 
 
 if __name__ == "__main__":
