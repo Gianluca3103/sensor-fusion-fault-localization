@@ -394,6 +394,33 @@ class RangeViewTests(unittest.TestCase):
         )
         self.assertEqual(len(no_radar.generated_points), 0)
 
+    def test_strong_radar_gate_requires_distinct_nearby_voxels(self):
+        empty_points = np.empty((0, 4), dtype=np.float32)
+        projection = project_lidar(empty_points, self.geometry)
+        add = np.zeros(self.geometry.shape, dtype=np.float32)
+        add[0, 0] = add[0, 4] = 1
+        center = self.point(0, 0, 5)[:3]
+        radar = np.asarray([
+            center, center, center,  # Repeated sweeps in one voxel count once.
+            center + [0.6, 0, 0], center + [0, 0.6, 0],
+        ], dtype=np.float32)
+        config = MergeConfig(radar_anchor_radius_m=1.0,
+                             radar_min_occupied_voxels=3,
+                             radar_support_voxel_size_m=0.5)
+        result = merge_reconstruction(
+            empty_points, projection, self.geometry, add, np.full_like(add, 5),
+            np.zeros_like(add), config=config, radar_points=radar,
+        )
+        np.testing.assert_array_equal(result.generated_cols, [0])
+        self.assertEqual(result.blocked_generated_radar_distance, 1)
+        repeated_only = merge_reconstruction(
+            empty_points, projection, self.geometry, add, np.full_like(add, 5),
+            np.zeros_like(add), config=config, radar_points=radar[:3],
+        )
+        self.assertEqual(len(repeated_only.generated_points), 0)
+        with self.assertRaisesRegex(ValueError, "requires radar_anchor_radius_m"):
+            MergeConfig(radar_min_occupied_voxels=3)
+
     def test_radar_region_gate_matches_focused_training_region(self):
         empty_points = np.empty((0, 4), dtype=np.float32)
         projection = project_lidar(empty_points, self.geometry)

@@ -39,6 +39,8 @@ def test_sve_export_writes_only_matched_validation_clouds(tmp_path: Path):
     manifest = json.loads((root / "export_manifest.json").read_text(encoding="utf-8"))
     assert manifest["condition"] == "reconstructed"
     assert manifest["splits"] == {"train": 0, "val": 2}
+    assert manifest["reconstruction_radar_min_occupied_voxels"] == 1
+    assert manifest["reconstruction_radar_support_voxel_size_m"] == 0.5
     assert not (root / "training" / "calib").exists()
     assert not (root / "training" / "velodyne" / "00003.bin").exists()
     for frame in ("00001", "00002"):

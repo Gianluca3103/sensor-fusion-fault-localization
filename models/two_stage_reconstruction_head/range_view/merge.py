@@ -18,6 +18,8 @@ class MergeConfig:
     forward_only: bool = False
     enforce_single_return_per_cell: bool = False
     radar_anchor_radius_m: float | None = None
+    radar_min_occupied_voxels: int = 1
+    radar_support_voxel_size_m: float = 0.5
     radar_region_row_radius: int | None = None
     radar_region_col_radius: int | None = None
 
@@ -30,6 +32,14 @@ class MergeConfig:
             not np.isfinite(self.radar_anchor_radius_m) or self.radar_anchor_radius_m <= 0
         ):
             raise ValueError("radar_anchor_radius_m must be finite and positive")
+        if (isinstance(self.radar_min_occupied_voxels, bool)
+                or not isinstance(self.radar_min_occupied_voxels, (int, np.integer))
+                or self.radar_min_occupied_voxels < 1):
+            raise ValueError("radar_min_occupied_voxels must be a positive integer")
+        if self.radar_min_occupied_voxels > 1 and self.radar_anchor_radius_m is None:
+            raise ValueError("radar_min_occupied_voxels > 1 requires radar_anchor_radius_m")
+        if not np.isfinite(self.radar_support_voxel_size_m) or self.radar_support_voxel_size_m <= 0:
+            raise ValueError("radar_support_voxel_size_m must be finite and positive")
         if (self.radar_region_row_radius is None) != (self.radar_region_col_radius is None):
             raise ValueError("both radar region radii are required together")
         if self.radar_region_row_radius is not None and (
@@ -131,10 +141,28 @@ def merge_reconstruction(
         radar_xyz = radar_xyz[np.isfinite(radar_xyz[:, :3]).all(axis=1), :3]
         if len(radar_xyz) and len(generated_xyz):
             from scipy.spatial import cKDTree
-            distances, _ = cKDTree(radar_xyz).query(generated_xyz, k=1)
-            near_radar = distances <= config.radar_anchor_radius_m
+
+            if config.radar_min_occupied_voxels > 1:
+                # Multi-frame returns at nearly the same location contribute
+                # one occupied cell, rather than creating false strong support.
+                cells = np.floor(radar_xyz / config.radar_support_voxel_size_m).astype(np.int64)
+                _, inverse = np.unique(cells, axis=0, return_inverse=True)
+                counts = np.bincount(inverse)
+                radar_xyz = np.column_stack([
+                    np.bincount(inverse, weights=radar_xyz[:, axis]) / counts
+                    for axis in range(3)
+                ])
+            distances, _ = cKDTree(radar_xyz).query(
+                generated_xyz, k=config.radar_min_occupied_voxels,
+                distance_upper_bound=config.radar_anchor_radius_m,
+            )
+            kth_distance = (distances if config.radar_min_occupied_voxels == 1
+                            else distances[:, -1])
+            near_radar = kth_distance <= config.radar_anchor_radius_m
         else:
             near_radar = np.zeros(len(generated_xyz), dtype=bool)
+        # For k > 1, the k-th nearest occupied radar voxel must fit inside
+        # the radius. This count includes both isolated and distant proposals.
         blocked_radar = int((~near_radar).sum())
         rows, cols, generated_xyz = rows[near_radar], cols[near_radar], generated_xyz[near_radar]
     generated = np.zeros((len(rows), original.shape[1]), dtype=np.float32)

@@ -34,6 +34,9 @@ def main() -> None:
                         help="Reject generated points in cells containing retained LiDAR returns")
     parser.add_argument("--radar-anchor-radius-m", type=float,
                         help="Retain generated points only within this 3D distance of aligned radar returns")
+    parser.add_argument("--radar-min-occupied-voxels", type=int, default=1,
+                        help="Require this many distinct radar voxels inside the 3D anchor radius")
+    parser.add_argument("--radar-support-voxel-size-m", type=float, default=0.5)
     parser.add_argument("--delete-thresholds", type=float, nargs="+", default=(0.95, 0.99, 0.995, 0.999))
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -72,7 +75,9 @@ def main() -> None:
                                          add_threshold=args.add_threshold,
                                          forward_only=forward_only,
                                          enforce_single_return_per_cell=args.enforce_first_return,
-                                         radar_anchor_radius_m=args.radar_anchor_radius_m),
+                                         radar_anchor_radius_m=args.radar_anchor_radius_m,
+                                         radar_min_occupied_voxels=args.radar_min_occupied_voxels,
+                                         radar_support_voxel_size_m=args.radar_support_voxel_size_m),
                 fault_map_root=(args.fault_map_root if config.use_fault_map_conditioning else None),
                 output_path=args.output_root / f"{name}.json",
                 visualization_root=args.output_root / name / "visualizations",

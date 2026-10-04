@@ -92,6 +92,12 @@ def _checkpoint(args: argparse.Namespace):
         merge_config = replace(merge_config, enforce_single_return_per_cell=True)
     if args.radar_anchor_radius_m is not None:
         merge_config = replace(merge_config, radar_anchor_radius_m=args.radar_anchor_radius_m)
+    if args.radar_min_occupied_voxels is not None:
+        merge_config = replace(merge_config,
+                               radar_min_occupied_voxels=args.radar_min_occupied_voxels)
+    if args.radar_support_voxel_size_m is not None:
+        merge_config = replace(merge_config,
+                               radar_support_voxel_size_m=args.radar_support_voxel_size_m)
     if merge_config.allow_original_deletion:
         raise ValueError("This benchmark expects conservative, original-preserving reconstruction")
     model_config = RangeModelConfig(**checkpoint["model_config"])
@@ -186,6 +192,8 @@ def export_sve_reconstructed_validation(args: argparse.Namespace, public: Path, 
         "reconstruction_filter_radar_by_lidar_min": loaded[5],
         "reconstruction_first_return_filter": loaded[2].enforce_single_return_per_cell,
         "reconstruction_radar_anchor_radius_m": loaded[2].radar_anchor_radius_m,
+        "reconstruction_radar_min_occupied_voxels": loaded[2].radar_min_occupied_voxels,
+        "reconstruction_radar_support_voxel_size_m": loaded[2].radar_support_voxel_size_m,
         "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0],
         "export_type": "sve_reconstructed_validation_only",
     }
@@ -207,6 +215,10 @@ def _arguments() -> argparse.Namespace:
                         help="Reject generated points in cells containing retained LiDAR returns")
     parser.add_argument("--radar-anchor-radius-m", type=float,
                         help="Retain generated points only within this 3D distance of aligned radar returns")
+    parser.add_argument("--radar-min-occupied-voxels", type=int,
+                        help="Require this many distinct nearby radar voxels for each generated point")
+    parser.add_argument("--radar-support-voxel-size-m", type=float,
+                        help="Radar voxel width for the multi-return gate (default: 0.5 m)")
     parser.add_argument("--with-radar", action="store_true",
                         help="Also export an early-fusion LiDAR+radar detector experiment")
     parser.add_argument("--sve-val-only", action="store_true",
@@ -306,6 +318,8 @@ def main() -> None:
                 "reconstruction_filter_radar_by_lidar_min": loaded[5] if loaded else False,
                 "reconstruction_first_return_filter": loaded[2].enforce_single_return_per_cell if loaded else False,
                 "reconstruction_radar_anchor_radius_m": loaded[2].radar_anchor_radius_m if loaded else None,
+                "reconstruction_radar_min_occupied_voxels": loaded[2].radar_min_occupied_voxels if loaded else None,
+                "reconstruction_radar_support_voxel_size_m": loaded[2].radar_support_voxel_size_m if loaded else None,
                 "radar_policy": "aligned_xyz_plus_rcs_as_intensity" if mode == "lidar_radar" else None,
                 "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0]}
             (root / "export_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

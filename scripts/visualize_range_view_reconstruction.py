@@ -472,6 +472,10 @@ def _arguments() -> argparse.Namespace:
                         help="Reject generated points in cells containing a retained LiDAR return")
     parser.add_argument("--radar-anchor-radius-m", type=float,
                         help="Retain generated points only within this 3D distance of aligned radar returns")
+    parser.add_argument("--radar-min-occupied-voxels", type=int,
+                        help="Require this many distinct nearby radar voxels for each generated point")
+    parser.add_argument("--radar-support-voxel-size-m", type=float,
+                        help="Radar voxel width for the multi-return gate (default: 0.5 m)")
     args = parser.parse_args()
     if args.max_plot_points < 1 or any(index < 0 for index in args.sample_indices):
         parser.error("sample indices and max plot points must be nonnegative/positive")
@@ -493,6 +497,12 @@ def main() -> None:
         merge_config = replace(merge_config, enforce_single_return_per_cell=True)
     if args.radar_anchor_radius_m is not None:
         merge_config = replace(merge_config, radar_anchor_radius_m=args.radar_anchor_radius_m)
+    if args.radar_min_occupied_voxels is not None:
+        merge_config = replace(merge_config,
+                               radar_min_occupied_voxels=args.radar_min_occupied_voxels)
+    if args.radar_support_voxel_size_m is not None:
+        merge_config = replace(merge_config,
+                               radar_support_voxel_size_m=args.radar_support_voxel_size_m)
     radar_floor_band_m = (checkpoint.get("radar_floor_band_m", 0.0)
                           if args.radar_floor_band_m is None else args.radar_floor_band_m)
     if not np.isfinite(radar_floor_band_m) or radar_floor_band_m < 0:
@@ -561,6 +571,8 @@ def main() -> None:
             "first_return_filter": merge_config.enforce_single_return_per_cell,
             "blocked_generated_occupied_cells": merged.blocked_generated_occupied_cells,
             "radar_anchor_radius_m": merge_config.radar_anchor_radius_m,
+            "radar_min_occupied_voxels": merge_config.radar_min_occupied_voxels,
+            "radar_support_voxel_size_m": merge_config.radar_support_voxel_size_m,
             "blocked_generated_radar_distance": merged.blocked_generated_radar_distance,
             "radar_floor_band_m": radar_floor_band_m,
             "radar_floor_removed_points": sample.metadata["radar_floor_removed_points"],
