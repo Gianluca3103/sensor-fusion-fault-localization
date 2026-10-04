@@ -30,7 +30,8 @@ from voxelization.inputs import (
 from voxelization.hard_voxelizer import VoxelizedPointCloud
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+SPARSE_SELECTOR_CONFIG = OracleFaultSelector3DConfig(halo_m=0.0)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -167,7 +168,7 @@ def _cache_one(
 
     sample_path = Path(sample_path)
     config = load_voxelization_config(config_path)
-    selector_config = OracleFaultSelector3DConfig()
+    selector_config = SPARSE_SELECTOR_CONFIG
     lidar_voxelizer = HardVoxelizer(config.grid, max_points_per_voxel=config.lidar.max_points_per_voxel)
     radar_voxelizer = HardVoxelizer(config.grid, max_points_per_voxel=config.radar.max_points_per_voxel)
     destination = _destination(Path(cache_root), split, sample_path)
@@ -203,7 +204,6 @@ def _cache_one(
             faulty_lidar=faulty_voxels,
             radar=radar_voxels,
             targets=targets,
-            selection=selection,
             component=component,
             grid=config.grid,
         )

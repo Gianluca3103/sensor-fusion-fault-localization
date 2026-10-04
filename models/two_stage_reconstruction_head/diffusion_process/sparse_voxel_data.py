@@ -16,7 +16,6 @@ import torch
 from ..voxelization.config import VoxelGridConfig
 from ..voxelization.fault_selector_3d import (
     OracleFaultComponent3D,
-    OracleFaultSelection3D,
 )
 from ..voxelization.fault_targets import VoxelFaultTargets
 from ..voxelization.hard_voxelizer import VoxelizedPointCloud
@@ -27,9 +26,8 @@ class SparseVoxelExample:
     """One unpadded 3D fault-component example.
 
     Coordinates are global integer ``zyx`` indices.  Condition features are
-    ``[log(1+faulty_count), log(1+radar_count), repair, remove, halo,
-    trusted_faulty]``.  The target is clean occupancy; it deliberately does
-    not encode a variable-length point list.
+    ``[log(1+faulty_count), log(1+radar_count)]``. The target is clean
+    occupancy; exact repair/remove labels and halo masks are not inputs.
     """
 
     coords_zyx: torch.Tensor
@@ -111,7 +109,6 @@ def build_sparse_voxel_example(
     faulty_lidar: VoxelizedPointCloud,
     radar: VoxelizedPointCloud,
     targets: VoxelFaultTargets,
-    selection: OracleFaultSelection3D,
     component: OracleFaultComponent3D,
     grid: VoxelGridConfig,
 ) -> SparseVoxelExample:

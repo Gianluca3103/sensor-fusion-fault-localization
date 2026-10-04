@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -30,6 +31,8 @@ class RadarTemporalFilterConfig:
     max_height_m: float = 5.0
     min_rcs: float | None = None
     max_abs_compensated_velocity_mps: float | None = None
+    moving_velocity_threshold_mps: float | None = None
+    moving_max_age_scans: int = 1
     temporal_radius_m: float | None = None
     temporal_min_scans: int = 2
     preserve_current_scan: bool = True
@@ -52,6 +55,11 @@ class RadarTemporalFilterConfig:
             raise ValueError(
                 "max_abs_compensated_velocity_mps must be positive when enabled"
             )
+        if (self.moving_velocity_threshold_mps is not None
+                and self.moving_velocity_threshold_mps <= 0.0):
+            raise ValueError("moving_velocity_threshold_mps must be positive")
+        if self.moving_max_age_scans < 0:
+            raise ValueError("moving_max_age_scans must be non-negative")
 
 
 def filter_accumulated_radar_points(
@@ -94,8 +102,16 @@ def filter_accumulated_radar_points(
 
     points = points[valid]
     after_validity = len(points)
-    temporal_keep = np.ones(after_validity, dtype=bool)
-    if config.temporal_radius_m is not None and after_validity:
+    after_motion = after_validity
+    if config.moving_velocity_threshold_mps is not None:
+        # Doppler gives only radial motion. Do not extrapolate a 3D position
+        # from it: retain recent moving returns and remove older trails.
+        moving = np.abs(points[:, 5]) >= config.moving_velocity_threshold_mps
+        stale = points[:, 6] < -config.moving_max_age_scans
+        points = points[~(moving & stale)]
+        after_motion = len(points)
+    temporal_keep = np.ones(after_motion, dtype=bool)
+    if config.temporal_radius_m is not None and after_motion:
         time_indices = np.rint(points[:, 6]).astype(np.int32)
         radius = config.temporal_radius_m
         if cKDTree is not None:
@@ -141,9 +157,9 @@ def filter_accumulated_radar_points(
                 )
 
         temporal_keep = np.fromiter(
-            (has_support(index) for index in range(after_validity)),
+            (has_support(index) for index in range(after_motion)),
             dtype=bool,
-            count=after_validity,
+            count=after_motion,
         )
         if config.preserve_current_scan:
             temporal_keep |= time_indices == 0
@@ -152,7 +168,8 @@ def filter_accumulated_radar_points(
     return points, {
         "input_points": initial_count,
         "validity_rejected": initial_count - after_validity,
-        "temporal_rejected": after_validity - len(points),
+        "motion_rejected": after_validity - after_motion,
+        "temporal_rejected": after_motion - len(points),
         "output_points": len(points),
     }
 
@@ -198,6 +215,52 @@ def radar_current_from_source(
     )
 
 
+def radar_current_from_official_previous(
+    previous_raw_path: str | Path,
+    current_official_five_path: str | Path,
+    *,
+    maximum_residual_m: float = 0.001,
+) -> np.ndarray:
+    """Recover VoD's preceding-scan transform from its released five-scan stack.
+
+    The official stack retains each source scan's row order and measured fields.
+    Fitting one rigid transform to those corresponding rows reproduces the
+    released coordinates without relying on a different odometry estimate.
+    Missing ``-1`` rows mean the current frame begins a new sequence.
+    """
+
+    source = load_vod_radar(previous_raw_path)
+    official = load_vod_radar(current_official_five_path)
+    previous = official[official[:, 6] == -1]
+    if not len(previous):
+        raise ValueError(f"No preceding scan in {current_official_five_path}")
+    if len(source) != len(previous):
+        raise ValueError("Official preceding scan does not match raw point count")
+    if not np.array_equal(source[:, 3:6], previous[:, 3:6]):
+        raise ValueError("Official preceding scan changed measured radar fields or row order")
+    source_xyz = source[:, :3].astype(np.float64)
+    target_xyz = previous[:, :3].astype(np.float64)
+    source_center = source_xyz.mean(axis=0)
+    target_center = target_xyz.mean(axis=0)
+    left, _, right = np.linalg.svd(
+        (source_xyz - source_center).T @ (target_xyz - target_center)
+    )
+    correction = np.eye(3)
+    correction[-1, -1] = np.linalg.det(left @ right)
+    row_rotation = left @ correction @ right
+    fitted = (source_xyz - source_center) @ row_rotation + target_center
+    residual = np.linalg.norm(fitted - target_xyz, axis=1)
+    if residual.max() > maximum_residual_m:
+        raise ValueError(
+            f"Official five-scan alignment is not rigid: max residual "
+            f"{residual.max():.6f} m in {current_official_five_path}"
+        )
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = row_rotation.T
+    transform[:3, 3] = target_center - source_center @ row_rotation
+    return transform
+
+
 def transform_radar_scan(
     radar_points: np.ndarray,
     current_from_source: np.ndarray,
@@ -229,6 +292,7 @@ def accumulate_vod_radar_scans(
     calibration_paths: list[str | Path],
     *,
     filter_config: RadarTemporalFilterConfig | None = None,
+    source_to_current: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
     """Align chronological source scans into the final scan's radar frame."""
 
@@ -236,6 +300,8 @@ def accumulate_vod_radar_scans(
         raise ValueError("At least one source radar scan is required")
     if not (len(source_paths) == len(pose_paths) == len(calibration_paths)):
         raise ValueError("Radar, pose, and calibration path counts must match")
+    if source_to_current is not None and len(source_to_current) != len(source_paths):
+        raise ValueError("A source-to-current transform is required for each scan")
 
     current_pose = pose_paths[-1]
     current_calibration = calibration_paths[-1]
@@ -249,7 +315,9 @@ def accumulate_vod_radar_scans(
             radar_path,
             allow_nonfinite=filter_config is not None,
         )
-        if time_index == 0:
+        if source_to_current is not None:
+            transform = source_to_current[index]
+        elif time_index == 0:
             transform = np.eye(4, dtype=np.float64)
         else:
             transform = radar_current_from_source(

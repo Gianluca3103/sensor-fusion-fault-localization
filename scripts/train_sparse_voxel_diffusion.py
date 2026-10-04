@@ -29,7 +29,7 @@ from voxelization import (
     load_voxelization_config,
     select_oracle_fault_regions_3d,
 )
-from scripts.cache_sparse_voxel_supervision import CACHE_VERSION
+from scripts.cache_sparse_voxel_supervision import CACHE_VERSION, SPARSE_SELECTOR_CONFIG
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -178,7 +178,6 @@ def _load_examples(
             faulty_lidar=faulty_voxels,
             radar=radar_voxels,
             targets=targets,
-            selection=selection,
             component=component,
             grid=lidar_voxelizer.grid,
         )
@@ -269,7 +268,7 @@ def main() -> None:
     voxelization = load_voxelization_config(args.voxel_config)
     lidar_voxelizer = HardVoxelizer(voxelization.grid, max_points_per_voxel=voxelization.lidar.max_points_per_voxel)
     radar_voxelizer = HardVoxelizer(voxelization.grid, max_points_per_voxel=voxelization.radar.max_points_per_voxel)
-    selector_config = OracleFaultSelector3DConfig()
+    selector_config = SPARSE_SELECTOR_CONFIG
     train_available = sorted((args.samples_root / "train").glob("*.npz"))
     val_available = sorted((args.samples_root / "val").glob("*.npz"))
     if args.cached_samples_only:
@@ -293,7 +292,12 @@ def main() -> None:
         if config.condition_feature_dim != SparseVoxelDiffusionConfig().condition_feature_dim:
             raise ValueError(
                 "This checkpoint uses the old target-leaking condition features. "
-                "Rebuild sparse supervision cache version 2 and retrain."
+                f"Rebuild sparse supervision cache version {CACHE_VERSION} and retrain."
+            )
+        if checkpoint.get("cache_version") != CACHE_VERSION:
+            raise ValueError(
+                f"Checkpoint was trained with cache version {checkpoint.get('cache_version')}; "
+                f"version {CACHE_VERSION} is required after removing the selector halo. Retrain."
             )
         if args.eval_skip_chamfer:
             config = replace(config, lambda_chamfer=0.0)
@@ -364,7 +368,7 @@ def main() -> None:
             record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
             history.write(json.dumps(record) + "\n")
             history.flush()
-            torch.save({"epoch": epoch, "model_config": config.__dict__, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "metrics": record}, output_root / "last_checkpoint.pt")
+            torch.save({"epoch": epoch, "cache_version": CACHE_VERSION, "model_config": config.__dict__, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "metrics": record}, output_root / "last_checkpoint.pt")
             print(json.dumps(record), flush=True)
 
 

@@ -138,7 +138,9 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = SparseVoxelDiffusionConfig(**checkpoint["model_config"])
     if config.condition_feature_dim != SparseVoxelDiffusionConfig().condition_feature_dim:
-        raise ValueError("Old target-leaking checkpoint; rebuild cache version 2 and retrain")
+        raise ValueError(f"Old target-leaking checkpoint; rebuild cache version {CACHE_VERSION} and retrain")
+    if checkpoint.get("cache_version") != CACHE_VERSION:
+        raise ValueError(f"Checkpoint cache version {checkpoint.get('cache_version')} is incompatible with cache version {CACHE_VERSION}")
     model = SparseVoxelDiffusionBaseline(config).to(device).eval()
     model.load_state_dict(checkpoint["model_state_dict"])
     selected = _select_components(

@@ -22,7 +22,9 @@ from models.two_stage_reconstruction_head.voxelization.inputs import (
 from models.two_stage_reconstruction_head.range_view.geometry import (
     RangeGeometry, angular_indices, project_lidar,
 )
-from models.two_stage_reconstruction_head.range_view.radar import project_aligned_radar
+from models.two_stage_reconstruction_head.range_view.radar import (
+    filter_radar_below_lidar, filter_radar_floor_band, project_aligned_radar,
+)
 from Fault_Localization_Model.vod_dataset.vod_io import load_vod_radar
 
 
@@ -131,6 +133,8 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--max-display-lidar", type=int, default=40000)
     parser.add_argument("--max-display-radar", type=int, default=10000)
+    parser.add_argument("--radar-floor-band-m", type=float, default=0.0,
+                        help="Preview radar with the minimum-z floor ablation; 0 disables")
     parser.add_argument("--view", choices=("range", "range-separate", "xyz"), default="range")
     parser.add_argument("--require-radar-frames", type=int,
                         help="Verify the radar source contains this many distinct scan time indices")
@@ -148,6 +152,8 @@ def main() -> None:
         parser.error("display limits must be positive")
     if args.azimuth_bins < 2 or args.elevation_bins < 2:
         parser.error("angular preview bins must be at least 2")
+    if not np.isfinite(args.radar_floor_band_m) or args.radar_floor_band_m < 0:
+        parser.error("radar floor band must be finite and nonnegative")
     aligned = load_aligned_point_inputs(args.sample, args.radar_root, lidar_source="faulty")
     if not aligned.metadata.get("range_view_full_scan", False):
         parser.error("sample is a legacy cropped artifact; regenerate it with create_range_view_fault_samples")
@@ -175,6 +181,10 @@ def main() -> None:
         lidar = lidar[lidar[:, 0] >= 0]
         radar = radar[radar[:, 0] >= 0]
         clean = clean[clean[:, 0] >= 0]
+    radar_before_lidar_filter = len(radar)
+    radar, lidar_min_z = filter_radar_below_lidar(radar, lidar)
+    radar_before_floor_filter = len(radar)
+    radar, radar_floor_z = filter_radar_floor_band(radar, args.radar_floor_band_m)
     rng = np.random.default_rng(args.seed)
     shown_clean = clean[_display_indices(len(clean), args.max_display_lidar, rng)]
     shown_lidar = lidar[_display_indices(len(lidar), args.max_display_lidar, rng)]
@@ -237,6 +247,11 @@ def main() -> None:
         "forward_only": not args.include_rear,
         "clean_lidar_points": len(clean), "faulty_lidar_points": len(lidar),
         "radar_points": len(radar),
+        "radar_lidar_min_z_m": lidar_min_z,
+        "radar_below_lidar_removed_points": radar_before_lidar_filter - radar_before_floor_filter,
+        "radar_floor_band_m": args.radar_floor_band_m,
+        "radar_floor_reference_z_m": radar_floor_z,
+        "radar_floor_removed_points": radar_before_floor_filter - len(radar),
         "radar_variant": radar_metadata.get("radar_variant"),
         "radar_scan_time_indices": None if radar_time_indices is None else radar_time_indices.tolist(),
         "visualization_mode": mode,

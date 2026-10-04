@@ -13,6 +13,7 @@ from models.two_stage_reconstruction_head.diffusion_process import (
     voxel_set_metrics_at_distance,
 )
 from models.two_stage_reconstruction_head.diffusion_process.sparse_voxel_data import SparseVoxelBatch
+from scripts.cache_sparse_voxel_supervision import SPARSE_SELECTOR_CONFIG
 from voxelization import (
     HardVoxelizer,
     OracleFaultSelector3DConfig,
@@ -52,7 +53,6 @@ class SparseVoxelDiffusionTests(unittest.TestCase):
             faulty_lidar=self.faulty_voxels,
             radar=self.radar_voxels,
             targets=self.targets,
-            selection=self.selection,
             component=self.selection.components[0],
             grid=self.grid,
         )
@@ -71,6 +71,15 @@ class SparseVoxelDiffusionTests(unittest.TestCase):
         self.assertTrue(torch.equal(batch.editable_mask[valid], torch.ones_like(batch.editable_mask[valid])))
         self.assertGreater(int(((batch.target_occupancy < 0.5) & valid).sum()), 0)
         self.assertGreater(int(((batch.target_occupancy > 0.5) & valid).sum()), 0)
+
+    def test_sparse_selector_has_no_explicit_halo(self):
+        selection = select_oracle_fault_regions_3d(
+            self.targets.repair_mask, self.targets.remove_mask,
+            self.grid, SPARSE_SELECTOR_CONFIG,
+        )
+        self.assertEqual(SPARSE_SELECTOR_CONFIG.halo_m, 0.0)
+        self.assertFalse(np.any(selection.context_halo))
+        self.assertGreater(len(selection.components), 0)
 
     def test_loss_matches_requested_baseline_and_backpropagates(self):
         batch = self._batch()
