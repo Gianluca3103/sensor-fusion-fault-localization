@@ -32,6 +32,8 @@ SUMMARY_FIELDS = (
     "val_reconstructed_f1_at_0_2m", "val_reconstructed_iou_at_0_2m",
     "val_net_f1_improvement", "val_addition_precision", "val_addition_recall",
     "val_generated_hallucination_rate", "val_generated_count",
+    "val_radar_translation_precision_at_0_2m", "val_radar_translation_recall_at_0_2m",
+    "val_radar_translation_f1_at_0_2m",
 )
 FAULT_FIELDS = (
     "epoch", "fault", "count", "faulty_f1_at_0_2m",
@@ -61,6 +63,9 @@ def _summary_rows(record: dict) -> tuple[dict, list[dict]]:
         "val_addition_recall": overall.get("addition_recall", ""),
         "val_generated_hallucination_rate": overall.get("generated_hallucination_rate", ""),
         "val_generated_count": overall.get("generated_count", ""),
+        "val_radar_translation_precision_at_0_2m": overall.get("radar_translation_precision_at_0.2m", ""),
+        "val_radar_translation_recall_at_0_2m": overall.get("radar_translation_recall_at_0.2m", ""),
+        "val_radar_translation_f1_at_0_2m": overall.get("radar_translation_f1_at_0.2m", ""),
     }
     faults = [
         {
@@ -134,6 +139,13 @@ def _format_epoch_summary(summary: dict, faults: list[dict], total_epochs: int) 
         f"recall {summary['val_addition_recall']:.4f}, "
         f"generated {summary['val_generated_count']:,.0f} per sample",
     ])
+    if summary.get("val_radar_translation_f1_at_0_2m", "") != "":
+        lines.append(
+            "  Radar→LiDAR alone @ 0.2m: "
+            f"precision {summary['val_radar_translation_precision_at_0_2m']:.4f}, "
+            f"recall {summary['val_radar_translation_recall_at_0_2m']:.4f}, "
+            f"F1 {summary['val_radar_translation_f1_at_0_2m']:.4f}"
+        )
     for fault in faults:
         lines.append(
             f"  {fault['fault']} (n={fault['count']}): "
@@ -162,6 +174,8 @@ def _arguments() -> argparse.Namespace:
                         help="Append each ray's unit XYZ direction as three input channels")
     parser.add_argument("--radar-focused-objective", action="store_true",
                         help="Train only in radar-supported regions and weight annotated VoD object returns")
+    parser.add_argument("--radar-to-clean", action="store_true",
+                        help="Predict clean LiDAR geometry from radar alone; use faulty LiDAR only for merging")
     parser.add_argument("--radar-region-row-radius", type=int, default=8)
     parser.add_argument("--radar-region-col-radius", type=int, default=32)
     parser.add_argument("--object-class-weights", type=float, nargs=3, default=(2.0, 4.0, 4.0),
@@ -171,6 +185,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--lambda-scanline", type=float, default=0.2)
     parser.add_argument("--radar-anchor-radius-m", type=float,
                         help="Optional 3D radar gate at validation; leave unset for the first focused experiment")
+    parser.add_argument("--radar-min-occupied-voxels", type=int, default=1,
+                        help="Require this many distinct radar voxels within the validation anchor radius")
+    parser.add_argument("--radar-support-voxel-size-m", type=float, default=0.5)
     parser.add_argument("--radar-floor-band-m", type=float, default=0.0,
                         help="Opt-in: remove radar returns within this height above each frame's minimum radar z; 0 disables")
     parser.add_argument("--include-rear", action="store_true",
@@ -215,6 +232,12 @@ def _arguments() -> argparse.Namespace:
         parser.error("radar-focused object targets require radar input")
     if args.radar_focused_objective and args.use_fault_map_conditioning:
         parser.error("radar-focused object targets do not support fault-map conditioning in this version")
+    if args.radar_to_clean and (not args.radar_focused_objective or args.no_radar
+                                or args.allow_original_deletion):
+        parser.error("radar-to-clean requires radar-focused targets, radar input, and preserved original LiDAR")
+    if args.radar_min_occupied_voxels < 1 or (args.radar_min_occupied_voxels > 1
+                                                and args.radar_anchor_radius_m is None):
+        parser.error("multiple radar voxels require a radar anchor radius")
     if (args.radar_region_row_radius < 0 or args.radar_region_col_radius < 0
             or args.lambda_scanline < 0 or args.background_positive_weight < 0
             or (args.radar_anchor_radius_m is not None
@@ -224,7 +247,9 @@ def _arguments() -> argparse.Namespace:
             or args.learning_rate <= 0 or args.validate_every < 1
             or args.chamfer_every < 1 or not np.isfinite(args.online_yaw_deg)
             or args.online_yaw_deg < 0 or not np.isfinite(args.radar_floor_band_m)
-            or args.radar_floor_band_m < 0):
+            or args.radar_floor_band_m < 0
+            or not np.isfinite(args.radar_support_voxel_size_m)
+            or args.radar_support_voxel_size_m <= 0):
         parser.error("invalid training settings")
     return args
 
@@ -254,13 +279,16 @@ def main() -> None:
         circular_azimuth=geometry.azimuth_span_rad >= 2 * np.pi - 1e-8,
         predict_intensity=args.predict_intensity,
         use_ray_encoding=args.use_ray_encoding,
+        radar_only_geometry=args.radar_to_clean,
     )
     loss_config = RangeLossConfig(
         lambda_add=args.lambda_add, lambda_range=args.lambda_range,
-        lambda_delete=args.lambda_delete, lambda_geometry=args.lambda_geometry,
+        lambda_delete=(0.0 if args.radar_to_clean else args.lambda_delete),
+        lambda_geometry=args.lambda_geometry,
         lambda_free_space=args.lambda_free_space,
         lambda_intensity=args.lambda_intensity,
         radar_focused_objective=args.radar_focused_objective,
+        radar_to_clean_objective=args.radar_to_clean,
         object_class_weights=tuple(args.object_class_weights),
         background_positive_weight=args.background_positive_weight,
         lambda_scanline=args.lambda_scanline if args.radar_focused_objective else 0.0,
@@ -274,6 +302,8 @@ def main() -> None:
         forward_only=not args.include_rear,
         enforce_single_return_per_cell=args.radar_focused_objective,
         radar_anchor_radius_m=(args.radar_anchor_radius_m if args.radar_focused_objective else None),
+        radar_min_occupied_voxels=(args.radar_min_occupied_voxels if args.radar_focused_objective else 1),
+        radar_support_voxel_size_m=args.radar_support_voxel_size_m,
         radar_region_row_radius=(args.radar_region_row_radius if args.radar_focused_objective else None),
         radar_region_col_radius=(args.radar_region_col_radius if args.radar_focused_objective else None),
     )

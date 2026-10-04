@@ -10,9 +10,9 @@ import numpy as np
 import torch
 
 from .data import load_range_sample
-from .geometry import RangeGeometry
+from .geometry import RangeGeometry, project_lidar
 from .merge import MergeConfig, merge_reconstruction
-from .metrics import evaluate_xyz
+from .metrics import _point_set_scores, evaluate_xyz
 
 
 def evaluate_range_model(
@@ -59,6 +59,22 @@ def evaluate_range_model(
         record["radar_below_lidar_removed_points"] = sample.metadata["radar_below_lidar_removed_points"]
         record.update(evaluate_xyz(sample, merged, tolerance_m=distance_m,
                                    compute_chamfer=compute_chamfer))
+        if bool(getattr(model.config, "radar_only_geometry", False)):
+            # Score the radar translation itself, before the faulty LiDAR
+            # fills in most of the scene and masks a weak predictor.
+            empty = np.empty((0, sample.faulty_points.shape[1]), dtype=np.float32)
+            radar_translation = merge_reconstruction(
+                empty, project_lidar(empty, geometry), geometry,
+                add_probability, add_range, delete_probability,
+                config=merge_config, radar_support=sample.radar_features[0],
+                radar_points=sample.radar_points,
+                add_intensity=(prediction["add_intensity"][0].cpu().numpy()
+                               if "add_intensity" in prediction else None),
+            )
+            record.update(_point_set_scores(
+                radar_translation.points, sample.clean_points, distance_m,
+                "radar_translation", compute_chamfer=compute_chamfer,
+            ))
         rows.append(record)
         if visualization_root is not None and index < visualization_limit:
             from .visualization import save_range_comparison

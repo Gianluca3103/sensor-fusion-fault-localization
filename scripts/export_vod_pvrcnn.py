@@ -194,6 +194,8 @@ def export_sve_reconstructed_validation(args: argparse.Namespace, public: Path, 
         "reconstruction_radar_anchor_radius_m": loaded[2].radar_anchor_radius_m,
         "reconstruction_radar_min_occupied_voxels": loaded[2].radar_min_occupied_voxels,
         "reconstruction_radar_support_voxel_size_m": loaded[2].radar_support_voxel_size_m,
+        "reconstruction_radar_only_geometry": bool(getattr(
+            getattr(loaded[0], "config", None), "radar_only_geometry", False)),
         "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0],
         "export_type": "sve_reconstructed_validation_only",
     }
@@ -320,6 +322,8 @@ def main() -> None:
                 "reconstruction_radar_anchor_radius_m": loaded[2].radar_anchor_radius_m if loaded else None,
                 "reconstruction_radar_min_occupied_voxels": loaded[2].radar_min_occupied_voxels if loaded else None,
                 "reconstruction_radar_support_voxel_size_m": loaded[2].radar_support_voxel_size_m if loaded else None,
+                "reconstruction_radar_only_geometry": bool(getattr(
+                    getattr(loaded[0], "config", None), "radar_only_geometry", False)) if loaded else None,
                 "radar_policy": "aligned_xyz_plus_rcs_as_intensity" if mode == "lidar_radar" else None,
                 "empty_cloud_sentinel": [0.01, 0.0, -2.9, 0.0]}
             (root / "export_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

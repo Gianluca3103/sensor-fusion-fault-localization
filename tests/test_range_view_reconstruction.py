@@ -18,8 +18,9 @@ from models.two_stage_reconstruction_head.range_view.merge import MergeConfig, m
 from models.two_stage_reconstruction_head.range_view.model import (
     CircularHorizontalConv, RangeModelConfig, RangeViewReconstructor,
 )
-from models.two_stage_reconstruction_head.range_view.loss import range_edit_loss
+from models.two_stage_reconstruction_head.range_view.loss import RangeLossConfig, range_edit_loss
 from models.two_stage_reconstruction_head.range_view.metrics import evaluate_xyz
+from models.two_stage_reconstruction_head.range_view.evaluation import evaluate_range_model
 from models.two_stage_reconstruction_head.range_view.data import (
     RangeViewDataset, load_range_sample, rotate_points_yaw,
 )
@@ -282,6 +283,86 @@ class RangeViewTests(unittest.TestCase):
         self.assertGreater(float(model.intensity_head.weight.grad.abs().sum()), 0)
         target["add"].zero_()
         self.assertEqual(float(range_edit_loss(result, target)["intensity_loss"]), 0)
+
+    def test_radar_only_geometry_ignores_faulty_lidar_channels(self):
+        torch.manual_seed(7)
+        model = RangeViewReconstructor(RangeModelConfig(
+            hidden_channels=8, max_range_m=50, radar_only_geometry=True,
+            use_ray_encoding=True,
+        )).eval()
+        features = torch.randn(1, 13, 2, 16)
+        modified = features.clone()
+        modified[:, :3] = torch.randn_like(modified[:, :3]) * 100
+        with torch.inference_mode():
+            before = model(features)
+            after = model(modified)
+        for name in ("add_probability", "add_range_m", "delete_probability"):
+            torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+
+    def test_radar_to_clean_occupancy_target_does_not_depend_on_fault_mask(self):
+        logits = torch.zeros(1, 1, 2, requires_grad=True)
+        prediction = {
+            "add_logit": logits, "add_probability": torch.sigmoid(logits),
+            "add_range_m": torch.full((1, 1, 2), 5.0),
+            "delete_logit": torch.zeros(1, 1, 2),
+        }
+        target = {key: torch.zeros(1, 1, 2) for key in (
+            "add", "add_range_m", "delete", "delete_valid", "clean_valid",
+            "clean_range_m", "object_class", "radar_region", "ground_mask",
+        )}
+        target["clean_valid"][0, 0, 0] = 1
+        target["clean_range_m"][0, 0, 0] = 5
+        target["radar_region"][:] = 1
+        config = RangeLossConfig(radar_focused_objective=True,
+                                 radar_to_clean_objective=True,
+                                 lambda_delete=0, lambda_free_space=0,
+                                 lambda_intensity=0, lambda_scanline=0)
+        healthy_loss = range_edit_loss(prediction, target, config)["loss"]
+        target["add"][0, 0, 0] = 1  # Same clean geometry, different fault.
+        faulty_loss = range_edit_loss(prediction, target, config)["loss"]
+        torch.testing.assert_close(healthy_loss, faulty_loss)
+        faulty_loss.backward()
+        self.assertLess(float(logits.grad[0, 0, 0]), 0)
+        self.assertGreater(float(logits.grad[0, 0, 1]), 0)
+
+    def test_radar_translation_is_scored_before_faulty_lidar_merge(self):
+        clean = np.stack([self.point(0, 0, 5)])
+        faulty = np.empty((0, 4), dtype=np.float32)
+        empty_projection = project_lidar(faulty, self.geometry)
+        targets = build_range_targets(empty_projection, project_lidar(clean, self.geometry),
+                                      faulty, clean, np.empty(0, dtype=np.int64))
+        sample = SimpleNamespace(
+            features=np.zeros((10, *self.geometry.shape), dtype=np.float32),
+            faulty_points=faulty, clean_points=clean,
+            faulty_projection=empty_projection, targets=targets,
+            faulty_source_ids=np.empty(0, dtype=np.int64),
+            radar_features=np.zeros((6, *self.geometry.shape), dtype=np.float32),
+            radar_points=np.asarray([self.point(0, 0, 5)[:3]], dtype=np.float32),
+            metadata={"fault": "total_loss", "radar_floor_removed_points": 0,
+                      "radar_below_lidar_removed_points": 0},
+        )
+        add = np.zeros(self.geometry.shape, dtype=np.float32)
+        add[0, 0] = 1
+
+        class StubModel:
+            config = RangeModelConfig(radar_only_geometry=True)
+
+            def eval(self):
+                return self
+
+            def __call__(self, _features):
+                return {"add_probability": torch.from_numpy(add[None]),
+                        "add_range_m": torch.full((1, *add.shape), 5.0),
+                        "delete_probability": torch.zeros((1, *add.shape))}
+
+        with patch("models.two_stage_reconstruction_head.range_view.evaluation.load_range_sample",
+                   return_value=sample):
+            result = evaluate_range_model(
+                StubModel(), [Path("sample.npz")], Path("radar"), self.geometry,
+                device=torch.device("cpu"), merge_config=MergeConfig(),
+                compute_chamfer=False,
+            )
+        self.assertAlmostEqual(result["overall_macro"]["radar_translation_f1_at_0.2m"], 1.0)
 
     def test_generated_intensity_preserves_original_intensity(self):
         original = np.stack([self.point(0, 0, 5, intensity=0.8)])

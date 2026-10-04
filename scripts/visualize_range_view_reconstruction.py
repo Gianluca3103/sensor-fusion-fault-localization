@@ -558,6 +558,7 @@ def main() -> None:
         metadata = {
             "sample": str(path), "checkpoint": str(args.checkpoint),
             "checkpoint_epoch": int(checkpoint["epoch"]),
+            "radar_only_geometry": model_config.radar_only_geometry,
             "fault": sample.metadata.get("fault", "unknown"),
             "faulty_points": len(sample.faulty_points),
             "clean_points": len(sample.clean_points),

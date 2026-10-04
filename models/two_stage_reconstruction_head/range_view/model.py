@@ -19,6 +19,7 @@ class RangeModelConfig:
     circular_azimuth: bool = True
     predict_intensity: bool = False
     use_ray_encoding: bool = False
+    radar_only_geometry: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_channels < 4 or self.hidden_channels % 4 or not 0 < self.min_range_m < self.max_range_m:
@@ -70,6 +71,10 @@ class RangeViewReconstructor(nn.Module):
         if features.ndim != 4 or features.shape[1] != self.input_channels:
             raise ValueError(f"expected [batch,{self.input_channels},beam,azimuth] range-view features")
         features = features.clone()
+        if self.config.radar_only_geometry:
+            # The predictor must infer clean geometry from radar and ray
+            # direction. Faulty LiDAR is used only by the conservative merge.
+            features[:, :3] = 0
         if not self.config.use_radar:
             features[:, 3:9] = 0
         if not self.config.use_fault_map_conditioning:
