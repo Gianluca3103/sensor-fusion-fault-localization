@@ -36,6 +36,7 @@ from models.two_stage_reconstruction_head.ray_depth_training import (
     clean_first_return_targets, ray_depth_blueprint_loss,
 )
 from scripts.train_radar_gated_ray_diffusion import choose_radar_tile, _paths
+from scripts.training_progress import blueprint_summary, record_epoch
 
 
 @dataclass(frozen=True)
@@ -348,7 +349,8 @@ def main() -> None:
                         (score == best_score and val_loss < best_val_loss))
             if improved:
                 best_score, best_val_loss = score, val_loss
-        print(json.dumps(message), flush=True)
+        record_epoch(args.output_root, message,
+                     blueprint_summary(message, settings.epochs))
         checkpoint = {
             "stage": "blueprint_pretraining", "epoch": epoch,
             "blueprint": model.state_dict(), "optimizer": optimizer.state_dict(),

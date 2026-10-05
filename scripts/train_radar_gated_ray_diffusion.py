@@ -38,6 +38,7 @@ from models.two_stage_reconstruction_head.ray_depth_queries import ray_tile_indi
 from models.two_stage_reconstruction_head.ray_depth_training import (
     ray_depth_blueprint_loss,
 )
+from scripts.training_progress import diffusion_summary, record_epoch
 
 
 @dataclass(frozen=True)
@@ -381,7 +382,8 @@ def main() -> None:
                 for key, value in val_metrics.items()
                 if key.startswith("calibration_")
             }
-        print(json.dumps(message), flush=True)
+        record_epoch(args.output_root, message,
+                     diffusion_summary(message, settings.epochs))
         checkpoint = {
             "epoch": epoch, "blueprint": blueprint_model.state_dict(),
             "diffusion": diffusion.state_dict(), "optimizer": optimizer.state_dict(),

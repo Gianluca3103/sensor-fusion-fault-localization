@@ -65,6 +65,11 @@ Candidate coverage measures whether a clean return has a nearby proposal, not
 whether the model selected the right return. The generated cloud and detector
 AP must be evaluated separately after later stages.
 
+New runs print a short train summary after each epoch and a second validation
+line when validation runs. All metrics remain available as JSON records in
+`epoch_metrics.jsonl` under each run's output directory. A Python process
+already running when this output change is installed keeps its earlier format.
+
 ## Later stages
 
 The diffusion trainer accepts `--pretrained-blueprint "$RUN/best_checkpoint.pt"`
