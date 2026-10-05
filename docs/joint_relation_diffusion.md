@@ -12,8 +12,20 @@ rays, so reconstruction is not limited to a 3 m correction around a selected
 radar depth. One generated point per eligible LiDAR ray preserves first-return
 geometry; multiple nearby rays may be supported by one radar pattern.
 
-This is a new checkpoint format. Do not pass an old ray-depth blueprint or
-range-view reconstruction checkpoint as `--resume`.
+The v2 objective trains the return classifier from radar and surviving LiDAR
+alone. It cannot read noised clean depth. Diffusion retains its noise loss,
+while positive first returns also receive a Huber depth error in metres
+(`--metric-depth-weight`, default 0.3). A small normalized-depth term supplies
+gradients when the denoised estimate is outside the sensor range. Both direct
+depth terms are weighted down at high diffusion noise levels. Intensity is
+not trained in v2; newly generated points have intensity zero, while
+surviving faulty LiDAR points keep their measured intensity. Consequently,
+detector scores from this version also reflect the missing synthetic
+intensity channel.
+
+The v2 checkpoint format cannot resume a v1 joint run. Keep the v1 run as a
+baseline and use a fresh output directory. The viewer and exporter can still
+read either version.
 
 ## Professor-machine inputs
 
@@ -74,7 +86,7 @@ Then train on every VoD training frame. These are starting hyperparameters,
 not tuned settings:
 
 ```bash
-RUN="$BASE/sensor_fusion_outputs/vod_joint_relation_diffusion_80ep"
+RUN="$BASE/sensor_fusion_outputs/vod_joint_relation_metric_depth_v2_80ep"
 "$PY" -u -m scripts.train_joint_relation_diffusion \
   --samples-root "$CACHE/samples" --vod-root "$VOD" \
   --geometry "$CACHE/angular_geometry.json" \
@@ -84,7 +96,8 @@ RUN="$BASE/sensor_fusion_outputs/vod_joint_relation_diffusion_80ep"
   --epochs 80 --batch-size 4 --grad-accum-steps 1 \
   --tile-rows 4 --tile-cols 64 --width 32 --hidden 32 \
   --learning-rate 0.0002 --alignment-weight 0.1 \
-  --paired-weight 0.1 --validate-every 5 --num-workers 2 --device cuda
+  --paired-weight 0.1 --metric-depth-weight 0.3 \
+  --validate-every 5 --num-workers 2 --device cuda
 ```
 
 `last_checkpoint.pt` is saved every epoch; `best_checkpoint.pt` is selected by
@@ -94,8 +107,10 @@ adding
 frames with frozen weights and the same tile selection seed as validation.
 Compare `train_eval` with `val` in `epoch_metrics.jsonl`; online training loss
 is not a fair generalization comparison. The printed return precision/recall
-and depth MAE are teacher-forced noisy-step diagnostics. They are not final
-sampled-cloud accuracy or object-detection AP.
+come from a condition-only head with the same inputs at training and
+inference. Depth MAE still comes from a single noisy denoising step and is
+not final sampled-cloud accuracy or object-detection AP. Inspect sampled
+validation clouds before interpreting the checkpoint ranking.
 
 To inspect a saved checkpoint while training continues, run the dedicated
 viewer on one or more validation indices. It creates a rotatable HTML

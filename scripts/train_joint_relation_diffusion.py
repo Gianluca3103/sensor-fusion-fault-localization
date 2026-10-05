@@ -50,6 +50,7 @@ class JointSettings:
     learning_rate: float
     alignment_weight: float
     paired_weight: float
+    metric_depth_weight: float
     validate_every: int
     seed: int
 
@@ -97,6 +98,10 @@ def _one_batch(
         paired_weight=settings.paired_weight)
     return {"loss": diffusion_loss["loss"] + relation_loss["loss"],
             "diffusion": diffusion_loss["loss"],
+            "noise": diffusion_loss["noise"],
+            "return_loss": diffusion_loss["return"],
+            "metric_depth": diffusion_loss["metric_depth"],
+            "normalized_depth": diffusion_loss["depth"],
             "alignment": relation_loss["alignment"],
             "paired": relation_loss["paired"],
             "supported": diffusion_loss["supported_rays"],
@@ -125,7 +130,8 @@ def _run_epoch(
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
     totals = {key: 0.0 for key in (
-        "loss", "diffusion", "alignment", "paired", "supported",
+        "loss", "diffusion", "noise", "return_loss", "metric_depth",
+        "normalized_depth", "alignment", "paired", "supported",
         "clean_hits", "predicted_hits", "true_hits", "depth_error_sum_m",
         "aligned_rays", "paired_rays")}
     rng = random.Random(seed)
@@ -158,7 +164,9 @@ def _run_epoch(
         progress.set_postfix(loss=f"{totals['loss'] / index:.3f}",
                              support=f"{totals['supported'] / index:.1f}")
     average = {key: totals[key] / len(loader)
-               for key in ("loss", "diffusion", "alignment", "paired")}
+               for key in ("loss", "diffusion", "noise", "return_loss",
+                           "metric_depth", "normalized_depth", "alignment",
+                           "paired")}
     average.update({key: totals[key] for key in totals if key not in average})
     precision = totals["true_hits"] / max(totals["predicted_hits"], 1)
     recall = totals["true_hits"] / max(totals["clean_hits"], 1)
@@ -173,8 +181,9 @@ def _run_epoch(
 def _summary(message: dict, total_epochs: int) -> str:
     epoch, train = message["epoch"], message["train"]
     line = (f"Epoch {epoch:02d}/{total_epochs} | train loss {train['loss']:.4f}"
-            f" (diffusion {train['diffusion']:.4f},"
-            f" relation {train['alignment']:.4f})")
+            f" | return {train['return_loss']:.3f}"
+            f" | depth(m) {train['metric_depth']:.2f}"
+            f" | noise {train['noise']:.3f}")
     if "val" in message:
         val = message["val"]
         line += (f"\n  val loss {val['loss']:.4f} | return P/R/F1 "
@@ -216,6 +225,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--alignment-weight", type=float, default=0.1)
     parser.add_argument("--paired-weight", type=float, default=0.1)
+    parser.add_argument("--metric-depth-weight", type=float, default=0.3,
+                        help="Weight of first-return Huber depth loss in metres")
     parser.add_argument("--validate-every", type=int, default=5)
     parser.add_argument("--audit-train-at-end",
                         action=argparse.BooleanOptionalAction, default=True)
@@ -230,6 +241,7 @@ def _arguments() -> argparse.Namespace:
             args.width % 8 or args.hidden < 8 or args.hidden % 8 or
             args.timesteps < 2 or args.learning_rate <= 0 or
             args.alignment_weight < 0 or args.paired_weight < 0 or
+            args.metric_depth_weight <= 0 or
             args.validate_every < 1 or args.num_workers < 0 or
             (args.train_limit is not None and args.train_limit < 1) or
             (args.val_limit is not None and args.val_limit < 1)):
@@ -251,7 +263,8 @@ def main() -> None:
         args.epochs, args.batch_size, args.grad_accum_steps,
         args.tile_rows, args.tile_cols, args.width, args.hidden,
         args.timesteps, args.learning_rate, args.alignment_weight,
-        args.paired_weight, args.validate_every, args.seed)
+        args.paired_weight, args.metric_depth_weight,
+        args.validate_every, args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -263,7 +276,8 @@ def main() -> None:
         geometry, grid, width=args.width, history_scans=20).to(device)
     diffusion = RadarRelationDiffusion(
         geometry, relation_width=args.width, hidden=args.hidden,
-        timesteps=args.timesteps).to(device)
+        timesteps=args.timesteps,
+        metric_depth_weight=args.metric_depth_weight).to(device)
     teacher_saved = torch.load(
         args.teacher_checkpoint, map_location=device, weights_only=False)
     if (teacher_saved.get("stage") != "clean_relationship_teacher" or
@@ -296,7 +310,7 @@ def main() -> None:
     start_epoch, best_val = 1, float("inf")
     if args.resume is not None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
-        if (saved.get("stage") != "joint_radar_relation_diffusion_v1" or
+        if (saved.get("stage") != "joint_radar_relation_diffusion_v2" or
                 saved.get("geometry_parameters") != asdict(geometry) or
                 saved.get("radar_variant") != args.radar_variant or
                 saved.get("radar_height_filter") != args.radar_height_filter or
@@ -304,7 +318,7 @@ def main() -> None:
                 str(args.teacher_checkpoint.resolve())):
             raise ValueError("Resume checkpoint belongs to a different model or input setup")
         for key in ("tile_rows", "tile_cols", "width", "hidden", "timesteps",
-                    "alignment_weight", "paired_weight"):
+                    "alignment_weight", "paired_weight", "metric_depth_weight"):
             if saved["settings"][key] != getattr(settings, key):
                 raise ValueError(f"Resume checkpoint disagrees on {key}")
         old_effective_batch = (saved["settings"]["batch_size"] *
@@ -322,7 +336,7 @@ def main() -> None:
             raise ValueError("Resume checkpoint already reached requested epochs")
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "training_config.json").write_text(json.dumps({
-        "stage": "joint_radar_relation_diffusion_v1",
+        "stage": "joint_radar_relation_diffusion_v2",
         "settings": asdict(settings),
         "geometry": str(args.geometry.resolve()),
         "geometry_parameters": asdict(geometry),
@@ -361,7 +375,7 @@ def main() -> None:
                     seed=args.seed + 10000, label="frozen train audit")
         record_epoch(args.output_root, message, _summary(message, args.epochs))
         checkpoint = {
-            "stage": "joint_radar_relation_diffusion_v1", "epoch": epoch,
+            "stage": "joint_radar_relation_diffusion_v2", "epoch": epoch,
             "relation": relation_model.state_dict(),
             "paired": paired_model.state_dict(),
             "diffusion": diffusion.state_dict(),

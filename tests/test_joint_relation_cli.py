@@ -92,7 +92,7 @@ class JointRelationCliTests(unittest.TestCase):
                 joint_main()
             saved = torch.load(run / "best_checkpoint.pt", map_location="cpu",
                                weights_only=False)
-            self.assertEqual(saved["stage"], "joint_radar_relation_diffusion_v1")
+            self.assertEqual(saved["stage"], "joint_radar_relation_diffusion_v2")
             self.assertNotIn("teacher", saved)
             self.assertGreater(saved["validation"]["supported"], 0)
             resumed = joint_args.copy()

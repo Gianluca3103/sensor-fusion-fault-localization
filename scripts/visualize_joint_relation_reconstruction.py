@@ -52,7 +52,9 @@ def main() -> None:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if saved.get("stage") != "joint_radar_relation_diffusion_v1":
+    if saved.get("stage") not in (
+            "joint_radar_relation_diffusion_v1",
+            "joint_radar_relation_diffusion_v2"):
         raise ValueError("Expected a joint relation/diffusion checkpoint")
     geometry = RangeGeometry(**saved["geometry_parameters"])
     if asdict(geometry) != saved["geometry_parameters"]:
@@ -65,7 +67,10 @@ def main() -> None:
     diffusion = RadarRelationDiffusion(
         geometry, relation_width=settings["width"],
         hidden=settings["hidden"],
-        timesteps=settings["timesteps"]).to(device).eval()
+        timesteps=settings["timesteps"],
+        objective_version=("legacy_v1" if saved["stage"].endswith("_v1")
+                           else "metric_depth_v2"),
+        metric_depth_weight=settings.get("metric_depth_weight", 0.3)).to(device).eval()
     relation.load_state_dict(saved["relation"])
     diffusion.load_state_dict(saved["diffusion"])
 

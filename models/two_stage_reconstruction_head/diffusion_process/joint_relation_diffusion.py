@@ -231,11 +231,26 @@ class RadarRelationDiffusion(nn.Module):
 
     def __init__(self, geometry: RangeGeometry, *, relation_width: int = 32,
                  hidden: int = 32, timesteps: int = 200,
-                 intensity_scale: float = 10.0) -> None:
+                 intensity_scale: float = 10.0,
+                 objective_version: str = "metric_depth_v2",
+                 metric_depth_weight: float = 0.3) -> None:
         super().__init__()
+        if objective_version not in ("legacy_v1", "metric_depth_v2"):
+            raise ValueError("Unknown joint diffusion objective")
+        if metric_depth_weight <= 0:
+            raise ValueError("Metric depth weight must be positive")
         self.geometry = geometry
         self.intensity_scale = float(intensity_scale)
+        self.objective_version = objective_version
+        self.metric_depth_weight = float(metric_depth_weight)
         self.denoiser = RadarGatedRangeUNet(relation_width, hidden)
+        # A return prediction cannot inspect a noised clean-depth target: at
+        # deployment the denoiser starts from random noise instead. The v2 head
+        # reads only the radar/faulty-LiDAR condition used at deployment.
+        self.return_head = (nn.Sequential(
+            nn.Conv2d(relation_width + 7, hidden, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(hidden, 1, 3, padding=1))
+            if objective_version == "metric_depth_v2" else None)
         self.schedule = GaussianNoiseSchedule(DiffusionProcessConfig(
             num_train_timesteps=timesteps))
 
@@ -310,8 +325,11 @@ class RadarRelationDiffusion(nn.Module):
             raise ValueError("Diffusion timestep or noise has incompatible shape")
         noisy, epsilon_target = self.schedule.add_masked_noise(
             target, noise, timestep, proposal.float())
-        epsilon, return_logit, intensity_latent = self.denoiser(
+        epsilon, legacy_return_logit, intensity_latent = self.denoiser(
             noisy, condition.static, timestep)
+        return_logit = (self.return_head(condition.static)
+                        if self.return_head is not None
+                        else legacy_return_logit)
         noise_loss = self._masked_mean(
             (epsilon - epsilon_target).square(), proposal.float())
         return_loss = self._masked_mean(
@@ -319,20 +337,45 @@ class RadarRelationDiffusion(nn.Module):
                 return_logit, clean_hit.float(), reduction="none"),
             proposal.float())
         x0 = self.schedule.predict_x0(noisy, epsilon, timestep)
-        depth_loss = self._masked_mean(
-            F.smooth_l1_loss(x0, target, reduction="none"), positive.float())
-        intensity_target = torch.asinh(intensity / self.intensity_scale)
-        intensity_loss = self._masked_mean(
-            F.smooth_l1_loss(intensity_latent, intensity_target,
-                             reduction="none"), positive.float())
-        total = noise_loss + return_loss + depth_loss + 0.05 * intensity_loss
+        normalized_depth_error = F.smooth_l1_loss(
+            x0, target, reduction="none")
+        if self.objective_version == "metric_depth_v2":
+            # Huber is measured in metres. Low-signal diffusion steps receive
+            # less direct x0 supervision because their x0 estimate is unstable.
+            # The normalized term remains to provide gradients when x0 falls
+            # outside the physical range and denormalize_depth clamps it.
+            predicted_depth_m = denormalize_depth(x0, self.geometry)
+            timestep_weight = self.schedule.sqrt_alpha_bars[timestep].view(
+                batch, 1, 1, 1)
+            weighted_positive = positive.float() * timestep_weight
+            normalized_depth_loss = (
+                (normalized_depth_error * weighted_positive).sum() /
+                positive.sum().clamp_min(1))
+            metric_depth_loss = (
+                F.huber_loss(predicted_depth_m, depth, delta=1.0,
+                             reduction="none") * weighted_positive
+                ).sum() / positive.sum().clamp_min(1)
+            total = (noise_loss + return_loss +
+                     0.25 * normalized_depth_loss +
+                     self.metric_depth_weight * metric_depth_loss)
+        else:
+            normalized_depth_loss = self._masked_mean(
+                normalized_depth_error, positive.float())
+            metric_depth_loss = normalized_depth_loss.new_zeros(())
+            intensity_target = torch.asinh(intensity / self.intensity_scale)
+            intensity_loss = self._masked_mean(
+                F.smooth_l1_loss(intensity_latent, intensity_target,
+                                 reduction="none"), positive.float())
+            total = (noise_loss + return_loss + normalized_depth_loss +
+                     0.05 * intensity_loss)
         with torch.no_grad():
             predicted = proposal & (return_logit.sigmoid() >= 0.5)
             correct = predicted & clean_hit
             depth_error = (denormalize_depth(x0.detach(), self.geometry) - depth).abs()
         return {
             "loss": total, "noise": noise_loss, "return": return_loss,
-            "depth": depth_loss, "intensity": intensity_loss,
+            "depth": normalized_depth_loss,
+            "metric_depth": metric_depth_loss,
             "supported_rays": proposal.sum().detach(),
             "clean_hits": positive.sum().detach(),
             "predicted_hits": predicted.sum().detach(),
@@ -360,6 +403,8 @@ class RadarRelationDiffusion(nn.Module):
         generated_intensity = torch.zeros_like(probability)
         added = torch.zeros_like(proposal)
         if bool(proposal.any()):
+            if self.return_head is not None:
+                probability = self.return_head(condition.static).sigmoid()
             state = torch.randn(proposal.shape, device=proposal.device,
                                 dtype=condition.static.dtype,
                                 generator=generator) * proposal
@@ -376,11 +421,13 @@ class RadarRelationDiffusion(nn.Module):
                 state, estimate = self.schedule.ddim_step(
                     state, epsilon, timestep, previous, proposal.float(),
                     eta=0.0, generator=generator)
-            probability = return_logit.sigmoid()
+            if self.return_head is None:
+                probability = return_logit.sigmoid()
             added = proposal & (probability >= return_threshold)
             generated_depth = denormalize_depth(estimate, self.geometry)
-            generated_intensity = (intensity_latent.clamp(-4, 4).sinh()
-                                   * self.intensity_scale)
+            if self.return_head is None:
+                generated_intensity = (intensity_latent.clamp(-4, 4).sinh()
+                                       * self.intensity_scale)
         depth = torch.where(condition.observed_mask, condition.observed_depth_m,
                             torch.where(added, generated_depth, 0))
         intensity = torch.where(condition.observed_mask, condition.observed_intensity,

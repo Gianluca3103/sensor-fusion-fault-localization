@@ -68,8 +68,11 @@ class JointRelationDiffusionTests(unittest.TestCase):
             timestep=torch.tensor([3]), noise=torch.ones((1, 1, 1, 8)))
         self.assertEqual(int(diffusion_loss["clean_hits"]), 1)
         self.assertTrue(torch.isfinite(diffusion_loss["loss"]))
+        self.assertGreaterEqual(float(diffusion_loss["metric_depth"].detach()), 0.0)
+        self.assertNotIn("intensity", diffusion_loss)
         (loss["loss"] + diffusion_loss["loss"]).backward()
         self.assertIsNotNone(self.diffusion.denoiser.output[-1].weight.grad)
+        self.assertIsNotNone(self.diffusion.return_head[-1].weight.grad)
         self.assertIsNotNone(self.relation_model.output[1].weight.grad)
         self.assertIsNotNone(paired.hit_head.weight.grad)
         self.assertTrue(all(parameter.grad is None for parameter in teacher.parameters()))
@@ -87,6 +90,46 @@ class JointRelationDiffusionTests(unittest.TestCase):
             self.clean, self.clean_valid, (1, 8),
             timestep=torch.tensor([2]), noise=torch.zeros((1, 1, 1, 8)))
         self.assertEqual(int(loss["clean_hits"]), 1)
+
+    def test_return_loss_does_not_read_noised_clean_depth(self):
+        relation = self.relation_model(
+            self.radar, self.radar_valid, self.rows, self.cols)
+        shape = (1, 1, 1, 8)
+        first = self.diffusion.training_loss(
+            relation, self.observed, self.observed_valid,
+            self.clean, self.clean_valid, (1, 8),
+            timestep=torch.tensor([1]), noise=torch.zeros(shape))
+        second = self.diffusion.training_loss(
+            relation, self.observed, self.observed_valid,
+            self.clean, self.clean_valid, (1, 8),
+            timestep=torch.tensor([6]), noise=torch.ones(shape))
+        torch.testing.assert_close(first["return"], second["return"])
+        self.assertNotEqual(float(first["metric_depth"].detach()),
+                            float(second["metric_depth"].detach()))
+
+    def test_five_metre_depth_error_has_substantial_weight(self):
+        relation = self.relation_model(
+            self.radar, self.radar_valid, self.rows, self.cols)
+
+        def predict_five_metres(noisy, _static, timestep):
+            alpha = self.diffusion.schedule.sqrt_alpha_bars[timestep].view(
+                -1, 1, 1, 1)
+            sigma = self.diffusion.schedule.sqrt_one_minus_alpha_bars[
+                timestep].view(-1, 1, 1, 1)
+            predicted = normalize_depth(torch.full_like(noisy, 5), self.geometry)
+            epsilon = (noisy - alpha * predicted) / sigma
+            return epsilon, torch.zeros_like(noisy), torch.zeros_like(noisy)
+
+        with patch.object(self.diffusion.denoiser, "forward",
+                          side_effect=predict_five_metres):
+            loss = self.diffusion.training_loss(
+                relation, self.observed, self.observed_valid,
+                self.clean, self.clean_valid, (1, 8),
+                timestep=torch.tensor([3]), noise=torch.zeros((1, 1, 1, 8)))
+        self.assertGreater(
+            float((self.diffusion.metric_depth_weight *
+                   loss["metric_depth"]).detach()),
+            10 * float((0.25 * loss["depth"]).detach()))
 
     def test_empty_radar_preserves_observed_lidar_without_additions(self):
         empty = self.radar[:, :0]
@@ -107,7 +150,10 @@ class JointRelationDiffusionTests(unittest.TestCase):
         def accept_supported(noisy, _static, _timestep):
             return torch.zeros_like(noisy), torch.full_like(noisy, 10), torch.zeros_like(noisy)
         with patch.object(self.diffusion.denoiser, "forward",
-                          side_effect=accept_supported):
+                          side_effect=accept_supported), \
+                patch.object(self.diffusion.return_head, "forward",
+                             side_effect=lambda static: torch.full_like(
+                                 static[:, :1], 10)):
             cloud = sample_joint_full_scan(
                 self.relation_model, self.diffusion,
                 self.radar, self.radar_valid,
@@ -117,6 +163,7 @@ class JointRelationDiffusionTests(unittest.TestCase):
         torch.testing.assert_close(cloud[:1], self.observed[0])
         self.assertTrue(bool((cloud[1:, :3].norm(dim=-1) >= 0.5 - 1e-4).all()))
         self.assertTrue(bool((cloud[1:, :3].norm(dim=-1) <= 12 + 1e-4).all()))
+        self.assertTrue(bool((cloud[1:, 3] == 0).all()))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_joint_step(self):
