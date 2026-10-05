@@ -1,8 +1,8 @@
-"""Local radar/LiDAR attention on calibrated LiDAR ray-depth candidates.
+"""Local attention on calibrated LiDAR ray-depth candidates.
 
-This is a reconstruction blueprint, not a point generator. Inference uses only
-radar and surviving LiDAR. Clean LiDAR can be encoded as a training teacher but
-never participates in proposals, attention, gating, or first-return logits.
+The deployed blueprint uses radar alone. A separate training-only teacher
+attends to clean LiDAR at the same radar-derived query positions. The teacher
+never participates in the deployed blueprint or diffusion conditioning.
 Process the scan in overlapping ray tiles to bound the neighborhood search.
 """
 
@@ -15,7 +15,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .cross_modal_encoders import EncodedGrid, EncoderGrid, RadarLidarEncoders
+from .cross_modal_encoders import (
+    EncodedGrid, EncoderGrid, LidarGeometryEncoder, RadarGeometryEncoder,
+)
 from .range_view.geometry import RangeGeometry
 from .ray_depth_queries import RayDepthQueries, propose_ray_depth_queries
 
@@ -24,11 +26,9 @@ from .ray_depth_queries import RayDepthQueries, propose_ray_depth_queries
 class RayDepthBlueprint:
     queries: RayDepthQueries
     features: torch.Tensor              # [B,Q,D,C]
-    evidence_weights: torch.Tensor      # [B,Q,D,3]: radar, observed, null
+    evidence_weights: torch.Tensor      # [B,Q,D,3]: radar, teacher-clean, null
     first_return_logits: torch.Tensor   # [B,Q,D+1], final index means no return
     depth_residual_m: torch.Tensor       # [B,Q,D], bounded candidate correction
-    clean_teacher: EncodedGrid | None = None
-
     @property
     def first_return_probabilities(self) -> torch.Tensor:
         """Uncalibrated model probabilities; calibrate on held-out data."""
@@ -317,29 +317,121 @@ class RayDepthCrossAttention(nn.Module):
                                  torch.cat((candidate_logits, no_return), -1), residual)
 
 
+def _empty_encoded_like(encoded: EncodedGrid) -> EncodedGrid:
+    """An absent modality with no tokens or attention support."""
+    batch, channels = encoded.features.shape[:2]
+    return EncodedGrid(
+        torch.zeros_like(encoded.features),
+        torch.zeros_like(encoded.occupied),
+        torch.zeros_like(encoded.support),
+        encoded.features.new_empty((batch, 0, channels)),
+        encoded.features.new_empty((batch, 0, 3)),
+        torch.zeros((batch, 0), device=encoded.features.device, dtype=torch.bool),
+    )
+
+
 class RayDepthBlueprintModel(nn.Module):
-    """End-to-end encoder + query + fusion entry point; clean is teacher only."""
+    """Radar-only student whose output is the diffusion blueprint."""
 
     def __init__(self, geometry: RangeGeometry,
                  grid: EncoderGrid = EncoderGrid(), width: int = 32,
                  history_scans: int = 20, **attention_kwargs) -> None:
         super().__init__()
         self.geometry = geometry
-        self.encoders = RadarLidarEncoders(grid, width, history_scans)
+        self.encoders = RadarGeometryEncoder(grid, width, history_scans)
         self.fusion = RayDepthCrossAttention(grid, width,
                                              history_scans=history_scans,
                                              **attention_kwargs)
+
+    def encode_radar(self, radar: torch.Tensor,
+                     radar_valid: torch.Tensor) -> EncodedGrid:
+        return self.encoders(radar, radar_valid)
+
+    def forward_encoded(self, radar: torch.Tensor, radar_valid: torch.Tensor,
+                        encoded: EncodedGrid, rows: torch.Tensor,
+                        cols: torch.Tensor) -> RayDepthBlueprint:
+        # Keep five candidate slots so the existing range-view diffusion
+        # interface is unchanged: three radar depths and two uniform anchors.
+        empty_points = radar.new_empty((len(radar), 0, 4))
+        empty_valid = torch.zeros((len(radar), 0), device=radar.device,
+                                  dtype=torch.bool)
+        queries = propose_ray_depth_queries(
+            self.geometry, rows, cols, radar, radar_valid,
+            empty_points, empty_valid,
+            radar_slots=3, lidar_slots=0, uniform_slots=2,
+        )
+        return self.fusion(self.geometry, queries, encoded,
+                           _empty_encoded_like(encoded), radar)
 
     def forward(self, radar: torch.Tensor, radar_valid: torch.Tensor,
                 observed_lidar: torch.Tensor, observed_valid: torch.Tensor,
                 rows: torch.Tensor, cols: torch.Tensor, *,
                 clean_lidar: torch.Tensor | None = None,
                 clean_valid: torch.Tensor | None = None) -> RayDepthBlueprint:
-        encoded = self.encoders(radar, radar_valid, observed_lidar, observed_valid,
-                                clean_lidar=clean_lidar, clean_valid=clean_valid)
-        queries = propose_ray_depth_queries(self.geometry, rows, cols, radar,
-            radar_valid, observed_lidar, observed_valid)
-        blueprint = self.fusion(self.geometry, queries, encoded["radar"],
-                                encoded["observed_lidar"], radar)
-        blueprint.clean_teacher = encoded.get("clean_teacher")
-        return blueprint
+        if clean_lidar is not None or clean_valid is not None:
+            raise ValueError("Clean LiDAR is training supervision, not a blueprint input")
+        if (observed_lidar.shape[:2] != observed_valid.shape or
+                observed_lidar.shape[0] != radar.shape[0] or
+                observed_lidar.shape[-1] != 4 or
+                observed_valid.dtype != torch.bool):
+            raise ValueError("Observed LiDAR and mask have incompatible shapes")
+        encoded = self.encode_radar(radar, radar_valid)
+        return self.forward_encoded(radar, radar_valid, encoded, rows, cols)
+
+
+class CleanLidarRelationshipTeacher(nn.Module):
+    """Training-only clean geometry encoder at radar-derived ray-depth queries.
+
+    Its clean-attended representation is supervised by the same first-return
+    target as the student, then used as a detached feature target. The teacher
+    is never loaded or called by the diffusion model.
+    """
+
+    def __init__(self, geometry: RangeGeometry,
+                 grid: EncoderGrid = EncoderGrid(), width: int = 32,
+                 history_scans: int = 20, **attention_kwargs) -> None:
+        super().__init__()
+        self.geometry = geometry
+        self.encoder = LidarGeometryEncoder(grid, width)
+        self.fusion = RayDepthCrossAttention(
+            grid, width, history_scans=history_scans, **attention_kwargs,
+        )
+
+    def forward(self, queries: RayDepthQueries, clean_lidar: torch.Tensor,
+                clean_valid: torch.Tensor) -> RayDepthBlueprint:
+        clean = self.encoder(clean_lidar, clean_valid)
+        # A full VoD scan can contain over 100k LiDAR points. Limit the
+        # fine-scale teacher keys to this ray tile and a small angular halo;
+        # the coarse occupied-grid context still describes the full scene.
+        xyz = clean.point_xyz
+        elevation = torch.atan2(xyz[..., 2], xyz[..., :2].norm(dim=-1))
+        beams = xyz.new_tensor(self.geometry.beam_elevations_rad)
+        point_rows = (elevation[..., None] - beams).abs().argmin(-1)
+        azimuth = torch.remainder(
+            torch.atan2(xyz[..., 1], xyz[..., 0]) -
+            self.geometry.azimuth_offset_rad, 2 * math.pi,
+        )
+        point_cols = torch.floor(
+            azimuth * self.geometry.azimuth_bins /
+            self.geometry.azimuth_span_rad,
+        ).long()
+        point_cols = point_cols.clamp(0, self.geometry.azimuth_bins - 1)
+        tile_valid = torch.zeros_like(clean.point_valid)
+        for scene in range(len(clean_lidar)):
+            row_min = int(queries.rows[scene].min())
+            row_max = int(queries.rows[scene].max())
+            col_min = int(queries.cols[scene].min())
+            col_max = int(queries.cols[scene].max())
+            columns = col_max - col_min + 1 + 8
+            col_near = (columns >= self.geometry.azimuth_bins or
+                        torch.remainder(point_cols[scene] - col_min + 4,
+                                        self.geometry.azimuth_bins) < columns)
+            tile_valid[scene] = (
+                clean.point_valid[scene] &
+                (point_rows[scene] >= row_min - 2) &
+                (point_rows[scene] <= row_max + 2) & col_near
+            )
+        clean.point_valid = tile_valid
+        empty_radar = _empty_encoded_like(clean)
+        raw_radar = clean_lidar.new_empty((len(clean_lidar), 0, 7))
+        return self.fusion(self.geometry, queries, empty_radar, clean, raw_radar)

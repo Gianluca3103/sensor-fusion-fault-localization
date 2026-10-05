@@ -5,12 +5,15 @@ import torch
 
 from models.two_stage_reconstruction_head.cross_modal_encoders import EncoderGrid
 from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry
-from models.two_stage_reconstruction_head.ray_depth_attention import RayDepthBlueprintModel
+from models.two_stage_reconstruction_head.ray_depth_attention import (
+    CleanLidarRelationshipTeacher, RayDepthBlueprintModel,
+)
 from models.two_stage_reconstruction_head.ray_depth_queries import (
     propose_ray_depth_queries, ray_tile_indices,
 )
 from models.two_stage_reconstruction_head.ray_depth_training import (
     clean_first_return_targets, ray_depth_blueprint_loss,
+    relationship_feature_loss,
 )
 
 
@@ -37,6 +40,10 @@ class RayDepthAttentionTests(unittest.TestCase):
         self.lidar = torch.tensor([[[*(self.xyz * 1.02).tolist(), 8.0]]])
         self.lidar_valid = torch.tensor([[True]])
         self.model = RayDepthBlueprintModel(
+            self.geometry, self.grid, width=8, heads=2,
+            neighbors=4, chunk_size=8,
+        )
+        self.teacher = CleanLidarRelationshipTeacher(
             self.geometry, self.grid, width=8, heads=2,
             neighbors=4, chunk_size=8,
         )
@@ -71,18 +78,25 @@ class RayDepthAttentionTests(unittest.TestCase):
         _, exists = result.predicted_first_return()
         self.assertFalse(bool(exists.any()))
 
-    def test_teacher_cannot_change_blueprint_and_is_rejected_at_inference(self):
+    def test_blueprint_ignores_faulty_lidar_and_rejects_clean_input(self):
         self.model.train()
         bare = self.model(self.radar, self.radar_valid, self.lidar,
                           self.lidar_valid, self.rows, self.cols)
-        taught = self.model(self.radar, self.radar_valid, self.lidar,
-                            self.lidar_valid, self.rows, self.cols,
-                            clean_lidar=self.lidar * 1.3,
-                            clean_valid=self.lidar_valid)
-        self.assertIsNotNone(taught.clean_teacher)
-        torch.testing.assert_close(bare.features, taught.features)
+        changed_lidar = self.lidar * 3.0
+        changed = self.model(self.radar, self.radar_valid, changed_lidar,
+                             self.lidar_valid, self.rows, self.cols)
+        torch.testing.assert_close(bare.features, changed.features)
         torch.testing.assert_close(bare.first_return_logits,
-                                   taught.first_return_logits)
+                                   changed.first_return_logits)
+        torch.testing.assert_close(bare.queries.depths_m,
+                                   changed.queries.depths_m)
+        self.assertFalse(bool((bare.evidence_weights[..., 1] > 0).any()))
+        encoded = self.model.encode_radar(self.radar, self.radar_valid)
+        tiled = self.model.forward_encoded(
+            self.radar, self.radar_valid, encoded, self.rows, self.cols)
+        torch.testing.assert_close(bare.features, tiled.features)
+        torch.testing.assert_close(bare.first_return_logits,
+                                   tiled.first_return_logits)
         self.model.eval()
         with self.assertRaisesRegex(ValueError, "training supervision"):
             self.model(self.radar, self.radar_valid, self.lidar,
@@ -128,15 +142,23 @@ class RayDepthAttentionTests(unittest.TestCase):
         self.assertFalse(bool(present[0, 1:].any()))
         self.model.train()
         result = self.model(self.radar, self.radar_valid, self.lidar,
-                            self.lidar_valid, self.rows, self.cols,
-                            clean_lidar=self.lidar, clean_valid=self.lidar_valid)
+                            self.lidar_valid, self.rows, self.cols)
+        teacher = self.teacher(result.queries, self.lidar, self.lidar_valid)
+        teacher_losses = ray_depth_blueprint_loss(
+            teacher, self.geometry, self.lidar, self.lidar_valid,
+        )
+        teacher_losses["loss"].backward()
+        self.assertIsNotNone(self.teacher.encoder.point_mlp[0].weight.grad)
         losses = ray_depth_blueprint_loss(
             result, self.geometry, self.lidar, self.lidar_valid,
-            grid=self.grid, teacher_weight=0.1,
+        )
+        feature_loss, pairs = relationship_feature_loss(
+            result, teacher, self.geometry, self.lidar, self.lidar_valid,
         )
         self.assertTrue(torch.isfinite(losses["loss"]))
         self.assertGreater(float(losses["coverage"]), 0)
-        losses["loss"].backward()
+        self.assertGreater(int(pairs), 0)
+        (losses["loss"] + 0.1 * feature_loss).backward()
         self.assertIsNotNone(self.model.fusion.return_head.weight.grad)
 
     def test_batched_different_sensor_availability(self):
@@ -152,7 +174,8 @@ class RayDepthAttentionTests(unittest.TestCase):
         self.assertEqual(result.first_return_logits.shape, (2, 4, 6))
         self.assertEqual(result.features.shape, (2, 4, 5, 8))
         self.assertTrue(bool((result.evidence_weights[0, 0, :, 0] > 0).any()))
-        self.assertTrue(bool((result.evidence_weights[1, 0, :, 1] > 0).any()))
+        self.assertFalse(bool((result.evidence_weights[1, 0, :, 1] > 0).any()))
+        self.assertTrue(bool((result.evidence_weights[1, 0, :, 2] == 1).any()))
 
 
 if __name__ == "__main__":

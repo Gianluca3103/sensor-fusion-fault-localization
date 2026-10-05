@@ -178,9 +178,13 @@ class RadarGatedRayDiffusionTests(unittest.TestCase):
                 self.geometry = geometry
                 self.encoder_calls = 0
 
-            def encoders(self, *_args):
+            def encode_radar(self, *_args):
                 self.encoder_calls += 1
-                return {"radar": None, "observed_lidar": None}
+                return None
+
+            def forward_encoded(self, radar, radar_valid, encoded, rows, cols):
+                return self.fusion(geometry, queries(geometry, rows, cols),
+                                   encoded, None, radar)
 
         def queries(_geometry, rows, cols, *_args):
             directions = torch.tensor(
@@ -196,8 +200,6 @@ class RadarGatedRayDiffusionTests(unittest.TestCase):
                                   [20.0, 0.0, 0.0, 3.0]]])
         radar = torch.zeros(1, 1, 7)
         with patch("models.two_stage_reconstruction_head.diffusion_process."
-                   "ray_view_diffusion.propose_ray_depth_queries", side_effect=queries), \
-             patch("models.two_stage_reconstruction_head.diffusion_process."
                    "ray_view_diffusion.project_lidar_tile",
                    wraps=project_lidar_tile) as projection:
             merged = sample_full_scan(

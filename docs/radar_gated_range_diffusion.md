@@ -6,8 +6,10 @@ missing LiDAR rays with measured local radar support. It does not modify the
 old BEV or sparse-voxel diffusion baselines. Only one-sample local smoke
 checkpoints exist; no full VoD run or detector evaluation has been completed.
 
-The command below trains the blueprint and diffusion jointly from scratch.
-For the recommended blueprint-first schedule, use
+The deployed blueprint is now radar-only. Training this script from scratch
+does **not** train the clean-LiDAR relationship teacher; it only supervises
+the radar blueprint from clean first-return targets. For the teacher-first
+relationship stage, use
 [`staged_ray_depth_training.md`](staged_ray_depth_training.md). Its stage-1
 checkpoint can initialize this trainer with `--pretrained-blueprint`; an
 optional `--freeze-blueprint-epochs` period then trains diffusion before joint

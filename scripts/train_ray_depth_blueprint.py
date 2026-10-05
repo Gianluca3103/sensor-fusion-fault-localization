@@ -1,7 +1,8 @@
-"""Pretrain the radar/LiDAR ray-depth blueprint before diffusion.
+"""Train a clean geometry teacher, then a radar-only relationship blueprint.
 
-The model sees the Doppler-aligned radar stack and observed faulty LiDAR.
-Clean LiDAR supplies only first-return and depth targets after the forward pass.
+The teacher attends to clean LiDAR on radar-derived ray-depth queries. The
+deployed student receives radar alone; clean LiDAR is used only after its
+forward pass as a supervised target and a detached teacher representation.
 """
 
 from __future__ import annotations
@@ -25,15 +26,16 @@ from models.two_stage_reconstruction_head.cross_modal_encoders import EncoderGri
 from models.two_stage_reconstruction_head.diffusion_process.ray_view_diffusion import (
     project_lidar_tile,
 )
-from models.two_stage_reconstruction_head.range_view.geometry import (
-    RangeGeometry, angular_indices,
-)
+from models.two_stage_reconstruction_head.range_view.geometry import RangeGeometry
 from models.two_stage_reconstruction_head.ray_depth_attention import (
-    RayDepthBlueprint, RayDepthBlueprintModel,
+    CleanLidarRelationshipTeacher, RayDepthBlueprint, RayDepthBlueprintModel,
 )
-from models.two_stage_reconstruction_head.ray_depth_queries import ray_tile_indices
+from models.two_stage_reconstruction_head.ray_depth_queries import (
+    propose_ray_depth_queries, ray_tile_indices,
+)
 from models.two_stage_reconstruction_head.ray_depth_training import (
     clean_first_return_targets, ray_depth_blueprint_loss,
+    relationship_feature_loss,
 )
 from scripts.train_radar_gated_ray_diffusion import choose_radar_tile, _paths
 from scripts.training_progress import blueprint_summary, record_epoch
@@ -50,42 +52,8 @@ class BlueprintSettings:
     learning_rate: float
     validate_every: int
     seed: int
-
-
-def choose_missing_radar_tile(
-    geometry: RangeGeometry, radar: torch.Tensor, radar_valid: torch.Tensor,
-    observed: torch.Tensor, observed_valid: torch.Tensor, grid: EncoderGrid,
-    tile_rows: int, tile_cols: int, rng: random.Random,
-) -> tuple[int, int]:
-    """Prefer input-derived radar positions on currently unobserved LiDAR rays."""
-    height, width = geometry.shape
-    xyz = radar[0, radar_valid[0], :3].detach().cpu().numpy()
-    observed_xyz = observed[0, observed_valid[0], :3].detach().cpu().numpy()
-    if not len(xyz):
-        return choose_radar_tile(
-            geometry, radar, radar_valid, grid, tile_rows, tile_cols, rng)
-    radar_row, radar_col, _, radar_valid_angle = angular_indices(
-        xyz, geometry, require_beam_match=False)
-    observed_row, observed_col, _, observed_valid_angle = angular_indices(
-        observed_xyz, geometry, require_beam_match=True)
-    occupied = np.zeros(height * width, dtype=bool)
-    occupied[observed_row[observed_valid_angle] * width +
-             observed_col[observed_valid_angle]] = True
-    minimum, maximum = np.asarray(grid.minimum_xyz), np.asarray(grid.maximum_xyz)
-    inside_grid = np.all((xyz >= minimum) & (xyz < maximum), axis=1)
-    missing = ~occupied[radar_row * width + radar_col]
-    candidates = np.flatnonzero(radar_valid_angle & inside_grid & missing)
-    if not len(candidates):
-        return choose_radar_tile(
-            geometry, radar, radar_valid, grid, tile_rows, tile_cols, rng)
-    voxel = np.floor((xyz[candidates] - minimum) /
-                     np.asarray(grid.voxel_size_xyz)).astype(np.int64)
-    _, representatives = np.unique(voxel, axis=0, return_index=True)
-    selected = int(candidates[representatives[rng.randrange(len(representatives))]])
-    return (max(0, min(int(radar_row[selected]) - tile_rows // 2,
-                       height - tile_rows)),
-            max(0, min(int(radar_col[selected]) - tile_cols // 2,
-                       width - tile_cols)))
+    teacher_epochs: int
+    distill_weight: float
 
 
 def _ray_counts(
@@ -124,6 +92,7 @@ def _ray_counts(
 
 def _run_epoch(
     loader: DataLoader, *, model: RayDepthBlueprintModel,
+    teacher: CleanLidarRelationshipTeacher,
     geometry: RangeGeometry, grid: EncoderGrid, settings: BlueprintSettings,
     optimizer: torch.optim.Optimizer | None, device: torch.device,
     epoch: int, seed: int, label: str,
@@ -136,6 +105,7 @@ def _run_epoch(
         "correct_3m", "depth_error_sum_m",
     )}
     loss_total = classification_total = depth_total = coverage_total = 0.0
+    distillation_total = pair_total = 0.0
     progress = tqdm(loader, desc=f"{label} {epoch}/{settings.epochs}", leave=False)
     if training:
         assert optimizer is not None
@@ -145,10 +115,9 @@ def _run_epoch(
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
         }
-        row_start, col_start = choose_missing_radar_tile(
-            geometry, batch["radar"], batch["radar_valid"],
-            batch["observed_lidar"], batch["observed_lidar_valid"],
-            grid, settings.tile_rows, settings.tile_cols, rng,
+        row_start, col_start = choose_radar_tile(
+            geometry, batch["radar"], batch["radar_valid"], grid,
+            settings.tile_rows, settings.tile_cols, rng,
         )
         rows, cols = ray_tile_indices(
             geometry, row_start=row_start,
@@ -166,13 +135,23 @@ def _run_epoch(
                 blueprint, geometry, batch["clean_lidar"],
                 batch["clean_lidar_valid"],
             )
+            with torch.no_grad():
+                teacher_blueprint = teacher(
+                    blueprint.queries, batch["clean_lidar"],
+                    batch["clean_lidar_valid"],
+                )
+            distillation, pairs = relationship_feature_loss(
+                blueprint, teacher_blueprint, geometry,
+                batch["clean_lidar"], batch["clean_lidar_valid"],
+            )
+            total = losses["loss"] + settings.distill_weight * distillation
             if training:
                 assert optimizer is not None
                 window_start = (
                     batch_index // settings.grad_accum_steps
                 ) * settings.grad_accum_steps
                 window_size = min(settings.grad_accum_steps, len(loader) - window_start)
-                (losses["loss"] / window_size).backward()
+                (total / window_size).backward()
                 if batch_index - window_start + 1 == window_size:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
@@ -185,10 +164,12 @@ def _run_epoch(
             )
         for key, value in counts.items():
             totals[key] += value
-        loss_total += float(losses["loss"].detach())
+        loss_total += float(total.detach())
         classification_total += float(losses["classification"].detach())
         depth_total += float(losses["depth"].detach())
         coverage_total += float(losses["coverage"])
+        distillation_total += float(distillation.detach())
+        pair_total += float(pairs)
         progress.set_postfix(loss=f"{loss_total / (progress.n + 1):.3f}")
     count = len(loader)
     predicted = totals["predicted_hits"]
@@ -201,6 +182,8 @@ def _run_epoch(
         "loss": loss_total / count,
         "classification_loss": classification_total / count,
         "depth_loss": depth_total / count,
+        "feature_distillation_loss": distillation_total / count,
+        "teacher_feature_pairs": pair_total,
         "candidate_coverage": coverage_total / count,
         "radar_supported_missing_rays": totals["eligible"],
         "clean_hits": clean,
@@ -213,6 +196,68 @@ def _run_epoch(
     }
 
 
+def _run_teacher_epoch(
+    loader: DataLoader, *, teacher: CleanLidarRelationshipTeacher,
+    geometry: RangeGeometry, grid: EncoderGrid, settings: BlueprintSettings,
+    optimizer: torch.optim.Optimizer | None, device: torch.device,
+    epoch: int, seed: int,
+) -> dict[str, float]:
+    training = optimizer is not None
+    teacher.train(training)
+    rng = random.Random(seed)
+    totals = {key: 0.0 for key in ("loss", "classification", "depth", "coverage")}
+    if training:
+        optimizer.zero_grad(set_to_none=True)
+    progress = tqdm(loader, desc=f"clean teacher {epoch}/{settings.teacher_epochs}",
+                    leave=False)
+    for batch_index, batch in enumerate(progress):
+        batch = {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
+        row_start, col_start = choose_radar_tile(
+            geometry, batch["radar"], batch["radar_valid"], grid,
+            settings.tile_rows, settings.tile_cols, rng,
+        )
+        rows, cols = ray_tile_indices(
+            geometry, row_start=row_start,
+            row_stop=row_start + settings.tile_rows,
+            col_start=col_start,
+            col_stop=col_start + settings.tile_cols,
+            batch_size=len(batch["radar"]), device=device,
+        )
+        empty_lidar = batch["clean_lidar"][:, :0]
+        empty_valid = batch["clean_lidar_valid"][:, :0]
+        queries = propose_ray_depth_queries(
+            geometry, rows, cols, batch["radar"], batch["radar_valid"],
+            empty_lidar, empty_valid,
+            radar_slots=3, lidar_slots=0, uniform_slots=2,
+        )
+        with torch.set_grad_enabled(training):
+            blueprint = teacher(
+                queries, batch["clean_lidar"], batch["clean_lidar_valid"],
+            )
+            losses = ray_depth_blueprint_loss(
+                blueprint, geometry, batch["clean_lidar"],
+                batch["clean_lidar_valid"],
+            )
+            if training:
+                window_start = (
+                    batch_index // settings.grad_accum_steps
+                ) * settings.grad_accum_steps
+                window_size = min(settings.grad_accum_steps,
+                                  len(loader) - window_start)
+                (losses["loss"] / window_size).backward()
+                if batch_index - window_start + 1 == window_size:
+                    torch.nn.utils.clip_grad_norm_(teacher.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+        for key in totals:
+            totals[key] += float(losses[key].detach())
+        progress.set_postfix(loss=f"{totals['loss'] / (progress.n + 1):.3f}")
+    return {key: value / len(loader) for key, value in totals.items()}
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples-root", type=Path, required=True)
@@ -220,6 +265,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--geometry", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--resume-teacher", type=Path,
+                        help="Continue interrupted clean-teacher pretraining")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--radar-height-filter", action=argparse.BooleanOptionalAction,
                         default=True)
@@ -232,16 +279,22 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--validate-every", type=int, default=5)
+    parser.add_argument("--teacher-epochs", type=int, default=5,
+                        help="Pretrain clean geometry teacher before radar-only student")
+    parser.add_argument("--distill-weight", type=float, default=0.1)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.resume is not None and args.resume_teacher is not None:
+        parser.error("Use --resume or --resume-teacher, not both")
     if (args.epochs < 1 or args.batch_size != 1 or
             args.grad_accum_steps < 1 or args.tile_rows < 1 or
             args.tile_cols < 4 or args.width < 8 or args.width % 4 or
             args.learning_rate <= 0 or args.validate_every < 1 or
+            args.teacher_epochs < 1 or args.distill_weight < 0 or
             args.num_workers < 0 or
             (args.train_limit is not None and args.train_limit < 1) or
             (args.val_limit is not None and args.val_limit < 1)):
@@ -265,12 +318,16 @@ def main() -> None:
         args.epochs, args.batch_size, args.grad_accum_steps,
         args.tile_rows, args.tile_cols,
         args.width, args.learning_rate, args.validate_every, args.seed,
+        args.teacher_epochs, args.distill_weight,
     )
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
     grid = EncoderGrid()
     model = RayDepthBlueprintModel(
+        geometry, grid, width=settings.width, history_scans=20,
+    ).to(device)
+    teacher = CleanLidarRelationshipTeacher(
         geometry, grid, width=settings.width, history_scans=20,
     ).to(device)
     training = CrossModalVoDDataset(
@@ -291,23 +348,30 @@ def main() -> None:
         validation, batch_size=settings.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_cross_modal,
     )
+    train_eval_loader = DataLoader(
+        training, batch_size=settings.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=collate_cross_modal,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=settings.learning_rate, weight_decay=1e-4,
     )
     start_epoch, best_score, best_val_loss = 1, -1.0, float("inf")
     if args.resume is not None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
-        if saved.get("stage") != "blueprint_pretraining":
-            raise ValueError("Resume checkpoint is not blueprint pretraining")
+        if (saved.get("stage") != "blueprint_pretraining" or
+                saved.get("relationship_version") != "radar_only_clean_teacher_v1"):
+            raise ValueError("Resume checkpoint is not this radar-only blueprint")
         if saved.get("geometry_parameters") != asdict(geometry):
             raise ValueError("Resume checkpoint uses different calibrated geometry")
-        for key in ("tile_rows", "tile_cols", "width", "grad_accum_steps"):
+        for key in ("tile_rows", "tile_cols", "width", "grad_accum_steps",
+                    "teacher_epochs", "distill_weight"):
             if saved["settings"].get(key, 1) != getattr(settings, key):
                 raise ValueError(f"Resume checkpoint disagrees on {key}")
         if (saved["radar_variant"] != args.radar_variant or
                 saved["radar_height_filter"] != args.radar_height_filter):
             raise ValueError("Resume checkpoint disagrees on radar input settings")
         model.load_state_dict(saved["blueprint"])
+        teacher.load_state_dict(saved["teacher"])
         optimizer.load_state_dict(saved["optimizer"])
         start_epoch = int(saved["epoch"]) + 1
         best_score = float(saved.get("best_score", -1.0))
@@ -316,16 +380,97 @@ def main() -> None:
             raise ValueError("Resume checkpoint already reached the requested epoch count")
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "training_config.json").write_text(json.dumps({
-        "stage": "blueprint_pretraining", "settings": asdict(settings),
+        "stage": "blueprint_pretraining",
+        "relationship_version": "radar_only_clean_teacher_v1",
+        "settings": asdict(settings),
         "geometry": str(args.geometry.resolve()),
         "geometry_parameters": asdict(geometry),
         "radar_variant": args.radar_variant,
         "radar_height_filter": args.radar_height_filter,
         "train_examples": len(training), "val_examples": len(validation),
     }, indent=2), encoding="utf-8")
+    if args.resume is None:
+        teacher_optimizer = torch.optim.AdamW(
+            teacher.parameters(), lr=settings.learning_rate, weight_decay=1e-4,
+        )
+        teacher_best, teacher_start = float("inf"), 1
+        if args.resume_teacher is not None:
+            previous = torch.load(args.resume_teacher, map_location=device,
+                                  weights_only=False)
+            if (previous.get("stage") != "clean_relationship_teacher" or
+                    previous.get("geometry_parameters") != asdict(geometry) or
+                    previous.get("radar_variant") != args.radar_variant or
+                    previous.get("radar_height_filter") != args.radar_height_filter):
+                raise ValueError("Teacher checkpoint disagrees with this data setup")
+            for key in ("tile_rows", "tile_cols", "width",
+                        "grad_accum_steps", "teacher_epochs"):
+                if previous["settings"][key] != getattr(settings, key):
+                    raise ValueError(f"Teacher checkpoint disagrees on {key}")
+            teacher.load_state_dict(previous["teacher"])
+            teacher_optimizer.load_state_dict(previous["optimizer"])
+            teacher_best = float(previous["best_val_loss"])
+            teacher_start = int(previous["epoch"]) + 1
+            if teacher_start > settings.teacher_epochs + 1:
+                raise ValueError("Teacher checkpoint has an invalid epoch")
+        for teacher_epoch in range(teacher_start, settings.teacher_epochs + 1):
+            teacher_train = _run_teacher_epoch(
+                train_loader, teacher=teacher, geometry=geometry, grid=grid,
+                settings=settings, optimizer=teacher_optimizer, device=device,
+                epoch=teacher_epoch, seed=settings.seed + teacher_epoch,
+            )
+            teacher_message = {"phase": "clean_teacher", "epoch": teacher_epoch,
+                               "train": teacher_train}
+            if (teacher_epoch % settings.validate_every == 0 or
+                    teacher_epoch == settings.teacher_epochs):
+                teacher_val = _run_teacher_epoch(
+                    val_loader, teacher=teacher, geometry=geometry, grid=grid,
+                    settings=settings, optimizer=None, device=device,
+                    epoch=teacher_epoch, seed=settings.seed + 10000,
+                )
+                teacher_message["val"] = teacher_val
+                if teacher_val["loss"] < teacher_best:
+                    teacher_best = teacher_val["loss"]
+                    temporary = args.output_root / "teacher_best_checkpoint.tmp"
+                    torch.save({
+                        "stage": "clean_relationship_teacher",
+                        "epoch": teacher_epoch,
+                        "teacher": teacher.state_dict(),
+                        "geometry_parameters": asdict(geometry),
+                        "settings": asdict(settings),
+                        "validation": teacher_val,
+                    }, temporary)
+                    os.replace(temporary,
+                               args.output_root / "teacher_best_checkpoint.pt")
+            with (args.output_root / "teacher_metrics.jsonl").open(
+                    "a", encoding="utf-8") as report:
+                report.write(json.dumps(teacher_message) + "\n")
+            print(f"Clean teacher {teacher_epoch}/{settings.teacher_epochs} | "
+                  f"train loss {teacher_train['loss']:.4f}" +
+                  (f" | val loss {teacher_message['val']['loss']:.4f}"
+                   if "val" in teacher_message else ""), flush=True)
+            temporary = args.output_root / "teacher_last_checkpoint.tmp"
+            torch.save({
+                "stage": "clean_relationship_teacher",
+                "epoch": teacher_epoch,
+                "teacher": teacher.state_dict(),
+                "optimizer": teacher_optimizer.state_dict(),
+                "best_val_loss": teacher_best,
+                "geometry_parameters": asdict(geometry),
+                "settings": asdict(settings),
+                "radar_variant": args.radar_variant,
+                "radar_height_filter": args.radar_height_filter,
+            }, temporary)
+            os.replace(temporary, args.output_root / "teacher_last_checkpoint.pt")
+        best_teacher = torch.load(
+            args.output_root / "teacher_best_checkpoint.pt",
+            map_location=device, weights_only=False,
+        )
+        teacher.load_state_dict(best_teacher["teacher"])
+    teacher.eval().requires_grad_(False)
     for epoch in range(start_epoch, settings.epochs + 1):
         train_metrics = _run_epoch(
-            train_loader, model=model, geometry=geometry, grid=grid,
+            train_loader, model=model, teacher=teacher,
+            geometry=geometry, grid=grid,
             settings=settings, optimizer=optimizer, device=device,
             epoch=epoch, seed=settings.seed + epoch, label="blueprint train",
         )
@@ -333,11 +478,22 @@ def main() -> None:
         improved = False
         if epoch % settings.validate_every == 0 or epoch == settings.epochs:
             val_metrics = _run_epoch(
-                val_loader, model=model, geometry=geometry, grid=grid,
+                val_loader, model=model, teacher=teacher,
+                geometry=geometry, grid=grid,
                 settings=settings, optimizer=None, device=device,
                 epoch=epoch, seed=settings.seed + 10000, label="blueprint val",
             )
             message["val"] = val_metrics
+            if epoch == settings.epochs:
+                # Unlike online train loss, this uses the final frozen weights
+                # and the same deterministic tile-selection seed as val.
+                message["train_eval"] = _run_epoch(
+                    train_eval_loader, model=model, teacher=teacher,
+                    geometry=geometry, grid=grid,
+                    settings=settings, optimizer=None, device=device,
+                    epoch=epoch, seed=settings.seed + 10000,
+                    label="blueprint train audit",
+                )
             if not val_metrics["clean_hits"]:
                 message["warning"] = (
                     "No clean returns on sampled radar-supported missing "
@@ -353,7 +509,9 @@ def main() -> None:
                      blueprint_summary(message, settings.epochs))
         checkpoint = {
             "stage": "blueprint_pretraining", "epoch": epoch,
+            "relationship_version": "radar_only_clean_teacher_v1",
             "blueprint": model.state_dict(), "optimizer": optimizer.state_dict(),
+            "teacher": teacher.state_dict(),
             "settings": asdict(settings),
             "geometry_parameters": asdict(geometry),
             "radar_variant": args.radar_variant,
@@ -361,6 +519,7 @@ def main() -> None:
             "best_score": best_score,
             "best_val_loss": best_val_loss,
             "validation": message.get("val"),
+            "train_eval": message.get("train_eval"),
         }
         temporary = args.output_root / "last_checkpoint.tmp"
         torch.save(checkpoint, temporary)

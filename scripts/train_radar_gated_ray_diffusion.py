@@ -304,6 +304,8 @@ def main() -> None:
             args.pretrained_blueprint, map_location=device, weights_only=False)
         if pretrained.get("stage") != "blueprint_pretraining":
             raise ValueError("Pretrained checkpoint is not a ray-depth blueprint")
+        if pretrained.get("relationship_version") != "radar_only_clean_teacher_v1":
+            raise ValueError("Pretrained blueprint must use the radar-only relationship stage")
         if pretrained.get("geometry_parameters") != asdict(geometry):
             raise ValueError("Pretrained blueprint uses different calibrated geometry")
         if pretrained["settings"]["width"] != settings.width:
@@ -332,6 +334,8 @@ def main() -> None:
     last_calibration = None
     if args.resume is not None:
         saved = torch.load(args.resume, map_location=device, weights_only=False)
+        if saved.get("relationship_version") != "radar_only_clean_teacher_v1":
+            raise ValueError("Resume checkpoint predates the radar-only relationship stage")
         if (saved.get("freeze_blueprint_epochs", 0) !=
                 args.freeze_blueprint_epochs):
             raise ValueError("Resume checkpoint disagrees on frozen blueprint epochs")
@@ -386,6 +390,7 @@ def main() -> None:
                      diffusion_summary(message, settings.epochs))
         checkpoint = {
             "epoch": epoch, "blueprint": blueprint_model.state_dict(),
+            "relationship_version": "radar_only_clean_teacher_v1",
             "diffusion": diffusion.state_dict(), "optimizer": optimizer.state_dict(),
             "settings": asdict(settings), "geometry": str(args.geometry.resolve()),
             "geometry_parameters": asdict(geometry),

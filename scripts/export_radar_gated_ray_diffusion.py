@@ -78,6 +78,8 @@ def main() -> None:
         raise RuntimeError("CUDA was requested but is unavailable")
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if checkpoint.get("relationship_version") != "radar_only_clean_teacher_v1":
+        raise ValueError("Checkpoint predates the radar-only relationship stage")
     checkpoint_radar_variant = checkpoint.get("radar_variant", "radar_20frames_verified")
     if args.radar_variant is not None and args.radar_variant != checkpoint_radar_variant:
         raise ValueError("Export radar variant disagrees with the training checkpoint")

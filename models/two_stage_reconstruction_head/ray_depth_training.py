@@ -1,9 +1,4 @@
-"""Training-only clean-LiDAR targets for ray-depth blueprints.
-
-Clean scans enter here after the inference path has produced its blueprint.
-The teacher feature term is opt-in: a randomly initialized teacher offers no
-useful geometric target. Freeze or EMA-train that encoder before enabling it.
-"""
+"""Clean-LiDAR supervision for the radar-only blueprint and paired teacher."""
 
 from __future__ import annotations
 
@@ -12,7 +7,6 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .cross_modal_encoders import EncoderGrid
 from .range_view.geometry import RangeGeometry
 from .ray_depth_attention import RayDepthBlueprint
 
@@ -69,17 +63,14 @@ def clean_first_return_targets(geometry: RangeGeometry, rows: torch.Tensor,
 def ray_depth_blueprint_loss(
     blueprint: RayDepthBlueprint, geometry: RangeGeometry,
     clean_lidar: torch.Tensor, clean_valid: torch.Tensor, *,
-    grid: EncoderGrid | None = None, depth_weight: float = 1.0,
-    teacher_weight: float = 0.0, max_residual_m: float = 3.0,
+    depth_weight: float = 1.0, max_residual_m: float = 3.0,
 ) -> dict[str, torch.Tensor]:
-    """Supervise first return, no return, metric depth and optional patch feature.
+    """Supervise first return, no return and metric depth.
 
     Returns reported ``coverage``: fraction of clean positive rays with an
     evidence-supported candidate within max_residual_m. Unsupported clean
     returns are trained to abstain rather than hallucinate from scene priors.
     """
-    if teacher_weight and (blueprint.clean_teacher is None or grid is None):
-        raise ValueError("Teacher feature loss needs a clean teacher and grid")
     target_depth, clean_return = clean_first_return_targets(
         geometry, blueprint.queries.rows, blueprint.queries.cols,
         clean_lidar, clean_valid,
@@ -103,32 +94,39 @@ def ray_depth_blueprint_loss(
         depth_loss = F.smooth_l1_loss(predicted_depth[covered], target_depth[covered])
     else:
         depth_loss = blueprint.features.sum() * 0
-    teacher_loss = depth_loss * 0
-    if teacher_weight and bool(covered.any()):
-        assert grid is not None and blueprint.clean_teacher is not None
-        selected = blueprint.features.gather(
-            2, nearest_index[..., None, None].expand(-1, -1, 1,
-                                                      blueprint.features.shape[-1])
-        ).squeeze(2)
-        clean_xyz = blueprint.queries.directions * target_depth.nan_to_num()[..., None]
-        minimum = clean_xyz.new_tensor(grid.minimum_xyz)
-        step = clean_xyz.new_tensor(grid.voxel_size_xyz)
-        xyz_index = torch.floor((clean_xyz - minimum) / step).long()
-        zyx_size = grid.shape_zyx
-        in_grid = (xyz_index[..., 0].ge(0) & xyz_index[..., 0].lt(zyx_size[2]) &
-                   xyz_index[..., 1].ge(0) & xyz_index[..., 1].lt(zyx_size[1]) &
-                   xyz_index[..., 2].ge(0) & xyz_index[..., 2].lt(zyx_size[0]))
-        x = xyz_index[..., 0].clamp(0, zyx_size[2] - 1)
-        y = xyz_index[..., 1].clamp(0, zyx_size[1] - 1)
-        z = xyz_index[..., 2].clamp(0, zyx_size[0] - 1)
-        batch = torch.arange(len(x), device=x.device)[:, None]
-        teacher = blueprint.clean_teacher.features[batch, :, z, y, x]
-        occupied = blueprint.clean_teacher.occupied[batch, 0, z, y, x]
-        use = covered & in_grid & occupied
-        if bool(use.any()):
-            teacher_loss = F.smooth_l1_loss(selected[use], teacher[use].detach())
-    total = classification + depth_weight * depth_loss + teacher_weight * teacher_loss
+    total = classification + depth_weight * depth_loss
     coverage = covered.sum().float() / clean_return.sum().clamp_min(1)
     return {"loss": total, "classification": classification,
-            "depth": depth_loss, "teacher": teacher_loss,
+            "depth": depth_loss,
             "coverage": coverage.detach()}
+
+
+def relationship_feature_loss(
+    student: RayDepthBlueprint, teacher: RayDepthBlueprint,
+    geometry: RangeGeometry, clean_lidar: torch.Tensor,
+    clean_valid: torch.Tensor, *, max_residual_m: float = 3.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distill clean-attended local geometry only at radar-supported targets.
+
+    The teacher is frozen and detached. Clean LiDAR selects training targets
+    here, after the student has produced its radar-only blueprint; it never
+    selects a query, candidate depth, or inference mask.
+    """
+    if (student.features.shape != teacher.features.shape or
+            student.queries.depths_m.shape != teacher.queries.depths_m.shape or
+            not torch.equal(student.queries.depths_m, teacher.queries.depths_m)):
+        raise ValueError("Student and teacher must share radar-derived queries")
+    target_depth, clean_return = clean_first_return_targets(
+        geometry, student.queries.rows, student.queries.cols,
+        clean_lidar, clean_valid,
+    )
+    near_target = ((student.queries.depths_m - target_depth[..., None]).abs()
+                   <= max_residual_m)
+    paired = (student.queries.valid & clean_return[..., None] & near_target &
+              (student.evidence_weights[..., 0] > 0) &
+              (teacher.evidence_weights[..., 1] > 0))
+    if not bool(paired.any()):
+        return student.features.sum() * 0, paired.sum().detach()
+    student_feature = F.normalize(student.features[paired], dim=-1)
+    teacher_feature = F.normalize(teacher.features[paired].detach(), dim=-1)
+    return F.smooth_l1_loss(student_feature, teacher_feature), paired.sum().detach()

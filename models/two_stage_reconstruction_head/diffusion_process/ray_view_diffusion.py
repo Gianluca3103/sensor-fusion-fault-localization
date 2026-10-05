@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from ..range_view.geometry import RangeGeometry
 from ..ray_depth_attention import RayDepthBlueprint, RayDepthBlueprintModel
-from ..ray_depth_queries import propose_ray_depth_queries, ray_tile_indices
+from ..ray_depth_queries import ray_tile_indices
 from .basic_diffusion_unet import SinusoidalTimeEmbedding, TimestepResidualBlock
 from .diffusion_process import DiffusionProcessConfig, GaussianNoiseSchedule
 
@@ -490,8 +490,7 @@ def sample_full_scan(
         geometry, all_rows, all_cols, observed_lidar, observed_valid)
     projection = tuple(value.reshape(1, height, width) for value in
                        (observed_depth, observed_intensity, observed_hit))
-    encoded = blueprint_model.encoders(
-        radar, radar_valid, observed_lidar, observed_valid)
+    encoded = blueprint_model.encode_radar(radar, radar_valid)
     additions: list[torch.Tensor] = []
     for row_start in range(0, height, tile_rows):
         row_stop = min(row_start + tile_rows, height)
@@ -507,12 +506,8 @@ def sample_full_scan(
                 col_start=col_start, col_stop=col_stop,
                 device=radar.device,
             )
-            queries = propose_ray_depth_queries(
-                geometry, rows, cols, radar, radar_valid,
-                observed_lidar, observed_valid)
-            blueprint = blueprint_model.fusion(
-                geometry, queries, encoded["radar"],
-                encoded["observed_lidar"], radar)
+            blueprint = blueprint_model.forward_encoded(
+                radar, radar_valid, encoded, rows, cols)
             result = diffusion.sample(
                 blueprint, observed_lidar, observed_valid,
                 (row_stop - row_start, col_stop - col_start),

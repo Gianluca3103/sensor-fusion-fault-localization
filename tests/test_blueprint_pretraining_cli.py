@@ -72,7 +72,8 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
                       "--tile-rows", "1", "--tile-cols", "4", "--width", "8",
                       "--num-workers", "0", "--device", "cpu"]
             blueprint_args = ["blueprint", *shared, "--output-root", str(blueprint_root),
-                              "--validate-every", "1", "--grad-accum-steps", "2"]
+                              "--validate-every", "1", "--grad-accum-steps", "2",
+                              "--teacher-epochs", "1"]
             blueprint_args[blueprint_args.index("--train-limit") + 1] = "3"
             with patch.object(sys, "argv", blueprint_args), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -80,8 +81,12 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
             stage1 = torch.load(blueprint_root / "best_checkpoint.pt",
                                 map_location="cpu", weights_only=False)
             self.assertEqual(stage1["stage"], "blueprint_pretraining")
+            self.assertEqual(stage1["relationship_version"],
+                             "radar_only_clean_teacher_v1")
+            self.assertTrue((blueprint_root / "teacher_best_checkpoint.pt").is_file())
             self.assertEqual(stage1["settings"]["grad_accum_steps"], 2)
             self.assertGreater(stage1["validation"]["clean_hits"], 0)
+            self.assertIn("depth_f1_3m", stage1["train_eval"])
             diffusion_root = root / "diffusion_run"
             diffusion_args = ["diffusion", *shared, "--output-root", str(diffusion_root),
                               "--hidden", "8", "--timesteps", "8",
