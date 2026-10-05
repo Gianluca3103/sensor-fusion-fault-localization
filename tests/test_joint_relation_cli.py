@@ -35,7 +35,8 @@ class JointRelationCliTests(unittest.TestCase):
                 np.cos(3 * np.pi / 8), np.sin(3 * np.pi / 8), 0,
             ], dtype=np.float32)
             identity = "Tr_velo_to_cam: 1 0 0 0 0 1 0 0 0 0 1 0\n"
-            for split, frame_id in (("train", "00001"), ("val", "00002")):
+            for split, frame_id in (("train", "00001"), ("train", "00003"),
+                                    ("val", "00002"), ("val", "00004")):
                 for relative in (
                     "lidar/ImageSets", "lidar/training/velodyne",
                     "lidar/training/calib", "radar/training/calib",
@@ -83,6 +84,7 @@ class JointRelationCliTests(unittest.TestCase):
             joint_args = ["joint", *shared, "--output-root", str(run),
                           "--teacher-checkpoint", str(teacher_checkpoint),
                           "--hidden", "8", "--timesteps", "8",
+                          "--batch-size", "2", "--grad-accum-steps", "1",
                           "--validate-every", "1", "--no-audit-train-at-end"]
             with patch.object(sys, "argv", joint_args), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -94,6 +96,8 @@ class JointRelationCliTests(unittest.TestCase):
             self.assertGreater(saved["validation"]["supported"], 0)
             resumed = joint_args.copy()
             resumed[resumed.index("--epochs") + 1] = "2"
+            resumed[resumed.index("--batch-size") + 1] = "1"
+            resumed[resumed.index("--grad-accum-steps") + 1] = "2"
             resumed += ["--resume", str(run / "last_checkpoint.pt")]
             with patch.object(sys, "argv", resumed), \
                     contextlib.redirect_stdout(io.StringIO()):

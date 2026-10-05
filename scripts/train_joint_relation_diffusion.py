@@ -67,13 +67,21 @@ def _one_batch(
     diffusion: RadarRelationDiffusion, settings: JointSettings,
     rng: random.Random,
 ) -> dict[str, torch.Tensor]:
-    row_start, col_start = choose_radar_tile(
-        geometry, batch["radar"], batch["radar_valid"], grid,
-        settings.tile_rows, settings.tile_cols, rng)
-    rows, cols = ray_tile_indices(
-        geometry, row_start=row_start, row_stop=row_start + settings.tile_rows,
-        col_start=col_start, col_stop=col_start + settings.tile_cols,
-        batch_size=1, device=batch["radar"].device)
+    rows_per_scene, cols_per_scene = [], []
+    for scene in range(batch["radar"].shape[0]):
+        row_start, col_start = choose_radar_tile(
+            geometry, batch["radar"][scene:scene + 1],
+            batch["radar_valid"][scene:scene + 1], grid,
+            settings.tile_rows, settings.tile_cols, rng)
+        rows, cols = ray_tile_indices(
+            geometry, row_start=row_start,
+            row_stop=row_start + settings.tile_rows,
+            col_start=col_start, col_stop=col_start + settings.tile_cols,
+            device=batch["radar"].device)
+        rows_per_scene.append(rows)
+        cols_per_scene.append(cols)
+    rows = torch.cat(rows_per_scene, dim=0)
+    cols = torch.cat(cols_per_scene, dim=0)
     # This path is identical at train and inference: no clean-LiDAR tensor is
     # passed to the relation encoder or diffusion's condition builder.
     relation = relation_model(batch["radar"], batch["radar_valid"], rows, cols)
@@ -217,7 +225,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    if (args.epochs < 1 or args.batch_size != 1 or args.grad_accum_steps < 1 or
+    if (args.epochs < 1 or args.batch_size < 1 or args.grad_accum_steps < 1 or
             args.tile_rows < 1 or args.tile_cols < 4 or args.width < 8 or
             args.width % 8 or args.hidden < 8 or args.hidden % 8 or
             args.timesteps < 2 or args.learning_rate <= 0 or
@@ -273,7 +281,8 @@ def main() -> None:
         radar_variant=args.radar_variant, include_clean=True,
         radar_height_filter=args.radar_height_filter)
     train_loader = DataLoader(
-        training, batch_size=1, shuffle=True, num_workers=args.num_workers,
+        training, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers,
         collate_fn=collate_cross_modal)
     val_loader = DataLoader(
         validation, batch_size=1, shuffle=False, num_workers=args.num_workers,
@@ -295,9 +304,14 @@ def main() -> None:
                 str(args.teacher_checkpoint.resolve())):
             raise ValueError("Resume checkpoint belongs to a different model or input setup")
         for key in ("tile_rows", "tile_cols", "width", "hidden", "timesteps",
-                    "grad_accum_steps", "alignment_weight", "paired_weight"):
+                    "alignment_weight", "paired_weight"):
             if saved["settings"][key] != getattr(settings, key):
                 raise ValueError(f"Resume checkpoint disagrees on {key}")
+        old_effective_batch = (saved["settings"]["batch_size"] *
+                               saved["settings"]["grad_accum_steps"])
+        new_effective_batch = settings.batch_size * settings.grad_accum_steps
+        if old_effective_batch != new_effective_batch:
+            raise ValueError("Resume checkpoint disagrees on effective batch size")
         relation_model.load_state_dict(saved["relation"])
         paired_model.load_state_dict(saved["paired"])
         diffusion.load_state_dict(saved["diffusion"])

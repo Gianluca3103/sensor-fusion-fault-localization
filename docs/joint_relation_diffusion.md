@@ -81,14 +81,15 @@ RUN="$BASE/sensor_fusion_outputs/vod_joint_relation_diffusion_80ep"
   --teacher-checkpoint "$TEACHER" --output-root "$RUN" \
   --radar-variant radar_20frames_verified_doppler_radial \
   --no-radar-height-filter \
-  --epochs 80 --batch-size 1 --grad-accum-steps 4 \
+  --epochs 80 --batch-size 4 --grad-accum-steps 1 \
   --tile-rows 4 --tile-cols 64 --width 32 --hidden 32 \
   --learning-rate 0.0002 --alignment-weight 0.1 \
   --paired-weight 0.1 --validate-every 5 --num-workers 2 --device cuda
 ```
 
 `last_checkpoint.pt` is saved every epoch; `best_checkpoint.pt` is selected by
-validation loss. Resume with the same settings, adding
+validation loss. Resume with the same model settings and effective batch size,
+adding
 `--resume "$RUN/last_checkpoint.pt"`. The final epoch also evaluates training
 frames with frozen weights and the same tile selection seed as validation.
 Compare `train_eval` with `val` in `epoch_metrics.jsonl`; online training loss
