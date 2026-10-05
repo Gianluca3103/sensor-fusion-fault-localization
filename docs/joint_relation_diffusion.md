@@ -97,6 +97,23 @@ is not a fair generalization comparison. The printed return precision/recall
 and depth MAE are teacher-forced noisy-step diagnostics. They are not final
 sampled-cloud accuracy or object-detection AP.
 
+To inspect a saved checkpoint while training continues, run the dedicated
+viewer on one or more validation indices. It creates a rotatable HTML
+comparison and full-resolution PLY clouds. Clean LiDAR and ground-truth boxes
+are used only for visualization:
+
+```bash
+PREVIEW="$BASE/sensor_fusion_outputs/joint_relation_preview"
+"$PY" -u -m scripts.visualize_joint_relation_reconstruction \
+  --vod-root "$VOD" --samples-root "$CACHE/samples" \
+  --checkpoint "$RUN/last_checkpoint.pt" --output-root "$PREVIEW" \
+  --sample-indices 0 --steps 20 --device cuda
+```
+
+Open the printed `interactive.html` path in a browser. To inspect the selected
+checkpoint by validation loss, set `--checkpoint` to
+`"$RUN/best_checkpoint.pt"` and use another output directory.
+
 ## Validation export
 
 Use a separate output directory for each checkpoint and return threshold.

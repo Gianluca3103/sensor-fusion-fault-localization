@@ -15,6 +15,7 @@ import torch
 from scripts.export_joint_relation_vod import main as export_main
 from scripts.train_joint_relation_diffusion import main as joint_main
 from scripts.train_ray_depth_blueprint import main as teacher_main
+from scripts.visualize_joint_relation_reconstruction import main as visualize_main
 
 
 class JointRelationCliTests(unittest.TestCase):
@@ -128,6 +129,20 @@ class JointRelationCliTests(unittest.TestCase):
                                   .read_text())
             self.assertTrue(manifest["complete"])
             self.assertFalse(manifest["clean_lidar_used_at_inference"])
+            viewed = root / "viewed"
+            viewer_args = ["viewer", "--vod-root", str(vod),
+                           "--samples-root", str(samples),
+                           "--checkpoint", str(run / "best_checkpoint.pt"),
+                           "--output-root", str(viewed),
+                           "--sample-indices", "0", "--steps", "2",
+                           "--device", "cpu"]
+            with patch.object(sys, "argv", viewer_args), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                visualize_main()
+            self.assertTrue((viewed / "00002_fault/interactive.html").is_file())
+            self.assertTrue((viewed / "00002_fault/generated.ply").is_file())
+            view_metadata = json.loads((viewed / "00002_fault/metadata.json").read_text())
+            self.assertFalse(view_metadata["clean_lidar_used_at_inference"])
 
 
 if __name__ == "__main__":
