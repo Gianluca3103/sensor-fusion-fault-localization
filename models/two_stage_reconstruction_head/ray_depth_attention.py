@@ -240,7 +240,8 @@ class RayDepthCrossAttention(nn.Module):
 
     def __init__(self, grid: EncoderGrid = EncoderGrid(), width: int = 32,
                  heads: int = 4, neighbors: int = 16, chunk_size: int = 64,
-                 max_candidates: int = 2048, history_scans: int = 20) -> None:
+                 max_candidates: int = 2048, history_scans: int = 20,
+                 predict_first_return: bool = True) -> None:
         super().__init__()
         if (width < 8 or heads < 1 or width % heads or neighbors < 1 or
                 chunk_size < 1 or max_candidates < 1 or history_scans < 1):
@@ -251,13 +252,39 @@ class RayDepthCrossAttention(nn.Module):
                                              nn.SiLU(), nn.Linear(width, width))
         self.blocks = nn.ModuleList(_FusionBlock(width, heads, neighbors, chunk_size)
                                     for _ in range(2))
-        self.return_head = nn.Linear(width, 1)
-        self.depth_head = nn.Linear(width, 1)
-        self.no_return_head = nn.Linear(width, 1)
+        self.return_head = nn.Linear(width, 1) if predict_first_return else None
+        self.depth_head = nn.Linear(width, 1) if predict_first_return else None
+        self.no_return_head = nn.Linear(width, 1) if predict_first_return else None
 
     def forward(self, geometry: RangeGeometry, queries: RayDepthQueries,
                 radar: EncodedGrid, observed_lidar: EncodedGrid,
                 raw_radar: torch.Tensor) -> RayDepthBlueprint:
+        if (self.return_head is None or self.depth_head is None or
+                self.no_return_head is None):
+            raise RuntimeError("Feature-only attention has no blueprint prediction heads")
+        output, gates = self.attend(
+            geometry, queries, radar, observed_lidar, raw_radar)
+        candidate_logits = self.return_head(output).squeeze(-1)
+        # The null path is operational, not merely a visualization: a ray
+        # candidate with no local sensor support cannot claim a return.
+        supported = gates[..., :2].sum(-1) > 0
+        candidate_logits = candidate_logits.masked_fill(~(queries.valid & supported), -1e4)
+        residual = 3.0 * self.depth_head(output).squeeze(-1).tanh()
+        residual = residual.clamp(
+            min=geometry.min_range_m - queries.depths_m,
+            max=geometry.max_range_m - queries.depths_m,
+        )
+        # Null logit pools only valid candidates and remains available even if
+        # every observed and radar measurement is absent.
+        pooled = (output * queries.valid[..., None]).sum(2) / queries.valid.sum(2).clamp_min(1)[..., None]
+        no_return = self.no_return_head(pooled)
+        return RayDepthBlueprint(queries, output, gates,
+                                 torch.cat((candidate_logits, no_return), -1), residual)
+
+    def attend(self, geometry: RangeGeometry, queries: RayDepthQueries,
+               radar: EncodedGrid, observed_lidar: EncodedGrid,
+               raw_radar: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode local sensor evidence without the blueprint prediction heads."""
         batch, rays, slots = queries.depths_m.shape
         count = rays * slots
         if count > self.max_candidates:
@@ -299,22 +326,7 @@ class RayDepthCrossAttention(nn.Module):
             gates.append(weight.reshape(rays, slots, 3))
         output = torch.stack(output)
         gates = torch.stack(gates)
-        candidate_logits = self.return_head(output).squeeze(-1)
-        # The null path is operational, not merely a visualization: a ray
-        # candidate with no local sensor support cannot claim a return.
-        supported = gates[..., :2].sum(-1) > 0
-        candidate_logits = candidate_logits.masked_fill(~(queries.valid & supported), -1e4)
-        residual = 3.0 * self.depth_head(output).squeeze(-1).tanh()
-        residual = residual.clamp(
-            min=geometry.min_range_m - queries.depths_m,
-            max=geometry.max_range_m - queries.depths_m,
-        )
-        # Null logit pools only valid candidates and remains available even if
-        # every observed and radar measurement is absent.
-        pooled = (output * queries.valid[..., None]).sum(2) / queries.valid.sum(2).clamp_min(1)[..., None]
-        no_return = self.no_return_head(pooled)
-        return RayDepthBlueprint(queries, output, gates,
-                                 torch.cat((candidate_logits, no_return), -1), residual)
+        return output, gates
 
 
 def _empty_encoded_like(encoded: EncodedGrid) -> EncodedGrid:

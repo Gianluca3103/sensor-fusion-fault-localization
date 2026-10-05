@@ -282,6 +282,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=5)
     parser.add_argument("--teacher-epochs", type=int, default=5,
                         help="Pretrain clean geometry teacher before radar-only student")
+    parser.add_argument("--teacher-only", action="store_true",
+                        help="Stop after clean teacher; use it for joint relation diffusion")
     parser.add_argument("--distill-weight", type=float, default=0.1)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
@@ -291,6 +293,8 @@ def _arguments() -> argparse.Namespace:
     args = parser.parse_args()
     if args.resume is not None and args.resume_teacher is not None:
         parser.error("Use --resume or --resume-teacher, not both")
+    if args.teacher_only and args.resume is not None:
+        parser.error("--teacher-only cannot resume a radar-only student")
     if (args.epochs < 1 or args.batch_size != 1 or
             args.grad_accum_steps < 1 or args.tile_rows < 1 or
             args.tile_cols < 4 or args.width < 8 or args.width % 4 or
@@ -381,7 +385,8 @@ def main() -> None:
             raise ValueError("Resume checkpoint already reached the requested epoch count")
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "training_config.json").write_text(json.dumps({
-        "stage": "blueprint_pretraining",
+        "stage": ("clean_relationship_teacher" if args.teacher_only
+                  else "blueprint_pretraining"),
         "relationship_version": "radar_only_clean_teacher_v1",
         "settings": asdict(settings),
         "geometry": str(args.geometry.resolve()),
@@ -468,6 +473,10 @@ def main() -> None:
         )
         teacher.load_state_dict(best_teacher["teacher"])
     teacher.eval().requires_grad_(False)
+    if args.teacher_only:
+        print(f"Clean teacher ready: {args.output_root / 'teacher_best_checkpoint.pt'}",
+              flush=True)
+        return
     for epoch in range(start_epoch, settings.epochs + 1):
         train_metrics = _run_epoch(
             train_loader, model=model, teacher=teacher,
