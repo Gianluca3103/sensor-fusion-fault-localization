@@ -269,7 +269,8 @@ def _arguments() -> argparse.Namespace:
                         help="Continue interrupted clean-teacher pretraining")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--radar-height-filter", action=argparse.BooleanOptionalAction,
-                        default=True)
+                        default=False,
+                        help="Optional faulty-LiDAR-derived gate; disabled for radar-only relationship training")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=1,

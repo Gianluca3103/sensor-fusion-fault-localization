@@ -30,6 +30,8 @@ diffusion trainer, but they are validated and ignored. Diffusion still uses
 faulty LiDAR directly to retain observed returns and avoid adding points on
 observed rays. The clean teacher is used only in stage-one training and is
 never instantiated or called by diffusion or export.
+The optional radar height filter, which derives bounds from faulty LiDAR, is
+disabled by default in both stages to keep this relationship path radar-only.
 
 The radar-only output is identical in stage-one training, diffusion training,
 and inference. A new checkpoint carries

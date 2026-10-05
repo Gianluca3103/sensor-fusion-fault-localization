@@ -59,8 +59,10 @@ processed per epoch. The clean teacher adds a separate training pass, so
 measure several real frames on the training machine before committing to a
 long run.
 
-The selected radar variant and observed-faulty-LiDAR height filter are on by
-default. Before a long run, add `--train-limit 2 --val-limit 2 --epochs 1
+The Doppler-shifted radar variant is selected by default. The optional
+per-frame height filter is **off** because it uses faulty LiDAR to modify the
+radar input, which would make the relationship blueprint indirectly depend on
+faulty LiDAR. Before a long run, add `--train-limit 2 --val-limit 2 --epochs 1
 --validate-every 1` and a separate output root for a short data check. This
 smoke run does not estimate blueprint quality.
 

@@ -83,6 +83,7 @@ class BlueprintPretrainingCliTests(unittest.TestCase):
             self.assertEqual(stage1["stage"], "blueprint_pretraining")
             self.assertEqual(stage1["relationship_version"],
                              "radar_only_clean_teacher_v1")
+            self.assertFalse(stage1["radar_height_filter"])
             self.assertTrue((blueprint_root / "teacher_best_checkpoint.pt").is_file())
             self.assertEqual(stage1["settings"]["grad_accum_steps"], 2)
             self.assertGreater(stage1["validation"]["clean_hits"], 0)

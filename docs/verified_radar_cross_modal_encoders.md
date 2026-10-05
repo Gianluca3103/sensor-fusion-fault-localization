@@ -48,10 +48,12 @@ independently moving objects; the model must use the preserved time and
 Doppler fields to reason about them. A stack is evidence from multiple times,
 not a single physically instantaneous radar scan.
 
-The ray diffusion training path now uses the **Doppler radial-shifted** verified
-stack by default and applies the observed faulty-LiDAR height gate after
-calibration. The unshifted verified stack remains available for a controlled
-ablation with `--radar-variant radar_20frames_verified`.
+The staged ray diffusion training path uses the **Doppler radial-shifted**
+verified stack by default. Its optional faulty-LiDAR height gate is disabled
+by default for the radar-only relationship experiment; enabling it makes the
+radar input indirectly depend on faulty LiDAR. The unshifted verified stack
+remains available for a controlled ablation with
+`--radar-variant radar_20frames_verified`.
 `docs/vod_motion_aware_radar.md` describes an optional velocity-age filtering
 ablation; its deletion of older moving returns can also remove useful cyclist
 evidence.

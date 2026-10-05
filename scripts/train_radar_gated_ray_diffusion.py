@@ -228,8 +228,8 @@ def _args() -> argparse.Namespace:
                         help="Train diffusion alone for this many initial epochs")
     parser.add_argument("--radar-variant", default="radar_20frames_verified_doppler_radial")
     parser.add_argument("--radar-height-filter", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Keep radar only between the observed faulty LiDAR's per-frame Z extrema")
+                        default=False,
+                        help="Optional faulty-LiDAR-derived gate; keep disabled with radar-only blueprints")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--tile-rows", type=int, default=4)

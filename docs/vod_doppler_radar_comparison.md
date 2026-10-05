@@ -110,19 +110,19 @@ python -m scripts.interactive_vod_doppler_3d \
   --random-count 7 --seed 42
 ```
 
-## Selected model input: radial shift and observed-LiDAR height gate
+## Selected model input: radial shift; optional observed-LiDAR height gate
 
 The new ray-diffusion trainer defaults to
-`radar_20frames_verified_doppler_radial`. At **sample loading time**, it
-transforms each radar stack to the current LiDAR frame, then keeps a radar
-return only if its LiDAR-frame Z lies between the minimum and maximum Z of
-the **observed faulty LiDAR** for that sample, inclusive. The clean LiDAR
-teacher is never consulted for this input filter. The radial radar files on
-disk remain unchanged, so distinct fault realizations of the same frame get
-their own bounds. If fewer than two faulty LiDAR points survive, the gate is
-skipped so a total LiDAR failure still has radar input. Training config,
-checkpoints, and exports record whether the gate is enabled. The
-`--no-radar-height-filter` switch permits a direct ablation.
+`radar_20frames_verified_doppler_radial`. The staged radar-only relationship
+experiment leaves the optional height gate **off**. If enabled with
+`--radar-height-filter`, sample loading transforms each stack to the current
+LiDAR frame, then keeps a return only when its Z lies between the minimum and
+maximum of the **observed faulty LiDAR** for that sample. That would make the
+radar input indirectly depend on faulty LiDAR, so use it only as a separate
+ablation. The clean LiDAR teacher is never consulted for this filter. The
+radial files on disk remain unchanged; if fewer than two faulty points
+survive, the gate is skipped. Training config, checkpoints, and exports record
+whether it was enabled.
 
 Using the local `reconstruction_vod_radar5_unique` validation fault artifacts
 as an **inspection sample** (the new full-scan training cache may differ), the
