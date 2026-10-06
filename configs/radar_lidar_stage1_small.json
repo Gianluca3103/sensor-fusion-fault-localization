@@ -1,0 +1,24 @@
+{
+  "grid": {
+    "minimum_xyz": [-128.0, -128.0, -32.0],
+    "maximum_xyz": [128.0, 128.0, 32.0],
+    "size_xyz": [0.2, 0.2, 0.25]
+  },
+  "channels": [16, 32, 64, 128],
+  "attention_radii_m": [0.75, 1.5, 3.0, 6.0],
+  "attention_dim": 64,
+  "max_neighbors": 24,
+  "growth_scales": [4],
+  "positive_radii_m": [0.4, 0.8, 1.6, 3.2],
+  "corr_scale_weights": [0.25, 0.25, 0.25, 0.25],
+  "temperature": 0.1,
+  "negative_strategy": "nearest",
+  "num_negatives": 16,
+  "correspondence_weight": 1.0,
+  "geometric_weight": 0.2,
+  "confidence_weight": 0.1,
+  "occupancy_weight": 1.0,
+  "local_geometry_weight": 1.0,
+  "confidence_sigma_m": 0.5,
+  "geometry_eval_tolerance_m": 0.2
+}
