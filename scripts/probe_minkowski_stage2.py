@@ -18,7 +18,7 @@ def _exercise(me, device: str, dtype: torch.dtype | None = None) -> dict:
     coordinates = torch.tensor([
         [0, 0, 0, 0], [0, 1, 0, 0], [0, 2, 0, 0],
         [0, 0, 1, 0], [0, 2, 2, 1], [0, 4, 3, 2],
-    ], dtype=torch.int32)
+    ], dtype=torch.int32, device=device)
     features = torch.randn(len(coordinates), 4, device=device, requires_grad=True)
     stem = me.MinkowskiConvolution(4, 8, kernel_size=3, stride=1, dimension=3).to(device)
     down = me.MinkowskiConvolution(8, 8, kernel_size=2, stride=2, dimension=3).to(device)
@@ -36,6 +36,8 @@ def _exercise(me, device: str, dtype: torch.dtype | None = None) -> dict:
         loss = encoded.F.square().mean() + coarse.F.square().mean()
         loss = loss + decoded.F.square().mean() + expanded.F.square().mean()
     loss.backward()
+    if not torch.isfinite(loss):
+        raise RuntimeError("Sparse forward pass produced a non-finite loss")
     if features.grad is None or not torch.isfinite(features.grad).all():
         raise RuntimeError("Sparse backward pass produced no finite input gradients")
     return {"device": device, "autocast_dtype": str(dtype) if dtype else "none",
