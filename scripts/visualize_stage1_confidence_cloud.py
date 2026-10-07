@@ -196,8 +196,6 @@ def main() -> None:
     limits = (args.x_min, args.x_max, args.y_min, args.y_max, args.z_min, args.z_max)
     if any(a >= b for a, b in zip(limits[::2], limits[1::2])):
         parser.error("Each display crop minimum must be smaller than its maximum")
-    if args.split == "test":
-        parser.error("Official VoD test labels do not provide a clean LiDAR comparison here; use train or val")
     model, saved = load_encoder(args.checkpoint, args.device)
     variant = args.radar_variant or saved.get("data", {}).get("radar_variant", "radar_20frames_verified_doppler_radial")
     dataset = VoDStage1Dataset(args.vod_root, args.split, frame_ids=args.frame_id,
