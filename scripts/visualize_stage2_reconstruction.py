@@ -6,12 +6,35 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage2.config import Stage2Config
 from models.radar_lidar_stage2.reconstruction_model import RadarLidarStage2
 from scripts.visualize_stage1_confidence_cloud import load_encoder, save_viewer, write_ply
+
+
+def load_faulty_sample(samples_root: Path, split: str, frame_id: str,
+                       fault_pattern: str) -> tuple[np.ndarray, Path, dict]:
+    pattern = f"{int(frame_id):05d}_{fault_pattern}.npz"
+    paths = sorted((samples_root / split).glob(pattern))
+    if len(paths) != 1:
+        raise ValueError(f"Expected exactly one faulty sample for frame {frame_id} "
+                         f"under {samples_root / split} matching {pattern}; "
+                         f"found {len(paths)}. Set --fault-pattern if necessary.")
+    with np.load(paths[0], allow_pickle=False) as archive:
+        if "faulty_lidar_points" not in archive.files or "metadata_json" not in archive.files:
+            raise ValueError(f"Fault sample is missing LiDAR or metadata: {paths[0]}")
+        metadata = json.loads(str(archive["metadata_json"].item()))
+        points = np.asarray(archive["faulty_lidar_points"], dtype=np.float32)
+    if (str(metadata.get("frame_id", "")).zfill(5) != str(frame_id).zfill(5)
+            or metadata.get("split") != split):
+        raise ValueError(f"Fault sample does not match {split}/{frame_id}: {paths[0]}")
+    if (points.ndim != 2 or points.shape[1] < 3 or
+            not np.isfinite(points[:, :3]).all()):
+        raise ValueError(f"Faulty LiDAR must contain finite XYZ rows: {paths[0]}")
+    return points[:, :3], paths[0], metadata
 
 
 @torch.no_grad()
@@ -21,6 +44,10 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--frame-id", nargs="+", required=True)
     parser.add_argument("--split", choices=("train", "val"), default="val")
+    parser.add_argument("--fault-samples-root", type=Path, required=True,
+                        help="Fault cache containing train/ and val/ NPZ samples")
+    parser.add_argument("--fault-pattern", default="*",
+                        help="Optional fault and severity filename pattern when a frame has multiple samples")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--stage1-checkpoint", type=Path,
                         help="Override the Stage-I checkpoint path recorded in Stage II")
@@ -61,6 +88,9 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
 
     for sample in dataset:
+        frame_id = sample["frame_id"]
+        faulty, fault_path, fault_metadata = load_faulty_sample(
+            args.fault_samples_root, args.split, frame_id, args.fault_pattern)
         batch = collate_stage1([sample])
         batch = {name: value.to(args.device) if isinstance(value, torch.Tensor) else value
                  for name, value in batch.items()}
@@ -74,6 +104,7 @@ def main() -> None:
         prefix = args.output_root / f"{sample['frame_id']}_stage2"
         write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar)
         write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), clean)
+        write_ply(prefix.with_name(prefix.name + "_faulty_lidar.ply"), faulty)
         write_ply(prefix.with_name(prefix.name + "_reconstructed.ply"), reconstructed,
                   occupancy_score)
         counts = save_viewer(
@@ -82,18 +113,25 @@ def main() -> None:
             limits=limits, max_points=args.max_plot_points, trained=True, calibrated=False,
             third_name="Reconstructed LiDAR", stage_name="Stage-II deterministic reconstruction",
             description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "
-                        "All three panels share one camera. Radar can be overlaid on reconstruction.",
-            notice="Predicted points come from radar only. Clean LiDAR is shown for comparison; "
+                        "All three panels share one camera. Faulty LiDAR and radar can be "
+                        "toggled over the reconstruction.",
+            notice="Predicted points come from radar only. Faulty and clean LiDAR are shown "
+                   "for comparison and are never model inputs; "
                    "diffusion is disabled. Occupancy scores are not calibrated as probabilities "
                    "of a correct surface.",
-            score_name="Occupancy score")
+            score_name="Occupancy score", overlay=faulty,
+            overlay_name="faulty LiDAR", overlay_color="#bd79e3", overlay_checked=True)
         metadata = {"frame_id": sample["frame_id"], "split": args.split,
                     "stage2_checkpoint": str(args.checkpoint.resolve()),
                     "stage1_checkpoint": str(stage1_path.resolve()),
                     "stage2_epoch": saved.get("epoch"), "diffusion_enabled": False,
                     "radar_variant": variant, "candidate_sites": len(output.candidate_coordinates),
                     "reconstructed_points": len(reconstructed), "clean_points": len(clean),
-                    "radar_points": len(radar), "occupancy_threshold": config.occupancy_threshold,
+                    "faulty_points": len(faulty), "radar_points": len(radar),
+                    "fault_sample": str(fault_path),
+                    "fault": fault_metadata.get("fault"),
+                    "severity": fault_metadata.get("severity"),
+                    "occupancy_threshold": config.occupancy_threshold,
                     "display_limits_xyz_m": limits, "display_counts": counts,
                     "note": "Display clouds are capped; PLY files contain all points. "
                             "Reconstruction excludes any surviving faulty LiDAR."}

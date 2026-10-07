@@ -80,7 +80,9 @@ def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarr
                 limits: tuple[float, ...], max_points: int, trained: bool,
                 calibrated: bool, third_name: str = "Stage-I confidence",
                 stage_name: str = "Stage-I", description: str | None = None,
-                notice: str | None = None, score_name: str = "Confidence") -> dict:
+                notice: str | None = None, score_name: str = "Confidence",
+                overlay: np.ndarray | None = None, overlay_name: str = "clean LiDAR",
+                overlay_color: str = "#45b975", overlay_checked: bool = False) -> dict:
     clouds = []
     for name, xyz, values in (("Radar", radar, None), ("Clean LiDAR", lidar, None),
                               (third_name, sites, confidence)):
@@ -89,13 +91,20 @@ def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarr
                        "shown": len(shown), "xyz": np.round(shown, 3).tolist(),
                        "confidence": None if selected_values is None
                        else np.round(selected_values, 4).tolist()})
+    overlay_cloud = None
+    if overlay is not None:
+        shown, _, in_view = display_subset(overlay, max_points, limits)
+        overlay_cloud = {"total": len(overlay), "in_view": in_view,
+                         "shown": len(shown), "xyz": np.round(shown, 3).tolist()}
     payload = {"frame_id": frame_id, "epoch": epoch, "clouds": clouds,
                "limits": limits, "trained": trained, "calibrated": calibrated,
                "stage_name": stage_name, "description": description or
                "Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. "
                "All three panels share one camera. Confidence markers are radar-derived S1 "
                "voxel centers, not reconstructed LiDAR points.",
-               "notice": notice, "score_name": score_name}
+               "notice": notice, "score_name": score_name,
+               "overlay_cloud": overlay_cloud, "overlay_name": overlay_name,
+               "overlay_color": overlay_color, "overlay_checked": overlay_checked}
     packed = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -115,7 +124,7 @@ h2{font-size:15px;margin:0 0 5px}canvas{width:100%;height:70vh;max-height:780px;
 <p id="description"></p>
 <div class="controls"><label>Minimum <span id="score-name"></span> <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="threshold-value">0.00</output></label>
 <label><input id="overlay-radar" type="checkbox" checked> Overlay radar on third panel</label>
-<label><input id="overlay-lidar" type="checkbox"> Overlay clean LiDAR on third panel</label>
+<label><input id="overlay-compare" type="checkbox"> Overlay <span id="overlay-name"></span> on third panel</label>
 <button id="zoom-in">Zoom in</button><button id="zoom-out">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><div class="legend"><span id="legend-name"></span> 0 <span class="ramp"></span> 1 · colors show a model score, not measured surface accuracy</div>
 <p id="notice"></p><p>Display crop: forward 0–80 m, lateral ±40 m, height −5–7 m by default. PLY files retain the full clouds. Display point counts are capped for speed.</p>
@@ -127,6 +136,7 @@ document.getElementById('title').textContent=`Frame ${d.frame_id} · ${d.stage_n
 document.getElementById('description').textContent=d.description;
 document.getElementById('score-name').textContent=d.score_name.toLowerCase();
 document.getElementById('legend-name').textContent=d.score_name;
+document.getElementById('overlay-name').textContent=d.overlay_name;
 document.getElementById('notice').textContent=d.notice!==null?d.notice:d.trained
   ? (d.calibrated?'Checkpoint marks confidence calibrated.':'Confidence was trained but is not calibrated as a probability of a correct LiDAR surface.')
   : 'Checkpoint does not mark confidence as trained; colors are not interpretable.';
@@ -136,7 +146,9 @@ const canvases=d.clouds.map((cloud,i)=>{const section=document.createElement('se
 const [xmin,xmax,ymin,ymax,zmin,zmax]=d.limits;
 const center=[(xmin+xmax)/2,(ymin+ymax)/2,(zmin+zmax)/2],radius=Math.hypot(xmax-xmin,ymax-ymin,zmax-zmin)/2;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
-const slider=document.getElementById('threshold'),overlayRadar=document.getElementById('overlay-radar'),overlayLidar=document.getElementById('overlay-lidar');
+const slider=document.getElementById('threshold'),overlayRadar=document.getElementById('overlay-radar'),overlayCompare=document.getElementById('overlay-compare');
+overlayCompare.checked=d.overlay_checked;
+const comparison=d.overlay_cloud||d.clouds[1];
 function color(v){const stops=[[40,98,190],[81,202,209],[255,225,115],[245,104,104]],a=Math.max(0,Math.min(.9999,v))*3,i=Math.floor(a),t=a-i;
   return `rgb(${stops[i].map((n,k)=>Math.round(n*(1-t)+stops[i+1][k]*t)).join(',')})`;}
 function project(p,w,h,scale){const x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cy=Math.cos(view.yaw),sy=Math.sin(view.yaw),cp=Math.cos(view.pitch),sp=Math.sin(view.pitch);
@@ -144,8 +156,8 @@ function project(p,w,h,scale){const x=p[0]-center[0],y=p[1]-center[1],z=p[2]-cen
 function layer(ctx,cloud,w,h,scale,kind,alpha){ctx.globalAlpha=alpha;const limit=Number(slider.value);
   for(let i=0;i<cloud.xyz.length;i++){if(kind==='confidence'&&cloud.confidence[i]<limit)continue;
     const [x,y]=project(cloud.xyz[i],w,h,scale);if(x<0||x>=w||y<0||y>=h)continue;
-    ctx.fillStyle=kind==='radar'?'#ffab40':kind==='lidar'?'#45b975':color(cloud.confidence[i]);
-    const r=kind==='radar'?1.7:kind==='lidar'?1.1:2.4;ctx.fillRect(x-r/2,y-r/2,r,r);}
+    ctx.fillStyle=kind==='radar'?'#ffab40':kind==='lidar'?'#45b975':kind==='overlay'?d.overlay_color:color(cloud.confidence[i]);
+    const r=kind==='radar'?1.7:kind==='lidar'?1.1:kind==='overlay'?1.2:2.4;ctx.fillRect(x-r/2,y-r/2,r,r);}
   ctx.globalAlpha=1;}
 function draw(c,index){const ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;if(!w||!h)return;
   const pw=Math.round(w*ratio),ph=Math.round(h*ratio);if(c.width!==pw||c.height!==ph){c.width=pw;c.height=ph;}
@@ -153,9 +165,9 @@ function draw(c,index){const ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clien
   const scale=.47*Math.min(w,h)*view.zoom/radius;
   if(index===0)layer(ctx,d.clouds[0],w,h,scale,'radar',.8);
   else if(index===1)layer(ctx,d.clouds[1],w,h,scale,'lidar',.6);
-  else{if(overlayLidar.checked)layer(ctx,d.clouds[1],w,h,scale,'lidar',.19);
-    if(overlayRadar.checked)layer(ctx,d.clouds[0],w,h,scale,'radar',.25);
-    layer(ctx,d.clouds[2],w,h,scale,'confidence',.95);}
+  else{if(overlayRadar.checked)layer(ctx,d.clouds[0],w,h,scale,'radar',.25);
+    layer(ctx,d.clouds[2],w,h,scale,'confidence',.95);
+    if(overlayCompare.checked)layer(ctx,comparison,w,h,scale,'overlay',.8);}
   const o=project([0,0,0],w,h,scale);for(const [axis,color,p] of [['X','#eb7777',[10,0,0]],['Y','#78d18b',[0,10,0]],['Z','#9eabf0',[0,0,3]]]){
     const e=project(p,w,h,scale);ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(...o);ctx.lineTo(...e);ctx.stroke();ctx.fillStyle=color;ctx.fillText(axis,e[0],e[1]);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;canvases.forEach(draw);});}
@@ -171,7 +183,7 @@ const active=new Map();for(const canvas of canvases){canvas.addEventListener('po
   for(const event of ['pointerup','pointercancel'])canvas.addEventListener(event,e=>active.delete(e.pointerId));
   canvas.addEventListener('wheel',e=>{e.preventDefault();zoom(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY,canvas.clientWidth,canvas.clientHeight);redraw();},{passive:false});}
 slider.addEventListener('input',()=>{document.getElementById('threshold-value').textContent=Number(slider.value).toFixed(2);redraw();});
-overlayRadar.addEventListener('change',redraw);overlayLidar.addEventListener('change',redraw);
+overlayRadar.addEventListener('change',redraw);overlayCompare.addEventListener('change',redraw);
 document.getElementById('zoom-in').onclick=()=>{zoom(1.6,canvases[0].clientWidth/2,canvases[0].clientHeight/2,canvases[0].clientWidth,canvases[0].clientHeight);redraw();};
 document.getElementById('zoom-out').onclick=()=>{zoom(1/1.6,canvases[0].clientWidth/2,canvases[0].clientHeight/2,canvases[0].clientWidth,canvases[0].clientHeight);redraw();};
 document.getElementById('reset').onclick=()=>{Object.assign(view,initial);redraw();};
