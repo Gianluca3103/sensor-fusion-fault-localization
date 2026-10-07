@@ -30,7 +30,7 @@ class CandidateDomain:
     coordinates: torch.Tensor  # sorted unique [N,4] in (batch,z,y,x) order
     confidence: torch.Tensor  # strongest supporting Stage-I seed, [N]
     grid: VoxelGrid
-    counts: dict[str, int | float]
+    counts: dict[str, int | float | str]
 
     @property
     def centers_xyz(self) -> torch.Tensor:
@@ -55,12 +55,33 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         raise ValueError("Stage-I grid and Stage-II candidate grid differ")
     if not torch.equal(fine.coords, confidence.coords):
         raise ValueError("Stage-I confidence must align with S1 coordinates")
-    scores = confidence.features.squeeze(-1)
-    if scores.shape != (len(fine.coords),) or not bool(torch.isfinite(scores).all()):
-        raise ValueError("Stage-I confidence has invalid shape or values")
+    if output.surface is None:
+        # Legacy Stage-I checkpoints have scores only at radar-occupied cells.
+        seed_coords = fine.coords
+        scores = confidence.features.squeeze(-1)
+        source = "radar_voxel"
+    else:
+        surface = output.surface
+        if (surface.xyz.ndim != 3 or surface.xyz.shape[0] != len(fine.coords)
+                or surface.xyz.shape[2] != 3 or surface.score.shape != surface.xyz.shape[:2]):
+            raise ValueError("Stage-I surface proposals have invalid shape")
+        xyz = surface.xyz.reshape(-1, 3)
+        scores = surface.score.reshape(-1)
+        if not bool(torch.isfinite(xyz).all()):
+            raise ValueError("Stage-I surface proposals must be finite")
+        minimum = torch.tensor(grid.minimum_xyz, dtype=torch.float64, device=xyz.device)
+        size = torch.tensor(grid.size_xyz, dtype=torch.float64, device=xyz.device)
+        index_xyz = torch.floor((xyz.to(torch.float64)-minimum)/size).long()
+        seed_coords = torch.cat((fine.coords[:,0,None].repeat_interleave(surface.xyz.shape[1],dim=0),
+                                 index_xyz[:,[2,1,0]]),dim=1)
+        source = "predicted_lidar_surface"
+    if scores.shape != (len(seed_coords),) or not bool(torch.isfinite(scores).all()):
+        raise ValueError("Stage-I proposal confidence has invalid shape or values")
     if len(scores) and (bool((scores < 0).any()) or bool((scores > 1).any())):
-        raise ValueError("Stage-I confidence must lie in [0,1]")
-    chosen = torch.nonzero(scores > confidence_threshold, as_tuple=False).flatten()
+        raise ValueError("Stage-I proposal confidence must lie in [0,1]")
+    shape = torch.tensor(grid.shape_zyx, device=fine.coords.device)
+    inside = ((seed_coords[:,1:] >= 0) & (seed_coords[:,1:] < shape)).all(-1)
+    chosen = torch.nonzero((scores > confidence_threshold) & inside, as_tuple=False).flatten()
     offsets = torch.tensor(list(product(*(range(-r, r + 1) for r in expansion_zyx))),
                            dtype=torch.long, device=fine.coords.device)
     if max_sites < len(offsets):
@@ -72,10 +93,8 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
     # unnecessarily severe seed cap. Binary search keeps the strongest seeds.
     max_proposals = max_sites * 4
     chosen = chosen[:max_proposals // len(offsets)]
-    shape = torch.tensor(grid.shape_zyx, device=fine.coords.device)
-
     def expanded_keys(seed_count: int) -> tuple[torch.Tensor, torch.Tensor]:
-        seeds = fine.coords[chosen[:seed_count]].long()
+        seeds = seed_coords[chosen[:seed_count]].long()
         expanded = seeds[:, None, :].expand(-1, len(offsets), -1).clone()
         expanded[:, :, 1:] += offsets[None]
         valid = ((expanded[:, :, 1:] >= 0) & (expanded[:, :, 1:] < shape)).all(-1)
@@ -102,6 +121,8 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         coordinates = fine.coords.new_empty((0, 4))
         propagated = scores.new_empty(0)
     counts = {"initial_stage1_sites": len(fine.coords),
+              "initial_surface_proposals": len(seed_coords),
+              "seed_source": source,
               "candidate_sites_after_confidence": selected_total,
               "selected_seeds_after_cap": len(chosen),
               "expanded_candidate_sites": len(coordinates),

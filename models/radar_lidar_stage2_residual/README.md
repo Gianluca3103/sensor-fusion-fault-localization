@@ -6,9 +6,11 @@ Diffusion remains **off**.
 
 ## Inputs and supervision
 
-1. Frozen radar-only Stage I encodes the aligned 20-frame radar stack. Its
-   confidence selects the same radar-supported fine-voxel candidate domain as
-   the previous Stage II.
+1. Frozen radar-only Stage I encodes the aligned 20-frame radar stack. A
+   surface-proposal checkpoint supplies predicted LiDAR XYZ and confidence;
+   those positions seed the fine-voxel candidate domain. A legacy checkpoint
+   still seeds from occupied radar voxels. The checkpoint type is determined
+   by its Stage-I configuration and is recorded in candidate counts.
 2. The cached faulty LiDAR is paired by official VoD frame ID. Seven
    faulty-only candidate features include same-voxel occupancy, capped local
    density at 0.4 and 1.0 m, nearest-point distance, nearest intensity, a

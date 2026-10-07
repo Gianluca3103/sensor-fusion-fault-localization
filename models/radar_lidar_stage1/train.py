@@ -26,7 +26,7 @@ def config_from_dict(values: dict) -> Stage1Config:
     grid=values.pop("grid",{})
     if isinstance(grid,dict):
         values["grid"]=VoxelGrid(**{k:tuple(v) if isinstance(v,list) else v for k,v in grid.items()})
-    for key in ("channels","attention_radii_m","growth_scales","positive_radii_m","corr_scale_weights"):
+    for key in ("channels","attention_radii_m","growth_scales","positive_radii_m","corr_scale_weights","surface_context_radii_m"):
         if key in values:
             values[key]=tuple(values[key])
     allowed={field.name for field in fields(Stage1Config)}
@@ -86,6 +86,7 @@ def _selection_value(metrics: dict, name: str):
     if name=="corr_within_0.2m":return corr["corr_within_0.2m"]
     if name=="geom_f1_0.2m":return metrics["geometry"]["0.2m"]["f1"]
     if name=="geom_f1_0.5m":return metrics["geometry"]["0.5m"]["f1"]
+    if name=="surface_f1_0.2m":return metrics.get("surface_proposals",{}).get("0.2m",{}).get("f1")
     raise ValueError(name)
 
 
@@ -100,6 +101,10 @@ def _flat_validation(losses: dict, metrics: dict) -> dict:
             flat[f"val/geom_{key}_{tolerance}"]=row[key]
     flat["val/conf_mean"]=metrics["confidence"]["mean"]
     flat["val/conf_ece"]=metrics["confidence"]["ece"]
+    for tolerance,row in metrics.get("surface_proposals",{}).items():
+        if tolerance.endswith("m") and isinstance(row,dict):
+            for key in ("precision","recall","f1"):
+                flat[f"val/surface_{key}_{tolerance}"]=row[key]
     half=next(row for row in metrics["confidence"]["threshold_sweep"] if row["threshold"]==0.5)
     for key in ("coverage","target_coverage","precision","recall","f1"):
         flat[f"val/conf_threshold_0.5/{key}"]=half[key]
@@ -119,6 +124,7 @@ def _tensorboard(writer,epoch: int,train: dict,flat: dict,metrics: dict) -> None
         if field.startswith("loss/"):tag="Loss/val_"+field.removeprefix("loss/")
         elif field.startswith("corr_"):tag="Correspondence/"+field
         elif field.startswith("geom_"):tag="Geometry/"+field
+        elif field.startswith("surface_"):tag="Surface/"+field
         elif field.startswith("conf_"):tag="Confidence/"+field
         elif field.startswith(("instance_","same_class_instance_")) or field in ("query_count","valid_corr_query_count","no_corr_query_count","no_corr_fraction"):
             tag="Diagnostics/"+field
@@ -157,6 +163,8 @@ def _pct(value):return "n/a" if value is None else f"{value*100:.1f}%"
 
 def _console(epoch,epochs,train,validation):
     print(f"Epoch {epoch:03d}/{epochs:03d} | train total {train['loss/total']:.4f} corr {train['loss/corr']:.4f} geom {train['loss/geom']:.4f} conf {train['loss/conf']:.4f}",flush=True)
+    if train.get("loss/surface_geom_weighted",0):
+        print(f"  surface train geometry {train['loss/surface_geom']:.4f} confidence {train['loss/surface_conf']:.4f}",flush=True)
     if not validation:return
     m=validation["metrics"];c=m["correspondence"];g=m["geometry"];q=m["confidence"]
     half=next(row for row in q["threshold_sweep"] if row["threshold"]==.5)
@@ -169,7 +177,13 @@ def _console(epoch,epochs,train,validation):
     objects=m["instances"].get("s1",{}).get("all")
     if objects:
         print(f"  instance R@1 {_pct(objects['r1'])} | same-class instance R@1 {_pct(objects['same_class_r1'])} ({objects['same_class_count']} queries)",flush=True)
-    print(f"  conf mean {q['mean'] if q['mean'] is not None else float('nan'):.3f} ECE {q['ece'] if q['ece'] is not None else float('nan'):.3f} | tau .5 coverage {_pct(half['coverage'])} precision {_pct(half['precision'])} | valid/no corr {c['valid_corr_query_count']}/{c['no_corr_query_count']}",flush=True)
+    surface=m.get("surface_proposals")
+    if surface:
+        row=surface["0.2m"]
+        print(f"  proposed surfaces .2 m P/R/F1 {_pct(row['precision'])}/{_pct(row['recall'])}/{_pct(row['f1'])} | score > {surface['score_threshold']:.2f} selected {surface['selected_voxels']} supported clean {surface['supported_clean_voxels']}",flush=True)
+        print(f"  legacy radar-site confidence is unused | valid/no corr {c['valid_corr_query_count']}/{c['no_corr_query_count']}",flush=True)
+    else:
+        print(f"  conf mean {q['mean'] if q['mean'] is not None else float('nan'):.3f} ECE {q['ece'] if q['ece'] is not None else float('nan'):.3f} | tau .5 coverage {_pct(half['coverage'])} precision {_pct(half['precision'])} | valid/no corr {c['valid_corr_query_count']}/{c['no_corr_query_count']}",flush=True)
 
 
 def main() -> None:
@@ -187,7 +201,7 @@ def main() -> None:
     parser.add_argument("--train-limit",type=int)
     parser.add_argument("--val-limit",type=int)
     parser.add_argument("--resume",type=Path)
-    parser.add_argument("--selection-metric",choices=("corr_r1","corr_within_0.2m","geom_f1_0.2m","geom_f1_0.5m"),default="corr_r1")
+    parser.add_argument("--selection-metric",choices=("corr_r1","corr_within_0.2m","geom_f1_0.2m","geom_f1_0.5m","surface_f1_0.2m"),default="corr_r1")
     parser.add_argument("--object-instances",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--corruption-every",type=int,default=0,help="Run shifted/mismatched radar diagnostic every N validation epochs; 0 disables")
     parser.add_argument("--corruption-limit",type=int,default=8)
@@ -197,6 +211,8 @@ def main() -> None:
     if min(args.epochs,args.batch_size,args.grad_accum_steps,args.validate_every)<1 or args.corruption_every<0 or args.corruption_limit<1:
         parser.error("epochs, batch size, accumulation and validation interval must be positive")
     config=config_from_dict(json.loads(args.config.read_text())) if args.config else Stage1Config()
+    if args.selection_metric=="surface_f1_0.2m" and not config.surface_proposals_per_site:
+        parser.error("surface_f1_0.2m requires a surface-proposal Stage-I config")
     args.output_root.mkdir(parents=True,exist_ok=True)
     (args.output_root/"config.json").write_text(json.dumps(config.as_dict(),indent=2))
     writer=None

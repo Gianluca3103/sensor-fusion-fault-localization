@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 
 from .correspondence import local_neighbors
@@ -46,6 +47,9 @@ class Stage1MetricAccumulator:
         self.sweep={t:{"sites":0,"targets_retained":0,"tp":0,"predictions":0} for t in THRESHOLDS}
         self.geom_target_total=0
         self.instance=defaultdict(lambda:defaultdict(lambda:defaultdict(int)))
+        self.surface={"raw_proposals":0,"selected_voxels":0,"supported_clean_voxels":0,
+                      "precision_hits_0.2m":0,"recall_hits_0.2m":0,
+                      "precision_hits_0.5m":0,"recall_hits_0.5m":0}
 
     @torch.no_grad()
     def update(self,model,radar,radar_valid,clean,clean_valid,*,intermediates=None):
@@ -113,6 +117,46 @@ class Stage1MetricAccumulator:
                 selected=retained & p
                 row["predictions"]+=int(selected.sum())
                 row["tp"]+=int((selected & h & (e<=self.config.geometry_eval_tolerance_m)).sum())
+        if output.surface is not None:
+            proposals=output.surface
+            xyz=proposals.xyz.detach().cpu().numpy()
+            scores=proposals.score.detach().cpu().numpy()
+            radar_centers=output.features["s1"].centers_xyz(self.config.grid).detach().cpu().numpy()
+            radar_batch=output.features["s1"].coords[:,0].detach().cpu().numpy()
+            clean_sites=lidar_levels[0]
+            clean_centers=clean_sites.centers_xyz(self.config.grid).detach().cpu().numpy()
+            clean_batch=clean_sites.coords[:,0].detach().cpu().numpy()
+            self.surface["raw_proposals"]+=scores.size
+            minimum=np.asarray(self.config.grid.minimum_xyz)
+            step=np.asarray(self.config.grid.size_xyz)
+            shape=np.asarray(self.config.grid.shape_zyx[::-1])
+            for frame in np.unique(radar_batch):
+                r=radar_batch==frame
+                c=clean_batch==frame
+                if not r.any():
+                    continue
+                clean_xyz=clean_centers[c]
+                supported=(cKDTree(radar_centers[r]).query(clean_xyz)[0]<=self.config.surface_radius_m
+                           if len(clean_xyz) else np.zeros(0,dtype=bool))
+                relevant_clean=clean_xyz[supported]
+                self.surface["supported_clean_voxels"]+=len(relevant_clean)
+                chosen=xyz[r][scores[r]>.25]
+                if len(chosen):
+                    grid_index=np.floor((chosen-minimum)/step).astype(np.int64)
+                    inside=((grid_index>=0)&(grid_index<shape)).all(1)
+                    chosen=chosen[inside]
+                    grid_index=grid_index[inside]
+                    _,unique=np.unique(grid_index,axis=0,return_index=True)
+                    chosen=chosen[unique]
+                self.surface["selected_voxels"]+=len(chosen)
+                if len(chosen) and len(clean_xyz):
+                    distance=cKDTree(clean_xyz).query(chosen)[0]
+                    for tolerance in (.2,.5):
+                        self.surface[f"precision_hits_{tolerance:.1f}m"]+=int((distance<=tolerance).sum())
+                if len(chosen) and len(relevant_clean):
+                    distance=cKDTree(chosen).query(relevant_clean)[0]
+                    for tolerance in (.2,.5):
+                        self.surface[f"recall_hits_{tolerance:.1f}m"]+=int((distance<=tolerance).sum())
 
     def add_instances(self,report: dict):
         for scale,classes in report.items():
@@ -125,6 +169,21 @@ class Stage1MetricAccumulator:
 
     def finish(self) -> dict:
         report={"scales":{},"geometry":{},"confidence":{},"instances":{}}
+        if self.config.surface_proposals_per_site:
+            surface=self.surface
+            summary={"raw_proposals":surface["raw_proposals"],
+                     "selected_voxels":surface["selected_voxels"],
+                     "supported_clean_voxels":surface["supported_clean_voxels"],
+                     "score_threshold":0.25,"support_radius_m":self.config.surface_radius_m}
+            for tolerance in (.2,.5):
+                name=f"{tolerance:.1f}m"
+                precision=surface[f"precision_hits_{name}"]/surface["selected_voxels"] if surface["selected_voxels"] else 0.0
+                recall=_fraction(surface[f"recall_hits_{name}"],surface["supported_clean_voxels"])
+                summary[name]={"precision":precision,"recall":recall,
+                               "f1":2*precision*recall/(precision+recall) if recall is not None and precision+recall else (0.0 if recall is not None else None),
+                               "precision_hits":surface[f"precision_hits_{name}"],
+                               "recall_hits":surface[f"recall_hits_{name}"]}
+            report["surface_proposals"]=summary
         total_valid=0; total_queries=0; total_knn=0; total_hits={k:0 for k in (1,5,10)}; arrays=[]
         for name,row in self.scales.items():
             valid=row["valid_corr_query_count"]; query=row["query_count"]

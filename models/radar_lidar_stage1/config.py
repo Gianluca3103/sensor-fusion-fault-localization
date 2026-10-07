@@ -59,6 +59,16 @@ class Stage1Config:
     local_geometry_weight: float = 1.0
     confidence_sigma_m: float = 0.5
     geometry_eval_tolerance_m: float = 0.2
+    # Zero preserves the original checkpoint architecture. The surface config
+    # enables multiple radar-conditioned LiDAR locations per fine radar site.
+    surface_proposals_per_site: int = 0
+    surface_radius_m: float = 1.5
+    surface_target_neighbors: int = 24
+    surface_geometry_weight: float = 0.0
+    surface_confidence_weight: float = 0.0
+    surface_match_sigma_m: float = 0.2
+    surface_context_radii_m: tuple[float, ...] = (1.0, 2.0, 4.0, 6.0)
+    surface_context_neighbors: int = 16
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.channels) <= 4 or min(self.channels) < 4:
@@ -81,10 +91,22 @@ class Stage1Config:
             raise ValueError("Growth scales must be distinct valid one-based scale indices")
         if any(not math.isfinite(x) or x < 0 for x in (self.correspondence_weight, self.geometric_weight, self.confidence_weight, self.occupancy_weight, self.local_geometry_weight)):
             raise ValueError("Loss weights must be nonnegative")
-        if self.correspondence_weight+self.geometric_weight+self.confidence_weight == 0:
+        if self.correspondence_weight+self.geometric_weight+self.confidence_weight+self.surface_geometry_weight+self.surface_confidence_weight == 0:
             raise ValueError("At least one implemented training objective must be enabled")
         if self.confidence_sigma_m <= 0 or self.geometry_eval_tolerance_m <= 0:
             raise ValueError("Confidence sigma and geometry evaluation tolerance must be positive meters")
+        if (self.surface_proposals_per_site < 0 or self.surface_target_neighbors < 1
+                or self.surface_context_neighbors < 1
+                or self.surface_radius_m <= 0 or self.surface_match_sigma_m <= 0
+                or min(self.surface_geometry_weight,self.surface_confidence_weight) < 0):
+            raise ValueError("Invalid surface proposal settings")
+        if len(self.surface_context_radii_m) < len(self.channels) or any(
+                radius <= 0 for radius in self.surface_context_radii_m[:len(self.channels)]):
+            raise ValueError("Surface context needs a positive physical radius per scale")
+        if self.surface_proposals_per_site == 0 and (self.surface_geometry_weight or self.surface_confidence_weight):
+            raise ValueError("Surface losses require surface proposals")
+        if self.surface_proposals_per_site and self.surface_geometry_weight == 0:
+            raise ValueError("Surface proposals need a geometric training objective")
         self.grid.scale_shape(2 ** (len(self.channels)-1))
 
     def as_dict(self) -> dict:

@@ -134,7 +134,7 @@ def main() -> None:
                     "severity": fault_metadata.get("severity"),
                     "occupancy_threshold": config.occupancy_threshold,
                     "display_limits_xyz_m": limits, "display_counts": counts,
-                    "note": "Display clouds are capped; PLY files contain all points. "
+                    "note": "Clean LiDAR is uncapped inside the display crop; other display clouds may be capped. PLY files contain all points. "
                             "Reconstruction excludes any surviving faulty LiDAR."}
         prefix.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"{sample['frame_id']}: {len(reconstructed):,} reconstructed points | "

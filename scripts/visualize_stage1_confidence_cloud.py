@@ -1,7 +1,7 @@
-"""Compare aligned VoD radar, clean LiDAR, and Stage-I confidence in 3D.
+"""Compare aligned VoD radar, full clean LiDAR, and Stage-I output in 3D.
 
-The confidence cloud consists of radar-derived S1 voxel centers. It is not a
-reconstructed LiDAR cloud, and clean LiDAR is loaded only for visualization.
+New checkpoints show radar-only proposed LiDAR surfaces; legacy checkpoints
+show scores at radar-derived S1 voxel centers. Clean LiDAR is visual only.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def write_ply(path: Path, xyz: np.ndarray, confidence: np.ndarray | None = None)
         stream.write(records.tobytes())
 
 
-def display_subset(xyz: np.ndarray, maximum: int, limits: tuple[float, ...],
+def display_subset(xyz: np.ndarray, maximum: int | None, limits: tuple[float, ...],
                    values: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray | None, int]:
     xmin, xmax, ymin, ymax, zmin, zmax = limits
     mask = ((xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax)
@@ -70,7 +70,7 @@ def display_subset(xyz: np.ndarray, maximum: int, limits: tuple[float, ...],
             & (xyz[:, 2] >= zmin) & (xyz[:, 2] <= zmax))
     indices = np.flatnonzero(mask)
     in_view = len(indices)
-    if len(indices) > maximum:
+    if maximum is not None and len(indices) > maximum:
         indices = indices[np.linspace(0, len(indices) - 1, maximum, dtype=np.int64)]
     return xyz[indices], None if values is None else values[indices], in_view
 
@@ -86,7 +86,10 @@ def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarr
     clouds = []
     for name, xyz, values in (("Radar", radar, None), ("Clean LiDAR", lidar, None),
                               (third_name, sites, confidence)):
-        shown, selected_values, in_view = display_subset(xyz, max_points, limits, values)
+        # Keep every clean LiDAR point inside the common 3D crop. Only sparse
+        # overlays may use the plotting cap.
+        shown, selected_values, in_view = display_subset(
+            xyz, None if name == "Clean LiDAR" else max_points, limits, values)
         clouds.append({"name": name, "total": len(xyz), "in_view": in_view,
                        "shown": len(shown), "xyz": np.round(shown, 3).tolist(),
                        "confidence": None if selected_values is None
@@ -123,11 +126,11 @@ h2{font-size:15px;margin:0 0 5px}canvas{width:100%;height:70vh;max-height:780px;
 <h1 id="title"></h1>
 <p id="description"></p>
 <div class="controls"><label>Minimum <span id="score-name"></span> <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="threshold-value">0.00</output></label>
-<label><input id="overlay-radar" type="checkbox" checked> Overlay radar on third panel</label>
+<label><input id="overlay-radar" type="checkbox"> Overlay raw radar on third panel</label>
 <label><input id="overlay-compare" type="checkbox"> Overlay <span id="overlay-name"></span> on third panel</label>
 <button id="zoom-in">Zoom in</button><button id="zoom-out">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><div class="legend"><span id="legend-name"></span> 0 <span class="ramp"></span> 1 · colors show a model score, not measured surface accuracy</div>
-<p id="notice"></p><p>Display crop: forward 0–80 m, lateral ±40 m, height −5–7 m by default. PLY files retain the full clouds. Display point counts are capped for speed.</p>
+<p id="notice"></p><p>The confidence slider filters model points only. Raw radar is hidden in the third panel by default. All clean LiDAR points within the shared display crop are shown. PLY files retain the full clouds.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -140,14 +143,18 @@ document.getElementById('overlay-name').textContent=d.overlay_name;
 document.getElementById('notice').textContent=d.notice!==null?d.notice:d.trained
   ? (d.calibrated?'Checkpoint marks confidence calibrated.':'Confidence was trained but is not calibrated as a probability of a correct LiDAR surface.')
   : 'Checkpoint does not mark confidence as trained; colors are not interpretable.';
+let confidenceHeading;
 const canvases=d.clouds.map((cloud,i)=>{const section=document.createElement('section'),h=document.createElement('h2'),c=document.createElement('canvas');
   h.textContent=`${cloud.name}: ${cloud.total.toLocaleString()} full, ${cloud.in_view.toLocaleString()} in crop, ${cloud.shown.toLocaleString()} displayed`;
+  if(i===2)confidenceHeading=h;
   section.append(h,c);panels.append(section);return c;});
 const [xmin,xmax,ymin,ymax,zmin,zmax]=d.limits;
 const center=[(xmin+xmax)/2,(ymin+ymax)/2,(zmin+zmax)/2],radius=Math.hypot(xmax-xmin,ymax-ymin,zmax-zmin)/2;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},view={...initial};
 const slider=document.getElementById('threshold'),overlayRadar=document.getElementById('overlay-radar'),overlayCompare=document.getElementById('overlay-compare');
 overlayCompare.checked=d.overlay_checked;
+function updateConfidenceHeading(){const cloud=d.clouds[2],selected=cloud.confidence.filter(value=>value>=Number(slider.value)).length;
+  confidenceHeading.textContent=`${cloud.name}: ${cloud.total.toLocaleString()} full, ${cloud.in_view.toLocaleString()} in crop, ${selected.toLocaleString()} shown above score ${Number(slider.value).toFixed(2)}`;}
 const comparison=d.overlay_cloud||d.clouds[1];
 function color(v){const stops=[[40,98,190],[81,202,209],[255,225,115],[245,104,104]],a=Math.max(0,Math.min(.9999,v))*3,i=Math.floor(a),t=a-i;
   return `rgb(${stops[i].map((n,k)=>Math.round(n*(1-t)+stops[i+1][k]*t)).join(',')})`;}
@@ -170,7 +177,7 @@ function draw(c,index){const ratio=devicePixelRatio||1,w=c.clientWidth,h=c.clien
     if(overlayCompare.checked)layer(ctx,comparison,w,h,scale,'overlay',.8);}
   const o=project([0,0,0],w,h,scale);for(const [axis,color,p] of [['X','#eb7777',[10,0,0]],['Y','#78d18b',[0,10,0]],['Z','#9eabf0',[0,0,3]]]){
     const e=project(p,w,h,scale);ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(...o);ctx.lineTo(...e);ctx.stroke();ctx.fillStyle=color;ctx.fillText(axis,e[0],e[1]);}}
-let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;canvases.forEach(draw);});}
+let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;updateConfidenceHeading();canvases.forEach(draw);});}
 function zoom(mult,x,y,w,h){const next=Math.max(.1,Math.min(80,view.zoom*mult)),k=next/view.zoom;
   view.panX=x-w/2-(x-w/2-view.panX)*k;view.panY=y-h/2-(y-h/2-view.panY)*k;view.zoom=next;}
 const active=new Map();for(const canvas of canvases){canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);active.set(e.pointerId,{x:e.clientX,y:e.clientY,canvas});});
@@ -205,7 +212,8 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", help="Override checkpoint radar variant")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--max-plot-points", type=int, default=30000)
+    parser.add_argument("--max-plot-points", type=int, default=30000,
+                        help="Cap radar and model points only; clean LiDAR is never capped")
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=80.0)
     parser.add_argument("--y-min", type=float, default=-40.0)
@@ -233,30 +241,49 @@ def main() -> None:
         points = sample["radar"].unsqueeze(0).to(args.device)
         valid = torch.ones(points.shape[:2], dtype=torch.bool, device=args.device)
         output = model(points, valid)
-        sites = output.confidence.centers_xyz(model.config.grid).cpu().numpy()
-        confidence = output.confidence.features[:, 0].cpu().numpy()
+        if output.surface is None:
+            sites = output.confidence.centers_xyz(model.config.grid).cpu().numpy()
+            confidence = output.confidence.features[:, 0].cpu().numpy()
+            third_name = "Stage-I radar-site confidence (legacy)"
+            cloud_suffix = "_confidence.ply"
+            note = "Legacy confidence is scored at radar-derived S1 voxel centers; it is not a LiDAR surface proposal."
+        else:
+            sites = output.surface.xyz.reshape(-1, 3).cpu().numpy()
+            confidence = output.surface.score.reshape(-1).cpu().numpy()
+            third_name = "Predicted LiDAR surface candidates"
+            cloud_suffix = "_surface_proposals.ply"
+            note = "Radar-only model predicts LiDAR surface positions and scores; clean LiDAR is displayed for comparison only."
         if not np.isfinite(confidence).all() or np.any((confidence < 0) | (confidence > 1)):
             raise ValueError("Confidence values must be finite and between zero and one")
         prefix = args.output_root / f"{sample['frame_id']}_stage1"
         write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar[:, :3])
         write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), lidar[:, :3])
-        write_ply(prefix.with_name(prefix.name + "_confidence.ply"), sites, confidence)
+        write_ply(prefix.with_name(prefix.name + cloud_suffix), sites, confidence)
         counts = save_viewer(prefix.with_suffix(".html"), frame_id=sample["frame_id"],
                              epoch=saved.get("epoch"), radar=radar[:, :3],
                              lidar=lidar[:, :3], sites=sites, confidence=confidence,
                              limits=limits, max_points=args.max_plot_points,
-                             trained=model.confidence_trained,
-                             calibrated=model.confidence_calibrated)
+                             trained=model.confidence_trained or output.surface is not None,
+                             calibrated=False, third_name=third_name,
+                             description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "
+                             "All panels share one metric camera. The third panel shows model-proposed "
+                             "LiDAR surfaces when the checkpoint has a surface head; otherwise it shows "
+                             "legacy radar-site confidence. Clean LiDAR is never an inference input.",
+                             notice=note+" Scores are not calibrated probabilities of a correct surface.")
         prefix.with_suffix(".json").write_text(json.dumps({
             "frame_id": sample["frame_id"], "split": args.split,
             "checkpoint": str(args.checkpoint.resolve()), "epoch": saved.get("epoch"),
             "radar_variant": variant, "confidence_trained": model.confidence_trained,
-            "confidence_calibrated": model.confidence_calibrated,
+            "confidence_calibrated": False,
+            "proposal_mode": "predicted_lidar_surface" if output.surface is not None else "legacy_radar_voxel",
+            "score_mean": float(confidence.mean()) if len(confidence) else None,
+            "score_min": float(confidence.min()) if len(confidence) else None,
+            "score_max": float(confidence.max()) if len(confidence) else None,
             "confidence_mean": float(confidence.mean()) if len(confidence) else None,
             "confidence_min": float(confidence.min()) if len(confidence) else None,
             "confidence_max": float(confidence.max()) if len(confidence) else None,
             "counts": counts, "display_limits_xyz_m": limits,
-            "note": "Confidence is on radar-derived S1 voxel centers; it is not a reconstructed LiDAR cloud."
+            "note": note
         }, indent=2), encoding="utf-8")
         print(prefix.with_suffix(".html"), flush=True)
 
