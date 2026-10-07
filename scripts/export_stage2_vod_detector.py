@@ -56,7 +56,9 @@ def detector_cloud(generated_xyz: np.ndarray, faulty_xyzi: np.ndarray | None, *,
     return detector_points(generated, None, forward_only=True).astype("<f4", copy=False)
 
 
-@torch.inference_mode()
+# Stage-I sparse neighbor caching reads Tensor._version, which inference_mode
+# disables. no_grad keeps version counters while avoiding autograd work.
+@torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", type=Path, required=True)
