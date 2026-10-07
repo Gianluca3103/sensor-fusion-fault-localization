@@ -1,0 +1,82 @@
+"""Clean-LiDAR occupancy and centroid targets on a fixed candidate domain."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from models.radar_lidar_stage1.sparse import encode_keys, voxelize
+from .candidate_domain import CandidateDomain
+
+
+@dataclass(frozen=True)
+class VoxelTargets:
+    occupied: torch.Tensor  # [N] positive if a measured clean point is in voxel
+    offsets_normalized: torch.Tensor  # [N,3], meaningful only for positives
+    clean_centroid_xyz: torch.Tensor  # [N,3], meaningful only for positives
+    clean_point_count: torch.Tensor  # [N]
+    clean_points_in_grid: int
+    clean_points_in_candidates: int
+    point_centroid_errors_m: torch.Tensor  # per represented clean return
+
+    @property
+    def candidate_occupancy_ratio(self) -> float:
+        return float(self.occupied.float().mean()) if len(self.occupied) else 0.0
+
+    @property
+    def clean_point_coverage(self) -> float:
+        return self.clean_points_in_candidates / max(self.clean_points_in_grid, 1)
+
+
+def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
+                 clean_valid: torch.Tensor) -> VoxelTargets:
+    """Measure clean geometry in the candidate voxels; no target alters support.
+
+    An unoccupied candidate is not necessarily physically free: occluded and
+    unobserved sites require a separate visibility mask before an occupancy
+    loss may label them negative.
+    """
+    grid = domain.grid
+    if clean_lidar.device != domain.coordinates.device:
+        raise ValueError("Clean LiDAR and candidate coordinates must share a device")
+    clean_coords, inverse, selected, _ = voxelize(clean_lidar, clean_valid, grid)
+    keys = encode_keys(domain.coordinates, grid.shape_zyx)
+    clean_keys = encode_keys(clean_coords, grid.shape_zyx)
+    n = len(keys)
+    occupied = torch.zeros(n, dtype=torch.bool, device=keys.device)
+    counts = torch.zeros(n, dtype=torch.long, device=keys.device)
+    centroids = clean_lidar.new_zeros((n, 3))
+    normalized = clean_lidar.new_zeros((n, 3))
+    if not n or not len(clean_keys):
+        return VoxelTargets(occupied, normalized, centroids, counts, len(selected), 0,
+                            clean_lidar.new_empty(0))
+    position = torch.searchsorted(keys, clean_keys)
+    valid = position < n
+    matched = valid & (keys[position.clamp(max=n - 1)] == clean_keys)
+    # First pool measured points by clean voxel, then transfer only matching
+    # voxels into the candidate domain. This preserves the exact centroid.
+    voxel_sum = clean_lidar.new_zeros((len(clean_keys), 3)).index_add_(0, inverse, selected[:, :3])
+    voxel_count = torch.zeros(len(clean_keys), dtype=torch.long, device=keys.device)
+    voxel_count.index_add_(0, inverse, torch.ones_like(inverse))
+    centroid_by_clean = voxel_sum / voxel_count.clamp_min(1)[:, None]
+    dest = position[matched]
+    occupied[dest] = True
+    counts[dest] = voxel_count[matched]
+    centroids[dest] = centroid_by_clean[matched]
+    sizes = centroids.new_tensor(grid.size_xyz)
+    normalized[dest] = (centroids[dest] - grid.centers_xyz(domain.coordinates[dest])) / sizes
+    if bool((normalized[dest].abs() > 0.50001).any()):
+        raise AssertionError("Clean voxel centroid escaped its physical cell")
+    represented = matched[inverse]
+    point_errors = torch.linalg.vector_norm(
+        selected[represented, :3] - centroid_by_clean[inverse[represented]], dim=-1)
+    return VoxelTargets(occupied, normalized, centroids, counts,
+                        len(selected), int(voxel_count[matched].sum()), point_errors)
+
+
+def decode_centroids(domain: CandidateDomain, offsets_normalized: torch.Tensor) -> torch.Tensor:
+    if offsets_normalized.shape != (len(domain.coordinates), 3):
+        raise ValueError("Expected one normalized XYZ offset per candidate voxel")
+    sizes = offsets_normalized.new_tensor(domain.grid.size_xyz)
+    return domain.centers_xyz + offsets_normalized.clamp(-0.5, 0.5) * sizes
