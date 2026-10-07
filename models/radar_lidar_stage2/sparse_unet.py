@@ -5,15 +5,17 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+_ME_IMPORT_ERROR = None
 try:
     import MinkowskiEngine as ME
-except ImportError:  # Allows CPU-only geometry tests before the professor-machine smoke test.
+except ImportError as error:  # Allows CPU-only geometry tests before the professor-machine smoke test.
     ME = None
+    _ME_IMPORT_ERROR = error
 
 
 def _require_me() -> None:
     if ME is None:
-        raise RuntimeError("MinkowskiEngine is required for the Stage-II network")
+        raise RuntimeError(f"MinkowskiEngine import failed: {_ME_IMPORT_ERROR}") from _ME_IMPORT_ERROR
 
 
 class SparseLayerNorm(nn.Module):
