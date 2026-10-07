@@ -99,6 +99,14 @@ Selected frames produce physical XYZ PLYs for radar, clean LiDAR, candidates,
 oracle occupied centroids, predictions, false predicted points, and missed
 clean returns. No object labels enter the model.
 
+For a rotating three-panel comparison without running full validation, use
+`python -m scripts.visualize_stage2_reconstruction --vod-root /path/to/vod
+--checkpoint /path/to/best_geom.ckpt --frame-id 00000 00001 --output-root
+/path/to/preview`. Open each resulting `*_stage2.html` in a browser. It shows
+radar, clean LiDAR, and Stage-II predicted points with shared rotate/zoom/pan
+controls, and also saves full-resolution PLY files. The preview does not merge
+surviving faulty LiDAR into the predictions.
+
 The active formulation answers whether the radar-derived Stage-I
 representation can deterministically support useful LiDAR geometry. Diffusion
 should be considered only after candidate coverage, representation loss, and

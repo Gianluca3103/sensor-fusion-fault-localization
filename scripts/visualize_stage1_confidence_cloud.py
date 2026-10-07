@@ -78,21 +78,28 @@ def display_subset(xyz: np.ndarray, maximum: int, limits: tuple[float, ...],
 def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarray,
                 lidar: np.ndarray, sites: np.ndarray, confidence: np.ndarray,
                 limits: tuple[float, ...], max_points: int, trained: bool,
-                calibrated: bool) -> dict:
+                calibrated: bool, third_name: str = "Stage-I confidence",
+                stage_name: str = "Stage-I", description: str | None = None,
+                notice: str | None = None, score_name: str = "Confidence") -> dict:
     clouds = []
     for name, xyz, values in (("Radar", radar, None), ("Clean LiDAR", lidar, None),
-                              ("Stage-I confidence", sites, confidence)):
+                              (third_name, sites, confidence)):
         shown, selected_values, in_view = display_subset(xyz, max_points, limits, values)
         clouds.append({"name": name, "total": len(xyz), "in_view": in_view,
                        "shown": len(shown), "xyz": np.round(shown, 3).tolist(),
                        "confidence": None if selected_values is None
                        else np.round(selected_values, 4).tolist()})
     payload = {"frame_id": frame_id, "epoch": epoch, "clouds": clouds,
-               "limits": limits, "trained": trained, "calibrated": calibrated}
+               "limits": limits, "trained": trained, "calibrated": calibrated,
+               "stage_name": stage_name, "description": description or
+               "Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. "
+               "All three panels share one camera. Confidence markers are radar-derived S1 "
+               "voxel centers, not reconstructed LiDAR points.",
+               "notice": notice, "score_name": score_name}
     packed = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stage-I radar, LiDAR and confidence</title>
+<title>Radar and LiDAR point-cloud comparison</title>
 <style>
 body{margin:0;padding:14px;background:#10161d;color:#edf3f8;font:14px system-ui,sans-serif}
 h1{font-size:20px;margin:0 0 4px}p{margin:4px 0 12px;color:#b9c6d3}
@@ -105,19 +112,22 @@ h2{font-size:15px;margin:0 0 5px}canvas{width:100%;height:70vh;max-height:780px;
 @media(max-width:950px){.panels{display:block}section{margin-bottom:12px}canvas{height:60vh;min-height:330px}}
 </style>
 <h1 id="title"></h1>
-<p>Drag to rotate · wheel or pinch to zoom · Shift-drag or two fingers to pan. All three panels share one camera. Confidence markers are radar-derived S1 voxel centers, not reconstructed LiDAR points.</p>
-<div class="controls"><label>Minimum confidence <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="threshold-value">0.00</output></label>
-<label><input id="overlay-radar" type="checkbox" checked> Overlay radar on confidence</label>
-<label><input id="overlay-lidar" type="checkbox"> Overlay clean LiDAR on confidence</label>
+<p id="description"></p>
+<div class="controls"><label>Minimum <span id="score-name"></span> <input id="threshold" type="range" min="0" max="1" step="0.01" value="0"><output id="threshold-value">0.00</output></label>
+<label><input id="overlay-radar" type="checkbox" checked> Overlay radar on third panel</label>
+<label><input id="overlay-lidar" type="checkbox"> Overlay clean LiDAR on third panel</label>
 <button id="zoom-in">Zoom in</button><button id="zoom-out">Zoom out</button><button id="reset">Reset view</button></div>
-<div id="panels" class="panels"></div><div class="legend">Confidence 0 <span class="ramp"></span> 1 · colors show model confidence, not measured surface accuracy</div>
+<div id="panels" class="panels"></div><div class="legend"><span id="legend-name"></span> 0 <span class="ramp"></span> 1 · colors show a model score, not measured surface accuracy</div>
 <p id="notice"></p><p>Display crop: forward 0–80 m, lateral ±40 m, height −5–7 m by default. PLY files retain the full clouds. Display point counts are capped for speed.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
 const d=JSON.parse(document.getElementById('data').textContent), panels=document.getElementById('panels');
-document.getElementById('title').textContent=`Frame ${d.frame_id} · Stage-I ${d.epoch===null?'radar-only export':'epoch '+d.epoch}`;
-document.getElementById('notice').textContent=d.trained
+document.getElementById('title').textContent=`Frame ${d.frame_id} · ${d.stage_name} ${d.epoch===null?'export':'epoch '+d.epoch}`;
+document.getElementById('description').textContent=d.description;
+document.getElementById('score-name').textContent=d.score_name.toLowerCase();
+document.getElementById('legend-name').textContent=d.score_name;
+document.getElementById('notice').textContent=d.notice!==null?d.notice:d.trained
   ? (d.calibrated?'Checkpoint marks confidence calibrated.':'Confidence was trained but is not calibrated as a probability of a correct LiDAR surface.')
   : 'Checkpoint does not mark confidence as trained; colors are not interpretable.';
 const canvases=d.clouds.map((cloud,i)=>{const section=document.createElement('section'),h=document.createElement('h2'),c=document.createElement('canvas');
