@@ -31,10 +31,10 @@ def load_faulty_sample(samples_root: Path, split: str, frame_id: str,
     if (str(metadata.get("frame_id", "")).zfill(5) != str(frame_id).zfill(5)
             or metadata.get("split") != split):
         raise ValueError(f"Fault sample does not match {split}/{frame_id}: {paths[0]}")
-    if (points.ndim != 2 or points.shape[1] < 3 or
-            not np.isfinite(points[:, :3]).all()):
-        raise ValueError(f"Faulty LiDAR must contain finite XYZ rows: {paths[0]}")
-    return points[:, :3], paths[0], metadata
+    if (points.ndim != 2 or points.shape[1] < 4 or
+            not np.isfinite(points[:, :4]).all()):
+        raise ValueError(f"Faulty LiDAR must contain finite XYZI rows: {paths[0]}")
+    return points[:, :4], paths[0], metadata
 
 
 @torch.no_grad()
@@ -89,8 +89,9 @@ def main() -> None:
 
     for sample in dataset:
         frame_id = sample["frame_id"]
-        faulty, fault_path, fault_metadata = load_faulty_sample(
+        faulty_xyzi, fault_path, fault_metadata = load_faulty_sample(
             args.fault_samples_root, args.split, frame_id, args.fault_pattern)
+        faulty = faulty_xyzi[:, :3]
         batch = collate_stage1([sample])
         batch = {name: value.to(args.device) if isinstance(value, torch.Tensor) else value
                  for name, value in batch.items()}

@@ -113,3 +113,17 @@ The active formulation answers whether the radar-derived Stage-I
 representation can deterministically support useful LiDAR geometry. Diffusion
 should be considered only after candidate coverage, representation loss, and
 learned reconstruction are separately measured.
+
+## Frozen detector comparison
+
+`scripts.export_stage2_vod_detector` writes all 1,296 official validation
+frames as four-column LiDAR binaries for `prepare_vod_official_faults.py`.
+Its default `--mode merged` retains each matched faulty LiDAR XYZI return and
+appends Stage-II generated XYZ with **zero intensity**. `--mode generated-only`
+exports just the synthetic points as an ablation. Stage I/II inference remains
+radar-only in either mode; faulty LiDAR is only merged after inference. Clean
+LiDAR is not read by the exporter. The detector must receive its original
+five-frame radar branch in the downstream SVEFusion evaluation. Use the same
+official detector checkpoint and validation IDs for clean, faulty, and
+reconstructed comparisons. Zero synthetic intensity is a compatibility
+placeholder and must be reported with detector results.
