@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+from scipy.spatial import cKDTree
 import torch
 
 from models.radar_lidar_stage1.sparse import encode_keys, voxelize
@@ -13,6 +15,7 @@ from .candidate_domain import CandidateDomain
 @dataclass(frozen=True)
 class VoxelTargets:
     occupied: torch.Tensor  # [N] positive if a measured clean point is in voxel
+    known_free: torch.Tensor  # [N] conservatively observed before a clean first return
     offsets_normalized: torch.Tensor  # [N,3], meaningful only for positives
     clean_centroid_xyz: torch.Tensor  # [N,3], meaningful only for positives
     clean_point_count: torch.Tensor  # [N]
@@ -30,7 +33,7 @@ class VoxelTargets:
 
 
 def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
-                 clean_valid: torch.Tensor) -> VoxelTargets:
+                 clean_valid: torch.Tensor, *, free_ray_tolerance_m: float = 0.15) -> VoxelTargets:
     """Measure clean geometry in the candidate voxels; no target alters support.
 
     An unoccupied candidate is not necessarily physically free: occluded and
@@ -45,11 +48,12 @@ def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
     clean_keys = encode_keys(clean_coords, grid.shape_zyx)
     n = len(keys)
     occupied = torch.zeros(n, dtype=torch.bool, device=keys.device)
+    known_free = torch.zeros_like(occupied)
     counts = torch.zeros(n, dtype=torch.long, device=keys.device)
     centroids = clean_lidar.new_zeros((n, 3))
     normalized = clean_lidar.new_zeros((n, 3))
     if not n or not len(clean_keys):
-        return VoxelTargets(occupied, normalized, centroids, counts, len(selected), 0,
+        return VoxelTargets(occupied, known_free, normalized, centroids, counts, len(selected), 0,
                             clean_lidar.new_empty(0))
     position = torch.searchsorted(keys, clean_keys)
     valid = position < n
@@ -71,7 +75,44 @@ def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
     represented = matched[inverse]
     point_errors = torch.linalg.vector_norm(
         selected[represented, :3] - centroid_by_clean[inverse[represented]], dim=-1)
-    return VoxelTargets(occupied, normalized, centroids, counts,
+    # Absence of a measured point is *unknown*. A negative is justified only
+    # where a clean scan ray passed through this cell before its first return.
+    # The sensor origin is (0,0,0) in calibrated LiDAR coordinates. We require
+    # a tight perpendicular distance to an actual measured ray and keep one
+    # half voxel diagonal clear of its endpoint; no space behind is negative.
+    centers = domain.centers_xyz.detach().cpu().numpy()
+    batches = domain.coordinates[:, 0].detach().cpu().numpy()
+    radius = np.linalg.norm(centers, axis=1)
+    half_diagonal = 0.5 * float(np.linalg.norm(grid.size_xyz))
+    for batch in np.unique(batches):
+        candidate_index = np.flatnonzero(batches == batch)
+        measured = clean_lidar[int(batch), clean_valid[int(batch)], :3].detach().cpu().numpy()
+        measured_range = np.linalg.norm(measured, axis=1)
+        good = measured_range > 1e-3
+        if not np.any(good):
+            continue
+        measured, measured_range = measured[good], measured_range[good]
+        ray = measured / measured_range[:, None]
+        query = centers[candidate_index]
+        query_range = radius[candidate_index]
+        nonzero = query_range > 1e-3
+        if not np.any(nonzero):
+            continue
+        # Several measured returns can have nearly the same direction. Use
+        # the earliest compatible return; choosing an arbitrary farther ray
+        # could falsely mark space behind a nearer occluder as free.
+        chord, nearest = cKDTree(ray).query(query[nonzero] / query_range[nonzero, None],
+                                                k=min(16, len(ray)), workers=1)
+        chord = np.atleast_2d(chord).reshape(np.count_nonzero(nonzero), -1)
+        nearest = np.atleast_2d(nearest).reshape(np.count_nonzero(nonzero), -1)
+        compatible = query_range[nonzero, None] * chord <= free_ray_tolerance_m
+        first_range = np.where(compatible, measured_range[nearest], np.inf).min(axis=1)
+        free = query_range[nonzero] + half_diagonal < first_range
+        free &= np.isfinite(first_range)
+        selected_candidates = candidate_index[nonzero][free]
+        known_free[selected_candidates] = True
+    known_free &= ~occupied
+    return VoxelTargets(occupied, known_free, normalized, centroids, counts,
                         len(selected), int(voxel_count[matched].sum()), point_errors)
 
 

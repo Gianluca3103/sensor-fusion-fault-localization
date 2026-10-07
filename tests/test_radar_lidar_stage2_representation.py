@@ -91,3 +91,43 @@ def test_empty_and_multibatch_targets_do_not_cross_match():
     empty = make_targets(domain, clean, torch.zeros_like(valid))
     assert not bool(empty.occupied.any())
     assert empty.clean_points_in_grid == 0
+
+
+def test_only_visible_space_before_clean_first_return_is_negative():
+    grid = VoxelGrid((0., -1., -1.), (5., 1., 1.), (.5, .5, .5))
+    coords = torch.tensor([[0, 2, 2, x] for x in (1, 3, 5, 7)])
+    sites = SparseSites(coords, torch.ones(4, 4), grid.shape_zyx)
+    evidence = Stage1Output({"s1": sites}, sites.replace_features(torch.ones(4, 1)),
+                            {"s1": coords}, {})
+    domain = make_candidates(evidence, grid, confidence_threshold=.5, expansion_zyx=(0, 0, 0))
+    # Centers are x=.75,1.75,2.75,3.75, y=z=.25. The clean ray ends
+    # at x=2.75,y=z=.25; x=3.75 is behind the first return.
+    clean = torch.tensor([[[2.75, .25, .25, .1]]])
+    target = make_targets(domain, clean, torch.ones((1, 1), dtype=torch.bool),
+                          free_ray_tolerance_m=.15)
+    assert target.occupied.tolist() == [False, False, True, False]
+    assert target.known_free.tolist() == [False, True, False, False]
+
+
+def test_stage2_configuration_rejects_active_diffusion():
+    from models.radar_lidar_stage2.config import Stage2Config
+    try:
+        Stage2Config(diffusion_enabled=True)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("Diffusion must remain disabled")
+
+
+def test_nearer_return_prevents_free_label_behind_it():
+    grid = VoxelGrid((0., -1., -1.), (6., 1., 1.), (.5, .5, .5))
+    coords = torch.tensor([[0, 2, 2, 6]])
+    sites = SparseSites(coords, torch.ones(1, 4), grid.shape_zyx)
+    evidence = Stage1Output({"s1": sites}, sites.replace_features(torch.ones(1, 1)),
+                            {"s1": coords}, {})
+    domain = make_candidates(evidence, grid, confidence_threshold=.5, expansion_zyx=(0, 0, 0))
+    clean = torch.tensor([[[2.25, .25, .25, .1], [4.25, .25, .25, .2]]])
+    target = make_targets(domain, clean, torch.ones((1, 2), dtype=torch.bool),
+                          free_ray_tolerance_m=.25)
+    assert not bool(target.occupied[0])
+    assert not bool(target.known_free[0])

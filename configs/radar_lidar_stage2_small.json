@@ -1,0 +1,18 @@
+{
+  "channels": [24, 48, 96, 128],
+  "conditioning_dim": 32,
+  "query_radii_m": [0.6, 1.2, 2.4, 4.8],
+  "max_neighbors": 8,
+  "confidence_threshold": 0.25,
+  "expansion_zyx": [1, 1, 1],
+  "max_candidate_sites": 40000,
+  "occupancy_threshold": 0.5,
+  "occupancy_weight": 1.0,
+  "offset_weight": 1.0,
+  "positive_weight": 2.0,
+  "free_ray_tolerance_m": 0.15,
+  "checkpoint_metric": "geom_f1_0.2m",
+  "diffusion_enabled": false,
+  "stage1_frozen": true,
+  "point_geometry_loss_enabled": false
+}

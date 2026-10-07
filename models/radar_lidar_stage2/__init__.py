@@ -1,4 +1,4 @@
-"""Deterministic Stage-II representation audit; sparse network awaits ME probe."""
+"""Radar-only deterministic Stage-II sparse LiDAR reconstruction."""
 
 from .candidate_domain import CandidateDomain, make_candidates
 from .voxel_target import VoxelTargets, decode_centroids, make_targets
