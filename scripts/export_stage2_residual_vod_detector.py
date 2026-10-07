@@ -17,6 +17,7 @@ from tqdm import tqdm
 from Fault_Localization_Model.vod_dataset.vod_io import resolve_vod_public_root
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage2_residual.config import ResidualStage2Config
+from models.radar_lidar_stage2_residual.data import fault_region_from_metadata
 from models.radar_lidar_stage2_residual.model import ResidualRadarLidarStage2
 from scripts.export_stage2_vod_detector import detector_cloud
 from scripts.visualize_stage1_confidence_cloud import load_encoder
@@ -110,8 +111,7 @@ def main():
             continue
         faulty, _, meta = load_faulty_sample(args.fault_samples_root, "val", frame_id,
                                              args.fault_pattern)
-        if "point_filter" not in meta:
-            raise ValueError(f"Fault cache lacks point_filter: val/{frame_id}")
+        region = fault_region_from_metadata(meta, f"val/{frame_id}")
         batch = collate_stage1([sample])
         batch = {key: value.to(args.device) if isinstance(value, torch.Tensor) else value
                  for key, value in batch.items()}
@@ -119,7 +119,7 @@ def main():
         faulty_tensor = torch.from_numpy(faulty).to(args.device)[None]
         faulty_valid = torch.ones(faulty_tensor.shape[:2], device=args.device, dtype=torch.bool)
         output = model(evidence, stage1.config.grid, faulty_tensor, faulty_valid,
-                       [meta["point_filter"]])
+                       [region])
         generated = output.reconstructed_points_xyz.detach().cpu().numpy()
         points = detector_cloud(generated, faulty, mode="merged")
         temporary = destination.with_suffix(".bin.tmp")

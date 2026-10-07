@@ -12,7 +12,9 @@ from models.radar_lidar_stage1.config import VoxelGrid
 from models.radar_lidar_stage2.candidate_domain import CandidateDomain, voxel_centers_xyz
 from models.radar_lidar_stage2_residual.config import ResidualStage2Config
 from models.radar_lidar_stage2_residual.coverage import faulty_coverage
-from models.radar_lidar_stage2_residual.data import PairedFaultDataset, collate_paired, within_fault_region
+from models.radar_lidar_stage2_residual.data import (
+    PairedFaultDataset, collate_paired, fault_region_from_metadata, within_fault_region,
+)
 from models.radar_lidar_stage2_residual.losses import residual_loss
 from models.radar_lidar_stage2_residual.model import ResidualOutput
 from models.radar_lidar_stage2_residual.targets import make_residual_targets
@@ -99,6 +101,19 @@ def test_fault_region_matches_cache_range_and_bev_filter():
     assert within_fault_region(xyz, REGION).tolist() == [True, False, False]
 
 
+def test_full_scan_marker_replaces_the_missing_crop_metadata():
+    region = fault_region_from_metadata({"range_view_full_scan": True}, "sample.npz")
+    xyz = np.array([[1., 0., 0.], [9., 0., 0.], [-7., 4., 2.]], np.float32)
+    assert region == {"full_scan": True}
+    assert within_fault_region(xyz, region).tolist() == [True, True, True]
+    try:
+        fault_region_from_metadata({}, "ambiguous.npz")
+    except ValueError as error:
+        assert "Cannot determine" in str(error)
+    else:
+        raise AssertionError("Missing crop and full-scan marker must fail closed")
+
+
 def test_global_missing_metric_counts_clean_points_beyond_candidate_domain():
     domain = _domain((2, 8, 8))
     clean = torch.tensor([[[1.25, .25, .25, .1], [2.25, 1.25, .25, .1]]])
@@ -142,3 +157,26 @@ def test_fault_cache_pairing_and_clean_crop():
         assert batch["clean_lidar_valid"].sum() == 1
         assert batch["faulty_lidar_valid"].sum() == 1
         assert batch["fault_region"] == [REGION]
+
+
+def test_full_scan_cache_keeps_clean_targets_uncropped():
+    class FakeBase:
+        def __init__(self, *args, **kwargs):
+            self.frames = [SimpleNamespace(frame_id="00001")]
+
+        def __getitem__(self, index):
+            return {"frame_id": "00001", "split": "train",
+                    "radar": torch.zeros((1, 7)),
+                    "clean_lidar": torch.tensor([[1., 0., 0., .1], [9., 0., 0., .2]])}
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        (root / "train").mkdir()
+        np.savez(root / "train" / "00001_fov_filter_s1.npz",
+                 faulty_lidar_points=np.array([[1., 0., 0., .1]], np.float32),
+                 metadata_json=np.asarray(json.dumps({"frame_id": "00001", "split": "train",
+                                                      "range_view_full_scan": True})))
+        with patch("models.radar_lidar_stage2_residual.data.VoDStage1Dataset", FakeBase):
+            sample = PairedFaultDataset(root, root, "train", radar_variant="test")[0]
+        assert len(sample["clean_lidar"]) == 2
+        assert sample["fault_region"] == {"full_scan": True}

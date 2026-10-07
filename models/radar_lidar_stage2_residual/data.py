@@ -14,12 +14,32 @@ from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 
 def within_fault_region(xyz: np.ndarray, region: dict) -> np.ndarray:
     """The cache injected faults only after this range and BEV crop."""
+    if region.get("full_scan") is True:
+        return np.isfinite(xyz).all(axis=1)
     r = np.linalg.norm(xyz, axis=1)
     x0, x1 = region["x_range"]
     y0, y1 = region["y_range"]
     return ((r >= region["min_range_m"]) & (r <= region["max_range_m"])
             & (xyz[:, 0] >= x0) & (xyz[:, 0] < x1)
             & (xyz[:, 1] >= y0) & (xyz[:, 1] < y1))
+
+
+def fault_region_from_metadata(metadata: dict, path: str | Path) -> dict:
+    """Accept cropped BEV artifacts and explicitly marked full-scan artifacts.
+
+    A missing point_filter alone cannot establish that the faulty scan is
+    complete. The range-view cache intentionally removes this field after
+    regenerating faults on the entire original LiDAR scan.
+    """
+    region = metadata.get("point_filter")
+    if region is not None:
+        if not isinstance(region, dict) or not all(k in region for k in
+               ("x_range", "y_range", "min_range_m", "max_range_m")):
+            raise ValueError(f"Invalid cache point_filter metadata: {path}")
+        return region
+    if metadata.get("range_view_full_scan") is True:
+        return {"full_scan": True}
+    raise ValueError(f"Cannot determine faulty LiDAR spatial coverage: {path}")
 
 
 class PairedFaultDataset(Dataset):
@@ -50,10 +70,7 @@ class PairedFaultDataset(Dataset):
             raise ValueError(f"Fault cache/frame mismatch: {path}")
         if points.ndim != 2 or points.shape[1] != 4 or not np.isfinite(points).all():
             raise ValueError(f"Invalid faulty XYZI: {path}")
-        region = meta.get("point_filter")
-        if not isinstance(region, dict) or not all(k in region for k in
-                 ("x_range", "y_range", "min_range_m", "max_range_m")):
-            raise ValueError(f"Missing cache point_filter metadata: {path}")
+        region = fault_region_from_metadata(meta, path)
         clean = sample["clean_lidar"].numpy()
         sample["clean_lidar"] = torch.from_numpy(clean[within_fault_region(clean[:, :3], region)].copy())
         if not bool(within_fault_region(points[:, :3], region).all()):

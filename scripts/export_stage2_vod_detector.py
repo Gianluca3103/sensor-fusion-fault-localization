@@ -22,6 +22,7 @@ from models.radar_lidar_stage2.config import Stage2Config
 from models.radar_lidar_stage2.reconstruction_model import RadarLidarStage2
 from models.radar_lidar_stage2.voxel_target import decode_centroids
 from models.radar_lidar_stage2_residual.coverage import faulty_coverage
+from models.radar_lidar_stage2_residual.data import fault_region_from_metadata
 from scripts.export_vod_pvrcnn import detector_points
 from scripts.visualize_stage1_confidence_cloud import load_encoder
 from scripts.visualize_stage2_reconstruction import load_faulty_sample
@@ -174,12 +175,11 @@ def main() -> None:
             faulty, _, fault_meta = load_faulty_sample(args.fault_samples_root, "val",
                                                        frame_id, args.fault_pattern)
         if args.exclude_observed_rays:
-            if "point_filter" not in fault_meta:
-                raise ValueError(f"Fault cache lacks point_filter for val/{frame_id}")
+            region = fault_region_from_metadata(fault_meta, f"val/{frame_id}")
             faulty_tensor = torch.from_numpy(faulty).to(args.device)[None]
             faulty_valid = torch.ones(faulty_tensor.shape[:2], dtype=torch.bool, device=args.device)
             coverage = faulty_coverage(output.domain, faulty_tensor, faulty_valid,
-                                       [fault_meta["point_filter"]])
+                                       [region])
             selected = (output.occupancy_probability > config.occupancy_threshold) & coverage.may_add
             generated = decode_centroids(output.domain, output.predicted_offsets)[selected].detach().cpu().numpy()
         else:

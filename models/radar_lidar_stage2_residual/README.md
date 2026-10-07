@@ -28,8 +28,10 @@ Diffusion remains **off**.
 Fog can move or add faulty returns. This additive model retains those returns
 and its observed-ray mask can suppress a valid addition behind a fog ghost.
 That limitation must be measured by fault type; this model does not repair
-false returns. The cache `point_filter` defines the region where the fault was
-injected; candidates outside it are neither learned nor exported.
+false returns. For cropped cache artifacts, `point_filter` defines the region
+where the fault was injected; candidates outside it are neither learned nor
+exported. For the staged full-scan cache, `range_view_full_scan=true` explicitly
+marks the whole LiDAR scan as the affected region.
 
 ## Professor-machine smoke test and training
 
