@@ -20,6 +20,8 @@ from Fault_Localization_Model.vod_dataset.vod_io import resolve_vod_public_root
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage2.config import Stage2Config
 from models.radar_lidar_stage2.reconstruction_model import RadarLidarStage2
+from models.radar_lidar_stage2.voxel_target import decode_centroids
+from models.radar_lidar_stage2_residual.coverage import faulty_coverage
 from scripts.export_vod_pvrcnn import detector_points
 from scripts.visualize_stage1_confidence_cloud import load_encoder
 from scripts.visualize_stage2_reconstruction import load_faulty_sample
@@ -69,6 +71,8 @@ def main() -> None:
                         help="Required for merged mode; contains val/*.npz")
     parser.add_argument("--fault-pattern", default="*",
                         help="Select one fault variant per validation frame")
+    parser.add_argument("--exclude-observed-rays", action="store_true",
+                        help="Ablation: suppress legacy generated points on surviving faulty rays")
     parser.add_argument("--stage1-checkpoint", type=Path,
                         help="Override the path saved in the Stage-II checkpoint")
     parser.add_argument("--limit", type=int,
@@ -79,6 +83,8 @@ def main() -> None:
         parser.error("--limit must be positive")
     if args.mode == "merged" and args.fault_samples_root is None:
         parser.error("--fault-samples-root is required in merged mode")
+    if args.exclude_observed_rays and args.mode != "merged":
+        parser.error("--exclude-observed-rays requires merged mode")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -128,6 +134,8 @@ def main() -> None:
         "fault_samples_root": (str(args.fault_samples_root.resolve())
                                if args.fault_samples_root else None),
         "fault_pattern": args.fault_pattern if args.mode == "merged" else None,
+        "exclude_observed_rays": args.exclude_observed_rays,
+        "observed_ray_tolerance_m": 0.1 if args.exclude_observed_rays else None,
         "generated_intensity": 0.0,
         "reconstruction_model_uses_faulty_lidar": False,
         "faulty_lidar_merged_after_inference": args.mode == "merged",
@@ -160,11 +168,22 @@ def main() -> None:
                  for key, value in batch.items()}
         evidence = stage1(batch["radar"], batch["radar_valid"], defer_diagnostics=True)
         output = model(evidence, stage1.config.grid)
-        generated = output.reconstructed_points_xyz.detach().cpu().numpy()
         faulty = None
+        fault_meta = None
         if args.mode == "merged":
-            faulty, _, _ = load_faulty_sample(args.fault_samples_root, "val",
-                                              frame_id, args.fault_pattern)
+            faulty, _, fault_meta = load_faulty_sample(args.fault_samples_root, "val",
+                                                       frame_id, args.fault_pattern)
+        if args.exclude_observed_rays:
+            if "point_filter" not in fault_meta:
+                raise ValueError(f"Fault cache lacks point_filter for val/{frame_id}")
+            faulty_tensor = torch.from_numpy(faulty).to(args.device)[None]
+            faulty_valid = torch.ones(faulty_tensor.shape[:2], dtype=torch.bool, device=args.device)
+            coverage = faulty_coverage(output.domain, faulty_tensor, faulty_valid,
+                                       [fault_meta["point_filter"]])
+            selected = (output.occupancy_probability > config.occupancy_threshold) & coverage.may_add
+            generated = decode_centroids(output.domain, output.predicted_offsets)[selected].detach().cpu().numpy()
+        else:
+            generated = output.reconstructed_points_xyz.detach().cpu().numpy()
         points = detector_cloud(generated, faulty, mode=args.mode)
         temporary = destination.with_suffix(".bin.tmp")
         points.tofile(temporary)
