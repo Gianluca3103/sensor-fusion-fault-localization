@@ -39,7 +39,7 @@ def config_from_dict(values: dict) -> Stage1Config:
 
 def save_checkpoint(path: Path, model: RadarLidarStage1, optimizer, scheduler, epoch: int, step: int, validation: dict, data: dict | None = None, best_scores: dict | None = None) -> None:
     path.parent.mkdir(parents=True,exist_ok=True)
-    torch.save({"config":model.config.as_dict(),"model":model.state_dict(),"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),"epoch":epoch,"step":step,"validation":validation,"data":data or {},"best_scores":best_scores or {},"confidence_calibrated":model.radar_only.confidence_calibrated,"confidence_trained":model.radar_only.confidence_trained},path)
+    torch.save({"config":model.config.as_dict(),"model":model.state_dict(),"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),"epoch":epoch,"step":step,"validation":validation,"data":data or {},"best_scores":best_scores or {},"region_metric_uncapped":model.config.surface_region_enabled,"confidence_calibrated":model.radar_only.confidence_calibrated,"confidence_trained":model.radar_only.confidence_trained},path)
 
 
 def export_radar_only(path: Path, model: RadarLidarStage1, data: dict | None = None) -> None:
@@ -192,7 +192,7 @@ def _console(epoch,epochs,train,validation):
         print(f"  legacy radar-site confidence is unused | valid/no corr {c['valid_corr_query_count']}/{c['no_corr_query_count']}",flush=True)
         region=m.get("support_region")
         if region:
-            print(f"  region cells {region['active_cells']} | near clean .5m {_pct(region['precision_within_0.5m'])} | clean coverage {_pct(region['supported_clean_coverage'])} | isolated {_pct(region['isolated_cell_fraction'])} | skipped patches {region['skipped_patches']}",flush=True)
+            print(f"  region cells {region['active_cells']} | near clean .5m {_pct(region['precision_within_0.5m'])} | clean coverage {_pct(region['supported_clean_coverage'])} | isolated {_pct(region['isolated_cell_fraction'])} | proposals {region['accepted_patches']}",flush=True)
     else:
         print(f"  conf mean {q['mean'] if q['mean'] is not None else float('nan'):.3f} ECE {q['ece'] if q['ece'] is not None else float('nan'):.3f} | tau .5 coverage {_pct(half['coverage'])} precision {_pct(half['precision'])} | valid/no corr {c['valid_corr_query_count']}/{c['no_corr_query_count']}",flush=True)
 
@@ -260,6 +260,11 @@ def main() -> None:
         start_epoch=checkpoint["epoch"]+1
         step=checkpoint["step"]
         best_scores=checkpoint.get("best_scores",{})
+        if config.surface_region_enabled and not checkpoint.get("region_metric_uncapped",False):
+            # A capped region F1 is not comparable to the complete-domain
+            # metric. Let the next validation select a fresh best checkpoint.
+            best_scores.pop("selected",None)
+            print("Resuming with uncapped region evaluation; resetting best_selected score",flush=True)
         model.radar_only.confidence_trained=bool(checkpoint.get("confidence_trained",False))
     interactive_progress=sys.stderr.isatty()
     for epoch in range(start_epoch,args.epochs+1):

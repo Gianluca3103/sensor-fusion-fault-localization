@@ -42,10 +42,10 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path,
                         help="Defaults to input root; existing HTML views will be replaced")
     parser.add_argument("--frame-id", nargs="+", required=True)
-    parser.add_argument("--max-plot-points", type=int, default=30000,
-                        help="Cap for radar and model points only; clean LiDAR is never capped")
+    parser.add_argument("--max-plot-points", type=int,
+                        help="Optional display limit when explicitly requested; default shows all points")
     args = parser.parse_args()
-    if args.max_plot_points < 1:
+    if args.max_plot_points is not None and args.max_plot_points < 1:
         parser.error("--max-plot-points must be positive")
     destination = args.output_root or args.input_root
     destination.mkdir(parents=True, exist_ok=True)
@@ -67,7 +67,7 @@ def main() -> None:
         counts = save_viewer(output, frame_id=frame_id, epoch=metadata.get("epoch"),
                              radar=radar, lidar=clean, sites=sites, confidence=confidence,
                              limits=limits,
-                             max_points=max(args.max_plot_points,len(sites)) if region else args.max_plot_points,
+                             max_points=args.max_plot_points,
                              trained=bool(metadata.get("confidence_trained", False)) or surface or region,
                              calibrated=False,
                              third_name="Predicted LiDAR support region" if region else

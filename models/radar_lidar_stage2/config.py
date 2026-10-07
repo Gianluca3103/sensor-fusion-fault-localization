@@ -15,7 +15,7 @@ class Stage2Config:
     max_neighbors: int = 8
     confidence_threshold: float = 0.25
     expansion_zyx: tuple[int, int, int] = (1, 1, 1)
-    max_candidate_sites: int = 40_000
+    max_candidate_sites: int | None = None  # Optional legacy point-proposal limit; learned regions are uncapped.
     occupancy_threshold: float = 0.5
     occupancy_weight: float = 1.0
     offset_weight: float = 1.0
@@ -35,7 +35,7 @@ class Stage2Config:
             raise ValueError("Invalid conditioning capacity")
         if not 0 <= self.confidence_threshold <= 1 or not 0 <= self.occupancy_threshold <= 1:
             raise ValueError("Thresholds must be in [0,1]")
-        if self.max_candidate_sites < 1 or self.positive_weight <= 0:
+        if (self.max_candidate_sites is not None and self.max_candidate_sites < 1) or self.positive_weight <= 0:
             raise ValueError("Invalid candidate cap or positive weight")
         if min(self.occupancy_weight, self.offset_weight) < 0 or self.free_ray_tolerance_m <= 0:
             raise ValueError("Loss weights must be nonnegative and free-ray tolerance positive")

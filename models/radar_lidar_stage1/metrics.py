@@ -52,8 +52,8 @@ class Stage1MetricAccumulator:
                       "precision_hits_0.2m":0,"recall_hits_0.2m":0,
                       "precision_hits_0.5m":0,"recall_hits_0.5m":0}
         self.region={"active_cells":0,"cells_near_clean_0.5m":0,
-                     "covered_supported_clean_cells":0,"skipped_patches":0,
-                     "accepted_patches":0,"isolated_cells":0,"frames_at_cap":0}
+                     "covered_supported_clean_cells":0,
+                     "accepted_patches":0,"isolated_cells":0}
 
     @torch.no_grad()
     def update(self,model,radar,radar_valid,clean,clean_valid,*,intermediates=None):
@@ -168,12 +168,9 @@ class Stage1MetricAccumulator:
                 # Match the exact sparse domain Stage II would receive. Clean
                 # is used only to audit it, never to construct it.
                 from models.radar_lidar_stage2.candidate_domain import make_candidates
-                domain=make_candidates(output,self.config.grid,confidence_threshold=.25,
-                                       max_sites=40000)
+                domain=make_candidates(output,self.config.grid,confidence_threshold=.25)
                 self.region["active_cells"]+=len(domain.coordinates)
-                self.region["skipped_patches"]+=domain.counts["skipped_regions_due_to_cap"]
-                self.region["accepted_patches"]+=domain.counts["selected_seeds_after_cap"]
-                self.region["frames_at_cap"]+=int(domain.counts["cap_applied"])
+                self.region["accepted_patches"]+=domain.counts["accepted_region_proposals"]
                 if len(domain.coordinates):
                     coords=domain.coordinates.detach().cpu().numpy()
                     keys=encode_keys(domain.coordinates,self.config.grid.shape_zyx).detach().cpu().numpy()
@@ -242,7 +239,7 @@ class Stage1MetricAccumulator:
                 "f1":2*precision*coverage/(precision+coverage)
                       if coverage is not None and precision+coverage else (0.0 if coverage is not None else None),
                 "isolated_cell_fraction":self.region["isolated_cells"]/active if active else 0.0,
-                "score_threshold":0.25,"max_sites_per_frame":40000}
+                "score_threshold":0.25}
         total_valid=0; total_queries=0; total_knn=0; total_hits={k:0 for k in (1,5,10)}; arrays=[]
         for name,row in self.scales.items():
             valid=row["valid_corr_query_count"]; query=row["query_count"]

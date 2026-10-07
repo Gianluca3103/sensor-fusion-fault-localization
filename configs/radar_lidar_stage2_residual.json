@@ -5,7 +5,7 @@
   "max_neighbors": 8,
   "confidence_threshold": 0.25,
   "expansion_zyx": [1, 1, 1],
-  "max_candidate_sites": 40000,
+  "max_candidate_sites": null,
   "occupancy_threshold": 0.5,
   "occupancy_weight": 1.0,
   "offset_weight": 1.0,

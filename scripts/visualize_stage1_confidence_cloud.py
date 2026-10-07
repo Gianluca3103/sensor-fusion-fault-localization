@@ -78,7 +78,7 @@ def display_subset(xyz: np.ndarray, maximum: int | None, limits: tuple[float, ..
 
 def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarray,
                 lidar: np.ndarray, sites: np.ndarray, confidence: np.ndarray,
-                limits: tuple[float, ...], max_points: int, trained: bool,
+                limits: tuple[float, ...], max_points: int | None, trained: bool,
                 calibrated: bool, third_name: str = "Stage-I confidence",
                 stage_name: str = "Stage-I", description: str | None = None,
                 notice: str | None = None, score_name: str = "Confidence",
@@ -87,8 +87,8 @@ def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarr
     clouds = []
     for name, xyz, values in (("Radar", radar, None), ("Clean LiDAR", lidar, None),
                               (third_name, sites, confidence)):
-        # Keep every clean LiDAR point inside the common 3D crop. Only sparse
-        # overlays may use the plotting cap.
+        # Show every point in the common 3D crop by default. An explicit
+        # max_points argument is available only for callers that request it.
         shown, selected_values, in_view = display_subset(
             xyz, None if name == "Clean LiDAR" else max_points, limits, values)
         clouds.append({"name": name, "total": len(xyz), "in_view": in_view,
@@ -131,7 +131,7 @@ h2{font-size:15px;margin:0 0 5px}canvas{width:100%;height:70vh;max-height:780px;
 <label><input id="overlay-compare" type="checkbox"> Overlay <span id="overlay-name"></span> on third panel</label>
 <button id="zoom-in">Zoom in</button><button id="zoom-out">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><div class="legend"><span id="legend-name"></span> 0 <span class="ramp"></span> 1 · colors show a model score, not measured surface accuracy</div>
-<p id="notice"></p><p>The confidence slider filters model points only. Raw radar is hidden in the third panel by default. All clean LiDAR points within the shared display crop are shown. PLY files retain the full clouds.</p>
+<p id="notice"></p><p>The confidence slider filters model points only. Raw radar is hidden in the third panel by default. All points within the shared display crop are shown by default. PLY files retain the full clouds.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -213,11 +213,10 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--radar-variant", help="Override checkpoint radar variant")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--max-plot-points", type=int, default=30000,
-                        help="Cap radar and model points only; clean LiDAR is never capped")
+    parser.add_argument("--max-plot-points", type=int,
+                        help="Optional display limit when explicitly requested; default shows all points")
     parser.add_argument("--support-threshold", type=float, default=0.25,
                         help="Proposal score threshold used to create the support region")
-    parser.add_argument("--max-candidate-sites", type=int, default=40000)
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=80.0)
     parser.add_argument("--y-min", type=float, default=-40.0)
@@ -225,10 +224,10 @@ def main() -> None:
     parser.add_argument("--z-min", type=float, default=-5.0)
     parser.add_argument("--z-max", type=float, default=7.0)
     args = parser.parse_args()
-    if args.max_plot_points < 1:
+    if args.max_plot_points is not None and args.max_plot_points < 1:
         parser.error("--max-plot-points must be positive")
-    if not 0 <= args.support_threshold <= 1 or args.max_candidate_sites < 1:
-        parser.error("Support threshold must be in [0,1] and candidate cap positive")
+    if not 0 <= args.support_threshold <= 1:
+        parser.error("Support threshold must be in [0,1]")
     limits = (args.x_min, args.x_max, args.y_min, args.y_max, args.z_min, args.z_max)
     if any(a >= b for a, b in zip(limits[::2], limits[1::2])):
         parser.error("Each display crop minimum must be smaller than its maximum")
@@ -250,8 +249,7 @@ def main() -> None:
         region_counts = None
         if output.surface is not None and output.surface.radii_xyz is not None:
             domain = make_candidates(output,model.config.grid,
-                                     confidence_threshold=args.support_threshold,
-                                     max_sites=args.max_candidate_sites)
+                                     confidence_threshold=args.support_threshold)
             sites = domain.centers_xyz.cpu().numpy()
             confidence = domain.confidence.cpu().numpy()
             region_counts = domain.counts
@@ -285,7 +283,7 @@ def main() -> None:
         counts = save_viewer(prefix.with_suffix(".html"), frame_id=sample["frame_id"],
                              epoch=saved.get("epoch"), radar=radar[:, :3],
                              lidar=lidar[:, :3], sites=sites, confidence=confidence,
-                             limits=limits, max_points=max(args.max_plot_points,len(sites)) if region_counts else args.max_plot_points,
+                             limits=limits, max_points=args.max_plot_points,
                              trained=model.confidence_trained or output.surface is not None,
                              calibrated=False, third_name=third_name,
                              description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "

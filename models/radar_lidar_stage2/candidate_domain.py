@@ -1,4 +1,4 @@
-"""Bounded sparse candidate coordinates from Stage-I radar-only confidence.
+"""Sparse candidate coordinates from Stage-I radar-only confidence.
 
 Candidate coordinates mean 'worth considering', never 'occupied LiDAR'.
 No clean or faulty LiDAR data are accepted by this module.
@@ -39,12 +39,8 @@ class CandidateDomain:
 
 
 def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
-                            confidence_threshold: float, max_sites: int) -> CandidateDomain:
-    """Rasterize complete learned support patches into connected fine cells.
-
-    Stronger proposals are considered first. A patch is skipped if admitting
-    it would exceed the cap; no patch is cut into a misleading fragment.
-    """
+                            confidence_threshold: float) -> CandidateDomain:
+    """Rasterize every accepted learned support patch into connected fine cells."""
     surface=output.surface
     assert surface is not None and surface.radii_xyz is not None
     xyz=surface.xyz.detach().cpu().numpy().reshape(-1,3).astype(np.float64)
@@ -58,13 +54,12 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
                     else output.features["s1"].coords[:,0].detach().cpu().numpy(),
                     surface.xyz.shape[1])
     selected=np.flatnonzero(scores>confidence_threshold)
-    selected=selected[np.argsort(-scores[selected],kind="stable")]
     origin=np.asarray(grid.minimum_xyz,dtype=np.float64)
     step=np.asarray(grid.size_xyz,dtype=np.float64)
     shape_xyz=np.asarray(grid.shape_zyx[::-1],dtype=np.int64)
     z_size,y_size,x_size=grid.shape_zyx
     values: dict[int,float]={}
-    accepted=skipped=0
+    accepted=0
     for proposal in selected:
         low=np.maximum(0,np.ceil((xyz[proposal]-radii[proposal]-origin)/step-.5).astype(np.int64))
         high=np.minimum(shape_xyz-1,np.floor((xyz[proposal]+radii[proposal]-origin)/step-.5).astype(np.int64))
@@ -81,10 +76,6 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
             continue
         cells=grid_xyz[inside]
         cell_keys=(((int(batch[proposal])*z_size+cells[:,2])*y_size+cells[:,1])*x_size+cells[:,0]).astype(np.int64)
-        new_count=sum(int(key) not in values for key in cell_keys)
-        if len(values)+new_count>max_sites:
-            skipped+=1
-            continue
         weighted=scores[proposal]*(1-.5*squared[inside])
         for key,score in zip(cell_keys,weighted):
             item=int(key)
@@ -102,23 +93,21 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
             "initial_surface_proposals":len(scores),
             "seed_source":"learned_surface_region",
             "candidate_sites_after_confidence":len(selected),
-            "selected_seeds_after_cap":accepted,
-            "skipped_regions_due_to_cap":skipped,
+            "accepted_region_proposals":accepted,
             "expanded_candidate_sites":len(coordinates),
-            "candidate_expansion_ratio":len(coordinates)/max(accepted,1),
-            "cap_applied":int(skipped>0)}
+            "candidate_expansion_ratio":len(coordinates)/max(accepted,1)}
     return CandidateDomain(coordinates,propagated,grid,counts)
 
 
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
                     confidence_threshold: float = 0.25,
                     expansion_zyx: tuple[int, int, int] = (1, 1, 1),
-                    max_sites: int = 100_000) -> CandidateDomain:
+                    max_sites: int | None = None) -> CandidateDomain:
     if not 0 <= confidence_threshold <= 1:
         raise ValueError("Confidence threshold must be in [0,1]")
     if len(expansion_zyx) != 3 or any(not isinstance(v, int) or v < 0 for v in expansion_zyx):
         raise ValueError("Expansion radius must contain three non-negative voxel counts")
-    if max_sites < 1:
+    if max_sites is not None and max_sites < 1:
         raise ValueError("max_sites must be positive")
     fine = output.features["s1"]
     confidence = output.confidence
@@ -138,7 +127,7 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
                 or (surface.anchor_batch is not None and
                     (surface.anchor_xyz is None or surface.anchor_xyz.shape != (anchor_count,3)))):
             raise ValueError("Stage-I support region shapes differ from radar-pattern anchors")
-        return _make_region_candidates(output,grid,confidence_threshold,max_sites)
+        return _make_region_candidates(output,grid,confidence_threshold)
     if output.surface is None:
         # Legacy Stage-I checkpoints have scores only at radar-occupied cells.
         seed_coords = fine.coords
@@ -168,15 +157,16 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
     chosen = torch.nonzero((scores > confidence_threshold) & inside, as_tuple=False).flatten()
     offsets = torch.tensor(list(product(*(range(-r, r + 1) for r in expansion_zyx))),
                            dtype=torch.long, device=fine.coords.device)
-    if max_sites < len(offsets):
+    if max_sites is not None and max_sites < len(offsets):
         raise ValueError("max_sites is smaller than one expanded neighborhood")
     selected_total = len(chosen)
     chosen = chosen[torch.argsort(scores[chosen], descending=True, stable=True)]
     # Bound temporary expansion memory to four times the final site budget.
     # Count *unique* sites, so overlapping neighborhoods do not cause an
     # unnecessarily severe seed cap. Binary search keeps the strongest seeds.
-    max_proposals = max_sites * 4
-    chosen = chosen[:max_proposals // len(offsets)]
+    if max_sites is not None:
+        max_proposals = max_sites * 4
+        chosen = chosen[:max_proposals // len(offsets)]
     def expanded_keys(seed_count: int) -> tuple[torch.Tensor, torch.Tensor]:
         seeds = seed_coords[chosen[:seed_count]].long()
         expanded = seeds[:, None, :].expand(-1, len(offsets), -1).clone()
@@ -185,7 +175,7 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         return encode_keys(expanded[valid], grid.shape_zyx), scores[chosen[:seed_count], None].expand(-1, len(offsets))[valid]
 
     raw_keys, seed_scores = expanded_keys(len(chosen))
-    if len(raw_keys) and len(torch.unique(raw_keys)) > max_sites:
+    if max_sites is not None and len(raw_keys) and len(torch.unique(raw_keys)) > max_sites:
         low, high = 0, len(chosen)
         while low + 1 < high:
             middle = (low + high) // 2

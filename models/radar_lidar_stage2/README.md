@@ -24,12 +24,12 @@ fusion with observed LiDAR.
   aggregated with inverse-distance weights, projected, and fused with
   candidate confidence and normalized position.
 - Stage-I candidate confidence above `confidence_threshold` activates an
-  entire learned support patch when region extents are present. The candidate
-  cap accepts complete patches in score order. Point-only checkpoints use a
-  bounded fixed neighborhood; legacy checkpoints use radar S1 voxel centers.
-  `max_candidate_sites` caps the **fixed** sparse domain. Candidate means
-  *eligible for prediction*, never occupied. The cap and candidate coverage
-  must be reported with reconstruction performance.
+  entire learned support patch when region extents are present. Every patch
+  above threshold is rasterized; learned-region support has no arbitrary site
+  cap. Point-only checkpoints use a fixed neighborhood; legacy checkpoints use
+  radar S1 voxel centers. Candidate means *eligible for prediction*, never
+  occupied. Report active-site counts and candidate coverage with reconstruction
+  performance; memory use grows with the number of active sites.
 - Each candidate predicts an occupancy logit and an XYZ centroid offset
   bounded to ±0.5 voxel. An occupied prediction decodes to one XYZ point and
   retains its supporting confidence. This is a V1 representation, not a claim
@@ -81,8 +81,8 @@ Once that succeeds, remove the sample limits and use a new output directory.
 The trainer writes `last.ckpt`, `best_geom.ckpt`, and `metrics.jsonl`. Best
 selection uses held-out geometry F1 at 0.2 m by default. Training prints a
 compact progress bar and an epoch summary. Batch size 1 is a conservative
-starting point for 40,000 candidate sites and four sparse U-Net levels; raise
-it after checking peak GPU memory.
+starting point for four sparse U-Net levels; raise it after checking peak GPU
+memory on full candidate regions.
 
 ## Evaluation and inspection
 

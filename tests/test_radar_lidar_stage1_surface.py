@@ -67,7 +67,7 @@ class SurfaceStage1Tests(unittest.TestCase):
         self.assertEqual(len(domain.confidence), 1)
         self.assertAlmostEqual(float(domain.confidence[0]), .9, places=5)
 
-    def test_learned_region_activates_connected_cells_and_is_never_partially_capped(self):
+    def test_learned_region_activates_all_connected_cells_without_a_cap(self):
         radar_cell = torch.tensor([[0,2,2,2]], dtype=torch.long)
         fine = SparseSites(radar_cell, torch.ones((1,8)), GRID.shape_zyx)
         confidence = fine.replace_features(torch.tensor([[.99]]))
@@ -92,10 +92,10 @@ class SurfaceStage1Tests(unittest.TestCase):
                         (b,z,y+1,x),(b,z,y-1,x),(b,z,y,x+1),(b,z,y,x-1))
                         if neighbor in cells and neighbor not in reached)
         self.assertEqual(reached,cells)
-        capped=make_candidates(evidence,GRID,confidence_threshold=.25,
-                               expansion_zyx=(0,0,0),max_sites=10)
-        self.assertEqual(len(capped.coordinates),0)
-        self.assertEqual(capped.counts["skipped_regions_due_to_cap"],1)
+        uncapped=make_candidates(evidence,GRID,confidence_threshold=.25,
+                                 expansion_zyx=(0,0,0),max_sites=10)
+        self.assertEqual(len(uncapped.coordinates),len(region.coordinates))
+        self.assertEqual(uncapped.counts["accepted_region_proposals"],1)
 
     def test_region_coverage_loss_trains_extent(self):
         torch.manual_seed(8)
@@ -157,6 +157,12 @@ class SurfaceStage1Tests(unittest.TestCase):
                                  trained=True,calibrated=False)
             self.assertEqual(counts["Radar"]["shown"], 2)
             self.assertEqual(counts["Clean LiDAR"]["shown"], 6)
+            full=save_viewer(Path(directory)/"full.html",frame_id="00000",epoch=1,
+                             radar=xyz,lidar=xyz,sites=xyz,
+                             confidence=np.ones(6,np.float32),
+                             limits=(-1,10,-1,1,-1,1),max_points=None,
+                             trained=True,calibrated=False)
+            self.assertTrue(all(row["shown"]==6 for row in full.values()))
             html = path.read_text(encoding="utf-8")
             self.assertIn('id="overlay-radar" type="checkbox">',html)
             payload = json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',html).group(1))

@@ -31,7 +31,8 @@ def main() -> None:
     parser.add_argument("--expand-z", type=int, default=1)
     parser.add_argument("--expand-y", type=int, default=1)
     parser.add_argument("--expand-x", type=int, default=1)
-    parser.add_argument("--max-candidate-sites", type=int, default=100_000)
+    parser.add_argument("--max-candidate-sites", type=int,
+                        help="Optional legacy point-proposal limit; learned regions are always uncapped")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     encoder, saved = load_encoder(args.checkpoint, args.device)
