@@ -54,24 +54,38 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
     chosen = torch.nonzero(scores > confidence_threshold, as_tuple=False).flatten()
     offsets = torch.tensor(list(product(*(range(-r, r + 1) for r in expansion_zyx))),
                            dtype=torch.long, device=fine.coords.device)
-    # Limit seed count before expansion, so even zero-overlap neighborhoods
-    # cannot exceed max_sites. Prefer strongest evidence deterministically.
-    seed_cap = max_sites // len(offsets)
-    if seed_cap < 1:
+    if max_sites < len(offsets):
         raise ValueError("max_sites is smaller than one expanded neighborhood")
     selected_total = len(chosen)
-    if len(chosen) > seed_cap:
-        chosen = chosen[torch.argsort(scores[chosen], descending=True, stable=True)[:seed_cap]]
-    seeds = fine.coords[chosen].long()
-    expanded = seeds[:, None, :].expand(-1, len(offsets), -1).clone()
-    expanded[:, :, 1:] += offsets[None]
-    shape = torch.tensor(grid.shape_zyx, device=expanded.device)
-    valid = ((expanded[:, :, 1:] >= 0) & (expanded[:, :, 1:] < shape)).all(-1)
-    flat = expanded[valid]
-    seed_scores = scores[chosen, None].expand(-1, len(offsets))[valid]
-    if len(flat):
-        keys, inverse = torch.unique(encode_keys(flat, grid.shape_zyx),
-                                     sorted=True, return_inverse=True)
+    chosen = chosen[torch.argsort(scores[chosen], descending=True, stable=True)]
+    # Bound temporary expansion memory to four times the final site budget.
+    # Count *unique* sites, so overlapping neighborhoods do not cause an
+    # unnecessarily severe seed cap. Binary search keeps the strongest seeds.
+    max_proposals = max_sites * 4
+    chosen = chosen[:max_proposals // len(offsets)]
+    shape = torch.tensor(grid.shape_zyx, device=fine.coords.device)
+
+    def expanded_keys(seed_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+        seeds = fine.coords[chosen[:seed_count]].long()
+        expanded = seeds[:, None, :].expand(-1, len(offsets), -1).clone()
+        expanded[:, :, 1:] += offsets[None]
+        valid = ((expanded[:, :, 1:] >= 0) & (expanded[:, :, 1:] < shape)).all(-1)
+        return encode_keys(expanded[valid], grid.shape_zyx), scores[chosen[:seed_count], None].expand(-1, len(offsets))[valid]
+
+    raw_keys, seed_scores = expanded_keys(len(chosen))
+    if len(raw_keys) and len(torch.unique(raw_keys)) > max_sites:
+        low, high = 0, len(chosen)
+        while low + 1 < high:
+            middle = (low + high) // 2
+            trial_keys, _ = expanded_keys(middle)
+            if len(torch.unique(trial_keys)) <= max_sites:
+                low = middle
+            else:
+                high = middle
+        chosen = chosen[:low]
+        raw_keys, seed_scores = expanded_keys(len(chosen))
+    if len(raw_keys):
+        keys, inverse = torch.unique(raw_keys, sorted=True, return_inverse=True)
         coordinates = decode_keys(keys, grid.shape_zyx)
         propagated = scores.new_full((len(keys),), -torch.inf)
         propagated.scatter_reduce_(0, inverse, seed_scores, reduce="amax", include_self=True)
