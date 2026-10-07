@@ -61,6 +61,18 @@ python -m scripts.visualize_radar_lidar_stage1 \
 
 Validation reports per-scale and pooled local Recall@1/5/10 against **any** clean voxel inside the configured physical positive radius; XYZ localization distributions and thresholds; S1 probe precision/recall/F1 at 0.1/0.2/0.5 m; 10 confidence reliability bins and thresholds 0.1–0.9; no-correspondence counts; and object-instance retrieval when annotations exist. Counts are pooled across frames before rates are calculated. Geometry recall is over radar S1 sites with a clean target within the probe radius, not every clean point in the scene. ECE compares confidence to the *soft quality target*; binary geometric success at `geometry_eval_tolerance_m` is also shown in each bin. This is not full-cloud reconstruction precision/recall.
 
+To inspect the learned confidence in a rotatable, synchronized three-panel cloud, run:
+
+```bash
+python -m scripts.visualize_stage1_confidence_cloud \
+  --vod-root /path/to/view_of_delft_PUBLIC \
+  --checkpoint /path/to/stage1_run/best_selected.ckpt \
+  --split val --frame-id 08433 05001 \
+  --output-root /path/to/stage1_confidence_views --device cuda
+```
+
+Open an output `*_stage1.html` in a browser. The viewer has a confidence threshold slider and optional radar/LiDAR overlays; `*_confidence.ply` stores **all** radar-derived S1 voxel centers with a confidence property. The radar and clean-LiDAR PLY files also contain the full clouds. The HTML display crop and point cap affect only rendering, not inference or PLY exports. These confidence sites are **not** reconstructed LiDAR points, and the confidence score is not a calibrated probability unless separately validated.
+
 **Interpretation limits:** Because positives are *defined* as a clean voxel near a radar query, nearest-neighbor retrieval has Recall@1 of 100% on eligible queries. The required learned-feature Recall@1 is useful for tracking optimization, but cannot alone prove semantic correspondence. Compare it with the logged nearest-neighbor baseline, held-out object-instance retrieval, radar-only probe geometry, confidence reliability, and the shifted-radar audit. Shifted-radar retrieval uses the shifted positions to define new eligible queries and can stay high even for a bad model; fixed original clean-LiDAR anchor coverage is logged separately. S4's large physical voxels can dominate pooled metrics, so inspect S1 and other scales separately, especially for 0.2 m thresholds. A one-frame smoke checkpoint has no meaningful quality claim. Confidence targets are derived from an in-sample probe and can be optimistic; judge calibration on held-out validation and consider out-of-fold targets if a substantial train/validation gap appears.
 
 ## Backend and current verification
