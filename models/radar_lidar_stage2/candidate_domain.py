@@ -16,6 +16,15 @@ from models.radar_lidar_stage1.model import Stage1Output
 from models.radar_lidar_stage1.sparse import decode_keys, encode_keys
 
 
+def voxel_centers_xyz(coordinates: torch.Tensor, grid: VoxelGrid, *,
+                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Compute fine-grid centers without float32 error at distant cell indices."""
+    xyz = coordinates[:, [3, 2, 1]].to(torch.float64)
+    origin = torch.tensor(grid.minimum_xyz, dtype=torch.float64, device=coordinates.device)
+    size = torch.tensor(grid.size_xyz, dtype=torch.float64, device=coordinates.device)
+    return (origin + (xyz + 0.5) * size).to(dtype)
+
+
 @dataclass(frozen=True)
 class CandidateDomain:
     coordinates: torch.Tensor  # sorted unique [N,4] in (batch,z,y,x) order
@@ -25,7 +34,7 @@ class CandidateDomain:
 
     @property
     def centers_xyz(self) -> torch.Tensor:
-        return self.grid.centers_xyz(self.coordinates)
+        return voxel_centers_xyz(self.coordinates, self.grid)
 
 
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,

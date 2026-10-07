@@ -8,6 +8,7 @@ from models.radar_lidar_stage1.config import VoxelGrid
 from models.radar_lidar_stage1.model import Stage1Output
 from models.radar_lidar_stage1.sparse import SparseSites
 from models.radar_lidar_stage2 import decode_centroids, make_candidates, make_targets
+from models.radar_lidar_stage2.candidate_domain import CandidateDomain
 
 
 GRID = VoxelGrid((0., 0., 0.), (2., 2., 2.), (.5, .5, .5))
@@ -51,6 +52,34 @@ def test_clean_centroid_target_and_physical_decode():
     assert torch.allclose(targets.clean_centroid_xyz[0], expected)
     assert torch.allclose(decode_centroids(domain, targets.offsets_normalized)[0], expected)
     assert bool((targets.offsets_normalized.abs() <= .5).all())
+
+
+def test_target_at_float32_grid_boundary_stays_inside_cell():
+    # At x=y=0 the original float32 center calculation is 0.1000061 m;
+    # its normalized offset is -0.5000305, outside the cell.
+    grid = VoxelGrid()
+    coords = torch.tensor([[0, 128, 640, 640]])
+    domain = CandidateDomain(coords, torch.ones(1), grid, {})
+    clean = torch.zeros((1, 2000, 4), dtype=torch.float32)
+    valid = torch.ones((1, 2000), dtype=torch.bool)
+    target = make_targets(domain, clean, valid)
+    assert target.occupied.tolist() == [True]
+    assert target.clean_point_count.tolist() == [2000]
+    assert torch.all(target.offsets_normalized.abs() <= 0.5)
+    assert torch.allclose(decode_centroids(domain, target.offsets_normalized),
+                          torch.zeros((1, 3)), atol=1e-6)
+
+
+def test_roundoff_at_float32_voxel_boundary_is_projected_only_micrometres():
+    grid = VoxelGrid()
+    coords = torch.tensor([[0, 128, 640, 641]])
+    domain = CandidateDomain(coords, torch.ones(1), grid, {})
+    clean = torch.tensor([[[0.1999969482421875, 0., 0., 0.]]])
+    target = make_targets(domain, clean, torch.ones((1, 1), dtype=torch.bool))
+    assert target.occupied.tolist() == [True]
+    assert torch.all(target.offsets_normalized.abs() <= 0.5)
+    reconstructed = decode_centroids(domain, target.offsets_normalized)[0]
+    assert torch.linalg.vector_norm(reconstructed - clean[0, 0, :3]) < 1e-5
 
 
 def test_empty_candidate_is_not_automatically_occupied():

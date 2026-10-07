@@ -9,7 +9,7 @@ from scipy.spatial import cKDTree
 import torch
 
 from models.radar_lidar_stage1.sparse import encode_keys, voxelize
-from .candidate_domain import CandidateDomain
+from .candidate_domain import CandidateDomain, voxel_centers_xyz
 
 
 @dataclass(frozen=True)
@@ -60,21 +60,32 @@ def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
     matched = valid & (keys[position.clamp(max=n - 1)] == clean_keys)
     # First pool measured points by clean voxel, then transfer only matching
     # voxels into the candidate domain. This preserves the exact centroid.
-    voxel_sum = clean_lidar.new_zeros((len(clean_keys), 3)).index_add_(0, inverse, selected[:, :3])
+    # Summing absolute XYZ in float32 loses precision for dense, distant
+    # voxels. Accumulate offsets from each cell center in float64 instead.
+    clean_centers = voxel_centers_xyz(clean_coords, grid, dtype=torch.float64)
+    voxel_sum = torch.zeros((len(clean_keys), 3), dtype=torch.float64, device=keys.device)
+    voxel_sum.index_add_(0, inverse, selected[:, :3].double() - clean_centers[inverse])
     voxel_count = torch.zeros(len(clean_keys), dtype=torch.long, device=keys.device)
     voxel_count.index_add_(0, inverse, torch.ones_like(inverse))
-    centroid_by_clean = voxel_sum / voxel_count.clamp_min(1)[:, None]
+    centroid_offset = voxel_sum / voxel_count.clamp_min(1)[:, None]
+    centroid_by_clean = clean_centers + centroid_offset
     dest = position[matched]
     occupied[dest] = True
     counts[dest] = voxel_count[matched]
-    centroids[dest] = centroid_by_clean[matched]
-    sizes = centroids.new_tensor(grid.size_xyz)
-    normalized[dest] = (centroids[dest] - grid.centers_xyz(domain.coordinates[dest])) / sizes
-    if bool((normalized[dest].abs() > 0.50001).any()):
-        raise AssertionError("Clean voxel centroid escaped its physical cell")
+    centroids[dest] = centroid_by_clean[matched].to(centroids.dtype)
+    sizes = torch.tensor(grid.size_xyz, dtype=torch.float64, device=keys.device)
+    clean_normalized = centroid_offset[matched] / sizes
+    # Stage I bins points in float32. A point within a few micrometres of a
+    # mathematical boundary can round into its adjacent cell. Project only
+    # that numerical sliver onto the representable cell edge.
+    excess = clean_normalized.abs() - 0.5
+    if bool((excess > 1e-4).any()):
+        raise AssertionError(f"Clean voxel centroid escaped its physical cell by "
+                             f"{float(excess.max()):.6g} normalized voxels")
+    normalized[dest] = clean_normalized.clamp(-0.5, 0.5).to(normalized.dtype)
     represented = matched[inverse]
     point_errors = torch.linalg.vector_norm(
-        selected[represented, :3] - centroid_by_clean[inverse[represented]], dim=-1)
+        selected[represented, :3] - centroid_by_clean[inverse[represented]].to(selected.dtype), dim=-1)
     # Absence of a measured point is *unknown*. A negative is justified only
     # where a clean scan ray passed through this cell before its first return.
     # The sensor origin is (0,0,0) in calibrated LiDAR coordinates. We require
