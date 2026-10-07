@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 
+import numpy as np
 import torch
 
 from models.radar_lidar_stage1.config import VoxelGrid
@@ -37,6 +38,78 @@ class CandidateDomain:
         return voxel_centers_xyz(self.coordinates, self.grid)
 
 
+def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
+                            confidence_threshold: float, max_sites: int) -> CandidateDomain:
+    """Rasterize complete learned support patches into connected fine cells.
+
+    Stronger proposals are considered first. A patch is skipped if admitting
+    it would exceed the cap; no patch is cut into a misleading fragment.
+    """
+    surface=output.surface
+    assert surface is not None and surface.radii_xyz is not None
+    xyz=surface.xyz.detach().cpu().numpy().reshape(-1,3).astype(np.float64)
+    radii=surface.radii_xyz.detach().cpu().numpy().reshape(-1,3).astype(np.float64)
+    scores=surface.score.detach().cpu().numpy().reshape(-1).astype(np.float64)
+    if (not np.isfinite(xyz).all() or not np.isfinite(radii).all()
+            or not np.isfinite(scores).all() or (radii<=0).any()
+            or (scores<0).any() or (scores>1).any()):
+        raise ValueError("Stage-I support regions need finite positive radii and scores in [0,1]")
+    batch=np.repeat(surface.anchor_batch.detach().cpu().numpy() if surface.anchor_batch is not None
+                    else output.features["s1"].coords[:,0].detach().cpu().numpy(),
+                    surface.xyz.shape[1])
+    selected=np.flatnonzero(scores>confidence_threshold)
+    selected=selected[np.argsort(-scores[selected],kind="stable")]
+    origin=np.asarray(grid.minimum_xyz,dtype=np.float64)
+    step=np.asarray(grid.size_xyz,dtype=np.float64)
+    shape_xyz=np.asarray(grid.shape_zyx[::-1],dtype=np.int64)
+    z_size,y_size,x_size=grid.shape_zyx
+    values: dict[int,float]={}
+    accepted=skipped=0
+    for proposal in selected:
+        low=np.maximum(0,np.ceil((xyz[proposal]-radii[proposal]-origin)/step-.5).astype(np.int64))
+        high=np.minimum(shape_xyz-1,np.floor((xyz[proposal]+radii[proposal]-origin)/step-.5).astype(np.int64))
+        if np.any(low>high):
+            continue
+        axes=[np.arange(low[i],high[i]+1,dtype=np.int64) for i in range(3)]
+        xx,yy,zz=np.meshgrid(*axes,indexing="ij")
+        grid_xyz=np.stack((xx.ravel(),yy.ravel(),zz.ravel()),axis=1)
+        center=origin+(grid_xyz+.5)*step
+        normalized=((center-xyz[proposal])/radii[proposal])**2
+        squared=normalized.sum(1)
+        inside=squared<=1+1e-9
+        if not inside.any():
+            continue
+        cells=grid_xyz[inside]
+        cell_keys=(((int(batch[proposal])*z_size+cells[:,2])*y_size+cells[:,1])*x_size+cells[:,0]).astype(np.int64)
+        new_count=sum(int(key) not in values for key in cell_keys)
+        if len(values)+new_count>max_sites:
+            skipped+=1
+            continue
+        weighted=scores[proposal]*(1-.5*squared[inside])
+        for key,score in zip(cell_keys,weighted):
+            item=int(key)
+            values[item]=max(values.get(item,0.),float(score))
+        accepted+=1
+    if values:
+        keys=np.asarray(sorted(values),dtype=np.int64)
+        coordinates=decode_keys(torch.as_tensor(keys,device=output.features["s1"].coords.device),
+                                grid.shape_zyx)
+        propagated=surface.score.new_tensor([values[int(key)] for key in keys])
+    else:
+        coordinates=output.features["s1"].coords.new_empty((0,4))
+        propagated=surface.score.new_empty(0)
+    counts={"initial_stage1_sites":len(output.features["s1"].coords),
+            "initial_surface_proposals":len(scores),
+            "seed_source":"learned_surface_region",
+            "candidate_sites_after_confidence":len(selected),
+            "selected_seeds_after_cap":accepted,
+            "skipped_regions_due_to_cap":skipped,
+            "expanded_candidate_sites":len(coordinates),
+            "candidate_expansion_ratio":len(coordinates)/max(accepted,1),
+            "cap_applied":int(skipped>0)}
+    return CandidateDomain(coordinates,propagated,grid,counts)
+
+
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
                     confidence_threshold: float = 0.25,
                     expansion_zyx: tuple[int, int, int] = (1, 1, 1),
@@ -55,6 +128,17 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         raise ValueError("Stage-I grid and Stage-II candidate grid differ")
     if not torch.equal(fine.coords, confidence.coords):
         raise ValueError("Stage-I confidence must align with S1 coordinates")
+    if output.surface is not None and output.surface.radii_xyz is not None:
+        surface=output.surface
+        anchor_count=len(surface.anchor_batch) if surface.anchor_batch is not None else len(fine.coords)
+        if (surface.xyz.ndim != 3 or surface.xyz.shape[0] != anchor_count
+                or surface.xyz.shape[-1] != 3
+                or surface.score.shape != surface.xyz.shape[:2]
+                or surface.radii_xyz.shape != surface.xyz.shape
+                or (surface.anchor_batch is not None and
+                    (surface.anchor_xyz is None or surface.anchor_xyz.shape != (anchor_count,3)))):
+            raise ValueError("Stage-I support region shapes differ from radar-pattern anchors")
+        return _make_region_candidates(output,grid,confidence_threshold,max_sites)
     if output.surface is None:
         # Legacy Stage-I checkpoints have scores only at radar-occupied cells.
         seed_coords = fine.coords

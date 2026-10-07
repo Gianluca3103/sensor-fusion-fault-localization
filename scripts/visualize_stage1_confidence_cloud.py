@@ -16,6 +16,7 @@ import torch
 from models.radar_lidar_stage1.data import VoDStage1Dataset
 from models.radar_lidar_stage1.model import RadarOnlyEncoder
 from models.radar_lidar_stage1.train import config_from_dict
+from models.radar_lidar_stage2.candidate_domain import make_candidates
 
 
 def load_encoder(path: Path, device: str) -> tuple[RadarOnlyEncoder, dict]:
@@ -214,6 +215,9 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-plot-points", type=int, default=30000,
                         help="Cap radar and model points only; clean LiDAR is never capped")
+    parser.add_argument("--support-threshold", type=float, default=0.25,
+                        help="Proposal score threshold used to create the support region")
+    parser.add_argument("--max-candidate-sites", type=int, default=40000)
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=80.0)
     parser.add_argument("--y-min", type=float, default=-40.0)
@@ -223,6 +227,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_plot_points < 1:
         parser.error("--max-plot-points must be positive")
+    if not 0 <= args.support_threshold <= 1 or args.max_candidate_sites < 1:
+        parser.error("Support threshold must be in [0,1] and candidate cap positive")
     limits = (args.x_min, args.x_max, args.y_min, args.y_max, args.z_min, args.z_max)
     if any(a >= b for a, b in zip(limits[::2], limits[1::2])):
         parser.error("Each display crop minimum must be smaller than its maximum")
@@ -241,7 +247,20 @@ def main() -> None:
         points = sample["radar"].unsqueeze(0).to(args.device)
         valid = torch.ones(points.shape[:2], dtype=torch.bool, device=args.device)
         output = model(points, valid)
-        if output.surface is None:
+        region_counts = None
+        if output.surface is not None and output.surface.radii_xyz is not None:
+            domain = make_candidates(output,model.config.grid,
+                                     confidence_threshold=args.support_threshold,
+                                     max_sites=args.max_candidate_sites)
+            sites = domain.centers_xyz.cpu().numpy()
+            confidence = domain.confidence.cpu().numpy()
+            region_counts = domain.counts
+            third_name = "Predicted LiDAR support region"
+            cloud_suffix = "_support_region.ply"
+            note = ("Third panel shows all active fine voxels in learned radar-conditioned "
+                    "LiDAR support patches; these cells are eligible for reconstruction, "
+                    "not confirmed LiDAR returns.")
+        elif output.surface is None:
             sites = output.confidence.centers_xyz(model.config.grid).cpu().numpy()
             confidence = output.confidence.features[:, 0].cpu().numpy()
             third_name = "Stage-I radar-site confidence (legacy)"
@@ -259,23 +278,29 @@ def main() -> None:
         write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar[:, :3])
         write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), lidar[:, :3])
         write_ply(prefix.with_name(prefix.name + cloud_suffix), sites, confidence)
+        if output.surface is not None and output.surface.radii_xyz is not None:
+            write_ply(prefix.with_name(prefix.name + "_surface_proposals.ply"),
+                      output.surface.xyz.reshape(-1,3).cpu().numpy(),
+                      output.surface.score.reshape(-1).cpu().numpy())
         counts = save_viewer(prefix.with_suffix(".html"), frame_id=sample["frame_id"],
                              epoch=saved.get("epoch"), radar=radar[:, :3],
                              lidar=lidar[:, :3], sites=sites, confidence=confidence,
-                             limits=limits, max_points=args.max_plot_points,
+                             limits=limits, max_points=max(args.max_plot_points,len(sites)) if region_counts else args.max_plot_points,
                              trained=model.confidence_trained or output.surface is not None,
                              calibrated=False, third_name=third_name,
                              description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "
-                             "All panels share one metric camera. The third panel shows model-proposed "
-                             "LiDAR surfaces when the checkpoint has a surface head; otherwise it shows "
-                             "legacy radar-site confidence. Clean LiDAR is never an inference input.",
+                             "All panels share one metric camera. " + note +
+                             " Clean LiDAR is never an inference input.",
                              notice=note+" Scores are not calibrated probabilities of a correct surface.")
         prefix.with_suffix(".json").write_text(json.dumps({
             "frame_id": sample["frame_id"], "split": args.split,
             "checkpoint": str(args.checkpoint.resolve()), "epoch": saved.get("epoch"),
             "radar_variant": variant, "confidence_trained": model.confidence_trained,
             "confidence_calibrated": False,
-            "proposal_mode": "predicted_lidar_surface" if output.surface is not None else "legacy_radar_voxel",
+            "proposal_mode": "learned_surface_region" if region_counts else
+                             ("predicted_lidar_surface" if output.surface is not None else "legacy_radar_voxel"),
+            "support_region_counts": region_counts,
+            "support_threshold": args.support_threshold if region_counts else None,
             "score_mean": float(confidence.mean()) if len(confidence) else None,
             "score_min": float(confidence.min()) if len(confidence) else None,
             "score_max": float(confidence.max()) if len(confidence) else None,

@@ -28,13 +28,24 @@ def local_neighbors(radar: SparseSites, lidar: SparseSites, grid: VoxelGrid, rad
     """Batched KD-tree radius lookup in physical XYZ, never global attention."""
     if radar.stride != lidar.stride or radius_m <= 0 or max_neighbors < 1:
         raise ValueError("Incompatible scale or local neighborhood settings")
-    idx = torch.full((len(radar.coords),max_neighbors),-1,dtype=torch.long,device=radar.coords.device)
-    distances = radar.features.new_full(idx.shape,float("inf"))
-    if not len(radar.coords) or not len(lidar.coords):
+    return local_neighbors_xyz(radar.centers_xyz(grid),radar.coords[:,0],lidar,grid,
+                               radius_m,max_neighbors)
+
+
+def local_neighbors_xyz(query_xyz: torch.Tensor, query_batch: torch.Tensor,
+                        lidar: SparseSites, grid: VoxelGrid, radius_m: float,
+                        max_neighbors: int) -> Neighborhood:
+    """Physical clean-surface neighbors for arbitrary radar-pattern query sites."""
+    if (query_xyz.ndim != 2 or query_xyz.shape[1] != 3 or
+            query_batch.shape != (len(query_xyz),) or radius_m <= 0 or max_neighbors < 1):
+        raise ValueError("Invalid physical query neighborhood settings")
+    idx = torch.full((len(query_xyz),max_neighbors),-1,dtype=torch.long,device=query_xyz.device)
+    distances = query_xyz.new_full(idx.shape,float("inf"))
+    if not len(query_xyz) or not len(lidar.coords):
         return Neighborhood(idx,distances)
-    rxyz = radar.centers_xyz(grid).detach().cpu().numpy()
+    rxyz = query_xyz.detach().cpu().numpy()
     lxyz = lidar.centers_xyz(grid).detach().cpu().numpy()
-    rb = radar.coords[:,0].detach().cpu().numpy()
+    rb = query_batch.detach().cpu().numpy()
     lb = lidar.coords[:,0].detach().cpu().numpy()
     for batch_id in np.unique(rb):
         ri = np.flatnonzero(rb==batch_id)

@@ -12,8 +12,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import Stage1Config
-from .correspondence import LocalCorrespondence, local_neighbors
-from .sparse import PointVoxelEncoder, SparseBackbone, SparseSites, receptive_fields
+from .correspondence import LocalCorrespondence, local_neighbors, local_neighbors_xyz
+from .sparse import PointVoxelEncoder, SparseBackbone, SparseSites, receptive_fields, encode_keys
 
 
 @dataclass
@@ -29,20 +29,23 @@ class Stage1Output:
 class SurfaceProposals:
     """Radar-only candidate LiDAR locations, never measured clean points."""
 
-    xyz: torch.Tensor  # [S1 sites, proposals per site, 3], metres in LiDAR frame
-    score: torch.Tensor  # [S1 sites, proposals per site], in [0, 1]
+    xyz: torch.Tensor  # [queries, proposals per query, 3], metres in LiDAR frame
+    score: torch.Tensor  # [queries, proposals per query], in [0, 1]
+    radii_xyz: torch.Tensor | None = None  # [queries, proposals, 3] support ellipsoid radii
+    anchor_xyz: torch.Tensor | None = None  # grouped radar-pattern centers in LiDAR coordinates
+    anchor_batch: torch.Tensor | None = None  # batch identity for each grouped pattern
 
 
-def radar_neighbor_indices(query: SparseSites, source: SparseSites, grid,
+def radar_neighbor_indices(query_xyz: torch.Tensor, query_batch: torch.Tensor, source: SparseSites, grid,
                            radius_m: float, max_neighbors: int) -> torch.Tensor:
     """Fixed spatial indices; gradients flow through source features, not XYZ search."""
-    result=torch.full((len(query.coords),max_neighbors),-1,dtype=torch.long,
-                      device=query.coords.device)
-    if not len(query.coords) or not len(source.coords):
+    result=torch.full((len(query_xyz),max_neighbors),-1,dtype=torch.long,
+                      device=query_xyz.device)
+    if not len(query_xyz) or not len(source.coords):
         return result
-    query_xyz=query.centers_xyz(grid).detach().cpu().numpy()
+    query_xyz=query_xyz.detach().cpu().numpy()
     source_xyz=source.centers_xyz(grid).detach().cpu().numpy()
-    query_batch=query.coords[:,0].detach().cpu().numpy()
+    query_batch=query_batch.detach().cpu().numpy()
     source_batch=source.coords[:,0].detach().cpu().numpy()
     for batch in np.unique(query_batch):
         qi=np.flatnonzero(query_batch==batch)
@@ -61,7 +64,7 @@ def radar_neighbor_indices(query: SparseSites, source: SparseSites, grid,
 
 
 class SurfaceProposalHead(nn.Module):
-    """Multiple LiDAR surface hypotheses per radar site from multiscale radar context."""
+    """Multiple LiDAR surface hypotheses per radar-pattern neighborhood."""
 
     def __init__(self,config: Stage1Config):
         super().__init__()
@@ -71,18 +74,37 @@ class SurfaceProposalHead(nn.Module):
         self.key=nn.ModuleList(nn.Linear(ch,width) for ch in config.channels)
         self.value=nn.ModuleList(nn.Linear(ch,width) for ch in config.channels)
         self.relative=nn.ModuleList(nn.Linear(3,1,bias=False) for _ in config.channels)
+        slot_width=7 if config.surface_region_enabled else 4
         self.head=nn.Sequential(nn.Linear(width*(len(config.channels)+1),width*2),
                                 nn.LayerNorm(width*2),nn.SiLU(),
-                                nn.Linear(width*2,4*config.surface_proposals_per_site))
+                                nn.Linear(width*2,slot_width*config.surface_proposals_per_site))
 
     def forward(self,features: dict[str,SparseSites]) -> SurfaceProposals:
         fine=features["s1"]
-        center=fine.centers_xyz(self.config.grid)
-        query=self.query(fine.features)
-        parts=[fine.features]
+        fine_center=fine.centers_xyz(self.config.grid)
+        if self.config.surface_region_enabled:
+            # One query represents a radar *neighborhood*, not an individual
+            # return. Pool its fine features before looking across scales.
+            coarse=fine.coords.clone()
+            coarse[:,1:]=torch.div(coarse[:,1:],self.config.surface_region_anchor_stride,
+                                  rounding_mode="floor")
+            coarse_shape=self.config.grid.scale_shape(self.config.surface_region_anchor_stride)
+            _,inverse=torch.unique(encode_keys(coarse,coarse_shape),sorted=True,return_inverse=True)
+            n=int(inverse.max())+1 if len(inverse) else 0
+            counts=fine.features.new_zeros((n,1)).index_add_(0,inverse,
+                                                fine.features.new_ones((len(inverse),1)))
+            pooled=fine.features.new_zeros((n,fine.features.shape[1])).index_add_(0,inverse,fine.features)/counts.clamp_min(1)
+            center=fine_center.new_zeros((n,3)).index_add_(0,inverse,fine_center)/counts.clamp_min(1)
+            batch=fine.coords.new_zeros(n).scatter_(0,inverse,fine.coords[:,0])
+        else:
+            center=fine_center
+            pooled=fine.features
+            batch=fine.coords[:,0]
+        query=self.query(pooled)
+        parts=[pooled]
         for i,source in enumerate(features.values()):
             radius=self.config.surface_context_radii_m[i]
-            index=radar_neighbor_indices(fine,source,self.config.grid,radius,
+            index=radar_neighbor_indices(center,batch,source,self.config.grid,radius,
                                          self.config.surface_context_neighbors)
             valid=index>=0
             if not len(source.coords):
@@ -99,9 +121,15 @@ class SurfaceProposalHead(nn.Module):
             weights=torch.softmax(logits,dim=-1)*valid
             weights=weights/weights.sum(-1,keepdim=True).clamp_min(1e-8)
             parts.append((weights[:,:,None]*values).sum(1))
-        raw=self.head(torch.cat(parts,dim=-1)).reshape(-1,self.config.surface_proposals_per_site,4)
-        return SurfaceProposals(center[:,None,:]+torch.tanh(raw[:,:,:3])*self.config.surface_radius_m,
-                                torch.sigmoid(raw[:,:,3]))
+        slot_width=7 if self.config.surface_region_enabled else 4
+        raw=self.head(torch.cat(parts,dim=-1)).reshape(-1,self.config.surface_proposals_per_site,slot_width)
+        xyz=center[:,None,:]+torch.tanh(raw[:,:,:3])*self.config.surface_radius_m
+        if self.config.surface_region_enabled:
+            minimum=raw.new_tensor(self.config.surface_region_min_radius_xyz_m)
+            maximum=raw.new_tensor(self.config.surface_region_max_radius_xyz_m)
+            radii=minimum+(maximum-minimum)*torch.sigmoid(raw[:,:,3:6])
+            return SurfaceProposals(xyz,torch.sigmoid(raw[:,:,6]),radii,center,batch)
+        return SurfaceProposals(xyz,torch.sigmoid(raw[:,:,3]))
 
 
 class RadarOnlyEncoder(nn.Module):
@@ -262,12 +290,17 @@ class RadarLidarStage1(nn.Module):
         scales=len(output.features)
         losses.update({"loss/corr":corr_loss,"loss/geom":geom_loss/scales,"loss/conf":conf_loss})
         surface_geom,surface_conf=zero,zero
+        region_coverage,region_volume=zero,zero
         if output.surface is not None:
             proposals=output.surface
             radar=output.features["s1"]
             clean=lidar_levels[0]
-            candidates=local_neighbors(radar,clean,self.config.grid,
-                                       self.config.surface_radius_m,self.config.surface_target_neighbors)
+            candidates=(local_neighbors_xyz(proposals.anchor_xyz,proposals.anchor_batch,clean,
+                                            self.config.grid,self.config.surface_radius_m,
+                                            self.config.surface_target_neighbors)
+                        if proposals.anchor_xyz is not None else
+                        local_neighbors(radar,clean,self.config.grid,
+                                        self.config.surface_radius_m,self.config.surface_target_neighbors))
             valid=candidates.valid
             has_target=valid.any(1)
             if len(clean.coords) and len(proposals.xyz):
@@ -281,6 +314,13 @@ class RadarLidarStage1(nn.Module):
                     reverse=distance.min(1).values[valid]
                     reverse=F.smooth_l1_loss(reverse,torch.zeros_like(reverse),beta=.2)
                     surface_geom=(forward+reverse)*.5
+                    if proposals.radii_xyz is not None:
+                        normalized=(proposals.xyz[:,:,None,:]-targets[:,None,:,:])/proposals.radii_xyz[:,:,None,:]
+                        squared=(normalized*normalized).sum(-1)
+                        soft_inside=torch.sigmoid((1-squared)/.15)
+                        support=proposals.score[:,:,None]*soft_inside
+                        union=1-torch.prod(1-support.clamp(max=1-1e-6),dim=1)
+                        region_coverage=-torch.log(union[valid].clamp_min(1e-6)).mean()
                 quality=torch.exp(-nearest_proposal.detach()/self.config.surface_match_sigma_m)
             else:
                 quality=proposals.score.new_zeros(proposals.score.shape)
@@ -291,19 +331,28 @@ class RadarLidarStage1(nn.Module):
                 bce=F.binary_cross_entropy(proposals.score.clamp(1e-6,1-1e-6),quality,
                                             reduction="none")
                 surface_conf=(bce*weights).sum()/weights.expand_as(bce).sum().clamp_min(1)
+                if proposals.radii_xyz is not None:
+                    max_volume=math.prod(self.config.surface_region_max_radius_xyz_m)
+                    region_volume=(proposals.score*proposals.radii_xyz.prod(-1)/max_volume).mean()
             diagnostics["surface"]={"proposals":proposals.score.numel(),
                                     "radar_sites_with_clean_targets":has_target.sum() if defer_diagnostics else int(has_target.sum()),
                                     "mean_score":proposals.score.mean().detach() if len(proposals.score) else zero.detach()}
         losses["loss/surface_geom"]=surface_geom
         losses["loss/surface_conf"]=surface_conf
+        losses["loss/region_coverage"]=region_coverage
+        losses["loss/region_volume"]=region_volume
         losses["loss/corr_weighted"]=self.config.correspondence_weight*losses["loss/corr"]
         losses["loss/geom_weighted"]=self.config.geometric_weight*losses["loss/geom"]
         losses["loss/conf_weighted"]=self.config.confidence_weight*losses["loss/conf"]
         losses["loss/surface_geom_weighted"]=self.config.surface_geometry_weight*surface_geom
         losses["loss/surface_conf_weighted"]=self.config.surface_confidence_weight*surface_conf
+        losses["loss/region_coverage_weighted"]=self.config.surface_region_coverage_weight*region_coverage
+        losses["loss/region_volume_weighted"]=self.config.surface_region_volume_weight*region_volume
         losses["loss/total"]=(losses["loss/corr_weighted"]+losses["loss/geom_weighted"]+
                               losses["loss/conf_weighted"]+losses["loss/surface_geom_weighted"]+
-                              losses["loss/surface_conf_weighted"])
+                              losses["loss/surface_conf_weighted"]+
+                              losses["loss/region_coverage_weighted"]+
+                              losses["loss/region_volume_weighted"])
         if intermediates is not None:
             diagnostics["intermediates"]=intermediates
         return losses,diagnostics

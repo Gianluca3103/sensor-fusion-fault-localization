@@ -1,9 +1,11 @@
 # Stage II: deterministic radar-supported LiDAR geometry
 
 Stage II consumes the **frozen, deployed radar-only** Stage-I S1–S4 sparse
-features and candidate confidence. A surface-proposal Stage-I checkpoint seeds
-candidate cells from predicted LiDAR positions; a legacy checkpoint seeds from
-radar S1 positions. Clean LiDAR is read only by target, loss, metric,
+features and candidate confidence. A learned-region Stage-I checkpoint supplies
+predicted LiDAR surface centers, scored support extents, and contiguous fine
+candidate cells. A point-only surface checkpoint seeds small neighborhoods from
+predicted positions; a legacy checkpoint seeds from radar S1 positions. Clean
+LiDAR is read only by target, loss, metric,
 and visualization code. The model forward API accepts Stage-I radar output and
 the physical voxel grid; it has no clean/faulty LiDAR or semantic input.
 
@@ -21,9 +23,10 @@ fusion with observed LiDAR.
   radii are configured in metres. The four features are queried locally,
   aggregated with inverse-distance weights, projected, and fused with
   candidate confidence and normalized position.
-- Stage-I candidate confidence above `confidence_threshold` seeds a bounded
-  neighborhood around each predicted surface location (or around radar S1
-  voxel centers for legacy checkpoints).
+- Stage-I candidate confidence above `confidence_threshold` activates an
+  entire learned support patch when region extents are present. The candidate
+  cap accepts complete patches in score order. Point-only checkpoints use a
+  bounded fixed neighborhood; legacy checkpoints use radar S1 voxel centers.
   `max_candidate_sites` caps the **fixed** sparse domain. Candidate means
   *eligible for prediction*, never occupied. The cap and candidate coverage
   must be reported with reconstruction performance.

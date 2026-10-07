@@ -55,25 +55,32 @@ def main() -> None:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
         radar, _ = read_ply(prefix.with_name(prefix.name + "_radar.ply"))
         clean, _ = read_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"))
+        region_path = prefix.with_name(prefix.name + "_support_region.ply")
         surface_path = prefix.with_name(prefix.name + "_surface_proposals.ply")
         legacy_path = prefix.with_name(prefix.name + "_confidence.ply")
+        region = region_path.exists()
         surface = surface_path.exists()
-        sites, confidence = read_ply(surface_path if surface else legacy_path, scored=True)
+        sites, confidence = read_ply(region_path if region else
+                                     (surface_path if surface else legacy_path), scored=True)
         limits = tuple(metadata.get("display_limits_xyz_m", (0,80,-40,40,-5,7)))
         output = destination / f"{frame_id}_stage1.html"
         counts = save_viewer(output, frame_id=frame_id, epoch=metadata.get("epoch"),
                              radar=radar, lidar=clean, sites=sites, confidence=confidence,
-                             limits=limits, max_points=args.max_plot_points,
-                             trained=bool(metadata.get("confidence_trained", False)) or surface,
+                             limits=limits,
+                             max_points=max(args.max_plot_points,len(sites)) if region else args.max_plot_points,
+                             trained=bool(metadata.get("confidence_trained", False)) or surface or region,
                              calibrated=False,
-                             third_name="Predicted LiDAR surface candidates" if surface else
-                                        "Stage-I radar-site confidence (legacy)",
+                             third_name="Predicted LiDAR support region" if region else
+                                        ("Predicted LiDAR surface candidates" if surface else
+                                         "Stage-I radar-site confidence (legacy)"),
                              description="All panels share one metric camera. "
-                             +( "The third panel shows radar-only predicted LiDAR surface locations. "
-                                if surface else "The third panel shows scores at occupied radar voxels, not LiDAR surfaces. ")
+                             +( "The third panel shows active fine voxels in learned support patches. "
+                                if region else ("The third panel shows radar-only predicted LiDAR surface locations. "
+                                if surface else "The third panel shows scores at occupied radar voxels, not LiDAR surfaces. "))
                              +"Clean LiDAR is displayed for comparison only.",
-                             notice=("Proposed LiDAR locations are predicted from radar only. "
-                                     if surface else "Legacy confidence is scored at radar voxel centers. ")+
+                             notice=("Support regions are predicted from radar only, and are not confirmed LiDAR returns. "
+                                     if region else ("Proposed LiDAR locations are predicted from radar only. "
+                                     if surface else "Legacy confidence is scored at radar voxel centers. "))+
                                     "Raw radar overlay is off by default; scores are not calibrated.")
         print(f"{output} | clean LiDAR: {counts['Clean LiDAR']['shown']:,} of "
               f"{counts['Clean LiDAR']['in_view']:,} in crop (uncapped)", flush=True)

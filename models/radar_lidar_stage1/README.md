@@ -10,11 +10,11 @@ This folder learns a **radar-only, sparse 3D geometric representation** with a s
 
 ### Radar-conditioned surface proposals
 
-[`configs/radar_lidar_stage1_surface.json`](../../configs/radar_lidar_stage1_surface.json) enables a new deployed output: four candidate LiDAR surface positions **and a score for each** per occupied fine radar voxel. The head attends to nearby radar features at all four scales, including coarser scene context. Its positions can move away from radar voxel centers within a configured 1.5 m local radius. Clean LiDAR teaches the proposed positions through a local bidirectional set-distance loss; scores learn whether each proposed position is near an observed clean surface. Sites with no nearby observed clean surface receive no geometry target and train the score toward abstention. The clean encoder and training-only radar–LiDAR correspondence loss remain separate from the radar-only deployed path.
+[`configs/radar_lidar_stage1_surface.json`](../../configs/radar_lidar_stage1_surface.json) enables a new deployed output: two candidate LiDAR surface positions, a score, and learned 3D support radii per grouped radar neighborhood. Fine radar features are pooled within 8-voxel anchor cells, then the head attends to nearby radar features at all four scales. Its positions can move away from the pooled radar-pattern center within a configured 1.5 m local radius. Clean LiDAR teaches the proposed positions through a local bidirectional set-distance loss; scores learn whether each proposed position is near an observed clean surface. A soft region coverage loss rewards patches covering nearby measured clean surfaces, while a scored-volume penalty discourages expansive patches. Anchors with no nearby observed clean surface receive no geometry or coverage target and train the score toward abstention. The clean encoder and training-only radar–LiDAR correspondence loss remain separate from the radar-only deployed path.
 
-Stage II now seeds its candidate voxels from these predicted LiDAR locations when a surface-proposal checkpoint is loaded. It uses the original radar-site confidence positions for old checkpoints, so previous checkpoints retain their previous behavior. This is a new interface and needs **new Stage-I training**, followed by new Stage-II training; old weights cannot be converted into learned surface proposals. The local proposal radius limits the initial search and should be audited against validation coverage. A proposal near a clean point is a geometric proxy, not proof that radar and LiDAR reflected from the same physical surface.
+Stage II rasterizes each scored proposal's learned ellipsoid into a **connected fine-voxel support patch**. Its sparse U-Net operates over the union of those patches. The candidate cap accepts or skips whole patches; it does not cut one into isolated fragments. It uses the original radar-site confidence positions for old checkpoints, so previous checkpoints retain their behavior. This is a new interface and needs **new Stage-I training**, followed by new Stage-II training; old weights cannot be converted into learned support regions. The local proposal radius limits the initial search and should be audited against validation coverage. A proposal near a clean point is a geometric proxy, not proof that radar and LiDAR reflected from the same physical surface.
 
-Start with the new config and select the best checkpoint on held-out proposed-surface F1:
+Start with the new config and select the best checkpoint on held-out support-region F1:
 
 ```bash
 python -u -m models.radar_lidar_stage1.train \
@@ -23,10 +23,10 @@ python -u -m models.radar_lidar_stage1.train \
   --output-root /path/to/stage1_surface_run \
   --config configs/radar_lidar_stage1_surface.json \
   --epochs 50 --batch-size 8 --validate-every 5 \
-  --selection-metric surface_f1_0.2m --num-workers 2 --device cuda
+  --selection-metric region_f1 --num-workers 2 --device cuda
 ```
 
-Validation logs proposal precision against all measured clean voxels and recall over clean voxels within the configured radar support radius, both at 0.2 m and 0.5 m. Candidate scores are thresholded at 0.25 to match the default Stage-II candidate selector. These proximity metrics do not establish reflector identity or point-cloud correctness; inspect held-out clouds and downstream results before using the proposal interface.
+Validation logs proposal precision against measured clean voxels and recall over clean voxels within the configured radar support radius, at 0.2 m and 0.5 m. It also rasterizes the exact Stage-II support domain and reports the active-cell count, fraction of cells within 0.5 m of clean LiDAR, covered radar-supported clean voxels, isolated-cell fraction, and patches skipped by the 40,000-site cap. Candidate scores are thresholded at 0.25 to match Stage II. These proximity metrics do not establish reflector identity or point-cloud correctness; inspect held-out clouds and downstream results before using the support interface.
 
 ## Representation and losses
 
@@ -91,7 +91,7 @@ python -m scripts.visualize_stage1_confidence_cloud \
   --output-root /path/to/stage1_confidence_views --device cuda
 ```
 
-Open an output `*_stage1.html` in a browser. The three panels share one 3D scale. Every clean LiDAR point **inside the common display crop** is rendered without a point-count cap. Raw radar is hidden on the third panel by default; its optional overlay is independent of the score slider. For a surface-proposal checkpoint, `*_surface_proposals.ply` contains the predicted candidate XYZ and score. For a legacy checkpoint, `*_confidence.ply` contains radar-derived S1 voxel centers and confidence; those centers are **not** reconstructed LiDAR points. All PLY files retain the full clouds, including points outside the HTML crop. The score is not a calibrated probability unless separately validated.
+Open an output `*_stage1.html` in a browser. The three panels share one 3D scale. Every clean LiDAR point **inside the common display crop** is rendered without a point-count cap. Raw radar is hidden on the third panel by default; its optional overlay is independent of the score slider. For a learned-region checkpoint, the third panel and `*_support_region.ply` show **all active fine voxels** in the proposed patches; `*_surface_proposals.ply` separately stores their learned centers and scores. For a point-only proposal checkpoint, the third panel shows proposal centers. For a legacy checkpoint, `*_confidence.ply` contains radar-derived S1 voxel centers and confidence; those centers are **not** reconstructed LiDAR points. All PLY files retain the full clouds, including points outside the HTML crop. The score is not a calibrated probability unless separately validated.
 
 Previously exported PLYs can be revisualized without rerunning the model or using CUDA:
 

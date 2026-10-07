@@ -67,6 +67,71 @@ class SurfaceStage1Tests(unittest.TestCase):
         self.assertEqual(len(domain.confidence), 1)
         self.assertAlmostEqual(float(domain.confidence[0]), .9, places=5)
 
+    def test_learned_region_activates_connected_cells_and_is_never_partially_capped(self):
+        radar_cell = torch.tensor([[0,2,2,2]], dtype=torch.long)
+        fine = SparseSites(radar_cell, torch.ones((1,8)), GRID.shape_zyx)
+        confidence = fine.replace_features(torch.tensor([[.99]]))
+        surface = SurfaceProposals(torch.tensor([[[4.25,4.25,4.25]]]),
+                                   torch.tensor([[.9]]),
+                                   torch.tensor([[[1.,1.,1.]]]))
+        evidence = Stage1Output({"s1":fine},confidence,{"s1":radar_cell},{},surface)
+        region = make_candidates(evidence,GRID,confidence_threshold=.25,
+                                 expansion_zyx=(0,0,0),max_sites=100)
+        self.assertEqual(region.counts["seed_source"],"learned_surface_region")
+        self.assertGreater(len(region.coordinates),20)
+        cells={tuple(row) for row in region.coordinates.tolist()}
+        pending=[next(iter(cells))]
+        reached=set()
+        while pending:
+            row=pending.pop()
+            if row in reached:
+                continue
+            reached.add(row)
+            b,z,y,x=row
+            pending.extend(neighbor for neighbor in ((b,z+1,y,x),(b,z-1,y,x),
+                        (b,z,y+1,x),(b,z,y-1,x),(b,z,y,x+1),(b,z,y,x-1))
+                        if neighbor in cells and neighbor not in reached)
+        self.assertEqual(reached,cells)
+        capped=make_candidates(evidence,GRID,confidence_threshold=.25,
+                               expansion_zyx=(0,0,0),max_sites=10)
+        self.assertEqual(len(capped.coordinates),0)
+        self.assertEqual(capped.counts["skipped_regions_due_to_cap"],1)
+
+    def test_region_coverage_loss_trains_extent(self):
+        torch.manual_seed(8)
+        model=RadarLidarStage1(configuration(surface_proposals_per_site=2,
+            surface_region_enabled=True,surface_region_coverage_weight=.4,
+            surface_region_volume_weight=.1,
+            surface_region_min_radius_xyz_m=(1.,1.,1.)))
+        radar=torch.tensor([[[1.,1.,1.,5.,0.,0.,0.],[1.5,1.5,1.,4.,0.,0.,1.]]])
+        clean=torch.tensor([[[1.2,1.,1.,.5],[1.4,1.3,1.,.5]]])
+        valid=torch.ones((1,2),dtype=torch.bool)
+        losses,_=model.forward_train(radar,valid,clean,valid)
+        self.assertTrue(torch.isfinite(losses["loss/region_coverage"]))
+        losses["loss/total"].backward()
+        gradient=model.radar_only.surface_head.head[-1].weight.grad
+        self.assertGreater(float(gradient[3:6].abs().sum()),0.)
+
+    def test_region_queries_pool_radar_neighborhoods_and_keep_batch_identity(self):
+        model=RadarLidarStage1(configuration(surface_proposals_per_site=2,
+            surface_region_enabled=True,surface_region_anchor_stride=4,
+            surface_region_coverage_weight=.4,surface_region_volume_weight=.1,
+            surface_region_min_radius_xyz_m=(1.,1.,1.)))
+        radar=torch.tensor([[[1.,1.,1.,5.,0.,0.,0.], [1.5,1.5,1.,4.,0.,0.,1.]],
+                            [[1.,1.,1.,5.,0.,0.,0.], [1.5,1.5,1.,4.,0.,0.,1.]]])
+        clean=torch.tensor([[[1.2,1.,1.,.5]], [[1.3,1.3,1.,.5]]])
+        radar_valid=torch.ones((2,2),dtype=torch.bool)
+        clean_valid=torch.ones((2,1),dtype=torch.bool)
+        output=model.forward_radar(radar,radar_valid).surface
+        self.assertEqual(output.anchor_batch.tolist(),[0,1])
+        self.assertEqual(output.xyz.shape,(2,2,3))
+        self.assertEqual(output.anchor_xyz.shape,(2,3))
+        losses,_=model.forward_train(radar,radar_valid,clean,clean_valid)
+        self.assertTrue(torch.isfinite(losses["loss/total"]))
+        evidence=model.forward_radar(radar,radar_valid)
+        domain=make_candidates(evidence,GRID,confidence_threshold=0,max_sites=1000)
+        self.assertEqual(set(domain.coordinates[:,0].tolist()),{0,1})
+
     def test_legacy_checkpoint_retains_old_representation(self):
         legacy = configuration(surface_proposals_per_site=0,
                                surface_geometry_weight=0.,surface_confidence_weight=0.)

@@ -21,12 +21,18 @@
   "local_geometry_weight": 1.0,
   "confidence_sigma_m": 0.5,
   "geometry_eval_tolerance_m": 0.2,
-  "surface_proposals_per_site": 4,
+  "surface_proposals_per_site": 2,
   "surface_radius_m": 1.5,
   "surface_target_neighbors": 24,
   "surface_geometry_weight": 0.5,
   "surface_confidence_weight": 0.2,
   "surface_match_sigma_m": 0.2,
   "surface_context_radii_m": [1.0, 2.0, 4.0, 6.0],
-  "surface_context_neighbors": 16
+  "surface_context_neighbors": 16,
+  "surface_region_enabled": true,
+  "surface_region_anchor_stride": 8,
+  "surface_region_min_radius_xyz_m": [0.4, 0.4, 0.5],
+  "surface_region_max_radius_xyz_m": [1.0, 1.0, 0.875],
+  "surface_region_coverage_weight": 0.4,
+  "surface_region_volume_weight": 0.1
 }

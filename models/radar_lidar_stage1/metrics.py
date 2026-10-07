@@ -10,6 +10,7 @@ import torch
 
 from .correspondence import local_neighbors
 from .model import probe_target
+from .sparse import encode_keys
 
 
 DISTANCES = (0.1, 0.2, 0.5, 1.0)
@@ -50,6 +51,9 @@ class Stage1MetricAccumulator:
         self.surface={"raw_proposals":0,"selected_voxels":0,"supported_clean_voxels":0,
                       "precision_hits_0.2m":0,"recall_hits_0.2m":0,
                       "precision_hits_0.5m":0,"recall_hits_0.5m":0}
+        self.region={"active_cells":0,"cells_near_clean_0.5m":0,
+                     "covered_supported_clean_cells":0,"skipped_patches":0,
+                     "accepted_patches":0,"isolated_cells":0,"frames_at_cap":0}
 
     @torch.no_grad()
     def update(self,model,radar,radar_valid,clean,clean_valid,*,intermediates=None):
@@ -123,6 +127,8 @@ class Stage1MetricAccumulator:
             scores=proposals.score.detach().cpu().numpy()
             radar_centers=output.features["s1"].centers_xyz(self.config.grid).detach().cpu().numpy()
             radar_batch=output.features["s1"].coords[:,0].detach().cpu().numpy()
+            proposal_batch=(proposals.anchor_batch.detach().cpu().numpy()
+                            if proposals.anchor_batch is not None else radar_batch)
             clean_sites=lidar_levels[0]
             clean_centers=clean_sites.centers_xyz(self.config.grid).detach().cpu().numpy()
             clean_batch=clean_sites.coords[:,0].detach().cpu().numpy()
@@ -132,6 +138,7 @@ class Stage1MetricAccumulator:
             shape=np.asarray(self.config.grid.shape_zyx[::-1])
             for frame in np.unique(radar_batch):
                 r=radar_batch==frame
+                p=proposal_batch==frame
                 c=clean_batch==frame
                 if not r.any():
                     continue
@@ -140,7 +147,7 @@ class Stage1MetricAccumulator:
                            if len(clean_xyz) else np.zeros(0,dtype=bool))
                 relevant_clean=clean_xyz[supported]
                 self.surface["supported_clean_voxels"]+=len(relevant_clean)
-                chosen=xyz[r][scores[r]>.25]
+                chosen=xyz[p][scores[p]>.25]
                 if len(chosen):
                     grid_index=np.floor((chosen-minimum)/step).astype(np.int64)
                     inside=((grid_index>=0)&(grid_index<shape)).all(1)
@@ -157,6 +164,46 @@ class Stage1MetricAccumulator:
                     distance=cKDTree(chosen).query(relevant_clean)[0]
                     for tolerance in (.2,.5):
                         self.surface[f"recall_hits_{tolerance:.1f}m"]+=int((distance<=tolerance).sum())
+            if output.surface.radii_xyz is not None:
+                # Match the exact sparse domain Stage II would receive. Clean
+                # is used only to audit it, never to construct it.
+                from models.radar_lidar_stage2.candidate_domain import make_candidates
+                domain=make_candidates(output,self.config.grid,confidence_threshold=.25,
+                                       max_sites=40000)
+                self.region["active_cells"]+=len(domain.coordinates)
+                self.region["skipped_patches"]+=domain.counts["skipped_regions_due_to_cap"]
+                self.region["accepted_patches"]+=domain.counts["selected_seeds_after_cap"]
+                self.region["frames_at_cap"]+=int(domain.counts["cap_applied"])
+                if len(domain.coordinates):
+                    coords=domain.coordinates.detach().cpu().numpy()
+                    keys=encode_keys(domain.coordinates,self.config.grid.shape_zyx).detach().cpu().numpy()
+                    connected=np.zeros(len(keys),dtype=bool)
+                    z_size,y_size,x_size=self.config.grid.shape_zyx
+                    for axis,step_key,limit in ((3,1,x_size),(2,x_size,y_size),(1,x_size*y_size,z_size)):
+                        for sign in (-1,1):
+                            valid=(coords[:,axis]+sign>=0)&(coords[:,axis]+sign<limit)
+                            neighbor=keys+sign*step_key
+                            at=np.searchsorted(keys,neighbor)
+                            connected|=valid&(at<len(keys))&(keys[np.minimum(at,len(keys)-1)]==neighbor)
+                    self.region["isolated_cells"]+=int((~connected).sum())
+                    domain_xyz=domain.centers_xyz.detach().cpu().numpy()
+                    domain_batch=coords[:,0]
+                    domain_keys=keys
+                    clean_keys=encode_keys(clean_sites.coords,self.config.grid.shape_zyx).detach().cpu().numpy()
+                    for frame in np.unique(domain_batch):
+                        d=domain_batch==frame
+                        c=clean_batch==frame
+                        r=radar_batch==frame
+                        if not c.any():
+                            continue
+                        clean_xyz=clean_centers[c]
+                        dist=cKDTree(clean_xyz).query(domain_xyz[d])[0]
+                        self.region["cells_near_clean_0.5m"]+=int((dist<=.5).sum())
+                        if r.any():
+                            supported=(cKDTree(radar_centers[r]).query(clean_xyz)[0]
+                                       <=self.config.surface_radius_m)
+                            self.region["covered_supported_clean_cells"]+=int(np.isin(
+                                clean_keys[c][supported],domain_keys[d],assume_unique=True).sum())
 
     def add_instances(self,report: dict):
         for scale,classes in report.items():
@@ -184,6 +231,18 @@ class Stage1MetricAccumulator:
                                "precision_hits":surface[f"precision_hits_{name}"],
                                "recall_hits":surface[f"recall_hits_{name}"]}
             report["surface_proposals"]=summary
+        if self.config.surface_region_enabled:
+            active=self.region["active_cells"]
+            supported=self.surface["supported_clean_voxels"]
+            precision=self.region["cells_near_clean_0.5m"]/active if active else 0.0
+            coverage=self.region["covered_supported_clean_cells"]/supported if supported else None
+            report["support_region"]={**self.region,
+                "precision_within_0.5m":precision,
+                "supported_clean_coverage":coverage,
+                "f1":2*precision*coverage/(precision+coverage)
+                      if coverage is not None and precision+coverage else (0.0 if coverage is not None else None),
+                "isolated_cell_fraction":self.region["isolated_cells"]/active if active else 0.0,
+                "score_threshold":0.25,"max_sites_per_frame":40000}
         total_valid=0; total_queries=0; total_knn=0; total_hits={k:0 for k in (1,5,10)}; arrays=[]
         for name,row in self.scales.items():
             valid=row["valid_corr_query_count"]; query=row["query_count"]
