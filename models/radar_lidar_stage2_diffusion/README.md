@@ -58,6 +58,42 @@ python -m scripts.evaluate_stage2_diffusion_steps \
 The detector export accepts `--sampling-steps 3`. Use a distinct output root
 for each sampling setting; the export manifest records the choice.
 
+## Frozen-preprocessing cache
+
+`scripts.cache_stage2_diffusion` stores a versioned file per VoD frame for both
+train and validation. It includes Stage-I source features, learned-region fine
+candidate coordinates, faulty-LiDAR coverage, four physical neighbor maps,
+and clean training targets. The cache builder uses clean LiDAR only for labels.
+At training time the conditioning projection, faulty encoder, fusion layers,
+and sparse U-Net remain trainable and are recalculated every batch. Detector
+inference still uses the uncached radar/faulty-only path.
+
+The cache manifest binds the Stage-I checkpoint hash, radar variant, fault
+sample location and pattern, and Stage-II geometry config. An interrupted build
+can resume at the same root. After 16 new frames it reports an estimated disk
+requirement and stops if available space appears insufficient. Neighbor maps
+can make this cache large; compression is enabled by default. Check the pilot
+size report before leaving the full build unattended.
+
+```bash
+python -m scripts.cache_stage2_diffusion \
+  --vod-root "$VOD" --fault-samples-root "$FAULTS" \
+  --stage1-checkpoint "$STAGE1" \
+  --output-root "$BASE/sensor_fusion_outputs/stage2_preprocess_cache" \
+  --config configs/radar_lidar_stage2_diffusion.json --device cuda
+
+python -m models.radar_lidar_stage2_diffusion.train \
+  --vod-root "$VOD" --fault-samples-root "$FAULTS" \
+  --stage1-checkpoint "$STAGE1" --output-root "$RUN" \
+  --preprocess-cache-root "$BASE/sensor_fusion_outputs/stage2_preprocess_cache" \
+  --config configs/radar_lidar_stage2_diffusion.json \
+  --epochs 50 --batch-size 4 --grad-accum-steps 1 \
+  --validate-every 5 --num-workers 2 --device cuda --amp bf16
+```
+
+The cached loader can resume an existing Stage-II checkpoint because it does
+not change the architecture, trainable parameters, or target definitions.
+
 `--amp bf16` optionally enables bfloat16 autocast for the Stage-II U-Net on
 CUDA; Stage I and target construction remain full precision. Run
 `python -m scripts.smoke_stage2_diffusion_minkowski` on the target GPU before

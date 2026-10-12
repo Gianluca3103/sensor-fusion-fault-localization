@@ -11,16 +11,27 @@ import torch
 from tqdm import tqdm
 
 from models.radar_lidar_stage2_residual.targets import make_residual_targets
-from models.radar_lidar_stage2_residual.train import ResidualMetrics, _loader, _to_device
+from models.radar_lidar_stage2_residual.train import ResidualMetrics, _loader
 from scripts.visualize_stage1_confidence_cloud import load_encoder
 
 from .config import DiffusionConfig
+from .cache import cached_loader, provenance, restore_cached
 from .losses import training_state, denoising_loss
 from .model import ResidualSparseDiffusion
 
 
 def _batch_count(batch: dict) -> int:
-    return batch["radar"].shape[0]
+    return len(batch["frame_id"])
+
+
+def _to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device(item, device) for item in value]
+    return value
 
 
 def _autocast(device: str, amp: str):
@@ -32,6 +43,8 @@ def _autocast(device: str, amp: str):
 
 
 def _context_target(model, stage1, batch, config):
+    if "cache" in batch:
+        return restore_cached(batch, model)
     with torch.no_grad():
         evidence = stage1(batch["radar"], batch["radar_valid"], defer_diagnostics=True)
     context = model.prepare(evidence, stage1.config.grid, batch["faulty_lidar"],
@@ -130,6 +143,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vod-root", required=True)
     parser.add_argument("--fault-samples-root", required=True)
+    parser.add_argument("--preprocess-cache-root",
+                        help="Complete per-frame Stage-II preprocessing cache")
     parser.add_argument("--fault-pattern", default="*")
     parser.add_argument("--stage1-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
@@ -185,11 +200,20 @@ def main():
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         start, best = int(saved["epoch"]) + 1, float(saved["best_score"])
-    training = _loader(args, "train", args.train_limit, True)
-    validation = _loader(args, "val", args.val_limit, False)
+    if args.preprocess_cache_root:
+        expected = provenance(stage1_checkpoint=args.stage1_checkpoint,
+                              vod_root=args.vod_root,
+                              fault_samples_root=args.fault_samples_root,
+                              radar_variant=args.radar_variant,
+                              fault_pattern=args.fault_pattern, config=config)
+        training = cached_loader(args, "train", args.train_limit, True, expected)
+        validation = cached_loader(args, "val", args.val_limit, False, expected)
+    else:
+        training = _loader(args, "train", args.train_limit, True)
+        validation = _loader(args, "val", args.val_limit, False)
     print(f"Sparse diffusion: train={len(training.dataset)} val={len(validation.dataset)} "
           f"timesteps={config.timesteps} Stage-I frozen=True grid={stage1.config.grid.size_xyz} "
-          f"amp={args.amp}", flush=True)
+          f"amp={args.amp} cached={bool(args.preprocess_cache_root)}", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = train_epoch(model, stage1, training, optimizer, config, args.device,
                             args.grad_accum_steps, epoch, args.epochs, args.amp)

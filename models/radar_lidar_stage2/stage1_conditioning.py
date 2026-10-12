@@ -58,10 +58,9 @@ class Stage1Conditioning(nn.Module):
         n = len(domain.coordinates)
         if not n:
             return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
-        center = domain.centers_xyz
         dest_xyz = domain.centers_xyz_numpy()
         dest_batch = domain.batch_numpy()
-        parts = []
+        sources, indices, distances = [], [], []
         for i in range(4):
             sites = (replacement_stage1 or stage1).features[f"s{i+1}"]
             if sites.stride != 2 ** i:
@@ -72,12 +71,35 @@ class Stage1Conditioning(nn.Module):
             src_batch = sites.coords[:, 0].detach().cpu().numpy()
             idx_np, dist_np = physical_neighbor_map(dest_xyz, dest_batch, src_xyz, src_batch,
                                                      self.config.query_radii_m[i], self.config.max_neighbors)
-            index = torch.as_tensor(idx_np, device=sites.features.device)
-            distance = torch.as_tensor(dist_np, device=sites.features.device)
+            sources.append(sites.features)
+            indices.append(torch.as_tensor(idx_np, device=sites.features.device))
+            distances.append(torch.as_tensor(dist_np, device=sites.features.device))
+        return self.forward_cached(domain, sources, indices, distances,
+                                   ablation="real" if ablation == "wrong_sample" else ablation)
+
+    def forward_cached(self, domain: CandidateDomain, sources: list[torch.Tensor],
+                       indices: list[torch.Tensor], distances: list[torch.Tensor], *,
+                       ablation: str = "real") -> torch.Tensor:
+        """Project cached neighbor maps with the current trainable Stage-II weights."""
+        if ablation not in {"real", "zero", "shuffle", "no_confidence", "s1_only", "s4_only"}:
+            raise ValueError(ablation)
+        n = len(domain.coordinates)
+        if not n:
+            return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
+        if not len(sources) == len(indices) == len(distances) == 4:
+            raise ValueError("Expected four cached Stage-I scales")
+        center = domain.centers_xyz
+        parts = []
+        for i, (source, index, distance) in enumerate(zip(sources, indices, distances)):
+            if (index.shape != (n, self.config.max_neighbors)
+                    or distance.shape != index.shape or source.ndim != 2
+                    or source.shape[1] != self.projections[i][0].in_features):
+                raise ValueError("Cached Stage-I neighbor shapes differ from the model")
+            index = index.long()
             valid = index >= 0
             linear, norm, activation = self.projections[i]
-            if len(sites.features):
-                source = sites.features.detach()
+            if len(source):
+                source = source.detach()
                 if ablation == "zero" or (ablation == "s1_only" and i != 0) or (ablation == "s4_only" and i != 3):
                     source = torch.zeros_like(source)
                 elif ablation == "shuffle":
