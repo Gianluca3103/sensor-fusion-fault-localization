@@ -7,6 +7,7 @@ encoder, Stage-II preparation, one denoising pass, backward, and optimizer.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import statistics
@@ -34,6 +35,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--amp", choices=("off", "bf16"), default="bf16")
+    parser.add_argument("--split-backward", action="store_true",
+                        help="Time denoiser and trainable conditioning gradients separately")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.batch_size < 1 or args.repeats < 1 or args.start_index < 0:
@@ -91,11 +94,24 @@ def main() -> None:
             context.domain, batch["clean_lidar"], batch["clean_lidar_valid"],
             context.coverage, free_ray_tolerance_m=config.residual.free_ray_tolerance_m))
         optimizer.zero_grad(set_to_none=True)
+        if args.split_backward:
+            # The detached leaf keeps the exact forward values and receives
+            # the gradient that will be propagated through the conditioner.
+            condition_leaf = context.condition.detach().requires_grad_(True)
+            denoiser_context = replace(context, condition=condition_leaf)
+        else:
+            denoiser_context = context
         losses, counts = timed("denoiser_forward_and_loss", lambda: _denoise(
-            model, context, target, args.batch_size, amp=args.amp))
+            model, denoiser_context, target, args.batch_size, amp=args.amp))
         if not bool(torch.isfinite(losses["total"])):
             raise FloatingPointError("The profiled diffusion loss is non-finite")
-        timed("backward", lambda: losses["total"].backward())
+        if args.split_backward:
+            timed("denoiser_backward", lambda: losses["total"].backward())
+            if condition_leaf.grad is None:
+                raise AssertionError("The denoiser did not propagate to Stage-II conditioning")
+            timed("conditioning_backward", lambda: context.condition.backward(condition_leaf.grad))
+        else:
+            timed("backward", lambda: losses["total"].backward())
         timed("optimizer_step", optimizer.step)
         records.append({"candidate_sites": len(context.domain.coordinates),
                         "unet_input_sites": counts["input"],
@@ -104,6 +120,7 @@ def main() -> None:
                         "region_sites": int(context.coverage.in_fault_region.sum())})
     print(json.dumps({"frames": batch["frame_id"], "batch_size": args.batch_size,
                       "repeats": args.repeats, "amp": args.amp,
+                      "split_backward": args.split_backward,
                       "seconds_median": {key: statistics.median(values)
                                          for key, values in ticks.items()},
                       "seconds_each": ticks, "iterations": records,
