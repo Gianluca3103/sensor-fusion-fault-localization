@@ -72,6 +72,13 @@ def test_diffusion_config_round_trip_and_rejects_deterministic_switch(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config.as_dict()), encoding="utf-8")
     assert DiffusionConfig.from_json(path) == config
+    assert config.diffusion_enabled is True
+    try:
+        DiffusionConfig(diffusion_enabled=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Diffusion run unexpectedly accepted diffusion off")
     try:
         DiffusionConfig(residual=ResidualStage2Config(diffusion_enabled=True))
     except NotImplementedError:

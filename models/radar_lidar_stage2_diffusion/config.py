@@ -12,6 +12,7 @@ from models.radar_lidar_stage2_residual.config import ResidualStage2Config
 @dataclass(frozen=True)
 class DiffusionConfig:
     residual: ResidualStage2Config = ResidualStage2Config()
+    diffusion_enabled: bool = True
     timesteps: int = 16
     occupancy_denoise_weight: float = 1.0
     offset_denoise_weight: float = 1.0
@@ -19,6 +20,8 @@ class DiffusionConfig:
     sample_seed: int = 1701
 
     def __post_init__(self) -> None:
+        if not self.diffusion_enabled:
+            raise ValueError("This module always runs diffusion")
         if self.residual.diffusion_enabled:
             raise ValueError("The nested residual settings describe conditioning only")
         if self.timesteps < 2:
