@@ -115,12 +115,17 @@ class ResidualSparseDiffusion(nn.Module):
             state = torch.randn((n, 4), dtype=context.condition.dtype,
                                 device=context.condition.device, generator=generator)
         blocked = ~coverage.may_add
+        known_noise = state[blocked].clone()
+        known_clean = torch.zeros_like(known_noise)
+        known_clean[:, 0] = -1
         for step in range(self.config.timesteps - 1, -1, -1):
+            alpha = self.schedule.alpha_bar[step].to(state.dtype)
+            state[blocked] = alpha.sqrt() * known_clean + (1 - alpha).sqrt() * known_noise
             timestep = torch.full((context.batch_size,), step, dtype=torch.long, device=state.device)
             predicted, counts = self.predict_clean(context, state, timestep)
             state = self.schedule.reverse_step(state, predicted, step)
-            # These locations are measured already or outside the injected fault.
-            state[blocked, 0] = -1
+        # These locations are measured already or outside the injected fault.
+        state[blocked] = known_clean
         probability = ((state[:, 0] + 1) * .5).clamp(0, 1)
         logits = torch.logit(probability.clamp(1e-5, 1 - 1e-5))
         offsets = .5 * state[:, 1:].clamp(-1, 1)
