@@ -69,7 +69,7 @@ def test_parallel_neighbor_queries_match_serial_queries():
     assert query_workers(10) == 1
 
 
-def test_source_projection_matches_projecting_each_pooled_candidate():
+def test_frozen_source_pooling_matches_projected_source_and_parameter_gradients():
     torch.manual_seed(47)
     source = torch.randn(29, 128)
     indices = torch.randint(0, 29, (107, 8))
@@ -77,7 +77,18 @@ def test_source_projection_matches_projecting_each_pooled_candidate():
     weights = weights / weights.sum(1, keepdim=True)
     weights[0] = 0  # A query without neighbors still receives the linear bias.
     linear = torch.nn.Linear(128, 32)
-    original = linear((source[indices] * weights[..., None]).sum(1))
+    with torch.no_grad():
+        pooled = source.new_zeros((len(indices), source.shape[1]))
+        for neighbor in range(indices.shape[1]):
+            pooled.add_(source.index_select(0, indices[:, neighbor])
+                        * weights[:, neighbor, None])
+    original = linear(pooled)
     projected_source = F.linear(source, linear.weight, bias=None)
     optimized = (projected_source[indices] * weights[..., None]).sum(1) + linear.bias
     torch.testing.assert_close(optimized, original, rtol=1e-5, atol=1e-6)
+    old_grads = torch.autograd.grad(optimized.square().sum(),
+                                   (linear.weight, linear.bias), retain_graph=True)
+    new_grads = torch.autograd.grad(original.square().sum(),
+                                   (linear.weight, linear.bias))
+    for old, new in zip(old_grads, new_grads):
+        torch.testing.assert_close(old, new, rtol=1e-5, atol=2e-5)

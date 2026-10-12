@@ -82,13 +82,19 @@ class Stage1Conditioning(nn.Module):
                     source = torch.zeros_like(source)
                 elif ablation == "shuffle":
                     source = source.flip(0)
-                weights = torch.where(valid, 1 / (distance + 0.05), 0.)
-                weights = weights / weights.sum(1, keepdim=True).clamp_min(1e-8)
-                # Linear projection commutes with weighted pooling. Apply it
-                # at the much smaller Stage-I source set, then gather 32-D
-                # features instead of up to 128-D features per candidate.
-                projected_source = F.linear(source, linear.weight, bias=None)
-                projected = (projected_source[index.clamp_min(0)] * weights[..., None]).sum(1)
+                # Stage I and the neighbor map are frozen. Pool raw features
+                # without autograd, then project each candidate. The linear
+                # operation commutes with weighted pooling, but this order
+                # avoids scattering millions of candidate gradients back to
+                # the much smaller Stage-I source set during backward.
+                with torch.no_grad():
+                    weights = torch.where(valid, 1 / (distance + 0.05), 0.)
+                    weights = weights / weights.sum(1, keepdim=True).clamp_min(1e-8)
+                    pooled = source.new_zeros((n, source.shape[1]))
+                    for neighbor in range(index.shape[1]):
+                        pooled.add_(source.index_select(0, index[:, neighbor].clamp_min(0))
+                                    * weights[:, neighbor, None])
+                projected = F.linear(pooled, linear.weight, bias=None)
             else:
                 projected = center.new_zeros((n, linear.out_features))
             if linear.bias is not None:
