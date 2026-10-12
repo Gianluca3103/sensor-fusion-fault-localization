@@ -63,10 +63,12 @@ class ResidualSparseDiffusion(nn.Module):
 
     def prepare_cached(self, domain: CandidateDomain, coverage: FaultyCoverage,
                        sources: list[torch.Tensor], indices: list[torch.Tensor],
-                       distances: list[torch.Tensor], batch_size: int) -> DiffusionContext:
+                       distances: list[torch.Tensor] | None, batch_size: int, *,
+                       source_centers: list[torch.Tensor] | None = None) -> DiffusionContext:
         """Use fixed geometry and neighbor maps with current trainable weights."""
         if len(domain.coordinates):
-            radar = self.conditioner.forward_cached(domain, sources, indices, distances)
+            radar = self.conditioner.forward_cached(domain, sources, indices, distances,
+                                                    source_centers=source_centers)
             observed = self.faulty_encoder(coverage.features)
             condition = torch.cat((radar, observed), dim=1)
         else:

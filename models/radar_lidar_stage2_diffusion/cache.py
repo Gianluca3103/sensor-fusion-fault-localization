@@ -24,7 +24,7 @@ from models.radar_lidar_stage2_residual.coverage import FaultyCoverage, faulty_c
 from models.radar_lidar_stage2_residual.targets import ResidualTargets, make_residual_targets
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def preprocessing_code_sha256() -> str:
@@ -78,7 +78,8 @@ def _array(value: torch.Tensor, dtype=None) -> np.ndarray:
 
 
 @torch.no_grad()
-def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config) -> dict[str, np.ndarray]:
+def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config, *,
+                  include_validation_clouds: bool = True) -> dict[str, np.ndarray]:
     """Compute all fixed geometry, supervision, and four local neighbor maps."""
     if len(batch["frame_id"]) != 1:
         raise ValueError("Cache entries must contain exactly one frame")
@@ -105,7 +106,6 @@ def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config) -> dict[str, n
         "target_addition": _array(target.addition, np.bool_),
         "target_observed": _array(target.observed, np.bool_),
         "target_known_free": _array(target.known_free, np.bool_),
-        "target_offsets": _array(target.offsets_normalized, np.float32),
         "clean_occupied": _array(clean.occupied, np.bool_),
         "clean_known_free": _array(clean.known_free, np.bool_),
         "clean_offsets": _array(clean.offsets_normalized, np.float32),
@@ -114,21 +114,26 @@ def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config) -> dict[str, n
         "clean_points_in_grid": np.asarray(clean.clean_points_in_grid, np.int64),
         "clean_points_in_candidates": np.asarray(clean.clean_points_in_candidates, np.int64),
         "point_centroid_errors": _array(clean.point_centroid_errors_m, np.float32),
-        "clean_lidar": _array(batch["clean_lidar"][0, batch["clean_lidar_valid"][0]], np.float32),
-        "faulty_lidar": _array(batch["faulty_lidar"][0, batch["faulty_lidar_valid"][0]], np.float32),
     }
+    if include_validation_clouds:
+        result["clean_lidar"] = _array(batch["clean_lidar"][0, batch["clean_lidar_valid"][0]], np.float32)
+        result["faulty_lidar"] = _array(batch["faulty_lidar"][0, batch["faulty_lidar_valid"][0]], np.float32)
     dest_xyz, dest_batch = domain.centers_xyz_numpy(), domain.batch_numpy()
     for i in range(4):
         sites = evidence.features[f"s{i+1}"]
         source_xyz = _array(sites.centers_xyz(grid), np.float32)
         source_batch = _array(sites.coords[:, 0], np.int64)
-        index, distance = physical_neighbor_map(
+        index, _ = physical_neighbor_map(
             dest_xyz, dest_batch, source_xyz, source_batch,
             base.query_radii_m[i], base.max_neighbors,
         )
         result[f"source_{i}"] = _array(sites.features, np.float32)
-        result[f"neighbor_index_{i}"] = index.astype(np.int32)
-        result[f"neighbor_distance_{i}"] = distance.astype(np.float32)
+        result[f"source_center_{i}"] = source_xyz
+        if len(source_xyz) < np.iinfo(np.uint16).max:
+            result[f"neighbor_index_{i}"] = np.where(index < 0, np.iinfo(np.uint16).max,
+                                                       index).astype(np.uint16)
+        else:
+            result[f"neighbor_index_{i}"] = index.astype(np.int32)
     return result
 
 
@@ -168,6 +173,8 @@ class CachedFrameDataset(Dataset):
             row = {name: archive[name] for name in archive.files}
         if str(row["frame_id"].item()) != frame_id:
             raise ValueError(f"Cached frame ID differs: {path}")
+        if self.split == "val" and ("clean_lidar" not in row or "faulty_lidar" not in row):
+            raise ValueError(f"Validation cloud data missing from cache: {path}")
         return row
 
 
@@ -188,18 +195,21 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
     for row in rows:
         for key, value in json.loads(str(row["counts_json"].item())).items():
             counts[key] = counts.get(key, 0) + value if isinstance(value, (int, float)) else value
-    sources, indices, distances = [], [], []
+    sources, source_centers, indices = [], [], []
     for scale in range(4):
         source_rows = [row[f"source_{scale}"] for row in rows]
         sources.append(_cat(rows, f"source_{scale}", np.float32))
+        source_centers.append(_cat(rows, f"source_center_{scale}", np.float32))
         index_rows = []
         source_offset = 0
         for row, source in zip(rows, source_rows):
-            local = row[f"neighbor_index_{scale}"].astype(np.int64)
+            stored = row[f"neighbor_index_{scale}"]
+            local = stored.astype(np.int64)
+            if stored.dtype == np.uint16:
+                local[local == np.iinfo(np.uint16).max] = -1
             index_rows.append(np.where(local >= 0, local + source_offset, -1))
             source_offset += len(source)
         indices.append(torch.from_numpy(np.concatenate(index_rows, axis=0)))
-        distances.append(_cat(rows, f"neighbor_distance_{scale}", np.float32))
     cache = {
         "coordinates": coordinates,
         "confidence": _cat(rows, "confidence", np.float32),
@@ -212,7 +222,6 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
         "target_addition": _cat(rows, "target_addition", np.bool_),
         "target_observed": _cat(rows, "target_observed", np.bool_),
         "target_known_free": _cat(rows, "target_known_free", np.bool_),
-        "target_offsets": _cat(rows, "target_offsets", np.float32),
         "clean_occupied": _cat(rows, "clean_occupied", np.bool_),
         "clean_known_free": _cat(rows, "clean_known_free", np.bool_),
         "clean_offsets": _cat(rows, "clean_offsets", np.float32),
@@ -222,16 +231,18 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
         "clean_points_in_candidates": sum(int(row["clean_points_in_candidates"]) for row in rows),
         "point_centroid_errors": _cat(rows, "point_centroid_errors", np.float32),
         "sources": sources,
+        "source_centers": source_centers,
         "indices": indices,
-        "distances": distances,
     }
     def padded(key: str) -> tuple[torch.Tensor, torch.Tensor]:
-        maximum = max(len(row[key]) for row in rows)
+        maximum = max(len(row.get(key, ())) for row in rows)
         points = torch.zeros((len(rows), maximum, 4), dtype=torch.float32)
         valid = torch.zeros((len(rows), maximum), dtype=torch.bool)
         for i, row in enumerate(rows):
-            length = len(row[key])
-            points[i, :length] = torch.from_numpy(row[key])
+            value = row.get(key)
+            length = 0 if value is None else len(value)
+            if length:
+                points[i, :length] = torch.from_numpy(value)
             valid[i, :length] = True
         return points, valid
     clean, clean_valid = padded("clean_lidar")
@@ -263,6 +274,7 @@ def restore_cached(batch: dict, model) -> tuple:
                          data["clean_point_count"], data["clean_points_in_grid"],
                          data["clean_points_in_candidates"], data["point_centroid_errors"])
     target = ResidualTargets(data["target_addition"], data["target_observed"],
-                             data["target_known_free"], data["target_offsets"], clean)
+                             data["target_known_free"], clean.offsets_normalized, clean)
     return model.prepare_cached(domain, coverage, data["sources"],
-                                data["indices"], data["distances"], len(batch["frame_id"])), target
+                                data["indices"], None, len(batch["frame_id"]),
+                                source_centers=data["source_centers"]), target

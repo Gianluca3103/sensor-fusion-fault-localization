@@ -47,6 +47,9 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
     target = make_residual_targets(domain, clean, batch["clean_lidar_valid"], coverage,
                                    free_ray_tolerance_m=base.free_ray_tolerance_m)
     arrays = prepare_frame(evidence, grid, batch, config)
+    assert all(arrays[f"neighbor_index_{scale}"].dtype == np.uint16 for scale in range(4))
+    assert all(f"neighbor_distance_{scale}" not in arrays for scale in range(4))
+    assert "target_offsets" not in arrays
     path = tmp_path / "00001.npz"
     save_frame(path, arrays, "fast")
     with np.load(path, allow_pickle=False) as archive:
@@ -62,8 +65,9 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
     conditioner = Stage1Conditioning((4, 4, 4, 4), base)
     direct = conditioner(evidence, domain)
     precomputed = conditioner.forward_cached(domain, cache["sources"],
-                                             cache["indices"], cache["distances"])
-    assert torch.allclose(precomputed, direct, atol=1e-6, rtol=1e-5)
+                                             cache["indices"], None,
+                                             source_centers=cache["source_centers"])
+    assert torch.allclose(precomputed, direct, atol=1e-5, rtol=1e-5)
     doubled_batch = collate_cached([loaded, loaded], grid)
     doubled = doubled_batch["cache"]
     for scale in range(4):
@@ -80,23 +84,28 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
                                    batch["fault_region"])
     restored, cached_target = restore_cached(cached, model)
     assert torch.equal(restored.domain.coordinates, domain.coordinates)
-    assert torch.allclose(restored.condition, direct_context.condition, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(restored.condition, direct_context.condition, atol=1e-5, rtol=1e-5)
     assert torch.equal(cached_target.clean.occupied, target.clean.occupied)
     doubled_context, doubled_target = restore_cached(doubled_batch, model)
     count = len(domain.coordinates)
     assert torch.allclose(doubled_context.condition[:count], restored.condition,
-                          atol=1e-6, rtol=1e-5)
+                          atol=1e-5, rtol=1e-5)
     assert torch.allclose(doubled_context.condition[count:], restored.condition,
-                          atol=1e-6, rtol=1e-5)
+                          atol=1e-5, rtol=1e-5)
     assert torch.equal(doubled_target.addition[:count], cached_target.addition)
 
     manifest = {"complete": True, "splits": {"train": ["00001"], "val": ["00001"]},
                 "grid": asdict(grid)}
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    save_frame(tmp_path / "train" / "00001.npz", arrays, "fast")
+    train_arrays = prepare_frame(evidence, grid, batch, config,
+                                 include_validation_clouds=False)
+    assert "clean_lidar" not in train_arrays and "faulty_lidar" not in train_arrays
+    save_frame(tmp_path / "train" / "00001.npz", train_arrays, "fast")
     args = SimpleNamespace(preprocess_cache_root=tmp_path, batch_size=1, num_workers=0)
     loaded_batch = _to_device(next(iter(cached_loader(args, "train", 0, False, {}))), "cpu")
     loaded_context, loaded_target = _context_target(model, None, loaded_batch, config)
     assert torch.allclose(loaded_context.condition, direct_context.condition,
-                          atol=1e-6, rtol=1e-5)
+                          atol=1e-5, rtol=1e-5)
     assert torch.equal(loaded_target.addition, target.addition)
+    assert loaded_batch["clean_lidar"].shape[1] == 0
+    assert loaded_batch["faulty_lidar"].shape[1] == 0

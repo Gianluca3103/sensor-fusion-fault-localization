@@ -34,7 +34,9 @@ def _cached(path: Path, frame_id: str) -> bool:
     if not path.exists():
         return False
     with np.load(path, allow_pickle=False) as data:
-        if str(data["frame_id"].item()) != frame_id or "neighbor_index_3" not in data:
+        if (str(data["frame_id"].item()) != frame_id or
+                "neighbor_index_3" not in data or "source_center_3" not in data or
+                "neighbor_distance_3" in data):
             raise ValueError(f"Incomplete or mismatched cache entry: {path}")
     return True
 
@@ -101,7 +103,8 @@ def main() -> None:
                          else value for key, value in raw.items()}
                 evidence = stage1(batch["radar"], batch["radar_valid"],
                                   defer_diagnostics=True)
-                arrays = prepare_frame(evidence, stage1.config.grid, batch, config)
+                arrays = prepare_frame(evidence, stage1.config.grid, batch, config,
+                                       include_validation_clouds=(split == "val"))
                 save_frame(path, arrays, args.compression)
                 written_bytes += path.stat().st_size
                 built += 1

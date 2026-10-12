@@ -78,7 +78,8 @@ class Stage1Conditioning(nn.Module):
                                    ablation="real" if ablation == "wrong_sample" else ablation)
 
     def forward_cached(self, domain: CandidateDomain, sources: list[torch.Tensor],
-                       indices: list[torch.Tensor], distances: list[torch.Tensor], *,
+                       indices: list[torch.Tensor], distances: list[torch.Tensor] | None, *,
+                       source_centers: list[torch.Tensor] | None = None,
                        ablation: str = "real") -> torch.Tensor:
         """Project cached neighbor maps with the current trainable Stage-II weights."""
         if ablation not in {"real", "zero", "shuffle", "no_confidence", "s1_only", "s4_only"}:
@@ -86,17 +87,33 @@ class Stage1Conditioning(nn.Module):
         n = len(domain.coordinates)
         if not n:
             return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
-        if not len(sources) == len(indices) == len(distances) == 4:
+        if (len(sources) != 4 or len(indices) != 4 or
+                (distances is None and (source_centers is None or len(source_centers) != 4)) or
+                (distances is not None and len(distances) != 4)):
             raise ValueError("Expected four cached Stage-I scales")
         center = domain.centers_xyz
         parts = []
-        for i, (source, index, distance) in enumerate(zip(sources, indices, distances)):
-            if (index.shape != (n, self.config.max_neighbors)
-                    or distance.shape != index.shape or source.ndim != 2
+        for i, (source, index) in enumerate(zip(sources, indices)):
+            if (index.shape != (n, self.config.max_neighbors) or source.ndim != 2
                     or source.shape[1] != self.projections[i][0].in_features):
                 raise ValueError("Cached Stage-I neighbor shapes differ from the model")
             index = index.long()
             valid = index >= 0
+            if distances is None:
+                source_xyz = source_centers[i]
+                if source_xyz.shape != (len(source), 3):
+                    raise ValueError("Cached Stage-I source positions differ from features")
+                if len(source):
+                    gathered = source_xyz.index_select(0, index.clamp_min(0).reshape(-1))
+                    gathered = gathered.reshape(n, index.shape[1], 3)
+                    distance = torch.linalg.vector_norm(gathered - center[:, None, :], dim=-1)
+                    distance = torch.where(valid, distance, torch.inf)
+                else:
+                    distance = center.new_full(index.shape, torch.inf)
+            else:
+                distance = distances[i]
+                if distance.shape != index.shape:
+                    raise ValueError("Cached Stage-I distance shape differs from neighbors")
             linear, norm, activation = self.projections[i]
             if len(source):
                 source = source.detach()
