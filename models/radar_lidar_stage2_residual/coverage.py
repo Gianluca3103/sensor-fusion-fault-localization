@@ -10,6 +10,7 @@ import torch
 
 from models.radar_lidar_stage1.sparse import encode_keys, voxelize
 from models.radar_lidar_stage2.candidate_domain import CandidateDomain
+from models.radar_lidar_stage2.cpu_query import query_workers
 from .data import within_fault_region
 
 
@@ -74,7 +75,8 @@ def faulty_coverage(domain: CandidateDomain, faulty: torch.Tensor, valid: torch.
             continue
         xyz = observed[:, :3]
         tree = cKDTree(xyz)
-        distance8, nearest8 = tree.query(query, k=min(8, len(xyz)), workers=1)
+        distance8, nearest8 = tree.query(query, k=min(8, len(xyz)),
+                                         workers=query_workers(len(query)))
         distance8 = np.asarray(distance8).reshape(len(query), -1)
         nearest8 = np.asarray(nearest8).reshape(len(query), -1)
         near, nearest = distance8[:, 0], nearest8[:, 0]
@@ -89,7 +91,8 @@ def faulty_coverage(domain: CandidateDomain, faulty: torch.Tensor, valid: torch.
         if not usable.any() or not qgood.any():
             continue
         dirs = xyz[usable] / length[usable, None]
-        chord, _ = cKDTree(dirs).query(query[qgood] / qlength[qgood, None], k=1, workers=1)
+        chord, _ = cKDTree(dirs).query(query[qgood] / qlength[qgood, None], k=1,
+                                       workers=query_workers(int(qgood.sum())))
         # Endpoint offsets and arbitrary farther returns are irrelevant here:
         # this test asks only whether a faulty first-return ray was measured.
         rays[idx[qgood]] = qlength[qgood] * chord <= ray_tolerance_m

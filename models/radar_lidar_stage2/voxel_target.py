@@ -10,6 +10,7 @@ import torch
 
 from models.radar_lidar_stage1.sparse import encode_keys, voxelize
 from .candidate_domain import CandidateDomain, voxel_centers_xyz
+from .cpu_query import query_workers
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,8 @@ def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
         # the earliest compatible return; choosing an arbitrary farther ray
         # could falsely mark space behind a nearer occluder as free.
         chord, nearest = cKDTree(ray).query(query[nonzero] / query_range[nonzero, None],
-                                                k=min(16, len(ray)), workers=1)
+                                                k=min(16, len(ray)),
+                                                workers=query_workers(int(nonzero.sum())))
         chord = np.atleast_2d(chord).reshape(np.count_nonzero(nonzero), -1)
         nearest = np.atleast_2d(nearest).reshape(np.count_nonzero(nonzero), -1)
         compatible = query_range[nonzero, None] * chord <= free_ray_tolerance_m

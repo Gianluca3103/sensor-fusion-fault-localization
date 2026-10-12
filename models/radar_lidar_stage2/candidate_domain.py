@@ -58,7 +58,8 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
     step=np.asarray(grid.size_xyz,dtype=np.float64)
     shape_xyz=np.asarray(grid.shape_zyx[::-1],dtype=np.int64)
     z_size,y_size,x_size=grid.shape_zyx
-    values: dict[int,float]={}
+    key_blocks=[]
+    score_blocks=[]
     accepted=0
     for proposal in selected:
         low=np.maximum(0,np.ceil((xyz[proposal]-radii[proposal]-origin)/step-.5).astype(np.int64))
@@ -77,15 +78,22 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
         cells=grid_xyz[inside]
         cell_keys=(((int(batch[proposal])*z_size+cells[:,2])*y_size+cells[:,1])*x_size+cells[:,0]).astype(np.int64)
         weighted=scores[proposal]*(1-.5*squared[inside])
-        for key,score in zip(cell_keys,weighted):
-            item=int(key)
-            values[item]=max(values.get(item,0.),float(score))
+        key_blocks.append(cell_keys)
+        score_blocks.append(weighted)
         accepted+=1
-    if values:
-        keys=np.asarray(sorted(values),dtype=np.int64)
+    if key_blocks:
+        # Sort once and reduce equal cell keys in NumPy. The previous scalar
+        # dictionary update ran Python code for every rasterized voxel.
+        raw_keys=np.concatenate(key_blocks)
+        raw_scores=np.concatenate(score_blocks)
+        order=np.argsort(raw_keys)
+        sorted_keys=raw_keys[order]
+        starts=np.flatnonzero(np.r_[True,sorted_keys[1:]!=sorted_keys[:-1]])
+        keys=sorted_keys[starts]
+        strongest=np.maximum.reduceat(raw_scores[order],starts)
         coordinates=decode_keys(torch.as_tensor(keys,device=output.features["s1"].coords.device),
                                 grid.shape_zyx)
-        propagated=surface.score.new_tensor([values[int(key)] for key in keys])
+        propagated=surface.score.new_tensor(strongest)
     else:
         coordinates=output.features["s1"].coords.new_empty((0,4))
         propagated=surface.score.new_empty(0)

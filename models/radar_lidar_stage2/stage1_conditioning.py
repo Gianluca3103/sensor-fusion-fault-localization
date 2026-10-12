@@ -10,6 +10,7 @@ from torch import nn
 from models.radar_lidar_stage1.model import Stage1Output
 from .candidate_domain import CandidateDomain
 from .config import Stage2Config
+from .cpu_query import query_workers
 
 
 def physical_neighbor_map(candidate_xyz: np.ndarray, candidate_batch: np.ndarray,
@@ -24,7 +25,8 @@ def physical_neighbor_map(candidate_xyz: np.ndarray, candidate_batch: np.ndarray
         if not len(dest) or not len(src):
             continue
         d, local = cKDTree(source_xyz[src]).query(candidate_xyz[dest], k=max_neighbors,
-                                                    distance_upper_bound=radius_m, workers=1)
+                                                    distance_upper_bound=radius_m,
+                                                    workers=query_workers(len(dest)))
         d = np.asarray(d).reshape(len(dest), max_neighbors)
         local = np.asarray(local).reshape(len(dest), max_neighbors)
         good = local < len(src)
