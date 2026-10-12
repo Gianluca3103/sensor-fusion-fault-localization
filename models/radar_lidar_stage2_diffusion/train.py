@@ -57,6 +57,8 @@ def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, ep
         batch = _to_device(raw, device)
         context, target = _context_target(model, stage1, batch, config)
         losses, counts = _denoise(model, context, target, _batch_count(batch))
+        if not bool(torch.isfinite(losses["total"])):
+            raise FloatingPointError(f"Non-finite diffusion loss at epoch {epoch}, batch {step}")
         (losses["total"] / grad_accum).backward()
         if step % grad_accum == 0 or step == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
@@ -82,6 +84,8 @@ def evaluate(model, stage1, loader, config, device):
         context, target = _context_target(model, stage1, batch, config)
         losses, _ = _denoise(model, context, target, _batch_count(batch), generator=generator,
                              fixed_timestep=config.timesteps // 2)
+        if not bool(torch.isfinite(losses["total"])):
+            raise FloatingPointError("Non-finite diffusion validation loss")
         for key in names:
             totals[key] += losses[key]
         output = model.sample(context, frame_seeds=[config.sample_seed + int(frame)
