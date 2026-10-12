@@ -38,8 +38,25 @@ proposal score. CPU nearest-neighbor queries use up to four threads for large
 query sets. Set `STAGE2_KDTREE_WORKERS=1` to compare against serial queries.
 During reverse diffusion, all timesteps reuse the same MinkowskiEngine
 coordinate manager and sparse output ordering. The conditioner projects each
-Stage-I source feature before pooling it into candidate cells. These changes
+pooled Stage-I feature once per candidate cell. These changes
 preserve the candidate set and network parameter shapes.
+
+An existing 16-timestep checkpoint can also be sampled with three DDIM passes.
+The passes use trained timesteps 15, 8, and 0, with a direct reverse update
+between them. This changes sampling only; training still draws one timestep per
+batch. Compare both settings on identical validation frames before relying on
+three-step geometry:
+
+```bash
+python -m scripts.evaluate_stage2_diffusion_steps \
+  --vod-root "$VOD" --fault-samples-root "$FAULTS" \
+  --checkpoint "$RUN/last.ckpt" --val-limit 16 \
+  --sampling-steps 3 16 --output "$RUN/sampling_3_vs_16.json" \
+  --device cuda
+```
+
+The detector export accepts `--sampling-steps 3`. Use a distinct output root
+for each sampling setting; the export manifest records the choice.
 
 `--amp bf16` optionally enables bfloat16 autocast for the Stage-II U-Net on
 CUDA; Stage I and target construction remain full precision. Run

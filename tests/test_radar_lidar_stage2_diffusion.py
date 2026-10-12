@@ -57,6 +57,8 @@ def test_unknown_training_latent_is_random_and_loss_masked():
 
 def test_schedule_reaches_noise_and_reverse_preserves_fixed_domain():
     schedule = CosineSchedule(16)
+    assert schedule.sampling_timesteps(3) == [15, 8, 0]
+    assert schedule.sampling_timesteps() == list(range(15, -1, -1))
     assert schedule.alpha_bar[0] > schedule.alpha_bar[-1]
     assert schedule.alpha_bar[-1] < .01
     clean = torch.tensor([[1., .2, -.4, .6], [-1., 0., 0., 0.]])
@@ -64,6 +66,10 @@ def test_schedule_reaches_noise_and_reverse_preserves_fixed_domain():
     state = schedule.mix(clean, noise, torch.full((2,), 15, dtype=torch.long))
     for t in range(15, -1, -1):
         state = schedule.reverse_step(state, clean, t)
+    assert torch.allclose(state, clean)
+    state = schedule.mix(clean, noise, torch.full((2,), 15, dtype=torch.long))
+    for current, previous in ((15, 8), (8, 0), (0, -1)):
+        state = schedule.reverse_step(state, clean, current, previous)
     assert torch.allclose(state, clean)
 
 
@@ -142,6 +148,7 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
             Sparse.coordinate_builds = Sparse.coordinate_reuses = 0
             first = model.sample(context, frame_seeds=[1701])
             second = model.sample(context, frame_seeds=[1701])
+            three_step = model.sample(context, frame_seeds=[1701], sampling_steps=3)
             predict_clean = model.predict_clean
 
             def bf16_prediction(*args, **kwargs):
@@ -152,9 +159,10 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
                 mixed = model.sample(context, frame_seeds=[1701])
                 mixed_generator = model.sample(context,
                                                generator=torch.Generator().manual_seed(1701))
-        assert Sparse.coordinate_builds == 4
-        assert Sparse.coordinate_reuses == 4 * (config.timesteps - 1)
+        assert Sparse.coordinate_builds == 5
+        assert Sparse.coordinate_reuses == 4 * (config.timesteps - 1) + 2
         assert torch.equal(first.addition_probability, second.addition_probability)
+        assert three_step.metadata["sampling_steps"] == 3
         assert mixed.addition_probability.dtype == torch.float32
         assert torch.isfinite(mixed.addition_probability).all()
         assert mixed_generator.addition_probability.dtype == torch.float32

@@ -64,10 +64,19 @@ def main():
     model.eval()
     with torch.no_grad():
         generated = model.sample(context, generator=torch.Generator(device=device).manual_seed(41))
+        generated_three = model.sample(context,
+                                       generator=torch.Generator(device=device).manual_seed(41),
+                                       sampling_steps=3)
+        assert generated_three.metadata["sampling_steps"] == 3
+        assert bool(torch.isfinite(generated_three.addition_probability).all())
         with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
               if device == "cuda" else nullcontext()):
             mixed_sample = model.sample(context, generator=torch.Generator(device=device).manual_seed(41))
+            mixed_three = model.sample(context,
+                                       generator=torch.Generator(device=device).manual_seed(41),
+                                       sampling_steps=3)
         assert bool(torch.isfinite(mixed_sample.addition_probability).all())
+        assert bool(torch.isfinite(mixed_three.addition_probability).all())
         assert not bool((generated.addition_probability[~context.coverage.may_add] > .5).any())
         assert bool(torch.isfinite(generated.reconstructed_points_xyz).all())
         with tempfile.TemporaryDirectory() as temporary:

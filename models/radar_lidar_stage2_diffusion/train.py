@@ -85,7 +85,7 @@ def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, ep
 
 
 @torch.no_grad()
-def evaluate(model, stage1, loader, config, device, amp="off"):
+def evaluate(model, stage1, loader, config, device, amp="off", sampling_steps=None):
     model.eval()
     metrics = ResidualMetrics()
     names = ("total", "occupancy_denoise", "offset_denoise", "classification")
@@ -102,13 +102,14 @@ def evaluate(model, stage1, loader, config, device, amp="off"):
             totals[key] += losses[key]
         with _autocast(str(device), amp):
             output = model.sample(context, frame_seeds=[config.sample_seed + int(frame)
-                                                        for frame in batch["frame_id"]])
+                                                        for frame in batch["frame_id"]],
+                                  sampling_steps=sampling_steps)
         metrics.add(output, target, config.residual.occupancy_threshold,
                     batch["clean_lidar"], batch["clean_lidar_valid"],
                     batch["faulty_lidar"], batch["faulty_lidar_valid"])
     report = metrics.summary()
     report["loss"] = {key: float(value / max(len(loader), 1)) for key, value in totals.items()}
-    report["sampling_steps"] = config.timesteps
+    report["sampling_steps"] = config.timesteps if sampling_steps is None else sampling_steps
     return report
 
 

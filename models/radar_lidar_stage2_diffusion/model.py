@@ -111,15 +111,19 @@ class ResidualSparseDiffusion(nn.Module):
     @torch.no_grad()
     def sample(self, context: DiffusionContext, *, generator: torch.Generator | None = None,
                frame_seeds: list[int] | None = None,
-               occupancy_threshold: float | None = None) -> ResidualOutput:
+               occupancy_threshold: float | None = None,
+               sampling_steps: int | None = None) -> ResidualOutput:
         domain, coverage = context.domain, context.coverage
+        selected_timesteps = self.schedule.sampling_timesteps(sampling_steps)
         n = len(domain.coordinates)
         if not n:
             empty = context.condition.new_empty(0)
             return ResidualOutput(domain, coverage, empty, empty,
                                   empty.reshape(0, 1).expand(0, 3),
                                   empty.reshape(0, 1).expand(0, 3), empty,
-                                  {"sites": {"input": 0, "output": 0}, "diffusion_enabled": True})
+                                  {"sites": {"input": 0, "output": 0}, "diffusion_enabled": True,
+                                   "timesteps": self.config.timesteps,
+                                   "sampling_steps": len(selected_timesteps)})
         if frame_seeds is not None:
             if len(frame_seeds) != context.batch_size:
                 raise ValueError("Expected one sampling seed per frame")
@@ -139,13 +143,16 @@ class ResidualSparseDiffusion(nn.Module):
         known_clean = torch.zeros_like(known_noise)
         known_clean[:, 0] = -1
         sparse_cache = {}
-        for step in range(self.config.timesteps - 1, -1, -1):
+        for index, step in enumerate(selected_timesteps):
+            previous_step = (selected_timesteps[index + 1]
+                             if index + 1 < len(selected_timesteps) else -1)
             alpha = self.schedule.alpha_bar[step].to(state.dtype)
             state[blocked] = alpha.sqrt() * known_clean + (1 - alpha).sqrt() * known_noise
             timestep = torch.full((context.batch_size,), step, dtype=torch.long, device=state.device)
             predicted, counts = self.predict_clean(context, state, timestep,
                                                    sparse_cache=sparse_cache)
-            state = self.schedule.reverse_step(state, predicted.float(), step).float()
+            state = self.schedule.reverse_step(state, predicted.float(), step,
+                                               previous_step).float()
         # These locations are measured already or outside the injected fault.
         state[blocked] = known_clean
         probability = ((state[:, 0] + 1) * .5).clamp(0, 1)
@@ -159,4 +166,5 @@ class ResidualSparseDiffusion(nn.Module):
                               domain.confidence[selected],
                               {"sites": counts, **domain.counts, "selected": int(selected.sum()),
                                "blocked": int(blocked.sum()), "diffusion_enabled": True,
-                               "timesteps": self.config.timesteps})
+                               "timesteps": self.config.timesteps,
+                               "sampling_steps": len(selected_timesteps)})

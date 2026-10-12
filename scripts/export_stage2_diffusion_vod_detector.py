@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--stage1-checkpoint", type=Path)
     parser.add_argument("--limit", type=int, help="First N frames for smoke test only")
+    parser.add_argument("--sampling-steps", type=int,
+                        help="DDIM sampling passes; defaults to all trained timesteps")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp", choices=("off", "bf16"),
                         help="Defaults to the precision saved in the Stage-II checkpoint")
@@ -61,6 +63,8 @@ def main():
         values[key] = tuple(values[key])
     diffusion_values = {key: value for key, value in saved["config"].items() if key != "residual"}
     config = DiffusionConfig(residual=ResidualStage2Config(**values), **diffusion_values)
+    if args.sampling_steps is not None and not 1 <= args.sampling_steps <= config.timesteps:
+        parser.error(f"--sampling-steps must be between 1 and {config.timesteps}")
     if args.fault_pattern != saved["fault_pattern"]:
         raise ValueError("Inference fault pattern differs from training")
     stage1_path = args.stage1_checkpoint or Path(saved["stage1_checkpoint"])
@@ -102,6 +106,7 @@ def main():
         "clean_lidar_used_at_inference": False, "diffusion_enabled": True,
         "amp": amp,
         "diffusion_timesteps": config.timesteps, "sample_seed": config.sample_seed,
+        "sampling_steps": args.sampling_steps or config.timesteps,
         "measured_ray_suppression": True, "ray_tolerance_m": config.residual.ray_tolerance_m,
         "complete_official_validation": args.limit is None, "frame_ids": ids,
     }
@@ -135,7 +140,8 @@ def main():
         precision = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                      if amp == "bf16" else nullcontext())
         with precision:
-            output = model.sample(context, frame_seeds=[config.sample_seed + int(frame_id)])
+            output = model.sample(context, frame_seeds=[config.sample_seed + int(frame_id)],
+                                  sampling_steps=args.sampling_steps)
         generated = output.reconstructed_points_xyz.detach().cpu().numpy()
         points = detector_cloud(generated, faulty, mode="merged")
         temporary = destination.with_suffix(".bin.tmp")
