@@ -142,8 +142,22 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
             Sparse.coordinate_builds = Sparse.coordinate_reuses = 0
             first = model.sample(context, frame_seeds=[1701])
             second = model.sample(context, frame_seeds=[1701])
-        assert Sparse.coordinate_builds == 2
-        assert Sparse.coordinate_reuses == 2 * (config.timesteps - 1)
+            predict_clean = model.predict_clean
+
+            def bf16_prediction(*args, **kwargs):
+                prediction, counts = predict_clean(*args, **kwargs)
+                return prediction.to(torch.bfloat16), counts
+
+            with patch.object(model, "predict_clean", side_effect=bf16_prediction):
+                mixed = model.sample(context, frame_seeds=[1701])
+                mixed_generator = model.sample(context,
+                                               generator=torch.Generator().manual_seed(1701))
+        assert Sparse.coordinate_builds == 4
+        assert Sparse.coordinate_reuses == 4 * (config.timesteps - 1)
         assert torch.equal(first.addition_probability, second.addition_probability)
+        assert mixed.addition_probability.dtype == torch.float32
+        assert torch.isfinite(mixed.addition_probability).all()
+        assert mixed_generator.addition_probability.dtype == torch.float32
+        assert torch.isfinite(mixed_generator.addition_probability).all()
         assert not bool((first.addition_probability[~context.coverage.may_add] > .5).any())
         assert first.metadata["diffusion_enabled"] is True

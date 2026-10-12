@@ -123,14 +123,16 @@ class ResidualSparseDiffusion(nn.Module):
         if frame_seeds is not None:
             if len(frame_seeds) != context.batch_size:
                 raise ValueError("Expected one sampling seed per frame")
-            state = context.condition.new_empty((n, 4))
+            # Keep the reverse diffusion state in FP32. Autocast may make the
+            # U-Net prediction BF16, including the final t=0 state.
+            state = torch.empty((n, 4), dtype=torch.float32, device=context.condition.device)
             for batch_id, seed in enumerate(frame_seeds):
                 selected = domain.coordinates[:, 0] == batch_id
                 frame_generator = torch.Generator(device=state.device).manual_seed(seed)
                 state[selected] = torch.randn((int(selected.sum()), 4), dtype=state.dtype,
                                               device=state.device, generator=frame_generator)
         else:
-            state = torch.randn((n, 4), dtype=context.condition.dtype,
+            state = torch.randn((n, 4), dtype=torch.float32,
                                 device=context.condition.device, generator=generator)
         blocked = ~coverage.may_add
         known_noise = state[blocked].clone()
@@ -143,7 +145,7 @@ class ResidualSparseDiffusion(nn.Module):
             timestep = torch.full((context.batch_size,), step, dtype=torch.long, device=state.device)
             predicted, counts = self.predict_clean(context, state, timestep,
                                                    sparse_cache=sparse_cache)
-            state = self.schedule.reverse_step(state, predicted, step)
+            state = self.schedule.reverse_step(state, predicted.float(), step).float()
         # These locations are measured already or outside the injected fault.
         state[blocked] = known_clean
         probability = ((state[:, 0] + 1) * .5).clamp(0, 1)
