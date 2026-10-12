@@ -6,6 +6,7 @@ Inference loads aligned radar and cached faulty LiDAR; it never opens clean LiDA
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -44,12 +45,17 @@ def main():
     parser.add_argument("--stage1-checkpoint", type=Path)
     parser.add_argument("--limit", type=int, help="First N frames for smoke test only")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--amp", choices=("off", "bf16"),
+                        help="Defaults to the precision saved in the Stage-II checkpoint")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if saved.get("model_type") != "stage2_residual_sparse_diffusion_v1" or saved.get("diffusion_enabled") is not True:
         raise ValueError("Expected a faulty-conditioned sparse diffusion Stage-II checkpoint")
+    amp = args.amp or saved.get("amp", "off")
+    if amp == "bf16" and torch.device(args.device).type != "cuda":
+        parser.error("bf16 autocast requires CUDA")
     values = dict(saved["config"]["residual"])
     for key in ("channels", "query_radii_m", "expansion_zyx"):
         values[key] = tuple(values[key])
@@ -94,6 +100,7 @@ def main():
         "faulty_lidar_merged_after_inference": True,
         "detector_input_includes_faulty_lidar": True,
         "clean_lidar_used_at_inference": False, "diffusion_enabled": True,
+        "amp": amp,
         "diffusion_timesteps": config.timesteps, "sample_seed": config.sample_seed,
         "measured_ray_suppression": True, "ray_tolerance_m": config.residual.ray_tolerance_m,
         "complete_official_validation": args.limit is None, "frame_ids": ids,
@@ -125,7 +132,10 @@ def main():
         faulty_valid = torch.ones(faulty_tensor.shape[:2], device=args.device, dtype=torch.bool)
         context = model.prepare(evidence, stage1.config.grid, faulty_tensor, faulty_valid,
                                 [region])
-        output = model.sample(context, frame_seeds=[config.sample_seed + int(frame_id)])
+        precision = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                     if amp == "bf16" else nullcontext())
+        with precision:
+            output = model.sample(context, frame_seeds=[config.sample_seed + int(frame_id)])
         generated = output.reconstructed_points_xyz.detach().cpu().numpy()
         points = detector_cloud(generated, faulty, mode="merged")
         temporary = destination.with_suffix(".bin.tmp")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 
@@ -22,6 +23,14 @@ def _batch_count(batch: dict) -> int:
     return batch["radar"].shape[0]
 
 
+def _autocast(device: str, amp: str):
+    if amp == "off":
+        return nullcontext()
+    if torch.device(device).type != "cuda" or amp != "bf16":
+        raise ValueError("Stage-II bf16 autocast requires a CUDA device")
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
 def _context_target(model, stage1, batch, config):
     with torch.no_grad():
         evidence = stage1(batch["radar"], batch["radar_valid"], defer_diagnostics=True)
@@ -33,7 +42,8 @@ def _context_target(model, stage1, batch, config):
     return context, target
 
 
-def _denoise(model, context, target, batches, *, generator=None, fixed_timestep=None):
+def _denoise(model, context, target, batches, *, generator=None, fixed_timestep=None,
+             amp="off"):
     clean = training_state(target, generator=generator)
     device = clean.device
     frame_t = (torch.randint(model.config.timesteps, (batches,), device=device)
@@ -42,11 +52,13 @@ def _denoise(model, context, target, batches, *, generator=None, fixed_timestep=
     site_t = frame_t[context.domain.coordinates[:, 0].long()]
     noise = torch.randn(clean.shape, device=device, dtype=clean.dtype, generator=generator)
     noisy = model.schedule.mix(clean, noise, site_t)
-    predicted, counts = model.predict_clean(context, noisy, frame_t)
-    return denoising_loss(predicted, clean, target, model.config), counts
+    with _autocast(str(device), amp):
+        predicted, counts = model.predict_clean(context, noisy, frame_t)
+    return denoising_loss(predicted.float(), clean, target, model.config), counts
 
 
-def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, epoch, epochs):
+def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, epoch, epochs,
+                amp="off"):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     names = ("total", "occupancy_denoise", "offset_denoise", "classification")
@@ -56,7 +68,7 @@ def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, ep
     for step, raw in enumerate(bar, 1):
         batch = _to_device(raw, device)
         context, target = _context_target(model, stage1, batch, config)
-        losses, counts = _denoise(model, context, target, _batch_count(batch))
+        losses, counts = _denoise(model, context, target, _batch_count(batch), amp=amp)
         if not bool(torch.isfinite(losses["total"])):
             raise FloatingPointError(f"Non-finite diffusion loss at epoch {epoch}, batch {step}")
         (losses["total"] / grad_accum).backward()
@@ -73,7 +85,7 @@ def train_epoch(model, stage1, loader, optimizer, config, device, grad_accum, ep
 
 
 @torch.no_grad()
-def evaluate(model, stage1, loader, config, device):
+def evaluate(model, stage1, loader, config, device, amp="off"):
     model.eval()
     metrics = ResidualMetrics()
     names = ("total", "occupancy_denoise", "offset_denoise", "classification")
@@ -83,13 +95,14 @@ def evaluate(model, stage1, loader, config, device):
         batch = _to_device(raw, device)
         context, target = _context_target(model, stage1, batch, config)
         losses, _ = _denoise(model, context, target, _batch_count(batch), generator=generator,
-                             fixed_timestep=config.timesteps // 2)
+                             fixed_timestep=config.timesteps // 2, amp=amp)
         if not bool(torch.isfinite(losses["total"])):
             raise FloatingPointError("Non-finite diffusion validation loss")
         for key in names:
             totals[key] += losses[key]
-        output = model.sample(context, frame_seeds=[config.sample_seed + int(frame)
-                                                    for frame in batch["frame_id"]])
+        with _autocast(str(device), amp):
+            output = model.sample(context, frame_seeds=[config.sample_seed + int(frame)
+                                                        for frame in batch["frame_id"]])
         metrics.add(output, target, config.residual.occupancy_threshold,
                     batch["clean_lidar"], batch["clean_lidar_valid"],
                     batch["faulty_lidar"], batch["faulty_lidar_valid"])
@@ -106,7 +119,7 @@ def _save(path, model, optimizer, epoch, config, args, report, best):
              "radar_variant": args.radar_variant,
              "fault_samples_root": str(Path(args.fault_samples_root).resolve()),
              "fault_pattern": args.fault_pattern, "validation": report,
-             "best_score": best, "diffusion_enabled": True}
+             "best_score": best, "diffusion_enabled": True, "amp": args.amp}
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(state, temporary)
     temporary.replace(path)
@@ -130,11 +143,15 @@ def main():
     parser.add_argument("--val-limit", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--amp", choices=("off", "bf16"), default="off",
+                        help="Optional bf16 autocast for the Stage-II sparse U-Net")
     parser.add_argument("--seed", type=int, default=1701)
     parser.add_argument("--resume")
     args = parser.parse_args()
     if min(args.epochs, args.batch_size, args.grad_accum_steps, args.validate_every) < 1:
         parser.error("Epochs, batch size, accumulation and validation interval must be positive")
+    if args.amp != "off" and torch.device(args.device).type != "cuda":
+        parser.error("--amp bf16 requires CUDA")
     config = DiffusionConfig.from_json(args.config)
     root = Path(args.output_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -170,13 +187,14 @@ def main():
     training = _loader(args, "train", args.train_limit, True)
     validation = _loader(args, "val", args.val_limit, False)
     print(f"Sparse diffusion: train={len(training.dataset)} val={len(validation.dataset)} "
-          f"timesteps={config.timesteps} Stage-I frozen=True grid={stage1.config.grid.size_xyz}", flush=True)
+          f"timesteps={config.timesteps} Stage-I frozen=True grid={stage1.config.grid.size_xyz} "
+          f"amp={args.amp}", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = train_epoch(model, stage1, training, optimizer, config, args.device,
-                            args.grad_accum_steps, epoch, args.epochs)
+                            args.grad_accum_steps, epoch, args.epochs, args.amp)
         report = None
         if epoch % args.validate_every == 0 or epoch == args.epochs:
-            report = evaluate(model, stage1, validation, config, args.device)
+            report = evaluate(model, stage1, validation, config, args.device, args.amp)
             score = report["global_missing_f1_0.2m"]
             if score > best:
                 best = score

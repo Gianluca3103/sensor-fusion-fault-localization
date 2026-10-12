@@ -6,7 +6,7 @@ No clean or faulty LiDAR data are accepted by this module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 
 import numpy as np
@@ -32,10 +32,22 @@ class CandidateDomain:
     confidence: torch.Tensor  # strongest supporting Stage-I seed, [N]
     grid: VoxelGrid
     counts: dict[str, int | float | str]
+    _cpu_coordinates: np.ndarray | None = field(default=None, repr=False, compare=False)
+    _cpu_centers_xyz: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     @property
     def centers_xyz(self) -> torch.Tensor:
         return voxel_centers_xyz(self.coordinates, self.grid)
+
+    def centers_xyz_numpy(self) -> np.ndarray:
+        if self._cpu_centers_xyz is not None:
+            return self._cpu_centers_xyz
+        return self.centers_xyz.detach().cpu().numpy()
+
+    def batch_numpy(self) -> np.ndarray:
+        if self._cpu_coordinates is not None:
+            return self._cpu_coordinates[:, 0]
+        return self.coordinates[:, 0].detach().cpu().numpy()
 
 
 def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
@@ -54,33 +66,44 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
                     else output.features["s1"].coords[:,0].detach().cpu().numpy(),
                     surface.xyz.shape[1])
     selected=np.flatnonzero(scores>confidence_threshold)
+    selected_total=len(selected)
     origin=np.asarray(grid.minimum_xyz,dtype=np.float64)
     step=np.asarray(grid.size_xyz,dtype=np.float64)
     shape_xyz=np.asarray(grid.shape_zyx[::-1],dtype=np.int64)
     z_size,y_size,x_size=grid.shape_zyx
     key_blocks=[]
     score_blocks=[]
+    low=np.maximum(0,np.ceil((xyz[selected]-radii[selected]-origin)/step-.5).astype(np.int64))
+    high=np.minimum(shape_xyz-1,np.floor((xyz[selected]+radii[selected]-origin)/step-.5).astype(np.int64))
+    valid=(low<=high).all(1)
+    selected,low,high=selected[valid],low[valid],high[valid]
     accepted=0
-    for proposal in selected:
-        low=np.maximum(0,np.ceil((xyz[proposal]-radii[proposal]-origin)/step-.5).astype(np.int64))
-        high=np.minimum(shape_xyz-1,np.floor((xyz[proposal]+radii[proposal]-origin)/step-.5).astype(np.int64))
-        if np.any(low>high):
-            continue
-        axes=[np.arange(low[i],high[i]+1,dtype=np.int64) for i in range(3)]
-        xx,yy,zz=np.meshgrid(*axes,indexing="ij")
-        grid_xyz=np.stack((xx.ravel(),yy.ravel(),zz.ravel()),axis=1)
-        center=origin+(grid_xyz+.5)*step
-        normalized=((center-xyz[proposal])/radii[proposal])**2
-        squared=normalized.sum(1)
-        inside=squared<=1+1e-9
-        if not inside.any():
-            continue
-        cells=grid_xyz[inside]
-        cell_keys=(((int(batch[proposal])*z_size+cells[:,2])*y_size+cells[:,1])*x_size+cells[:,0]).astype(np.int64)
-        weighted=scores[proposal]*(1-.5*squared[inside])
-        key_blocks.append(cell_keys)
-        score_blocks.append(weighted)
-        accepted+=1
+    start=0
+    while start<len(selected):
+        # Bound the temporary [proposal, bounding-cell, XYZ] array, while
+        # evaluating many support ellipsoids in NumPy instead of Python.
+        end=min(start+64,len(selected))
+        spans=high[start:end]-low[start:end]+1
+        while end>start+1 and (end-start)*int(np.prod(spans.max(0)))>250_000:
+            end=start+max(1,(end-start)//2)
+            spans=high[start:end]-low[start:end]+1
+        offsets=np.indices(tuple(spans.max(0)),dtype=np.int64).reshape(3,-1).T
+        cells=low[start:end,None,:]+offsets[None,:,:]
+        in_box=(cells<=high[start:end,None,:]).all(-1)
+        center=origin+(cells+.5)*step
+        squared=(((center-xyz[selected[start:end],None,:])/
+                  radii[selected[start:end],None,:])**2).sum(-1)
+        proposal_rows,cell_rows=np.nonzero(in_box & (squared<=1+1e-9))
+        if len(proposal_rows):
+            inside_cells=cells[proposal_rows,cell_rows]
+            proposals=selected[start+proposal_rows]
+            cell_keys=(((batch[proposals]*z_size+inside_cells[:,2])*y_size+
+                        inside_cells[:,1])*x_size+inside_cells[:,0]).astype(np.int64)
+            weighted=scores[proposals]*(1-.5*squared[proposal_rows,cell_rows])
+            key_blocks.append(cell_keys)
+            score_blocks.append(weighted)
+            accepted+=len(np.unique(proposal_rows))
+        start=end
     if key_blocks:
         # Sort once and reduce equal cell keys in NumPy. The previous scalar
         # dictionary update ran Python code for every rasterized voxel.
@@ -91,20 +114,26 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
         starts=np.flatnonzero(np.r_[True,sorted_keys[1:]!=sorted_keys[:-1]])
         keys=sorted_keys[starts]
         strongest=np.maximum.reduceat(raw_scores[order],starts)
-        coordinates=decode_keys(torch.as_tensor(keys,device=output.features["s1"].coords.device),
-                                grid.shape_zyx)
+        rest,xx=np.divmod(keys,x_size)
+        rest,yy=np.divmod(rest,y_size)
+        bb,zz=np.divmod(rest,z_size)
+        cpu_coordinates=np.stack((bb,zz,yy,xx),axis=1)
+        cpu_centers=(origin+(cpu_coordinates[:,[3,2,1]].astype(np.float64)+.5)*step).astype(np.float32)
+        coordinates=torch.as_tensor(cpu_coordinates,device=output.features["s1"].coords.device)
         propagated=surface.score.new_tensor(strongest)
     else:
         coordinates=output.features["s1"].coords.new_empty((0,4))
         propagated=surface.score.new_empty(0)
+        cpu_coordinates=np.empty((0,4),dtype=np.int64)
+        cpu_centers=np.empty((0,3),dtype=np.float32)
     counts={"initial_stage1_sites":len(output.features["s1"].coords),
             "initial_surface_proposals":len(scores),
             "seed_source":"learned_surface_region",
-            "candidate_sites_after_confidence":len(selected),
+            "candidate_sites_after_confidence":selected_total,
             "accepted_region_proposals":accepted,
             "expanded_candidate_sites":len(coordinates),
             "candidate_expansion_ratio":len(coordinates)/max(accepted,1)}
-    return CandidateDomain(coordinates,propagated,grid,counts)
+    return CandidateDomain(coordinates,propagated,grid,counts,cpu_coordinates,cpu_centers)
 
 
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,

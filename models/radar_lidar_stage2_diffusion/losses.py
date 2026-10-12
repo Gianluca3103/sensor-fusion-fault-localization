@@ -28,15 +28,14 @@ def training_state(target: ResidualTargets, *, generator: torch.Generator | None
     """
     state = clean_state(target)
     unknown = ~target.supervised
-    count = int(unknown.sum())
-    if count:
-        random = torch.rand((count, 4), dtype=state.dtype, device=state.device,
-                            generator=generator)
-        pseudo_positive = random[:, 0] >= .5
-        state[unknown, 0] = torch.where(pseudo_positive, 1., -1.)
-        offsets = random[:, 1:] * 2 - 1
-        state[unknown, 1:] = torch.where(pseudo_positive[:, None], offsets,
-                                        torch.zeros_like(offsets))
+    # Draw on the fixed candidate shape, avoiding a GPU-to-CPU count read on
+    # every batch. Only the unknown positions are copied into the clean state.
+    random = torch.rand(state.shape, dtype=state.dtype, device=state.device,
+                        generator=generator)
+    pseudo_positive = random[:, 0] >= .5
+    state[:, 0] = torch.where(unknown, torch.where(pseudo_positive, 1., -1.), state[:, 0])
+    offsets = torch.where(pseudo_positive[:, None], random[:, 1:] * 2 - 1, 0.)
+    state[:, 1:] = torch.where(unknown[:, None], offsets, state[:, 1:])
     return state
 
 
@@ -44,23 +43,26 @@ def denoising_loss(predicted: torch.Tensor, clean: torch.Tensor,
                    target: ResidualTargets, config: DiffusionConfig) -> dict[str, torch.Tensor]:
     if predicted.shape != clean.shape or predicted.shape != (len(target.addition), 4):
         raise ValueError("Predicted and target diffusion states differ")
-    zero = predicted.sum() * 0
     positive = target.addition
     observed = target.observed
     free = target.known_free
     # Balance categories. Unknown cells have no denoising target and no loss.
-    terms = []
-    cls_terms = []
+    occupancy = predicted.sum() * 0
+    classification = predicted.sum() * 0
+    active_groups = predicted.new_zeros(())
+    occupancy_error = (predicted[:, 0] - clean[:, 0]).square()
     for mask, weight, sign in ((positive, config.residual.positive_weight, 1),
                                (observed, config.residual.observed_weight, -1),
                                (free, 1., -1)):
-        if bool(mask.any()):
-            terms.append(weight * F.mse_loss(predicted[mask, 0], clean[mask, 0]))
-            cls_terms.append(weight * F.softplus(-4 * sign * predicted[mask, 0]).mean())
-    occupancy = sum(terms) / len(terms) if terms else zero
-    classification = sum(cls_terms) / len(cls_terms) if cls_terms else zero
-    offset = (F.mse_loss(predicted[positive, 1:], clean[positive, 1:])
-              if bool(positive.any()) else zero)
+        count = mask.sum()
+        scale = mask.to(predicted.dtype) / count.clamp_min(1)
+        active_groups = active_groups + (count > 0).to(predicted.dtype)
+        occupancy = occupancy + weight * (occupancy_error * scale).sum()
+        classification = classification + weight * (F.softplus(-4 * sign * predicted[:, 0]) * scale).sum()
+    occupancy = occupancy / active_groups.clamp_min(1)
+    classification = classification / active_groups.clamp_min(1)
+    offset_scale = positive.to(predicted.dtype)[:, None] / (positive.sum() * 3).clamp_min(1)
+    offset = (((predicted[:, 1:] - clean[:, 1:]).square()) * offset_scale).sum()
     total = (config.occupancy_denoise_weight * occupancy
              + config.offset_denoise_weight * offset
              + config.classification_weight * classification)

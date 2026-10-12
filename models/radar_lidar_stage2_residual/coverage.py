@@ -57,8 +57,8 @@ def faulty_coverage(domain: CandidateDomain, faulty: torch.Tensor, valid: torch.
         position = torch.searchsorted(keys, fault_keys)
         matched = (position < n) & (keys[position.clamp(max=n-1)] == fault_keys)
         measured_voxel[position[matched]] = True
-    centers = domain.centers_xyz.detach().cpu().numpy()
-    batches = domain.coordinates[:, 0].detach().cpu().numpy()
+    centers = domain.centers_xyz_numpy()
+    batches = domain.batch_numpy()
     pts = faulty.detach().cpu().numpy()
     masks = valid.detach().cpu().numpy()
     rays = np.zeros(n, dtype=np.bool_)

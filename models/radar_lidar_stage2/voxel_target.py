@@ -92,8 +92,8 @@ def make_targets(domain: CandidateDomain, clean_lidar: torch.Tensor,
     # The sensor origin is (0,0,0) in calibrated LiDAR coordinates. We require
     # a tight perpendicular distance to an actual measured ray and keep one
     # half voxel diagonal clear of its endpoint; no space behind is negative.
-    centers = domain.centers_xyz.detach().cpu().numpy()
-    batches = domain.coordinates[:, 0].detach().cpu().numpy()
+    centers = domain.centers_xyz_numpy()
+    batches = domain.batch_numpy()
     radius = np.linalg.norm(centers, axis=1)
     half_diagonal = 0.5 * float(np.linalg.norm(grid.size_xyz))
     for batch in np.unique(batches):

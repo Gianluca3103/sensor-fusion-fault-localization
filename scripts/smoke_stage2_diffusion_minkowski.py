@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import tempfile
@@ -48,9 +49,21 @@ def main():
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
     assert gradients and all(bool(torch.isfinite(g).all()) for g in gradients)
     assert all(sites.features.grad is None for sites in stage1.features.values())
+    if device == "cuda":
+        model.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            mixed, _ = model.predict_clean(context, noisy, t)
+        mixed_loss = denoising_loss(mixed.float(), truth, target, config)["total"]
+        assert bool(torch.isfinite(mixed_loss))
+        mixed_loss.backward()
+        assert all(bool(torch.isfinite(p.grad).all()) for p in model.parameters() if p.grad is not None)
     model.eval()
     with torch.no_grad():
         generated = model.sample(context, generator=torch.Generator(device=device).manual_seed(41))
+        with (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+              if device == "cuda" else nullcontext()):
+            mixed_sample = model.sample(context, generator=torch.Generator(device=device).manual_seed(41))
+        assert bool(torch.isfinite(mixed_sample.addition_probability).all())
         assert not bool((generated.addition_probability[~context.coverage.may_add] > .5).any())
         assert bool(torch.isfinite(generated.reconstructed_points_xyz).all())
         with tempfile.TemporaryDirectory() as temporary:
@@ -69,6 +82,7 @@ def main():
                       "positive_sites": int(target.addition.sum()),
                       "observed_sites": int(target.observed.sum()),
                       "sampling_steps": config.timesteps, "finite_gradients": True,
+                      "bf16_finite": device == "cuda",
                       "checkpoint_reproduces_output": True}, indent=2))
 
 

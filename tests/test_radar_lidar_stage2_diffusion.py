@@ -91,8 +91,21 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
     # The real MinkowskiEngine forward/backward is checked on the professor GPU.
     # This check verifies the entire input/target/sampling boundary on the CPU.
     class Sparse:
-        def __init__(self, *, features, coordinates):
-            self.F, self.C = features, coordinates
+        coordinate_builds = 0
+        coordinate_reuses = 0
+
+        def __init__(self, *, features, coordinates=None, coordinate_map_key=None,
+                     coordinate_manager=None):
+            self.F = features
+            if coordinates is not None:
+                Sparse.coordinate_builds += 1
+                self.coordinate_map_key = "input"
+                self.coordinate_manager = {"input": coordinates}
+            else:
+                Sparse.coordinate_reuses += 1
+                self.coordinate_map_key = coordinate_map_key
+                self.coordinate_manager = coordinate_manager
+            self.C = self.coordinate_manager[self.coordinate_map_key]
 
     class IdentityUNet(nn.Module):
         def __init__(self, channels):
@@ -126,8 +139,11 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
         assert model.clean_head.weight.grad is not None
         model.eval()
         with torch.no_grad():
+            Sparse.coordinate_builds = Sparse.coordinate_reuses = 0
             first = model.sample(context, frame_seeds=[1701])
             second = model.sample(context, frame_seeds=[1701])
+        assert Sparse.coordinate_builds == 2
+        assert Sparse.coordinate_reuses == 2 * (config.timesteps - 1)
         assert torch.equal(first.addition_probability, second.addition_probability)
         assert not bool((first.addition_probability[~context.coverage.may_add] > .5).any())
         assert first.metadata["diffusion_enabled"] is True

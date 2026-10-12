@@ -68,12 +68,14 @@ class ResidualSparseDiffusion(nn.Module):
         return torch.cat((phase.sin(), phase.cos()), dim=1)
 
     def predict_clean(self, context: DiffusionContext, noisy: torch.Tensor,
-                      timestep: torch.Tensor) -> tuple[torch.Tensor, dict]:
+                      timestep: torch.Tensor, *,
+                      sparse_cache: dict | None = None) -> tuple[torch.Tensor, dict]:
         domain = context.domain
         n = len(domain.coordinates)
         if noisy.shape != (n, 4):
             raise ValueError("Expected occupancy and XYZ state at every candidate")
         if timestep.shape != (context.batch_size,) or (n and
+                (sparse_cache is None or "input_key" not in sparse_cache) and
                 int(domain.coordinates[:, 0].max()) >= context.batch_size):
             raise ValueError("One diffusion timestep per frame is required")
         if n == 0:
@@ -81,13 +83,29 @@ class ResidualSparseDiffusion(nn.Module):
         t_feature = self.time_encoder(self._time_features(timestep, noisy.dtype))
         per_site_time = t_feature[domain.coordinates[:, 0].long()]
         features = self.input_fuse(torch.cat((context.condition, noisy, per_site_time), dim=1))
-        sparse = ME.SparseTensor(features=features.contiguous(), coordinates=domain.coordinates.int())
+        if sparse_cache is not None and "input_key" in sparse_cache:
+            sparse = ME.SparseTensor(features=features.contiguous(),
+                                     coordinate_map_key=sparse_cache["input_key"],
+                                     coordinate_manager=sparse_cache["manager"])
+        else:
+            sparse = ME.SparseTensor(features=features.contiguous(), coordinates=domain.coordinates.int())
+            if sparse_cache is not None:
+                sparse_cache["input_key"] = sparse.coordinate_map_key
+                sparse_cache["manager"] = sparse.coordinate_manager
         decoded, counts = self.unet(sparse)
-        expected = encode_keys(domain.coordinates, domain.grid.shape_zyx)
-        actual = encode_keys(decoded.C.long().to(expected.device), domain.grid.shape_zyx)
-        order = torch.argsort(actual)
-        if not torch.equal(actual[order], expected):
-            raise AssertionError("Diffusion changed the candidate coordinates")
+        if sparse_cache is not None and "order" in sparse_cache:
+            if decoded.coordinate_map_key != sparse_cache["output_key"]:
+                raise AssertionError("Diffusion changed its sparse output map between timesteps")
+            order = sparse_cache["order"]
+        else:
+            expected = encode_keys(domain.coordinates, domain.grid.shape_zyx)
+            actual = encode_keys(decoded.C.long().to(expected.device), domain.grid.shape_zyx)
+            order = torch.argsort(actual)
+            if not torch.equal(actual[order], expected):
+                raise AssertionError("Diffusion changed the candidate coordinates")
+            if sparse_cache is not None:
+                sparse_cache["order"] = order
+                sparse_cache["output_key"] = decoded.coordinate_map_key
         return torch.tanh(self.clean_head(decoded.F[order])), counts
 
     @torch.no_grad()
@@ -118,11 +136,13 @@ class ResidualSparseDiffusion(nn.Module):
         known_noise = state[blocked].clone()
         known_clean = torch.zeros_like(known_noise)
         known_clean[:, 0] = -1
+        sparse_cache = {}
         for step in range(self.config.timesteps - 1, -1, -1):
             alpha = self.schedule.alpha_bar[step].to(state.dtype)
             state[blocked] = alpha.sqrt() * known_clean + (1 - alpha).sqrt() * known_noise
             timestep = torch.full((context.batch_size,), step, dtype=torch.long, device=state.device)
-            predicted, counts = self.predict_clean(context, state, timestep)
+            predicted, counts = self.predict_clean(context, state, timestep,
+                                                   sparse_cache=sparse_cache)
             state = self.schedule.reverse_step(state, predicted, step)
         # These locations are measured already or outside the injected fault.
         state[blocked] = known_clean

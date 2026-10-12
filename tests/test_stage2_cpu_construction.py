@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from models.radar_lidar_stage1.config import VoxelGrid
 from models.radar_lidar_stage1.model import Stage1Output, SurfaceProposals
@@ -66,3 +67,17 @@ def test_parallel_neighbor_queries_match_serial_queries():
     np.testing.assert_array_equal(parallel[0], serial[0])
     np.testing.assert_array_equal(parallel[1], serial[1])
     assert query_workers(10) == 1
+
+
+def test_source_projection_matches_projecting_each_pooled_candidate():
+    torch.manual_seed(47)
+    source = torch.randn(29, 128)
+    indices = torch.randint(0, 29, (107, 8))
+    weights = torch.rand(107, 8)
+    weights = weights / weights.sum(1, keepdim=True)
+    weights[0] = 0  # A query without neighbors still receives the linear bias.
+    linear = torch.nn.Linear(128, 32)
+    original = linear((source[indices] * weights[..., None]).sum(1))
+    projected_source = F.linear(source, linear.weight, bias=None)
+    optimized = (projected_source[indices] * weights[..., None]).sum(1) + linear.bias
+    torch.testing.assert_close(optimized, original, rtol=1e-5, atol=1e-6)

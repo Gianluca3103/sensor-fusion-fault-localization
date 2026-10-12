@@ -6,6 +6,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from models.radar_lidar_stage1.model import Stage1Output
 from .candidate_domain import CandidateDomain
@@ -58,8 +59,8 @@ class Stage1Conditioning(nn.Module):
         if not n:
             return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
         center = domain.centers_xyz
-        dest_xyz = center.detach().cpu().numpy()
-        dest_batch = domain.coordinates[:, 0].detach().cpu().numpy()
+        dest_xyz = domain.centers_xyz_numpy()
+        dest_batch = domain.batch_numpy()
         parts = []
         for i in range(4):
             sites = (replacement_stage1 or stage1).features[f"s{i+1}"]
@@ -74,6 +75,7 @@ class Stage1Conditioning(nn.Module):
             index = torch.as_tensor(idx_np, device=sites.features.device)
             distance = torch.as_tensor(dist_np, device=sites.features.device)
             valid = index >= 0
+            linear, norm, activation = self.projections[i]
             if len(sites.features):
                 source = sites.features.detach()
                 if ablation == "zero" or (ablation == "s1_only" and i != 0) or (ablation == "s4_only" and i != 3):
@@ -82,10 +84,16 @@ class Stage1Conditioning(nn.Module):
                     source = source.flip(0)
                 weights = torch.where(valid, 1 / (distance + 0.05), 0.)
                 weights = weights / weights.sum(1, keepdim=True).clamp_min(1e-8)
-                pooled = (source[index.clamp_min(0)] * weights[..., None]).sum(1)
+                # Linear projection commutes with weighted pooling. Apply it
+                # at the much smaller Stage-I source set, then gather 32-D
+                # features instead of up to 128-D features per candidate.
+                projected_source = F.linear(source, linear.weight, bias=None)
+                projected = (projected_source[index.clamp_min(0)] * weights[..., None]).sum(1)
             else:
-                pooled = center.new_zeros((n, self.projections[i][0].in_features))
-            embedding = self.projections[i](pooled)
+                projected = center.new_zeros((n, linear.out_features))
+            if linear.bias is not None:
+                projected = projected + linear.bias
+            embedding = activation(norm(projected))
             support = valid.any(1).to(center.dtype)[:, None]
             if ablation == "zero":
                 support = torch.zeros_like(support)

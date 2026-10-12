@@ -30,6 +30,24 @@ is selected by sampled validation F1 at 20 cm on all missing clean points,
 including those outside the candidate regions. Validation and export use the
 same fixed per-frame sampling seed.
 
+## Performance
+
+Learned Stage-I regions are rasterized without a candidate cap. The rasterizer
+reduces overlapping cells in NumPy batches; each candidate keeps the strongest
+proposal score. CPU nearest-neighbor queries use up to four threads for large
+query sets. Set `STAGE2_KDTREE_WORKERS=1` to compare against serial queries.
+During reverse diffusion, all timesteps reuse the same MinkowskiEngine
+coordinate manager and sparse output ordering. The conditioner projects each
+Stage-I source feature before pooling it into candidate cells. These changes
+preserve the candidate set and network parameter shapes.
+
+`--amp bf16` optionally enables bfloat16 autocast for the Stage-II U-Net on
+CUDA; Stage I and target construction remain full precision. Run
+`python -m scripts.smoke_stage2_diffusion_minkowski` on the target GPU before
+using it. The export command automatically uses the precision recorded in a
+new checkpoint. To measure the real frame preparation costs, run
+`python -m scripts.profile_stage2_cpu_construction --help`.
+
 ## Professor-machine run
 
 Run from the updated repository checkout. Use the Stage-I checkpoint from the
