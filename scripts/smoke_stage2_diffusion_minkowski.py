@@ -30,10 +30,10 @@ def main():
     model = ResidualSparseDiffusion((4, 4, 4, 4), config).to(device).train()
     clean = torch.tensor([[[2.25, 2.25, 2.25, .1], [2.75, 2.25, 2.75, .2]]], device=device)
     faulty = clean[:, :1].clone()
+    faulty_valid = torch.ones((1, 1), dtype=torch.bool, device=device)
     region = {"x_range": [0., 8.], "y_range": [0., 8.],
               "min_range_m": 0., "max_range_m": 20.}
-    context = model.prepare(stage1, grid, faulty,
-                            torch.ones((1, 1), dtype=torch.bool, device=device), [region])
+    context = model.prepare(stage1, grid, faulty, faulty_valid, [region])
     target = make_residual_targets(context.domain, clean,
                                    torch.ones((1, 2), dtype=torch.bool, device=device),
                                    context.coverage, free_ray_tolerance_m=.15)
@@ -51,8 +51,12 @@ def main():
     assert all(sites.features.grad is None for sites in stage1.features.values())
     if device == "cuda":
         model.zero_grad(set_to_none=True)
+        # Conditioning contains trainable projections. Rebuild its graph before
+        # the second backward pass, as training does for each new batch.
+        mixed_context = model.prepare(stage1, grid, faulty, faulty_valid, [region])
+        assert torch.equal(context.domain.coordinates, mixed_context.domain.coordinates)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            mixed, _ = model.predict_clean(context, noisy, t)
+            mixed, _ = model.predict_clean(mixed_context, noisy, t)
         mixed_loss = denoising_loss(mixed.float(), truth, target, config)["total"]
         assert bool(torch.isfinite(mixed_loss))
         mixed_loss.backward()
