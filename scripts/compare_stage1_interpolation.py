@@ -1,12 +1,13 @@
-"""Compare ellipsoid, trilinear, and radar-feature-guided Stage-I support.
+"""Compare local Stage-I support interpolation methods against the ellipsoid.
 
 This is an inference-only audit. It never trains a checkpoint or passes clean
-LiDAR to either interpolation method; clean LiDAR is used only for evaluation.
+LiDAR to any interpolation method; clean LiDAR is used only for evaluation.
 """
 
 from __future__ import annotations
 
 import argparse
+from html import escape
 import json
 from pathlib import Path
 
@@ -15,7 +16,10 @@ from scipy.spatial import cKDTree
 import torch
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset
-from models.radar_lidar_stage1.interpolation import edge_aware_seed_field, trilinear_seed_field
+from models.radar_lidar_stage1.interpolation import (
+    edge_aware_seed_field, gaussian_seed_field, inverse_distance_seed_field,
+    nearest_seed_field, trilinear_seed_field,
+)
 from models.radar_lidar_stage2.candidate_domain import make_candidates
 from scripts.visualize_stage1_confidence_cloud import load_encoder, write_ply
 
@@ -43,9 +47,88 @@ def _rates(sites: np.ndarray, clean: np.ndarray, radar: np.ndarray,
             "near_radar_fraction_0.5m": float(np.mean(radar_distance <= .5))}
 
 
+def _write_summary(output_root: Path, reports: list[dict]) -> None:
+    """Aggregate measured-frame metrics without using them to choose regions."""
+    methods = list(reports[0]["methods"])
+    summary = {"checkpoint": reports[0]["checkpoint"],
+               "checkpoint_epoch": reports[0]["checkpoint_epoch"],
+               "frames": [report["frame"] for report in reports],
+               "tolerance_m": .2, "score_threshold": .25,
+               "methods": {}}
+    for method in methods:
+        rows = [(report, report["methods"][method]["threshold_sweep_20cm"]["0.25"])
+                for report in reports]
+        matched = [(report, report["methods"][method]["matched_site_count_20cm"])
+                   for report in reports]
+        sites = sum(row["sites"] for _, row in rows)
+        matched_sites = sum(row["sites"] for _, row in matched)
+        clean = sum(report["clean_lidar_points_in_crop"] for report, _ in rows)
+        near_clean = sum(report["radar_near_clean_points_in_crop"] for report, _ in rows)
+        summary["methods"][method] = {
+            "active_sites": sites,
+            "site_precision_20cm": (sum(row["site_precision"] * row["sites"]
+                                        for _, row in rows) / sites if sites else 0.),
+            "clean_coverage_20cm": (sum(row["clean_coverage"] * report["clean_lidar_points_in_crop"]
+                                         for report, row in rows) / clean if clean else 0.),
+            "radar_near_clean_coverage_20cm": (
+                sum(row["radar_near_clean_coverage"] * report["radar_near_clean_points_in_crop"]
+                    for report, row in rows) / near_clean if near_clean else 0.),
+            "matched_budget_complete_frames": sum(
+                report["methods"][method]["matched_budget_complete"] for report in reports),
+            "matched_sites": matched_sites,
+            "matched_site_precision_20cm": (
+                sum(row["site_precision"] * row["sites"] for _, row in matched) / matched_sites
+                if matched_sites else 0.),
+            "matched_radar_near_clean_coverage_20cm": (
+                sum(row["radar_near_clean_coverage"] * report["radar_near_clean_points_in_crop"]
+                    for report, row in matched) / near_clean if near_clean else 0.),
+        }
+    (output_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    body = []
+    for method, row in summary["methods"].items():
+        body.append("<tr><td>" + escape(method.replace("_", " ").title()) + "</td>" +
+                    f"<td>{row['active_sites']:,}</td>" +
+                    f"<td>{row['site_precision_20cm']:.1%}</td>" +
+                    f"<td>{row['clean_coverage_20cm']:.1%}</td>" +
+                    f"<td>{row['radar_near_clean_coverage_20cm']:.1%}</td></tr>")
+    matched_body = []
+    for method, row in summary["methods"].items():
+        complete = row["matched_budget_complete_frames"] == len(reports)
+        precision = f"{row['matched_site_precision_20cm']:.1%}" if complete else "n/a"
+        coverage = f"{row['matched_radar_near_clean_coverage_20cm']:.1%}" if complete else "n/a"
+        matched_body.append("<tr><td>" + escape(method.replace("_", " ").title()) +
+                            f"</td><td>{row['matched_sites']:,}</td><td>{precision}</td>"
+                            f"<td>{coverage}</td></tr>")
+    links = " ".join(f'<a href="{escape(report["frame"])}_interpolation.html">'
+                     f'{escape(report["frame"])}</a>' for report in reports)
+    page = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
+            "<title>Stage I interpolation comparison</title>"
+            "<style>body{background:#10161d;color:#e8eff5;font:15px system-ui,sans-serif;"
+            "margin:24px;max-width:1100px}a{color:#83c9ed;margin-right:14px}"
+            "table{border-collapse:collapse;margin:18px 0}td,th{border:1px solid #456075;"
+            "padding:8px;text-align:right}td:first-child,th:first-child{text-align:left}</style>"
+            f"<h1>Stage I interpolation · epoch {summary['checkpoint_epoch']}</h1>"
+            "<p>Radar-only candidate regions. Clean LiDAR is used only to measure the rows below. "
+            "The methods have different active-cell counts, so read precision together with coverage. "
+            "This is a support-region audit, not reconstructed point-cloud accuracy.</p>"
+            f"<p>Frame views: {links}</p>"
+            "<table><tr><th>Method</th><th>Active cells</th><th>Cell precision at 20 cm</th>"
+            "<th>Clean coverage at 20 cm</th><th>Radar-near clean coverage at 20 cm</th></tr>"
+            + "".join(body) + "</table><p>Scores use a 0.25 threshold. "
+            "Radar-near clean means at least three stacked radar returns within 1.5 m; "
+            "this subset is used only for evaluation.</p>"
+            "<h2>Matched active-cell budget</h2><p>Within each frame, all methods except Nearest "
+            "are compared using the same number of highest-scoring cells. Nearest cannot fill "
+            "that budget, so its matched scores are not comparable.</p>"
+            "<table><tr><th>Method</th><th>Matched cells</th><th>Cell precision at 20 cm</th>"
+            "<th>Radar-near clean coverage at 20 cm</th></tr>" + "".join(matched_body) + "</table>"
+            "</html>")
+    (output_root / "index.html").write_text(page, encoding="utf-8")
+
+
 def _viewer(path: Path, frame: str, epoch: int | None, clouds: list[dict],
             limits: tuple[float, ...], threshold: float) -> None:
-    """Five synchronized metric cameras; no cloud is truncated."""
+    """Synchronized metric cameras; no cloud is truncated."""
     data = {"frame": frame, "epoch": epoch, "clouds": clouds, "limits": limits,
             "threshold": threshold}
     packed = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
@@ -55,15 +138,15 @@ body{background:#10161d;color:#e8eff5;font:13px system-ui,sans-serif;margin:12px
 h1{font-size:20px;margin:0 0 6px}p{color:#acbdca;margin:5px 0 10px}
 .controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:10px 0}
 input[type=range]{width:180px}button{background:#2b4050;border:1px solid #637d90;border-radius:5px;color:white;padding:5px 9px}
-.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:7px}
 section{min-width:0;background:#19242e;border:1px solid #3b5265;padding:5px;border-radius:5px}
 h2{font-size:12px;margin:0 0 4px;min-height:32px}
 canvas{width:100%;height:68vh;min-height:400px;touch-action:none;background:#0b151e;cursor:grab}
-@media(max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}canvas{height:45vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only support methods. Clean LiDAR is shown for comparison and is never used to create either interpolated field. All panels share the same metric camera; no cloud is capped.</p>
+@media(max-width:700px){canvas{height:45vh;min-height:300px}}
+</style><h1 id="title"></h1><p>Radar-only support methods. Clean LiDAR is shown for comparison and is never used to create an interpolated field. All panels share the same metric camera; no cloud is capped.</p>
 <div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label>
 <label><input type="checkbox" id="overlay"> Overlay raw radar on support panels</label><button id="reset">Reset view</button></div>
-<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates model score. The ellipsoid panel is the current Stage II candidate rule. Trilinear and edge-aware panels start from the same predicted surface seeds and ignore the learned ellipsoid radii.</p>
+<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates a support score, not calibrated accuracy. The ellipsoid panel is the current Stage II candidate rule. Every other method starts from the same predicted surface seeds and ignores the learned ellipsoid radii. Nearest is an unsmoothed baseline; Gaussian and inverse-distance use compact local kernels.</p>
 <script id="data" type="application/json">__DATA__</script><script>
 (()=>{const d=JSON.parse(document.getElementById('data').textContent),root=document.getElementById('grid');
 document.getElementById('title').textContent=`Frame ${d.frame} · Stage I epoch ${d.epoch??'unknown'}`;
@@ -93,6 +176,8 @@ def main() -> None:
     parser.add_argument("--seed-threshold", type=float, default=.25)
     parser.add_argument("--display-threshold", type=float, default=.25)
     parser.add_argument("--lattice-stride", type=int, default=2)
+    parser.add_argument("--gaussian-sigma", type=float, default=.6)
+    parser.add_argument("--inverse-distance-power", type=float, default=2.)
     parser.add_argument("--max-link-m", type=float, default=2.0)
     parser.add_argument("--feature-sigma", type=float, default=.25)
     parser.add_argument("--score-sigma", type=float, default=.20)
@@ -102,7 +187,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 <= args.seed_threshold <= 1 or not 0 <= args.display_threshold <= 1:
         parser.error("Thresholds must be in [0,1]")
-    if (args.lattice_stride < 1 or args.max_link_m <= 0 or args.feature_sigma <= 0
+    if (args.lattice_stride < 1 or args.gaussian_sigma <= 0 or args.inverse_distance_power <= 0
+            or args.max_link_m <= 0 or args.feature_sigma <= 0
             or args.score_sigma <= 0 or not 0 < args.min_affinity < 1
             or args.edge_neighbors < 1):
         parser.error("Invalid interpolation parameters")
@@ -114,6 +200,7 @@ def main() -> None:
     if found != set(args.frame_id):
         raise ValueError(f"Missing frame IDs: {sorted(set(args.frame_id) - found)}")
     args.output_root.mkdir(parents=True, exist_ok=True)
+    reports = []
     for sample in dataset:
         frame = sample["frame_id"]
         with torch.no_grad():
@@ -131,25 +218,33 @@ def main() -> None:
         nearest = cKDTree(source).query(anchor, workers=-1)[1]
         learned_guide = np.repeat(fine.features.detach().cpu().numpy()[nearest],
                                   output.surface.xyz.shape[1], axis=0)
-        linear = trilinear_seed_field(seed_xyz, seed_score, grid,
-                                     lattice_stride=args.lattice_stride,
-                                     seed_threshold=args.seed_threshold)
-        guided = edge_aware_seed_field(seed_xyz, seed_score, learned_guide, grid,
-                                       groups=np.repeat(np.arange(len(anchor)),
-                                                        output.surface.xyz.shape[1]),
-                                       lattice_stride=args.lattice_stride,
-                                       seed_threshold=args.seed_threshold,
-                                       max_link_m=args.max_link_m,
-                                       feature_sigma=args.feature_sigma,
-                                       score_sigma=args.score_sigma,
-                                       min_affinity=args.min_affinity,
-                                       neighbors=args.edge_neighbors)
+        fields = {
+            "nearest": nearest_seed_field(seed_xyz, seed_score, grid,
+                                          seed_threshold=args.seed_threshold),
+            "trilinear": trilinear_seed_field(seed_xyz, seed_score, grid,
+                                              lattice_stride=args.lattice_stride,
+                                              seed_threshold=args.seed_threshold),
+            "inverse_distance": inverse_distance_seed_field(
+                seed_xyz, seed_score, grid, lattice_stride=args.lattice_stride,
+                seed_threshold=args.seed_threshold, power=args.inverse_distance_power),
+            "gaussian": gaussian_seed_field(seed_xyz, seed_score, grid,
+                                            lattice_stride=args.lattice_stride,
+                                            seed_threshold=args.seed_threshold,
+                                            sigma=args.gaussian_sigma),
+            "edge_aware": edge_aware_seed_field(
+                seed_xyz, seed_score, learned_guide, grid,
+                groups=np.repeat(np.arange(len(anchor)), output.surface.xyz.shape[1]),
+                lattice_stride=args.lattice_stride,
+                seed_threshold=args.seed_threshold,
+                max_link_m=args.max_link_m, feature_sigma=args.feature_sigma,
+                score_sigma=args.score_sigma, min_affinity=args.min_affinity,
+                neighbors=args.edge_neighbors),
+        }
         baseline = make_candidates(output, grid, confidence_threshold=args.seed_threshold)
-        clouds_xyz = {"ellipsoid": baseline.centers_xyz.detach().cpu().numpy(),
-                      "trilinear": linear.centers_xyz(grid),
-                      "edge_aware": guided.centers_xyz(grid)}
-        clouds_score = {"ellipsoid": baseline.confidence.detach().cpu().numpy(),
-                        "trilinear": linear.scores, "edge_aware": guided.scores}
+        clouds_xyz = {"ellipsoid": baseline.centers_xyz.detach().cpu().numpy()}
+        clouds_xyz.update({name: field.centers_xyz(grid) for name, field in fields.items()})
+        clouds_score = {"ellipsoid": baseline.confidence.detach().cpu().numpy()}
+        clouds_score.update({name: field.scores for name, field in fields.items()})
         radar = sample["radar"].numpy()[:, :3]
         clean = sample["clean_lidar"].numpy()[:, :3]
         cropped_radar, cropped_clean = radar[_crop(radar, limits)], clean[_crop(clean, limits)]
@@ -165,7 +260,7 @@ def main() -> None:
         results = {}
         html_clouds = [{"name": "Radar", "xyz": np.round(cropped_radar, 3).tolist()},
                        {"name": "Clean LiDAR", "xyz": np.round(cropped_clean, 3).tolist()}]
-        for key in ("ellipsoid", "trilinear", "edge_aware"):
+        for key in clouds_xyz:
             xyz, score = clouds_xyz[key], clouds_score[key]
             write_ply(prefix.with_name(prefix.name + f"_{key}.ply"), xyz, score)
             crop = _crop(xyz, limits)
@@ -180,37 +275,48 @@ def main() -> None:
             results[key] = {"full_sites": len(clouds_xyz[key]), "crop_sites": len(xyz),
                             "score_mean": float(score.mean()) if len(score) else None,
                             "threshold_sweep_20cm": sweep}
+        # Nearest deliberately cannot create more than one cell per seed. It
+        # stays in the raw comparison, but cannot set the shared support budget.
+        budget_methods = [key for key in results if key != "nearest"]
         selected_count = min(int(np.count_nonzero(clouds_score[key][_crop(clouds_xyz[key], limits)]
                                                       >= args.display_threshold))
-                             for key in results)
+                             for key in budget_methods)
         for key in results:
             xyz = clouds_xyz[key]
             score = clouds_score[key]
             crop = _crop(xyz, limits)
             xyz, score = xyz[crop], score[crop]
-            top = np.argsort(score)[-selected_count:] if selected_count else np.empty(0, dtype=np.int64)
+            count = min(selected_count, len(xyz))
+            top = np.argsort(score)[-count:] if count else np.empty(0, dtype=np.int64)
             results[key]["matched_site_count_20cm"] = _rates(xyz[top], cropped_clean,
                                                                 cropped_radar, radar_near_clean, .2)
+            results[key]["matched_budget_complete"] = count == selected_count
         report = {"frame": frame, "checkpoint": str(args.checkpoint.resolve()),
                   "checkpoint_epoch": saved.get("epoch"), "radar_variant": variant,
                   "input_boundary": "radar only; clean LiDAR used only for metrics and display",
                   "seed_count": len(seed_xyz), "seed_threshold": args.seed_threshold,
                   "display_threshold": args.display_threshold,
-                  "lattice_stride": args.lattice_stride, "max_link_m": args.max_link_m,
+                  "lattice_stride": args.lattice_stride,
+                  "gaussian_sigma": args.gaussian_sigma,
+                  "inverse_distance_power": args.inverse_distance_power,
+                  "max_link_m": args.max_link_m,
                   "feature_sigma": args.feature_sigma, "score_sigma": args.score_sigma,
                   "min_affinity": args.min_affinity, "edge_neighbors": args.edge_neighbors,
-                  "edge_graph_links": guided.accepted_edges,
+                  "edge_graph_links": fields["edge_aware"].accepted_edges,
                   "matched_active_sites": selected_count,
                   "crop_xyz_m": limits, "clean_lidar_points_in_crop": len(cropped_clean),
                   "radar_near_clean_audit_definition": "At least 3 stacked radar returns within 1.5 m; evaluation denominator only",
                   "radar_near_clean_points_in_crop": int(radar_near_clean.sum()),
                   "methods": results}
         prefix.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        reports.append(report)
         _viewer(prefix.with_suffix(".html"), frame, saved.get("epoch"), html_clouds,
                 limits, args.display_threshold)
-        print(f"{frame}: links={guided.accepted_edges}, matched={selected_count}; " +
+        print(f"{frame}: links={fields['edge_aware'].accepted_edges}, matched={selected_count}; " +
               " | ".join(f"{name}={int(np.count_nonzero(clouds_score[name][_crop(clouds_xyz[name], limits)] >= args.display_threshold))}"
                          for name in results) + f" | {prefix.with_suffix('.html')}", flush=True)
+    _write_summary(args.output_root, reports)
+    print(f"Summary: {args.output_root / 'index.html'}", flush=True)
 
 
 if __name__ == "__main__":

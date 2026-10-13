@@ -3,7 +3,10 @@
 import numpy as np
 
 from models.radar_lidar_stage1.config import VoxelGrid
-from models.radar_lidar_stage1.interpolation import edge_aware_seed_field, trilinear_seed_field
+from models.radar_lidar_stage1.interpolation import (
+    edge_aware_seed_field, gaussian_seed_field, inverse_distance_seed_field,
+    nearest_seed_field, trilinear_seed_field,
+)
 
 
 GRID = VoxelGrid(minimum_xyz=(-4., -4., -4.), maximum_xyz=(4., 4., 4.),
@@ -41,3 +44,21 @@ def test_alternative_slots_from_one_anchor_do_not_bridge() -> None:
     field = edge_aware_seed_field(points, scores, features, GRID,
                                   groups=np.array([5, 5]), max_link_m=2.)
     assert field.accepted_edges == 0
+
+
+def test_nearest_keeps_one_cell_and_duplicate_proposals_do_not_add_scores() -> None:
+    xyz = np.array([[.03, .02, -.04], [.03, .02, -.04]])
+    field = nearest_seed_field(xyz, np.array([.8, .7]), GRID)
+    assert len(field.coordinates_xyz) == 1
+    assert np.isclose(field.scores[0], .8)
+
+
+def test_compact_radial_kernels_do_not_bridge_distant_proposals() -> None:
+    xyz = np.array([[.03, .07, -.04], [2., 0., 0.]])
+    for method in (gaussian_seed_field, inverse_distance_seed_field):
+        field = method(xyz, np.array([.8, .8]), GRID, lattice_stride=2)
+        centers = field.centers_xyz(GRID)
+        assert len(centers) > 2
+        assert not np.any((centers[:, 0] > .6) & (centers[:, 0] < 1.4))
+        assert np.isclose(field.scores.max(), .8)
+        assert np.all((field.scores > 0) & (field.scores <= 1))

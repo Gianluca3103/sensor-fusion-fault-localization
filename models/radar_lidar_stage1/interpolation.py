@@ -37,6 +37,111 @@ def _validate_seeds(xyz: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray, np
     return xyz, scores
 
 
+def _merge_max(keys: list[np.ndarray], values: list[np.ndarray],
+               shape: np.ndarray, source_seeds: int) -> InterpolatedField:
+    if not keys:
+        return InterpolatedField(np.empty((0, 3), dtype=np.int32),
+                                 np.empty(0, dtype=np.float32), source_seeds)
+    all_keys = np.concatenate(keys)
+    all_values = np.concatenate(values)
+    order = np.argsort(all_keys)
+    sorted_keys = all_keys[order]
+    first = np.flatnonzero(np.r_[True, sorted_keys[1:] != sorted_keys[:-1]])
+    unique = sorted_keys[first]
+    maximum = np.maximum.reduceat(all_values[order], first)
+    cells = np.stack(np.unravel_index(unique, tuple(shape)), axis=1).astype(np.int32)
+    return InterpolatedField(cells, maximum, source_seeds)
+
+
+def nearest_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
+                       seed_threshold: float = 0.25) -> InterpolatedField:
+    """Assign each learned proposal to its nearest fine voxel, with no spread."""
+    xyz, scores = _validate_seeds(xyz, scores)
+    if not 0 <= seed_threshold <= 1:
+        raise ValueError("Invalid seed threshold")
+    chosen = scores > seed_threshold
+    xyz, scores = xyz[chosen], scores[chosen]
+    shape = np.asarray(grid.shape_zyx[::-1], dtype=np.int64)
+    if not len(xyz):
+        return _merge_max([], [], shape, 0)
+    origin = np.asarray(grid.minimum_xyz, dtype=np.float64)
+    step = np.asarray(grid.size_xyz, dtype=np.float64)
+    cells = np.rint((xyz - origin) / step - .5).astype(np.int64)
+    inside = np.all((cells >= 0) & (cells < shape), axis=1)
+    keys = np.ravel_multi_index(cells[inside].T, shape)
+    return _merge_max([keys] if len(keys) else [],
+                      [scores[inside].astype(np.float32)] if len(keys) else [],
+                      shape, len(xyz))
+
+
+def _compact_radial_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
+                          lattice_stride: int, seed_threshold: float,
+                          method: str, scale: float) -> InterpolatedField:
+    """Splat a finite-radius radial kernel; correlated proposals combine by max."""
+    xyz, scores = _validate_seeds(xyz, scores)
+    if lattice_stride < 1 or not 0 <= seed_threshold <= 1 or scale <= 0:
+        raise ValueError("Invalid compact interpolation settings")
+    chosen = scores > seed_threshold
+    xyz, scores = xyz[chosen], scores[chosen]
+    shape = np.asarray(grid.shape_zyx[::-1], dtype=np.int64)
+    if not len(xyz):
+        return _merge_max([], [], shape, 0)
+    origin = np.asarray(grid.minimum_xyz, dtype=np.float64)
+    step = np.asarray(grid.size_xyz, dtype=np.float64)
+    local = (xyz - origin) / step - .5
+    keys: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    for center, score in zip(local, scores):
+        lo = np.maximum(0, np.floor(center - lattice_stride).astype(np.int64) + 1)
+        hi = np.minimum(shape - 1, np.ceil(center + lattice_stride).astype(np.int64) - 1)
+        if np.any(lo > hi):
+            continue
+        cells = np.stack(np.meshgrid(*(np.arange(a, b + 1) for a, b in zip(lo, hi)),
+                                     indexing="ij"), axis=-1).reshape(-1, 3)
+        radius = np.linalg.norm((cells - center) / lattice_stride, axis=1)
+        positive = radius < 1
+        if not positive.any():
+            continue
+        cells, radius = cells[positive], radius[positive]
+        if method == "gaussian":
+            weight = np.exp(-.5 * (radius / scale) ** 2)
+        elif method == "inverse_distance":
+            weight = (radius + .25) ** -scale
+        else:
+            raise ValueError(method)
+        # The taper makes the compact support go continuously to zero.
+        weight *= 1 - radius
+        weight /= weight.max()
+        keys.append(np.ravel_multi_index(cells.T, shape))
+        values.append((score * weight).astype(np.float32))
+    return _merge_max(keys, values, shape, len(xyz))
+
+
+def gaussian_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
+                        lattice_stride: int = 2, seed_threshold: float = 0.25,
+                        sigma: float = 0.6) -> InterpolatedField:
+    """Compact Gaussian kernel on learned surface proposals, with radial taper.
+
+    Sigma is a fraction of the radius ``lattice_stride * voxel_size``. The
+    radius only defines local interpolation support; it is not a radar sphere.
+    """
+    return _compact_radial_field(xyz, scores, grid, lattice_stride=lattice_stride,
+                                 seed_threshold=seed_threshold, method="gaussian", scale=sigma)
+
+
+def inverse_distance_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
+                                lattice_stride: int = 2, seed_threshold: float = 0.25,
+                                power: float = 2.0) -> InterpolatedField:
+    """Compact inverse-distance kernel on learned surface proposals.
+
+    This is a distance-decayed splat with max aggregation, rather than global
+    inverse-distance interpolation, which would activate unsupported space.
+    """
+    return _compact_radial_field(xyz, scores, grid, lattice_stride=lattice_stride,
+                                 seed_threshold=seed_threshold, method="inverse_distance",
+                                 scale=power)
+
+
 def trilinear_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
                          lattice_stride: int = 2, seed_threshold: float = 0.25) -> InterpolatedField:
     """Splat sparse surface proposals with a separable 3D linear hat basis.
@@ -78,17 +183,7 @@ def trilinear_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *
         weight = weight / weight.max()
         keys.append(np.ravel_multi_index(cells.T, shape))
         values.append((score * weight).astype(np.float32))
-    if not keys:
-        return InterpolatedField(np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32), len(xyz))
-    all_keys = np.concatenate(keys)
-    all_values = np.concatenate(values)
-    order = np.argsort(all_keys)
-    sorted_keys = all_keys[order]
-    first = np.flatnonzero(np.r_[True, sorted_keys[1:] != sorted_keys[:-1]])
-    unique = sorted_keys[first]
-    maximum = np.maximum.reduceat(all_values[order], first)
-    cells = np.stack(np.unravel_index(unique, tuple(shape)), axis=1).astype(np.int32)
-    return InterpolatedField(cells, maximum, len(xyz))
+    return _merge_max(keys, values, shape, len(xyz))
 
 
 def edge_aware_seed_field(xyz: np.ndarray, scores: np.ndarray, features: np.ndarray,
