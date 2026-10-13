@@ -61,7 +61,12 @@ def train(args, config):
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch, step = checkpoint["epoch"] + 1, checkpoint["step"]
-        best = checkpoint.get("validation", {}).get("support_f1") or float("-inf")
+        selected_path = args.output_root / "best_selected.ckpt"
+        selected = (torch.load(selected_path, map_location="cpu", weights_only=False)
+                    if selected_path.is_file() else checkpoint)
+        if selected.get("stage1_interface") != "bottleneck_support_v1":
+            raise ValueError("Existing best checkpoint is from another Stage-I interface")
+        best = selected.get("validation", {}).get("support_f1", float("-inf"))
     provenance = {"vod_root": str(args.vod_root.resolve()), "radar_variant": args.radar_variant,
                   "train_frames": len(train_set), "val_frames": len(val_set)}
     print(f"Bottleneck Stage I: train={len(train_set)} val={len(val_set)} support stride={config.support_stride}", flush=True)
