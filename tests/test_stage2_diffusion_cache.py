@@ -10,6 +10,7 @@ from torch import nn
 from unittest.mock import patch
 
 from models.radar_lidar_stage1.config import VoxelGrid
+from models.radar_lidar_stage1.model import SurfaceProposals
 from models.radar_lidar_stage2.candidate_domain import make_candidates
 from models.radar_lidar_stage2.stage1_conditioning import Stage1Conditioning
 from models.radar_lidar_stage2_diffusion.cache import (
@@ -31,6 +32,12 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
                                 query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4)
     config = DiffusionConfig(residual=base, timesteps=4)
     evidence = _stage1(grid, "cpu")
+    proposal_xyz = torch.tensor([[[2.25, 2.25, 2.25]],
+                                 [[2.75, 2.75, 2.75]]])
+    evidence.surface = SurfaceProposals(
+        proposal_xyz, torch.full((2, 1), .9),
+        torch.full_like(proposal_xyz, 1.5), proposal_xyz[:, 0],
+        torch.zeros(2, dtype=torch.long))
     clean = torch.tensor([[[2.25, 2.25, 2.25, .1], [2.75, 2.75, 2.75, .2]]])
     faulty = clean[:, :1].clone()
     batch = {"frame_id": ["00001"], "clean_lidar": clean,
@@ -39,7 +46,9 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
              "faulty_lidar_valid": torch.ones((1, 1), dtype=torch.bool),
              "fault_region": [{"full_scan": True}]}
     domain = make_candidates(evidence, grid, confidence_threshold=base.confidence_threshold,
-                             expansion_zyx=base.expansion_zyx)
+                             expansion_zyx=base.expansion_zyx,
+                             method=base.candidate_method)
+    assert domain.counts["seed_source"] == "edge_aware_surface_interpolation"
     coverage = faulty_coverage(domain, faulty, batch["faulty_lidar_valid"],
                                batch["fault_region"], ray_tolerance_m=base.ray_tolerance_m)
     target = make_residual_targets(domain, clean, batch["clean_lidar_valid"], coverage,

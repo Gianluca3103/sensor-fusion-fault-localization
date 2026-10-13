@@ -46,7 +46,8 @@ class RadarLidarStage2(nn.Module):
         cfg = self.config
         domain = make_candidates(stage1, grid,
                                  confidence_threshold=cfg.confidence_threshold if confidence_threshold is None else confidence_threshold,
-                                 expansion_zyx=cfg.expansion_zyx, max_sites=cfg.max_candidate_sites)
+                                 expansion_zyx=cfg.expansion_zyx, max_sites=cfg.max_candidate_sites,
+                                 method=cfg.candidate_method)
         n = len(domain.coordinates)
         if n == 0:
             zero = self.occupancy_head.weight.sum() * 0

@@ -1,12 +1,18 @@
 """Behavioral checks for the inference-only region comparison methods."""
 
 import numpy as np
+import torch
 
 from models.radar_lidar_stage1.config import VoxelGrid
+from models.radar_lidar_stage1.model import Stage1Output, SurfaceProposals
+from models.radar_lidar_stage1.sparse import SparseSites
 from models.radar_lidar_stage1.interpolation import (
     edge_aware_seed_field, gaussian_seed_field, inverse_distance_seed_field,
     local_signed_distance_field, nearest_seed_field, trilinear_seed_field,
 )
+from models.radar_lidar_stage2.candidate_domain import make_candidates
+from models.radar_lidar_stage2.config import Stage2Config
+from models.radar_lidar_stage2_diffusion.config import DiffusionConfig
 
 
 GRID = VoxelGrid(minimum_xyz=(-4., -4., -4.), maximum_xyz=(4., 4., 4.),
@@ -92,3 +98,46 @@ def test_local_signed_distance_does_not_treat_one_anchor_as_a_patch() -> None:
     field = local_signed_distance_field(
         xyz, np.full(len(xyz), .9), GRID, groups=np.zeros(len(xyz), dtype=int))
     assert len(field.coordinates_xyz) == 0
+
+
+def test_stage2_edge_aware_ignores_radii_and_keeps_batches_separate() -> None:
+    coords = torch.tensor([[0, 16, 20, 17], [0, 16, 20, 22],
+                           [1, 16, 20, 17], [1, 16, 20, 22]])
+    features = torch.tensor([[1., 0.], [-1., 0.],
+                             [1., 0.], [1., 0.]])
+    fine = SparseSites(coords, features, GRID.shape_zyx)
+    xyz = torch.tensor([[[-.5, 0., 0.]], [[.5, 0., 0.]],
+                        [[-.5, 0., 0.]], [[.5, 0., 0.]]])
+    scores = torch.full((4, 1), .9)
+    batch = torch.tensor([0, 0, 1, 1])
+
+    def output(radius: float) -> Stage1Output:
+        surface = SurfaceProposals(xyz, scores, torch.full_like(xyz, radius),
+                                   xyz[:, 0], batch)
+        return Stage1Output({"s1": fine}, fine.replace_features(scores),
+                            {"s1": coords}, {}, surface)
+
+    narrow = make_candidates(output(.4), GRID, confidence_threshold=.25)
+    wide = make_candidates(output(3.), GRID, confidence_threshold=.25)
+    no_radii = output(.4)
+    no_radii.surface.radii_xyz = None
+    radius_free = make_candidates(no_radii, GRID, confidence_threshold=.25)
+    assert torch.equal(narrow.coordinates, wide.coordinates)
+    assert torch.equal(narrow.coordinates, radius_free.coordinates)
+    assert torch.equal(narrow.confidence, wide.confidence)
+    assert narrow.counts["seed_source"] == "edge_aware_surface_interpolation"
+    assert narrow.counts["accepted_feature_edges"] == 1
+    assert len(narrow.coordinates[narrow.coordinates[:, 0] == 1]) > len(
+        narrow.coordinates[narrow.coordinates[:, 0] == 0])
+    assert not torch.any(narrow.coordinates[:, 0] > 1)
+
+
+def test_old_stage2_checkpoint_keeps_its_ellipsoid_method() -> None:
+    previous = Stage2Config().as_dict()
+    previous.pop("candidate_method")
+    assert Stage2Config.from_checkpoint_dict(previous).candidate_method == "ellipsoid"
+    assert Stage2Config().candidate_method == "edge_aware"
+    old_diffusion = DiffusionConfig().as_dict()
+    old_diffusion["residual"].pop("candidate_method")
+    assert DiffusionConfig.from_checkpoint_dict(
+        old_diffusion).residual.candidate_method == "ellipsoid"

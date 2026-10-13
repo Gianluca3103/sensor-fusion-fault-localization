@@ -53,7 +53,7 @@ class Stage1MetricAccumulator:
                       "precision_hits_0.5m":0,"recall_hits_0.5m":0}
         self.region={"active_cells":0,"cells_near_clean_0.5m":0,
                      "covered_supported_clean_cells":0,
-                     "accepted_patches":0,"isolated_cells":0}
+                     "accepted_patches":0,"accepted_feature_edges":0,"isolated_cells":0}
 
     @torch.no_grad()
     def update(self,model,radar,radar_valid,clean,clean_valid,*,intermediates=None):
@@ -170,7 +170,8 @@ class Stage1MetricAccumulator:
                 from models.radar_lidar_stage2.candidate_domain import make_candidates
                 domain=make_candidates(output,self.config.grid,confidence_threshold=.25)
                 self.region["active_cells"]+=len(domain.coordinates)
-                self.region["accepted_patches"]+=domain.counts["accepted_region_proposals"]
+                self.region["accepted_patches"]+=domain.counts.get("accepted_region_proposals",0)
+                self.region["accepted_feature_edges"]+=domain.counts.get("accepted_feature_edges",0)
                 if len(domain.coordinates):
                     coords=domain.coordinates.detach().cpu().numpy()
                     keys=encode_keys(domain.coordinates,self.config.grid.shape_zyx).detach().cpu().numpy()

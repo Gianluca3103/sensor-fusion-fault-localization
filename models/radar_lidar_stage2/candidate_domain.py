@@ -10,9 +10,11 @@ from dataclasses import dataclass, field
 from itertools import product
 
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 
 from models.radar_lidar_stage1.config import VoxelGrid
+from models.radar_lidar_stage1.interpolation import edge_aware_seed_field
 from models.radar_lidar_stage1.model import Stage1Output
 from models.radar_lidar_stage1.sparse import decode_keys, encode_keys
 
@@ -48,6 +50,92 @@ class CandidateDomain:
         if self._cpu_coordinates is not None:
             return self._cpu_coordinates[:, 0]
         return self.coordinates[:, 0].detach().cpu().numpy()
+
+
+def proposal_radar_features(output: Stage1Output, grid: VoxelGrid) -> np.ndarray:
+    """Assign each surface proposal a nearby S1 radar feature from its own frame."""
+    surface = output.surface
+    if surface is None:
+        raise ValueError("Edge-aware proposals require predicted surface locations")
+    fine = output.features["s1"]
+    anchor = (surface.anchor_xyz.detach().cpu().numpy() if surface.anchor_xyz is not None
+              else surface.xyz.detach().cpu().numpy().mean(axis=1))
+    if surface.anchor_batch is None and len(anchor) != len(fine.coords):
+        raise ValueError("Missing batch identity for grouped surface anchors")
+    anchor_batch = (surface.anchor_batch.detach().cpu().numpy() if surface.anchor_batch is not None
+                    else fine.coords[:, 0].detach().cpu().numpy())
+    source = fine.centers_xyz(grid).detach().cpu().numpy()
+    source_batch = fine.coords[:, 0].detach().cpu().numpy()
+    source_features = fine.features.detach().cpu().numpy()
+    guide = np.empty((len(anchor), source_features.shape[1]), dtype=source_features.dtype)
+    for batch in np.unique(anchor_batch):
+        queries = np.flatnonzero(anchor_batch == batch)
+        candidates = np.flatnonzero(source_batch == batch)
+        if not len(candidates):
+            raise ValueError("Surface anchor has no radar features in its frame")
+        nearest = cKDTree(source[candidates]).query(anchor[queries], workers=1)[1]
+        guide[queries] = source_features[candidates[np.asarray(nearest).reshape(-1)]]
+    return np.repeat(guide, surface.xyz.shape[1], axis=0)
+
+
+def _make_edge_aware_candidates(output: Stage1Output, grid: VoxelGrid,
+                                confidence_threshold: float) -> CandidateDomain:
+    """Interpolate between compatible radar-derived proposals, without ellipsoids."""
+    surface = output.surface
+    assert surface is not None
+    fine = output.features["s1"]
+    xyz = surface.xyz.detach().cpu().numpy().reshape(-1, 3)
+    scores = surface.score.detach().cpu().numpy().reshape(-1)
+    if (not np.isfinite(xyz).all() or not np.isfinite(scores).all()
+            or np.any((scores < 0) | (scores > 1))):
+        raise ValueError("Stage-I surface proposals must be finite with scores in [0,1]")
+    anchor_batch = (surface.anchor_batch.detach().cpu().numpy() if surface.anchor_batch is not None
+                    else fine.coords[:, 0].detach().cpu().numpy())
+    batch = np.repeat(anchor_batch, surface.xyz.shape[1])
+    groups = np.repeat(np.arange(len(anchor_batch)), surface.xyz.shape[1])
+    guide = proposal_radar_features(output, grid)
+    coordinates, confidence = [], []
+    accepted_edges = 0
+    selected_seeds = 0
+    interpolated_sites = 0
+    for frame in np.unique(batch):
+        selected = batch == frame
+        field = edge_aware_seed_field(xyz[selected], scores[selected], guide[selected], grid,
+                                      groups=groups[selected], seed_threshold=confidence_threshold)
+        accepted_edges += field.accepted_edges
+        selected_seeds += field.source_seeds
+        interpolated_sites += len(field.coordinates_xyz)
+        active = field.scores > confidence_threshold
+        cells = field.coordinates_xyz[active]
+        if len(cells):
+            coordinates.append(np.column_stack((np.full(len(cells), frame, dtype=np.int64),
+                                                cells[:, [2, 1, 0]])))
+            confidence.append(field.scores[active])
+    if coordinates:
+        cpu_coordinates = np.concatenate(coordinates).astype(np.int64)
+        cpu_confidence = np.concatenate(confidence).astype(np.float32)
+        order = np.lexsort((cpu_coordinates[:, 3], cpu_coordinates[:, 2],
+                            cpu_coordinates[:, 1], cpu_coordinates[:, 0]))
+        cpu_coordinates, cpu_confidence = cpu_coordinates[order], cpu_confidence[order]
+        origin = np.asarray(grid.minimum_xyz, dtype=np.float64)
+        step = np.asarray(grid.size_xyz, dtype=np.float64)
+        cpu_centers = (origin + (cpu_coordinates[:, [3, 2, 1]] + .5) * step).astype(np.float32)
+        sites = torch.as_tensor(cpu_coordinates, dtype=fine.coords.dtype, device=fine.coords.device)
+        propagated = torch.as_tensor(cpu_confidence, dtype=surface.score.dtype, device=surface.score.device)
+    else:
+        cpu_coordinates = np.empty((0, 4), dtype=np.int64)
+        cpu_centers = np.empty((0, 3), dtype=np.float32)
+        sites = fine.coords.new_empty((0, 4))
+        propagated = surface.score.new_empty(0)
+    counts = {"initial_stage1_sites": len(fine.coords),
+              "initial_surface_proposals": len(scores),
+              "seed_source": "edge_aware_surface_interpolation",
+              "candidate_sites_after_confidence": selected_seeds,
+              "accepted_feature_edges": accepted_edges,
+              "interpolated_sites_before_confidence": interpolated_sites,
+              "expanded_candidate_sites": len(sites),
+              "candidate_expansion_ratio": len(sites) / max(selected_seeds, 1)}
+    return CandidateDomain(sites, propagated, grid, counts, cpu_coordinates, cpu_centers)
 
 
 def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
@@ -139,7 +227,10 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
                     confidence_threshold: float = 0.25,
                     expansion_zyx: tuple[int, int, int] = (1, 1, 1),
-                    max_sites: int | None = None) -> CandidateDomain:
+                    max_sites: int | None = None,
+                    method: str = "edge_aware") -> CandidateDomain:
+    if method not in {"edge_aware", "ellipsoid"}:
+        raise ValueError("Candidate method must be edge_aware or ellipsoid")
     if not 0 <= confidence_threshold <= 1:
         raise ValueError("Confidence threshold must be in [0,1]")
     if len(expansion_zyx) != 3 or any(not isinstance(v, int) or v < 0 for v in expansion_zyx):
@@ -154,16 +245,23 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         raise ValueError("Stage-I grid and Stage-II candidate grid differ")
     if not torch.equal(fine.coords, confidence.coords):
         raise ValueError("Stage-I confidence must align with S1 coordinates")
-    if output.surface is not None and output.surface.radii_xyz is not None:
+    if (output.surface is not None and
+            (output.surface.radii_xyz is not None or
+             (method == "edge_aware" and output.surface.anchor_xyz is not None))):
         surface=output.surface
         anchor_count=len(surface.anchor_batch) if surface.anchor_batch is not None else len(fine.coords)
         if (surface.xyz.ndim != 3 or surface.xyz.shape[0] != anchor_count
                 or surface.xyz.shape[-1] != 3
                 or surface.score.shape != surface.xyz.shape[:2]
-                or surface.radii_xyz.shape != surface.xyz.shape
+                or (surface.radii_xyz is not None and
+                    surface.radii_xyz.shape != surface.xyz.shape)
                 or (surface.anchor_batch is not None and
                     (surface.anchor_xyz is None or surface.anchor_xyz.shape != (anchor_count,3)))):
             raise ValueError("Stage-I support region shapes differ from radar-pattern anchors")
+        if method == "edge_aware":
+            return _make_edge_aware_candidates(output, grid, confidence_threshold)
+        if surface.radii_xyz is None:
+            raise ValueError("Historical ellipsoid candidates require radii")
         return _make_region_candidates(output,grid,confidence_threshold)
     if output.surface is None:
         # Legacy Stage-I checkpoints have scores only at radar-occupied cells.

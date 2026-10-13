@@ -255,8 +255,8 @@ def main() -> None:
             region_counts = domain.counts
             third_name = "Predicted LiDAR support region"
             cloud_suffix = "_support_region.ply"
-            note = ("Third panel shows all active fine voxels in learned radar-conditioned "
-                    "LiDAR support patches; these cells are eligible for reconstruction, "
+            note = ("Third panel shows the active fine voxels in edge-aware radar-conditioned "
+                    "LiDAR support regions; these cells are eligible for reconstruction, "
                     "not confirmed LiDAR returns.")
         elif output.surface is None:
             sites = output.confidence.centers_xyz(model.config.grid).cpu().numpy()
@@ -295,7 +295,7 @@ def main() -> None:
             "checkpoint": str(args.checkpoint.resolve()), "epoch": saved.get("epoch"),
             "radar_variant": variant, "confidence_trained": model.confidence_trained,
             "confidence_calibrated": False,
-            "proposal_mode": "learned_surface_region" if region_counts else
+            "proposal_mode": region_counts["seed_source"] if region_counts else
                              ("predicted_lidar_surface" if output.surface is not None else "legacy_radar_voxel"),
             "support_region_counts": region_counts,
             "support_threshold": args.support_threshold if region_counts else None,

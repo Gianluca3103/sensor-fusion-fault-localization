@@ -49,10 +49,7 @@ def main():
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if saved.get("model_type") != "stage2_residual_faulty_conditioned_v1" or saved.get("diffusion_enabled") is not False:
         raise ValueError("Expected a deterministic faulty-conditioned residual Stage-II checkpoint")
-    values = dict(saved["config"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        values[key] = tuple(values[key])
-    config = ResidualStage2Config(**values)
+    config = ResidualStage2Config.from_checkpoint_dict(saved["config"])
     if args.fault_pattern != saved["fault_pattern"]:
         raise ValueError("Inference fault pattern differs from training")
     stage1_path = args.stage1_checkpoint or Path(saved["stage1_checkpoint"])

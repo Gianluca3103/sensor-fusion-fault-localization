@@ -47,7 +47,8 @@ class ResidualRadarLidarStage2(nn.Module):
                 occupancy_threshold: float | None = None) -> ResidualOutput:
         cfg = self.config
         domain = make_candidates(stage1, grid, confidence_threshold=cfg.confidence_threshold,
-                                 expansion_zyx=cfg.expansion_zyx, max_sites=cfg.max_candidate_sites)
+                                 expansion_zyx=cfg.expansion_zyx, max_sites=cfg.max_candidate_sites,
+                                 method=cfg.candidate_method)
         coverage = faulty_coverage(domain, faulty, faulty_valid, regions,
                                    ray_tolerance_m=cfg.ray_tolerance_m)
         n = len(domain.coordinates)

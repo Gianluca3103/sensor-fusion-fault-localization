@@ -38,6 +38,12 @@ class DiffusionConfig:
         return asdict(self)
 
     @classmethod
+    def from_checkpoint_dict(cls, saved: dict) -> "DiffusionConfig":
+        values = dict(saved)
+        residual = ResidualStage2Config.from_checkpoint_dict(values.pop("residual"))
+        return cls(residual=residual, **values)
+
+    @classmethod
     def from_json(cls, path: str | Path) -> "DiffusionConfig":
         values = json.loads(Path(path).read_text(encoding="utf-8"))
         residual = values.pop("residual")

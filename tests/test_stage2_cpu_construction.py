@@ -32,7 +32,8 @@ def test_overlapping_regions_keep_the_strongest_score_and_batch_identity():
     )
     evidence = Stage1Output({"s1": fine}, fine.replace_features(torch.ones((2, 1))),
                             {"s1": coords}, {}, proposals)
-    domain = make_candidates(evidence, grid, confidence_threshold=.25)
+    domain = make_candidates(evidence, grid, confidence_threshold=.25,
+                             method="ellipsoid")
     expected = {}
     for batch, z, y, x in product(range(2), range(8), range(8), range(8)):
         center = np.array([x, y, z], dtype=np.float64) * .5 + .25

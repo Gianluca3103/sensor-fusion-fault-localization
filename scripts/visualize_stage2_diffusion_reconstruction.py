@@ -27,12 +27,7 @@ def checkpoint_config(saved: dict) -> DiffusionConfig:
     if (saved.get("model_type") != "stage2_residual_sparse_diffusion_v1"
             or saved.get("diffusion_enabled") is not True):
         raise ValueError("Expected a sparse diffusion Stage-II checkpoint")
-    residual = dict(saved["config"]["residual"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        residual[key] = tuple(residual[key])
-    diffusion = {key: value for key, value in saved["config"].items()
-                 if key != "residual"}
-    return DiffusionConfig(residual=ResidualStage2Config(**residual), **diffusion)
+    return DiffusionConfig.from_checkpoint_dict(saved["config"])
 
 
 @torch.no_grad()

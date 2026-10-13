@@ -24,7 +24,7 @@ from models.radar_lidar_stage2_residual.coverage import FaultyCoverage, faulty_c
 from models.radar_lidar_stage2_residual.targets import ResidualTargets, make_residual_targets
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def preprocessing_code_sha256() -> str:
@@ -86,7 +86,8 @@ def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config, *,
     base = config.residual
     domain = make_candidates(evidence, grid, confidence_threshold=base.confidence_threshold,
                              expansion_zyx=base.expansion_zyx,
-                             max_sites=base.max_candidate_sites)
+                             max_sites=base.max_candidate_sites,
+                             method=base.candidate_method)
     coverage = faulty_coverage(domain, batch["faulty_lidar"],
                                batch["faulty_lidar_valid"], batch["fault_region"],
                                ray_tolerance_m=base.ray_tolerance_m)

@@ -4,6 +4,7 @@
   "query_radii_m": [0.6, 1.2, 2.4, 4.8],
   "max_neighbors": 8,
   "confidence_threshold": 0.25,
+  "candidate_method": "edge_aware",
   "expansion_zyx": [1, 1, 1],
   "max_candidate_sites": null,
   "occupancy_threshold": 0.5,

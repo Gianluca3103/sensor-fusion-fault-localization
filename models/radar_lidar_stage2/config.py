@@ -14,6 +14,7 @@ class Stage2Config:
     query_radii_m: tuple[float, float, float, float] = (0.6, 1.2, 2.4, 4.8)
     max_neighbors: int = 8
     confidence_threshold: float = 0.25
+    candidate_method: str = "edge_aware"
     expansion_zyx: tuple[int, int, int] = (1, 1, 1)
     max_candidate_sites: int | None = None  # Optional legacy point-proposal limit; learned regions are uncapped.
     occupancy_threshold: float = 0.5
@@ -35,6 +36,8 @@ class Stage2Config:
             raise ValueError("Invalid conditioning capacity")
         if not 0 <= self.confidence_threshold <= 1 or not 0 <= self.occupancy_threshold <= 1:
             raise ValueError("Thresholds must be in [0,1]")
+        if self.candidate_method not in {"edge_aware", "ellipsoid"}:
+            raise ValueError("Candidate method must be edge_aware or ellipsoid")
         if (self.max_candidate_sites is not None and self.max_candidate_sites < 1) or self.positive_weight <= 0:
             raise ValueError("Invalid candidate cap or positive weight")
         if min(self.occupancy_weight, self.offset_weight) < 0 or self.free_ray_tolerance_m <= 0:
@@ -46,6 +49,16 @@ class Stage2Config:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_checkpoint_dict(cls, saved: dict) -> "Stage2Config":
+        """Old checkpoints used ellipsoids; never reinterpret them as edge-aware."""
+        values = dict(saved)
+        values.setdefault("candidate_method", "ellipsoid")
+        for key in ("channels", "query_radii_m", "expansion_zyx"):
+            if key in values:
+                values[key] = tuple(values[key])
+        return cls(**values)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Stage2Config":

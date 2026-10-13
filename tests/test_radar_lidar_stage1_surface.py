@@ -76,7 +76,8 @@ class SurfaceStage1Tests(unittest.TestCase):
                                    torch.tensor([[[1.,1.,1.]]]))
         evidence = Stage1Output({"s1":fine},confidence,{"s1":radar_cell},{},surface)
         region = make_candidates(evidence,GRID,confidence_threshold=.25,
-                                 expansion_zyx=(0,0,0),max_sites=100)
+                                 expansion_zyx=(0,0,0),max_sites=100,
+                                 method="ellipsoid")
         self.assertEqual(region.counts["seed_source"],"learned_surface_region")
         self.assertGreater(len(region.coordinates),20)
         cells={tuple(row) for row in region.coordinates.tolist()}
@@ -93,7 +94,8 @@ class SurfaceStage1Tests(unittest.TestCase):
                         if neighbor in cells and neighbor not in reached)
         self.assertEqual(reached,cells)
         uncapped=make_candidates(evidence,GRID,confidence_threshold=.25,
-                                 expansion_zyx=(0,0,0),max_sites=10)
+                                 expansion_zyx=(0,0,0),max_sites=10,
+                                 method="ellipsoid")
         self.assertEqual(len(uncapped.coordinates),len(region.coordinates))
         self.assertEqual(uncapped.counts["accepted_region_proposals"],1)
 

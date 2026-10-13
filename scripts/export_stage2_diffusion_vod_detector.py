@@ -58,11 +58,7 @@ def main():
     amp = args.amp or saved.get("amp", "off")
     if amp == "bf16" and torch.device(args.device).type != "cuda":
         parser.error("bf16 autocast requires CUDA")
-    values = dict(saved["config"]["residual"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        values[key] = tuple(values[key])
-    diffusion_values = {key: value for key, value in saved["config"].items() if key != "residual"}
-    config = DiffusionConfig(residual=ResidualStage2Config(**values), **diffusion_values)
+    config = DiffusionConfig.from_checkpoint_dict(saved["config"])
     if args.sampling_steps is not None and not 1 <= args.sampling_steps <= config.timesteps:
         parser.error(f"--sampling-steps must be between 1 and {config.timesteps}")
     if args.fault_pattern != saved["fault_pattern"]:

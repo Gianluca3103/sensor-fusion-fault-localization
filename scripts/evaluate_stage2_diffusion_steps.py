@@ -41,13 +41,7 @@ def main():
         raise ValueError("Expected a sparse diffusion Stage-II checkpoint")
     if args.fault_pattern != saved["fault_pattern"]:
         raise ValueError("Fault pattern differs from training")
-    residual = dict(saved["config"]["residual"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        residual[key] = tuple(residual[key])
-    config = DiffusionConfig(
-        residual=ResidualStage2Config(**residual),
-        **{key: value for key, value in saved["config"].items() if key != "residual"},
-    )
+    config = DiffusionConfig.from_checkpoint_dict(saved["config"])
     for steps in args.sampling_steps:
         if not 1 <= steps <= config.timesteps:
             parser.error(f"Sampling steps must be between 1 and {config.timesteps}")

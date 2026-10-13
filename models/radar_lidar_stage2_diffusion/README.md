@@ -6,7 +6,10 @@ faulty-conditioned checkpoints remain incompatible by design.
 ## Inputs and output
 
 At inference, frozen Stage I encodes the aligned 20-frame radar stack and
-proposes radar-supported 3D regions. Stage II reads those features and the
+proposes radar-supported surface locations. Edge-aware interpolation connects
+only nearby proposals with compatible learned radar features and scores, then
+keeps fine cells above the configured confidence threshold. The old ellipsoid
+radii are ignored by new Stage-II runs. Stage II reads those features and the
 surviving faulty LiDAR. A fixed candidate grid at the Stage-I fine voxel size
 is used throughout diffusion. The state has four values per candidate: one
 addition/abstention value and three within-voxel XYZ offsets. One occupied
@@ -32,9 +35,8 @@ same fixed per-frame sampling seed.
 
 ## Performance
 
-Learned Stage-I regions are rasterized without a candidate cap. The rasterizer
-reduces overlapping cells in NumPy batches; each candidate keeps the strongest
-proposal score. The diffusion configuration rejects any numerical candidate
+Edge-aware candidate sites are built without an ellipsoid or candidate cap.
+The diffusion configuration rejects any numerical candidate
 cap, and the diffusion viewer displays every generated addition within its
 selected spatial crop. Its PLY export contains all additions. CPU nearest-neighbor
 queries use up to four threads for large query sets. Set
@@ -64,7 +66,7 @@ for each sampling setting; the export manifest records the choice.
 ## Frozen-preprocessing cache
 
 `scripts.cache_stage2_diffusion` stores a versioned file per VoD frame for both
-train and validation. It includes Stage-I source features, learned-region fine
+train and validation. It includes Stage-I source features, edge-aware fine
 candidate coordinates, faulty-LiDAR coverage, four physical neighbor maps,
 and clean training targets. The cache builder uses clean LiDAR only for labels.
 At training time the conditioning projection, faulty encoder, fusion layers,
@@ -77,6 +79,10 @@ can resume at the same root. After 16 new frames it reports an estimated disk
 requirement and stops if available space appears insufficient. Neighbor maps
 can make this cache large; compression is enabled by default. Check the pilot
 size report before leaving the full build unattended.
+
+Changing from ellipsoids to edge-aware support changes the candidate domain.
+Build a new cache root and train Stage II from epoch 1. Previous Stage-II
+checkpoints retain their original ellipsoid setting when loaded for comparison.
 
 ```bash
 python -m scripts.cache_stage2_diffusion \

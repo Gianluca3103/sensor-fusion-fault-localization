@@ -1,7 +1,8 @@
-"""Compare local Stage-I support interpolation methods against the ellipsoid.
+"""Compare edge-aware Stage-II support with other interpolation methods.
 
 This is an inference-only audit. It never trains a checkpoint or passes clean
 LiDAR to any interpolation method; clean LiDAR is used only for evaluation.
+The old ellipsoid is retained solely as a historical comparison.
 """
 
 from __future__ import annotations
@@ -21,11 +22,11 @@ from models.radar_lidar_stage1.interpolation import (
     edge_aware_seed_field, gaussian_seed_field, inverse_distance_seed_field,
     local_signed_distance_field, nearest_seed_field, trilinear_seed_field,
 )
-from models.radar_lidar_stage2.candidate_domain import make_candidates
+from models.radar_lidar_stage2.candidate_domain import make_candidates, proposal_radar_features
 from scripts.visualize_stage1_confidence_cloud import load_encoder, write_ply
 
 
-METHOD_LABELS = {"ellipsoid": "Learned ellipsoid",
+METHOD_LABELS = {"ellipsoid": "Old ellipsoid baseline (inactive)",
                  "nearest": "Nearest neighbor",
                  "trilinear": "Trilinear",
                  "inverse_distance": "Inverse-distance weighting",
@@ -159,7 +160,9 @@ def _write_summary(output_root: Path, reports: list[dict]) -> None:
             f"<h1>Stage I interpolation · epoch {summary['checkpoint_epoch']}</h1>"
             "<p>Radar-only candidate regions. Clean LiDAR is used only to measure the rows below. "
             "The methods have different active-cell counts, so read precision together with coverage. "
-            "This is a support-region audit, not reconstructed point-cloud accuracy.</p>"
+            "This is a support-region audit, not reconstructed point-cloud accuracy. "
+            "The metric rows use a fixed 0–80 m by ±40 m by −5–7 m audit area; "
+            "the interactive views and PLY files contain every generated point.</p>"
             f"<p>Frame views: {links}</p>"
             "<h2>Full point clouds</h2><p>Each bundle contains uncapped PLY files for raw stacked "
             "radar, raw Stage I proposals, every interpolation, and clean LiDAR as a reference. "
@@ -167,7 +170,7 @@ def _write_summary(output_root: Path, reports: list[dict]) -> None:
             + "".join(downloads) + "</ul>"
             "<table><tr><th>Method</th><th>Active cells</th><th>Cell precision at 20 cm</th>"
             "<th>Clean coverage at 20 cm</th><th>Radar-near clean coverage at 20 cm</th></tr>"
-            + "".join(body) + "</table><p>Scores use a 0.25 threshold. "
+            + "".join(body) + "</table><p>Audit rows use a 0.25 score threshold; the viewer shows all points. "
             "Radar-near clean means at least three stacked radar returns within 1.5 m; "
             "this subset is used only for evaluation.</p>"
             "<h2>Matched active-cell budget</h2><p>The budget comes from the ellipsoid, "
@@ -181,10 +184,9 @@ def _write_summary(output_root: Path, reports: list[dict]) -> None:
 
 
 def _viewer(path: Path, frame: str, epoch: int | None, clouds: list[dict],
-            limits: tuple[float, ...], threshold: float) -> None:
+            limits: tuple[float, ...]) -> None:
     """Synchronized metric cameras; no cloud is truncated."""
-    data = {"frame": frame, "epoch": epoch, "clouds": clouds, "limits": limits,
-            "threshold": threshold}
+    data = {"frame": frame, "epoch": epoch, "clouds": clouds, "limits": limits}
     packed = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
     html = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stage I interpolation comparison</title><style>
@@ -198,26 +200,26 @@ h2{font-size:12px;margin:0 0 4px;min-height:32px}
 .download{display:inline-block;color:#83c9ed;margin:0 0 5px}
 canvas{width:100%;height:68vh;min-height:400px;touch-action:none;background:#0b151e;cursor:grab}
 @media(max-width:700px){canvas{height:45vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only support methods. Raw Stage I proposals are the model output before interpolation; raw stacked radar is the sensor input. Clean LiDAR is shown only as a reference. All panels share the same metric camera; no cloud is capped. <a id="bundle" class="download">Download every point cloud for this frame</a></p>
-<div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label>
+</style><h1 id="title"></h1><p>Radar-only support methods. Raw Stage I proposals are the model output before interpolation; raw stacked radar is the sensor input. Clean LiDAR is shown only as a reference. Every generated point is present in each panel, with no crop, score cutoff, or point cap. All panels share the same metric camera. <a id="bundle" class="download">Download every point cloud for this frame</a></p>
+<div class="controls">
 <label><input type="checkbox" id="overlay"> Overlay raw radar on support panels</label><label><input type="checkbox" id="sdfcolor"> Color local SDF by signed distance</label><button id="reset">Reset view</button></div>
-<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates a support score, not calibrated accuracy. The ellipsoid panel is the current Stage II candidate rule. Every interpolation starts from the same raw Stage I proposals; no interpolation uses clean LiDAR. Nearest is an unsmoothed baseline; Gaussian and inverse-distance use compact local kernels. The local SDF estimates oriented planes from nearby predicted seeds. With signed-distance coloring, blue is behind a patch, white is near zero, and red faces the LiDAR sensor; behind is unknown, not occupied.</p>
+<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates a support score, not calibrated accuracy. Edge-aware interpolation is the current Stage II candidate rule; the ellipsoid remains here as a historical comparison. Every interpolation starts from the same raw Stage I proposals; no interpolation uses clean LiDAR. Nearest is an unsmoothed baseline; Gaussian and inverse-distance use compact local kernels. The local SDF estimates oriented planes from nearby predicted seeds. With signed-distance coloring, blue is behind a patch, white is near zero, and red faces the LiDAR sensor; behind is unknown, not occupied.</p>
 <script id="data" type="application/json">__DATA__</script><script>
 (()=>{const d=JSON.parse(document.getElementById('data').textContent),root=document.getElementById('grid');
 document.getElementById('title').textContent=`Frame ${d.frame} · Stage I epoch ${d.epoch??'unknown'}`;
 const bundle=document.getElementById('bundle');bundle.href=`${d.frame}_interpolation_pointclouds.zip`;bundle.download=bundle.href;
 const cs=d.clouds.map((cloud)=>{let s=document.createElement('section'),h=document.createElement('h2'),a=document.createElement('a'),c=document.createElement('canvas');a.className='download';a.textContent='Download full PLY';a.href=cloud.file;a.download=cloud.file;s.append(h,a,c);root.append(s);return {h,c,cloud};});
-const slider=document.getElementById('threshold'),label=document.getElementById('value'),overlay=document.getElementById('overlay'),sdfcolor=document.getElementById('sdfcolor');slider.value=d.threshold;
+const overlay=document.getElementById('overlay'),sdfcolor=document.getElementById('sdfcolor');
 const [x0,x1,y0,y1,z0,z1]=d.limits,center=[(x0+x1)/2,(y0+y1)/2,(z0+z1)/2],radius=Math.hypot(x1-x0,y1-y0,z1-z0)/2;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},v={...initial};
 function color(s){const a=[[40,98,190],[81,202,209],[255,225,115],[245,104,104]],q=Math.max(0,Math.min(.9999,s))*3,i=Math.floor(q),t=q-i;return `rgb(${a[i].map((n,k)=>Math.round(n*(1-t)+a[i+1][k]*t)).join(',')})`;}
 function distanceColor(s){const t=Math.min(1,Math.abs(s)/.25),base=s>=0?[242,100,84]:[76,148,238];return `rgb(${base.map(v=>Math.round(235*(1-t)+v*t)).join(',')})`;}
 function project(p,w,h,scale){let x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cy=Math.cos(v.yaw),sy=Math.sin(v.yaw),cp=Math.cos(v.pitch),sp=Math.sin(v.pitch),u=cy*x-sy*y,depth=sy*x+cy*y;return [w/2+v.panX+u*scale,h/2+v.panY-(cp*z-sp*depth)*scale];}
-function layer(ctx,cloud,w,h,scale,kind,alpha){ctx.globalAlpha=alpha;for(let i=0;i<cloud.xyz.length;i++){if(kind==='score'&&cloud.score[i]<Number(slider.value))continue;let [x,y]=project(cloud.xyz[i],w,h,scale);if(x<0||x>w||y<0||y>h)continue;ctx.fillStyle=kind==='radar'?'#ffab40':kind==='lidar'?'#45b975':cloud.signed_distance_m&&sdfcolor.checked?distanceColor(cloud.signed_distance_m[i]):color(cloud.score[i]);const size=kind==='score'?2.2:1.2;ctx.fillRect(x-size/2,y-size/2,size,size);}ctx.globalAlpha=1;}
-function draw(){label.textContent=Number(slider.value).toFixed(2);for(let index=0;index<cs.length;index++){let {h,c,cloud}=cs[index],n=cloud.score?cloud.score.filter(q=>q>=Number(slider.value)).length:cloud.xyz.length;h.textContent=`${cloud.name}: ${n.toLocaleString()} shown / ${cloud.xyz.length.toLocaleString()} in crop`;let w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);let ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);let scale=.47*Math.min(w,height)*v.zoom/radius;if(index>1&&overlay.checked)layer(ctx,d.clouds[0],w,height,scale,'radar',.3);layer(ctx,cloud,w,height,scale,cloud.kind,.9);}}
+function layer(ctx,cloud,w,h,scale,kind,alpha){ctx.globalAlpha=alpha;for(let i=0;i<cloud.xyz.length;i++){let [x,y]=project(cloud.xyz[i],w,h,scale);if(x<0||x>w||y<0||y>h)continue;ctx.fillStyle=kind==='radar'?'#ffab40':kind==='lidar'?'#45b975':cloud.signed_distance_m&&sdfcolor.checked?distanceColor(cloud.signed_distance_m[i]):color(cloud.score[i]);const size=kind==='score'?2.2:1.2;ctx.fillRect(x-size/2,y-size/2,size,size);}ctx.globalAlpha=1;}
+function draw(){for(let index=0;index<cs.length;index++){let {h,c,cloud}=cs[index];h.textContent=`${cloud.name}: ${cloud.xyz.length.toLocaleString()} total points`;let w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);let ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);let scale=.47*Math.min(w,height)*v.zoom/radius;if(index>1&&overlay.checked)layer(ctx,d.clouds[0],w,height,scale,'radar',.3);layer(ctx,cloud,w,height,scale,cloud.kind,.9);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;draw();});}
 const active=new Map();for(const {c} of cs){c.addEventListener('pointerdown',e=>{c.setPointerCapture(e.pointerId);active.set(e.pointerId,[e.clientX,e.clientY]);});c.addEventListener('pointermove',e=>{let old=active.get(e.pointerId);if(!old)return;let dx=e.clientX-old[0],dy=e.clientY-old[1];active.set(e.pointerId,[e.clientX,e.clientY]);if(e.shiftKey){v.panX+=dx;v.panY+=dy;}else{v.yaw+=dx*.008;v.pitch=Math.max(-1.55,Math.min(1.55,v.pitch+dy*.008));}redraw();});for(let ev of ['pointerup','pointercancel'])c.addEventListener(ev,e=>active.delete(e.pointerId));c.addEventListener('wheel',e=>{e.preventDefault();v.zoom=Math.max(.1,Math.min(80,v.zoom*Math.exp(-e.deltaY*.001)));redraw();},{passive:false});}
-slider.addEventListener('input',redraw);overlay.addEventListener('change',redraw);sdfcolor.addEventListener('change',redraw);document.getElementById('reset').onclick=()=>{Object.assign(v,initial);redraw();};window.addEventListener('resize',redraw);redraw();})();
+overlay.addEventListener('change',redraw);sdfcolor.addEventListener('change',redraw);document.getElementById('reset').onclick=()=>{Object.assign(v,initial);redraw();};window.addEventListener('resize',redraw);redraw();})();
 </script></html>'''.replace("__DATA__", packed)
     path.write_text(html, encoding="utf-8")
 
@@ -275,11 +277,7 @@ def main() -> None:
         seed_xyz = output.surface.xyz.reshape(-1, 3).detach().cpu().numpy()
         seed_score = output.surface.score.reshape(-1).detach().cpu().numpy()
         fine = output.features["s1"]
-        anchor = output.surface.anchor_xyz.detach().cpu().numpy()
-        source = fine.centers_xyz(grid).detach().cpu().numpy()
-        nearest = cKDTree(source).query(anchor, workers=-1)[1]
-        learned_guide = np.repeat(fine.features.detach().cpu().numpy()[nearest],
-                                  output.surface.xyz.shape[1], axis=0)
+        learned_guide = proposal_radar_features(output, grid)
         fields = {
             "nearest": nearest_seed_field(seed_xyz, seed_score, grid,
                                           seed_threshold=args.seed_threshold),
@@ -295,7 +293,7 @@ def main() -> None:
                                             sigma=args.gaussian_sigma),
             "edge_aware": edge_aware_seed_field(
                 seed_xyz, seed_score, learned_guide, grid,
-                groups=np.repeat(np.arange(len(anchor)), output.surface.xyz.shape[1]),
+                groups=np.repeat(np.arange(len(output.surface.xyz)), output.surface.xyz.shape[1]),
                 lattice_stride=args.lattice_stride,
                 seed_threshold=args.seed_threshold,
                 max_link_m=args.max_link_m, feature_sigma=args.feature_sigma,
@@ -303,14 +301,15 @@ def main() -> None:
                 neighbors=args.edge_neighbors),
             "local_sdf": local_signed_distance_field(
                 seed_xyz, seed_score, grid,
-                groups=np.repeat(np.arange(len(anchor)), output.surface.xyz.shape[1]),
+                groups=np.repeat(np.arange(len(output.surface.xyz)), output.surface.xyz.shape[1]),
                 lattice_stride=args.lattice_stride,
                 seed_threshold=args.seed_threshold,
                 normal_radius_m=args.sdf_normal_radius_m,
                 surface_band_m=args.sdf_surface_band_m,
                 min_normal_quality=args.sdf_min_normal_quality),
         }
-        baseline = make_candidates(output, grid, confidence_threshold=args.seed_threshold)
+        baseline = make_candidates(output, grid, confidence_threshold=args.seed_threshold,
+                                   method="ellipsoid")
         clouds_xyz = {"ellipsoid": baseline.centers_xyz.detach().cpu().numpy()}
         clouds_xyz.update({name: field.centers_xyz(grid) for name, field in fields.items()})
         clouds_score = {"ellipsoid": baseline.confidence.detach().cpu().numpy()}
@@ -328,22 +327,20 @@ def main() -> None:
         write_ply(_pointcloud_path(prefix, "clean_lidar"), clean)
         write_ply(_pointcloud_path(prefix, "seeds"), seed_xyz, seed_score)
         results = {}
-        crop_seeds = _crop(seed_xyz, limits)
         html_clouds = [
             {"name": "Raw stacked radar", "kind": "radar", "file": _pointcloud_path(prefix, "radar").name,
-             "xyz": np.round(cropped_radar, 3).tolist()},
+             "xyz": np.round(radar, 3).tolist()},
             {"name": "Clean LiDAR reference", "kind": "lidar", "file": _pointcloud_path(prefix, "clean_lidar").name,
-             "xyz": np.round(cropped_clean, 3).tolist()},
+             "xyz": np.round(clean, 3).tolist()},
             {"name": "Raw Stage I proposals (no interpolation)", "kind": "score",
              "file": _pointcloud_path(prefix, "seeds").name,
-             "xyz": np.round(seed_xyz[crop_seeds], 3).tolist(),
-             "score": np.round(seed_score[crop_seeds], 4).tolist()},
+             "xyz": np.round(seed_xyz, 3).tolist(),
+             "score": np.round(seed_score, 4).tolist()},
         ]
         for key in clouds_xyz:
             xyz, score = clouds_xyz[key], clouds_score[key]
             write_ply(_pointcloud_path(prefix, key), xyz, score)
             crop = _crop(xyz, limits)
-            xyz, score = xyz[crop], score[crop]
             html_clouds.append({"name": METHOD_LABELS[key], "kind": "score",
                                 "file": _pointcloud_path(prefix, key).name,
                                 "xyz": np.round(xyz, 3).tolist(),
@@ -351,10 +348,11 @@ def main() -> None:
             if key == "local_sdf":
                 signed = fields[key].signed_distance_m
                 assert signed is not None
-                html_clouds[-1]["signed_distance_m"] = np.round(signed[crop], 4).tolist()
+                html_clouds[-1]["signed_distance_m"] = np.round(signed, 4).tolist()
                 np.savez_compressed(prefix.with_name(prefix.name + "_local_sdf.npz"),
                                     xyz=clouds_xyz[key], score=clouds_score[key],
                                     signed_distance_m=signed)
+            xyz, score = xyz[crop], score[crop]
             sweep = {}
             for threshold in (.10, .20, .25, .30, .40, .50):
                 sweep[f"{threshold:.2f}"] = _rates(xyz[score >= threshold], cropped_clean,
@@ -402,8 +400,15 @@ def main() -> None:
                   "methods": results}
         prefix.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         reports.append(report)
+        all_xyz = [radar, clean, seed_xyz, *clouds_xyz.values()]
+        occupied = [points for points in all_xyz if len(points)]
+        low = np.min([points.min(axis=0) for points in occupied], axis=0)
+        high = np.max([points.max(axis=0) for points in occupied], axis=0)
+        padding = max(.5, float(np.max(high - low)) * .02)
+        view_limits = tuple(value for lower, upper in zip(low, high)
+                            for value in (float(lower - padding), float(upper + padding)))
         _viewer(prefix.with_suffix(".html"), frame, saved.get("epoch"), html_clouds,
-                limits, args.display_threshold)
+                view_limits)
         _bundle_pointclouds(prefix)
         print(f"{frame}: links={fields['edge_aware'].accepted_edges}, matched={selected_count}; " +
               " | ".join(f"{name}={int(np.count_nonzero(clouds_score[name][_crop(clouds_xyz[name], limits)] >= args.display_threshold))}"

@@ -90,10 +90,7 @@ def main() -> None:
         raise RuntimeError("CUDA was requested but is unavailable")
 
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg_values = dict(saved["config"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        cfg_values[key] = tuple(cfg_values[key])
-    config = Stage2Config(**cfg_values)
+    config = Stage2Config.from_checkpoint_dict(saved["config"])
     if saved.get("diffusion_enabled") is not False:
         raise ValueError("This exporter expects deterministic Stage II with diffusion disabled")
     stage1_path = args.stage1_checkpoint or Path(saved["stage1_checkpoint"])

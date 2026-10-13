@@ -67,10 +67,7 @@ def main() -> None:
         parser.error("Each display minimum must be below its maximum")
 
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    config_data = dict(saved["config"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        config_data[key] = tuple(config_data[key])
-    config = Stage2Config(**config_data)
+    config = Stage2Config.from_checkpoint_dict(saved["config"])
     stage1_path = args.stage1_checkpoint or Path(saved["stage1_checkpoint"])
     stage1, stage1_saved = load_encoder(stage1_path, args.device)
     variant = saved["radar_variant"]

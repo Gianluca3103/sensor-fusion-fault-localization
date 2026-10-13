@@ -66,10 +66,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg_values = dict(saved["config"])
-    for key in ("channels", "query_radii_m", "expansion_zyx"):
-        cfg_values[key] = tuple(cfg_values[key])
-    config = Stage2Config(**cfg_values)
+    config = Stage2Config.from_checkpoint_dict(saved["config"])
     stage1_path = args.stage1_checkpoint or saved["stage1_checkpoint"]
     stage1, saved_stage1 = load_encoder(Path(stage1_path), args.device)
     trained_variant = saved_stage1.get("data", {}).get("radar_variant")

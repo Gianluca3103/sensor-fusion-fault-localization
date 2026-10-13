@@ -213,6 +213,7 @@ def main():
         validation = _loader(args, "val", args.val_limit, False)
     print(f"Sparse diffusion: train={len(training.dataset)} val={len(validation.dataset)} "
           f"timesteps={config.timesteps} Stage-I frozen=True grid={stage1.config.grid.size_xyz} "
+          f"candidates={config.residual.candidate_method} "
           f"amp={args.amp} cached={bool(args.preprocess_cache_root)}", flush=True)
     for epoch in range(start, args.epochs + 1):
         train = train_epoch(model, stage1, training, optimizer, config, args.device,
