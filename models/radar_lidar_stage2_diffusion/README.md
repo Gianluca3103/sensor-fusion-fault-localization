@@ -34,8 +34,11 @@ same fixed per-frame sampling seed.
 
 Learned Stage-I regions are rasterized without a candidate cap. The rasterizer
 reduces overlapping cells in NumPy batches; each candidate keeps the strongest
-proposal score. CPU nearest-neighbor queries use up to four threads for large
-query sets. Set `STAGE2_KDTREE_WORKERS=1` to compare against serial queries.
+proposal score. The diffusion configuration rejects any numerical candidate
+cap, and the diffusion viewer displays every generated addition within its
+selected spatial crop. Its PLY export contains all additions. CPU nearest-neighbor
+queries use up to four threads for large query sets. Set
+`STAGE2_KDTREE_WORKERS=1` to compare against serial queries.
 During reverse diffusion, all timesteps reuse the same MinkowskiEngine
 coordinate manager and sparse output ordering. The conditioner projects each
 pooled Stage-I feature once per candidate cell. These changes

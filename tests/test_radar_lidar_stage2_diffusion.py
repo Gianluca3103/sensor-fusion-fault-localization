@@ -80,6 +80,12 @@ def test_diffusion_config_round_trip_and_rejects_deterministic_switch(tmp_path):
     assert DiffusionConfig.from_json(path) == config
     assert config.diffusion_enabled is True
     try:
+        DiffusionConfig(residual=ResidualStage2Config(max_candidate_sites=3000))
+    except ValueError as error:
+        assert "cannot cap candidate sites" in str(error)
+    else:
+        raise AssertionError("Diffusion run unexpectedly accepted an addition cap")
+    try:
         DiffusionConfig(diffusion_enabled=False)
     except ValueError:
         pass
@@ -123,8 +129,7 @@ def test_sparse_diffusion_data_flow_with_coordinate_preserving_engine_stub():
 
     grid = VoxelGrid((0., 0., 0.), (8., 8., 8.), (.5, .5, .5))
     base = ResidualStage2Config(channels=(8, 12, 16, 24), conditioning_dim=8,
-                                query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4,
-                                max_candidate_sites=3000)
+                                query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4)
     config = DiffusionConfig(residual=base, timesteps=4)
     evidence = _stage1(grid, "cpu")
     clean = torch.tensor([[[2.25, 2.25, 2.25, .1], [2.75, 2.25, 2.75, .2]]])

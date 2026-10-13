@@ -28,8 +28,7 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
     torch.manual_seed(31)
     grid = VoxelGrid((0., 0., 0.), (8., 8., 8.), (.5, .5, .5))
     base = ResidualStage2Config(channels=(8, 12, 16, 24), conditioning_dim=8,
-                                query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4,
-                                max_candidate_sites=3000)
+                                query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4)
     config = DiffusionConfig(residual=base, timesteps=4)
     evidence = _stage1(grid, "cpu")
     clean = torch.tensor([[[2.25, 2.25, 2.25, .1], [2.75, 2.75, 2.75, .2]]])
@@ -40,8 +39,7 @@ def test_cached_candidates_targets_and_radar_projection_match(tmp_path):
              "faulty_lidar_valid": torch.ones((1, 1), dtype=torch.bool),
              "fault_region": [{"full_scan": True}]}
     domain = make_candidates(evidence, grid, confidence_threshold=base.confidence_threshold,
-                             expansion_zyx=base.expansion_zyx,
-                             max_sites=base.max_candidate_sites)
+                             expansion_zyx=base.expansion_zyx)
     coverage = faulty_coverage(domain, faulty, batch["faulty_lidar_valid"],
                                batch["fault_region"], ray_tolerance_m=base.ray_tolerance_m)
     target = make_residual_targets(domain, clean, batch["clean_lidar_valid"], coverage,

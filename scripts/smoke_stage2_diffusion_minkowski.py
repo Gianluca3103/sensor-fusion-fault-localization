@@ -24,7 +24,7 @@ def main():
     grid = VoxelGrid((0., 0., 0.), (8., 8., 8.), (.5, .5, .5))
     base = ResidualStage2Config(channels=(8, 12, 16, 24), conditioning_dim=8,
                                 query_radii_m=(.75, 1.5, 3., 6.), max_neighbors=4,
-                                expansion_zyx=(1, 1, 1), max_candidate_sites=3000)
+                                expansion_zyx=(1, 1, 1))
     config = DiffusionConfig(residual=base, timesteps=4)
     stage1 = _stage1(grid, device)
     model = ResidualSparseDiffusion((4, 4, 4, 4), config).to(device).train()

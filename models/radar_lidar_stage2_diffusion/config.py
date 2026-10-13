@@ -24,6 +24,8 @@ class DiffusionConfig:
             raise ValueError("This module always runs diffusion")
         if self.residual.diffusion_enabled:
             raise ValueError("The nested residual settings describe conditioning only")
+        if self.residual.max_candidate_sites is not None:
+            raise ValueError("Sparse diffusion cannot cap candidate sites or generated additions")
         if self.timesteps < 2:
             raise ValueError("Diffusion requires at least two timesteps")
         if min(self.occupancy_denoise_weight, self.offset_denoise_weight,

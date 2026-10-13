@@ -50,7 +50,7 @@ class ResidualSparseDiffusion(nn.Module):
                 faulty_valid: torch.Tensor, regions: list[dict]) -> DiffusionContext:
         base = self.config.residual
         domain = make_candidates(stage1, grid, confidence_threshold=base.confidence_threshold,
-                                 expansion_zyx=base.expansion_zyx, max_sites=base.max_candidate_sites)
+                                 expansion_zyx=base.expansion_zyx)
         coverage = faulty_coverage(domain, faulty, faulty_valid, regions,
                                    ray_tolerance_m=base.ray_tolerance_m)
         if len(domain.coordinates):
