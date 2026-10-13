@@ -51,8 +51,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", choices=("off", "bf16"),
                         help="Defaults to the precision saved in the checkpoint")
-    parser.add_argument("--max-plot-points", type=int, default=75000,
-                        help="Browser display limit for additions and overlays; PLY remains complete")
+    parser.add_argument("--max-plot-points", type=int,
+                        help="Optional browser display limit; the default shows every point in the crop")
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=80.0)
     parser.add_argument("--y-min", type=float, default=-40.0)
@@ -61,8 +61,10 @@ def main() -> None:
     parser.add_argument("--z-max", type=float, default=7.0)
     args = parser.parse_args()
 
-    if args.max_plot_points < 1 or len(set(args.frame_id)) != len(args.frame_id):
-        parser.error("Display limit must be positive and frame IDs must be unique")
+    if args.max_plot_points is not None and args.max_plot_points < 1:
+        parser.error("Display limit must be positive")
+    if len(set(args.frame_id)) != len(args.frame_id):
+        parser.error("Frame IDs must be unique")
     limits = (args.x_min, args.x_max, args.y_min, args.y_max, args.z_min, args.z_max)
     if any(lo >= hi for lo, hi in zip(limits[::2], limits[1::2])):
         parser.error("Each display minimum must be below its maximum")
