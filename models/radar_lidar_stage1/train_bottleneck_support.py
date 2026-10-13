@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from .bottleneck_support import BottleneckSupportStage1
 from .data import VoDStage1Dataset, collate_stage1
+from .static_geometry_cache import Stage1StaticGeometryCache
 
 
 def _move(batch, device):
@@ -39,6 +40,9 @@ def train(args, config):
         train_set.frames = train_set.frames[:args.train_limit]
     if args.val_limit:
         val_set.frames = val_set.frames[:args.val_limit]
+    static_cache = (None if args.no_static_cache else Stage1StaticGeometryCache(
+        args.static_cache_root or args.output_root / "static_geometry", config,
+        [*train_set.frames, *val_set.frames]))
     loaders = {
         "train": DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, collate_fn=collate_stage1,
@@ -69,18 +73,24 @@ def train(args, config):
         best = selected.get("validation", {}).get("support_f1", float("-inf"))
     provenance = {"vod_root": str(args.vod_root.resolve()), "radar_variant": args.radar_variant,
                   "train_frames": len(train_set), "val_frames": len(val_set)}
-    print(f"Bottleneck Stage I: train={len(train_set)} val={len(val_set)} support stride={config.support_stride}", flush=True)
+    print(f"Bottleneck Stage I: train={len(train_set)} val={len(val_set)} "
+          f"support stride={config.support_stride} static cache="
+          f"{static_cache.root if static_cache is not None else 'off'}", flush=True)
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        sums = {"loss/total": 0., "loss/corr": 0., "loss/distill": 0., "loss/support": 0.}
+        loss_names = ("loss/total", "loss/corr", "loss/distill", "loss/support")
+        sums = torch.zeros(len(loss_names), device=args.device, dtype=torch.float64)
         progress = tqdm(loaders["train"], desc=f"Bottleneck train {epoch:03d}/{args.epochs:03d}", unit="batch", dynamic_ncols=True)
         samples = 0
+        cache_hits = cache_builds = 0
         for batch_index, raw in enumerate(progress):
             batch = _move(raw, args.device)
-            loss, _ = model.forward_train(batch["radar"], batch["radar_valid"],
+            loss, diagnostics = model.forward_train(batch["radar"], batch["radar_valid"],
                                           batch["clean_lidar"], batch["clean_lidar_valid"],
-                                          defer_diagnostics=True, trusted_inputs=True)
+                                          defer_diagnostics=True, trusted_inputs=True,
+                                          static_cache=static_cache, frame_ids=batch["frame_id"],
+                                          split="train")
             group_start = batch_index - batch_index % args.grad_accum_steps
             group_size = min(args.grad_accum_steps, len(loaders["train"]) - group_start)
             (loss["loss/total"] / group_size).backward()
@@ -90,45 +100,54 @@ def train(args, config):
                 step += 1
             count = len(batch["frame_id"])
             samples += count
-            for key in sums:
-                sums[key] += float(loss[key].detach()) * count
+            sums += torch.stack([loss[key].detach() for key in loss_names]).double() * count
+            cache_hits += diagnostics["cache_hits"]
+            cache_builds += diagnostics["cache_builds"]
             if batch_index % 20 == 0:
-                progress.set_postfix(loss=f"{sums['loss/total']/samples:.4f}")
+                progress.set_postfix(loss=f"{(sums[0] / samples).item():.4f}",
+                                     cached=cache_hits, built=cache_builds)
         scheduler.step()
-        training = {key: value / max(samples, 1) for key, value in sums.items()}
+        training = dict(zip(loss_names, (sums / max(samples, 1)).cpu().tolist()))
+        training.update(cache_hits=cache_hits, cache_builds=cache_builds)
         validation = {}
         if epoch % args.validate_every == 0 or epoch == args.epochs:
             model.eval()
-            tp = fp = positives = unknown_selected = support_sites = clean_covered = clean_total = 0
-            val_loss = 0.
+            counters = torch.zeros(4, dtype=torch.long, device=args.device)
+            support_sites = clean_covered = clean_total = 0
+            val_loss = torch.zeros((), device=args.device)
+            val_cache_hits = val_cache_builds = 0
             with torch.no_grad():
                 for raw in tqdm(loaders["val"], desc=f"Bottleneck val {epoch:03d}", unit="frame", dynamic_ncols=True):
                     batch = _move(raw, args.device)
                     loss, diagnostics = model.forward_train(batch["radar"], batch["radar_valid"],
                         batch["clean_lidar"], batch["clean_lidar_valid"],
-                        defer_diagnostics=True, trusted_inputs=True)
-                    val_loss += float(loss["loss/total"])
+                        defer_diagnostics=True, trusted_inputs=True,
+                        static_cache=static_cache, frame_ids=batch["frame_id"], split="val")
+                    val_loss += loss["loss/total"].detach()
                     output = diagnostics["output"]
                     selected = output.confidence_region.features[:, 0] > config.support_eval_threshold
                     occupied = diagnostics["occupied"]
                     free = diagnostics["known_free"]
-                    tp += int((selected & occupied).sum())
-                    fp += int((selected & free).sum())
-                    positives += int(occupied.sum())
-                    unknown_selected += int((selected & ~(occupied | free)).sum())
+                    counters += torch.stack(((selected & occupied).sum(),
+                                             (selected & free).sum(), occupied.sum(),
+                                             (selected & ~(occupied | free)).sum()))
                     support_sites += len(selected)
                     clean_covered += diagnostics["clean_points_in_support"]
                     clean_total += diagnostics["clean_points_in_grid"]
+                    val_cache_hits += diagnostics["cache_hits"]
+                    val_cache_builds += diagnostics["cache_builds"]
+            tp, fp, positives, unknown_selected = counters.cpu().tolist()
             precision = tp / (tp + fp) if tp + fp else 0.
             recall = tp / positives if positives else 0.
-            validation = {"loss": val_loss / max(len(loaders["val"]), 1),
+            validation = {"loss": (val_loss / max(len(loaders["val"]), 1)).item(),
                           "support_threshold": config.support_eval_threshold,
                           "support_precision_on_observed": precision,
                           "support_recall_on_eligible_clean": recall,
                           "support_f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.,
                           "unverified_selected_sites": unknown_selected,
                           "support_sites": support_sites,
-                          "clean_point_coverage_before_score": clean_covered / max(clean_total, 1)}
+                          "clean_point_coverage_before_score": clean_covered / max(clean_total, 1),
+                          "cache_hits": val_cache_hits, "cache_builds": val_cache_builds}
             (args.output_root / f"validation_epoch_{epoch:03d}.json").write_text(
                 json.dumps(validation, indent=2), encoding="utf-8")
         with (args.output_root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
@@ -144,5 +163,6 @@ def train(args, config):
         state["data"] = provenance
         torch.save(state, args.output_root / "radar_only.pth")
         print(f"Epoch {epoch:03d}/{args.epochs:03d} | train {training['loss/total']:.4f}"
+              f" | cache reused {cache_hits} built {cache_builds}"
               + (f" | val {validation['loss']:.4f} support F1 {validation['support_f1']:.3f}"
                  if validation else ""), flush=True)

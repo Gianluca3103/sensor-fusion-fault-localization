@@ -219,6 +219,10 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps",type=int,default=1)
     parser.add_argument("--learning-rate",type=float,default=2e-4)
     parser.add_argument("--num-workers",type=int,default=0)
+    parser.add_argument("--static-cache-root",type=Path,
+                        help="Bottleneck Stage-I fixed geometry cache; defaults to output-root/static_geometry")
+    parser.add_argument("--no-static-cache",action="store_true",
+                        help="Disable the bottleneck Stage-I fixed geometry cache")
     parser.add_argument("--validate-every",type=int,default=1)
     parser.add_argument("--train-limit",type=int)
     parser.add_argument("--val-limit",type=int)

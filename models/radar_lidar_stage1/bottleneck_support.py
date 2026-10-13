@@ -17,6 +17,7 @@ from .config import Stage1Config, VoxelGrid
 from .correspondence import LocalCorrespondence, local_neighbors
 from .pfe_spconv import PFEPointVoxelEncoder, PFESpconvBackbone
 from .sparse import SparseSites, encode_keys
+from .static_geometry_cache import Stage1StaticGeometryCache
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,9 @@ class BottleneckSupportStage1(nn.Module):
         return self.radar_only(radar_points, radar_valid)
 
     def forward_train(self, radar_points, radar_valid, clean_lidar, clean_valid, *,
-                      defer_diagnostics: bool = False, trusted_inputs: bool = False):
+                      defer_diagnostics: bool = False, trusted_inputs: bool = False,
+                      static_cache: Stage1StaticGeometryCache | None = None,
+                      frame_ids: list[str] | None = None, split: str | None = None):
         output, radar_levels, support_logits = self.radar_only.encode(
             radar_points, radar_valid, defer_diagnostics=defer_diagnostics,
             check_finite=not trusted_inputs)
@@ -129,8 +132,24 @@ class BottleneckSupportStage1(nn.Module):
         lidar_levels, _ = self.lidar_backbone(lidar_sites,
                                                defer_diagnostics=defer_diagnostics)
         radar_coarse, lidar_coarse = radar_levels[-1], lidar_levels[-1]
-        neighbors = local_neighbors(radar_coarse, lidar_coarse, self.config.grid,
-                                    self.config.attention_radii_m[-1], self.config.max_neighbors)
+        support = output.confidence_region
+        if static_cache is None:
+            from models.radar_lidar_stage2.candidate_domain import CandidateDomain
+            from models.radar_lidar_stage2.voxel_target import make_targets
+            neighbors = local_neighbors(radar_coarse, lidar_coarse, self.config.grid,
+                                        self.config.attention_radii_m[-1], self.config.max_neighbors)
+            coarse_grid = VoxelGrid(
+                self.config.grid.minimum_xyz, self.config.grid.maximum_xyz,
+                tuple(v * self.config.support_stride for v in self.config.grid.size_xyz))
+            domain = CandidateDomain(support.coords, support.features[:, 0].detach(), coarse_grid, {})
+            targets = make_targets(domain, clean_lidar, clean_valid)
+            cache_hits = cache_builds = 0
+        else:
+            if frame_ids is None or split is None:
+                raise ValueError("Static cache requires frame IDs and split")
+            neighbors, targets, cache_hits, cache_builds = static_cache.get_batch(
+                frame_ids, split, radar_coarse, lidar_coarse, support,
+                clean_lidar, clean_valid)
         attention = self.correspondence(
             radar_coarse, lidar_coarse, self.config.grid, neighbors,
             self.config.attention_radii_m[-1], self.config.positive_radii_m[-1],
@@ -138,35 +157,29 @@ class BottleneckSupportStage1(nn.Module):
             self.config.num_negatives, defer_diagnostics=defer_diagnostics)
         zero = output.bottleneck.features.sum() * 0
         positive = attention["positive_mask"]
-        if len(lidar_coarse.coords) and bool(positive.any()):
+        if len(lidar_coarse.coords):
             lidar_embedding = F.normalize(self.correspondence.key_value(lidar_coarse.features), dim=-1)
             selected = lidar_embedding[neighbors.indices.clamp_min(0)]
             weights = attention["weights"] * positive
             weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-8)
             target = F.normalize((selected * weights[:, :, None]).sum(1), dim=-1).detach()
             valid = positive.any(-1)
-            distill = (1 - F.cosine_similarity(output.bottleneck.features[valid], target[valid])).mean()
+            error = 1 - F.cosine_similarity(output.bottleneck.features, target)
+            distill = (error * valid).sum() / valid.sum().clamp_min(1)
         else:
             distill = zero
 
         # The clean scan supplies positives and measured free space. Unobserved
         # sites (including those behind a first return) are never labeled free.
-        from models.radar_lidar_stage2.candidate_domain import CandidateDomain
-        from models.radar_lidar_stage2.voxel_target import make_targets
-        coarse_grid = VoxelGrid(self.config.grid.minimum_xyz, self.config.grid.maximum_xyz,
-                                tuple(v * self.config.support_stride for v in self.config.grid.size_xyz))
-        support = output.confidence_region
-        domain = CandidateDomain(support.coords, support.features.squeeze(-1), coarse_grid, {})
-        targets = make_targets(domain, clean_lidar, clean_valid)
         positives, free = targets.occupied, targets.known_free
         unknown = ~(positives | free)
-        positive_loss = (F.binary_cross_entropy_with_logits(
-            support_logits[positives, 0], torch.ones_like(support_logits[positives, 0]))
-                         if bool(positives.any()) else zero)
-        free_loss = (F.binary_cross_entropy_with_logits(
-            support_logits[free, 0], torch.zeros_like(support_logits[free, 0]))
-                     if bool(free.any()) else zero)
-        abstention = support.features[unknown].mean() if bool(unknown.any()) else zero
+        scores = support_logits[:, 0]
+        positive_loss = (F.softplus(-scores).masked_fill(~positives, 0).sum() /
+                         positives.sum().clamp_min(1))
+        free_loss = (F.softplus(scores).masked_fill(~free, 0).sum() /
+                     free.sum().clamp_min(1))
+        abstention = (support.features[:, 0].masked_fill(~unknown, 0).sum() /
+                      unknown.sum().clamp_min(1))
         support_loss = positive_loss + free_loss + self.config.support_abstention_weight * abstention
         total = (self.config.correspondence_weight * attention["loss"] +
                  self.config.bottleneck_distill_weight * distill +
@@ -177,7 +190,8 @@ class BottleneckSupportStage1(nn.Module):
                        "positive_queries": attention["positive_queries"],
                        "support_sites": len(support.coords),
                        "clean_points_in_support": targets.clean_points_in_candidates,
-                       "clean_points_in_grid": targets.clean_points_in_grid}
+                       "clean_points_in_grid": targets.clean_points_in_grid,
+                       "cache_hits": cache_hits, "cache_builds": cache_builds}
         return losses, diagnostics
 
     def radar_only_state_dict(self) -> dict:

@@ -23,6 +23,18 @@ python -u -m models.radar_lidar_stage1.train \
 
 Validation reports support precision on measured clean/free cells, recall on clean cells inside the radar-derived lattice, unknown selected sites, and clean coverage before scoring. These metrics cannot prove object reconstruction quality; inspect held-out clouds and Stage-II results.
 
+The trainer builds a per-frame cache under `output-root/static_geometry` as it
+visits frames. It stores fixed bottleneck neighbor indices and distances plus
+the support lattice's clean occupied and measured free-space labels. The first
+epoch builds entries; later epochs and resumed runs reuse them even when batch
+order changes. Radar and LiDAR encoder features, attention weights, support
+scores and gradients are computed afresh every step. The cache is invalidated
+when the configuration or source radar/LiDAR/calibration file metadata changes.
+Use `--static-cache-root /path/to/cache` to put it on another volume or
+`--no-static-cache` to compare with uncached execution. The progress bar and
+epoch metrics report reused and built frame counts. Loss statistics stay on
+the GPU until periodic progress updates and the epoch summary.
+
 Visualize a held-out frame with `python -m scripts.visualize_stage1_confidence_cloud --vod-root /path/to/view_of_delft_PUBLIC --checkpoint /path/to/stage1_bottleneck_support/best_selected.ckpt --split val --frame-id 08236 --output-root /path/to/stage1_views --device cuda`. The viewer writes both the raw scored support lattice and its interpolated Stage-II region as uncapped PLY files.
 
 ### Historical surface-proposal interface (older checkpoints only)
