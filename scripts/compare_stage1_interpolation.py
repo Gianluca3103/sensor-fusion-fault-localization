@@ -10,6 +10,7 @@ import argparse
 from html import escape
 import json
 from pathlib import Path
+from zipfile import ZIP_STORED, ZipFile
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -31,6 +32,32 @@ METHOD_LABELS = {"ellipsoid": "Learned ellipsoid",
                  "gaussian": "Gaussian weighting",
                  "edge_aware": "Edge-aware",
                  "local_sdf": "Local signed-distance field"}
+POINTCLOUD_LABELS = {"radar": "Raw stacked radar", "clean_lidar": "Clean LiDAR reference",
+                     "seeds": "Raw Stage I proposals", **METHOD_LABELS}
+
+
+def _pointcloud_path(prefix: Path, name: str) -> Path:
+    return prefix.with_name(f"{prefix.name}_{name}.ply")
+
+
+def _bundle_pointclouds(prefix: Path) -> Path:
+    """Bundle the full-resolution PLY exports without resampling or point caps."""
+    bundle = prefix.with_name(f"{prefix.name}_pointclouds.zip")
+    with ZipFile(bundle, "w", compression=ZIP_STORED) as archive:
+        for name in POINTCLOUD_LABELS:
+            cloud = _pointcloud_path(prefix, name)
+            archive.write(cloud, arcname=cloud.name)
+        sdf = prefix.with_name(f"{prefix.name}_local_sdf.npz")
+        archive.write(sdf, arcname=sdf.name)
+        manifest = {"frame": prefix.name.split("_", 1)[0],
+                    "pointclouds": {name: {"label": label,
+                                           "file": _pointcloud_path(prefix, name).name}
+                                    for name, label in POINTCLOUD_LABELS.items()},
+                    "local_sdf_data": sdf.name,
+                    "note": "Raw radar and raw Stage I proposals are distinct. Clean LiDAR is a reference only."
+                    }
+        archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+    return bundle
 
 
 def _crop(xyz: np.ndarray, limits: tuple[float, ...]) -> np.ndarray:
@@ -108,19 +135,36 @@ def _write_summary(output_root: Path, reports: list[dict]) -> None:
         matched_body.append("<tr><td>" + escape(METHOD_LABELS[method]) +
                             f"</td><td>{row['matched_sites']:,}</td><td>{precision}</td>"
                             f"<td>{coverage}</td></tr>")
-    links = " ".join(f'<a href="{escape(report["frame"])}_interpolation.html">'
+    links = " ".join(f'<a href="{escape(report["frame"], quote=True)}_interpolation.html">'
                      f'{escape(report["frame"])}</a>' for report in reports)
+    downloads = []
+    for report in reports:
+        prefix = f'{report["frame"]}_interpolation'
+        files = " ".join(
+            f'<a href="{escape(prefix + "_" + name + ".ply", quote=True)}">{escape(label)}</a>'
+            for name, label in POINTCLOUD_LABELS.items())
+        files += (f' <a href="{escape(prefix + "_local_sdf.npz", quote=True)}">'
+                  'SDF scores and signed distances</a>')
+        downloads.append(
+            f'<li><b>Frame {escape(report["frame"])}</b>: '
+            f'<a href="{escape(prefix + "_pointclouds.zip", quote=True)}">Download all point clouds</a>'
+            f'<div class="files">{files}</div></li>')
     page = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
             "<title>Stage I interpolation comparison</title>"
             "<style>body{background:#10161d;color:#e8eff5;font:15px system-ui,sans-serif;"
             "margin:24px;max-width:1100px}a{color:#83c9ed;margin-right:14px}"
             "table{border-collapse:collapse;margin:18px 0}td,th{border:1px solid #456075;"
-            "padding:8px;text-align:right}td:first-child,th:first-child{text-align:left}</style>"
+            "padding:8px;text-align:right}td:first-child,th:first-child{text-align:left}"
+            "li{margin:12px 0}.files{margin:5px 0;line-height:1.8}</style>"
             f"<h1>Stage I interpolation · epoch {summary['checkpoint_epoch']}</h1>"
             "<p>Radar-only candidate regions. Clean LiDAR is used only to measure the rows below. "
             "The methods have different active-cell counts, so read precision together with coverage. "
             "This is a support-region audit, not reconstructed point-cloud accuracy.</p>"
             f"<p>Frame views: {links}</p>"
+            "<h2>Full point clouds</h2><p>Each bundle contains uncapped PLY files for raw stacked "
+            "radar, raw Stage I proposals, every interpolation, and clean LiDAR as a reference. "
+            "The local SDF also includes an NPZ with scores and signed distances.</p><ul>"
+            + "".join(downloads) + "</ul>"
             "<table><tr><th>Method</th><th>Active cells</th><th>Cell precision at 20 cm</th>"
             "<th>Clean coverage at 20 cm</th><th>Radar-near clean coverage at 20 cm</th></tr>"
             + "".join(body) + "</table><p>Scores use a 0.25 threshold. "
@@ -151,16 +195,18 @@ input[type=range]{width:180px}button{background:#2b4050;border:1px solid #637d90
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:7px}
 section{min-width:0;background:#19242e;border:1px solid #3b5265;padding:5px;border-radius:5px}
 h2{font-size:12px;margin:0 0 4px;min-height:32px}
+.download{display:inline-block;color:#83c9ed;margin:0 0 5px}
 canvas{width:100%;height:68vh;min-height:400px;touch-action:none;background:#0b151e;cursor:grab}
 @media(max-width:700px){canvas{height:45vh;min-height:300px}}
-</style><h1 id="title"></h1><p>Radar-only support methods. Clean LiDAR is shown for comparison and is never used to create an interpolated field. All panels share the same metric camera; no cloud is capped.</p>
+</style><h1 id="title"></h1><p>Radar-only support methods. Raw Stage I proposals are the model output before interpolation; raw stacked radar is the sensor input. Clean LiDAR is shown only as a reference. All panels share the same metric camera; no cloud is capped. <a id="bundle" class="download">Download every point cloud for this frame</a></p>
 <div class="controls"><label>Minimum score <input type="range" id="threshold" min="0" max="1" step="0.01"><output id="value"></output></label>
 <label><input type="checkbox" id="overlay"> Overlay raw radar on support panels</label><label><input type="checkbox" id="sdfcolor"> Color local SDF by signed distance</label><button id="reset">Reset view</button></div>
-<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates a support score, not calibrated accuracy. The ellipsoid panel is the current Stage II candidate rule. Every other method starts from the same predicted surface seeds and ignores the learned ellipsoid radii. Nearest is an unsmoothed baseline; Gaussian and inverse-distance use compact local kernels. The local SDF estimates oriented planes from nearby predicted seeds. With signed-distance coloring, blue is behind a patch, white is near zero, and red faces the LiDAR sensor; behind is unknown, not occupied.</p>
+<div id="grid" class="grid"></div><p>Blue → cyan → yellow → red indicates a support score, not calibrated accuracy. The ellipsoid panel is the current Stage II candidate rule. Every interpolation starts from the same raw Stage I proposals; no interpolation uses clean LiDAR. Nearest is an unsmoothed baseline; Gaussian and inverse-distance use compact local kernels. The local SDF estimates oriented planes from nearby predicted seeds. With signed-distance coloring, blue is behind a patch, white is near zero, and red faces the LiDAR sensor; behind is unknown, not occupied.</p>
 <script id="data" type="application/json">__DATA__</script><script>
 (()=>{const d=JSON.parse(document.getElementById('data').textContent),root=document.getElementById('grid');
 document.getElementById('title').textContent=`Frame ${d.frame} · Stage I epoch ${d.epoch??'unknown'}`;
-const cs=d.clouds.map((cloud)=>{let s=document.createElement('section'),h=document.createElement('h2'),c=document.createElement('canvas');s.append(h,c);root.append(s);return {h,c,cloud};});
+const bundle=document.getElementById('bundle');bundle.href=`${d.frame}_interpolation_pointclouds.zip`;bundle.download=bundle.href;
+const cs=d.clouds.map((cloud)=>{let s=document.createElement('section'),h=document.createElement('h2'),a=document.createElement('a'),c=document.createElement('canvas');a.className='download';a.textContent='Download full PLY';a.href=cloud.file;a.download=cloud.file;s.append(h,a,c);root.append(s);return {h,c,cloud};});
 const slider=document.getElementById('threshold'),label=document.getElementById('value'),overlay=document.getElementById('overlay'),sdfcolor=document.getElementById('sdfcolor');slider.value=d.threshold;
 const [x0,x1,y0,y1,z0,z1]=d.limits,center=[(x0+x1)/2,(y0+y1)/2,(z0+z1)/2],radius=Math.hypot(x1-x0,y1-y0,z1-z0)/2;
 const initial={yaw:-.65,pitch:.35,zoom:1,panX:0,panY:0},v={...initial};
@@ -168,7 +214,7 @@ function color(s){const a=[[40,98,190],[81,202,209],[255,225,115],[245,104,104]]
 function distanceColor(s){const t=Math.min(1,Math.abs(s)/.25),base=s>=0?[242,100,84]:[76,148,238];return `rgb(${base.map(v=>Math.round(235*(1-t)+v*t)).join(',')})`;}
 function project(p,w,h,scale){let x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cy=Math.cos(v.yaw),sy=Math.sin(v.yaw),cp=Math.cos(v.pitch),sp=Math.sin(v.pitch),u=cy*x-sy*y,depth=sy*x+cy*y;return [w/2+v.panX+u*scale,h/2+v.panY-(cp*z-sp*depth)*scale];}
 function layer(ctx,cloud,w,h,scale,kind,alpha){ctx.globalAlpha=alpha;for(let i=0;i<cloud.xyz.length;i++){if(kind==='score'&&cloud.score[i]<Number(slider.value))continue;let [x,y]=project(cloud.xyz[i],w,h,scale);if(x<0||x>w||y<0||y>h)continue;ctx.fillStyle=kind==='radar'?'#ffab40':kind==='lidar'?'#45b975':cloud.signed_distance_m&&sdfcolor.checked?distanceColor(cloud.signed_distance_m[i]):color(cloud.score[i]);const size=kind==='score'?2.2:1.2;ctx.fillRect(x-size/2,y-size/2,size,size);}ctx.globalAlpha=1;}
-function draw(){label.textContent=Number(slider.value).toFixed(2);for(let index=0;index<cs.length;index++){let {h,c,cloud}=cs[index],n=cloud.score?cloud.score.filter(q=>q>=Number(slider.value)).length:cloud.xyz.length;h.textContent=`${cloud.name}: ${n.toLocaleString()} shown / ${cloud.xyz.length.toLocaleString()} in crop`;let w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);let ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);let scale=.47*Math.min(w,height)*v.zoom/radius;if(index>1&&overlay.checked)layer(ctx,d.clouds[0],w,height,scale,'radar',.3);layer(ctx,cloud,w,height,scale,index===0?'radar':index===1?'lidar':'score',.9);}}
+function draw(){label.textContent=Number(slider.value).toFixed(2);for(let index=0;index<cs.length;index++){let {h,c,cloud}=cs[index],n=cloud.score?cloud.score.filter(q=>q>=Number(slider.value)).length:cloud.xyz.length;h.textContent=`${cloud.name}: ${n.toLocaleString()} shown / ${cloud.xyz.length.toLocaleString()} in crop`;let w=c.clientWidth,height=c.clientHeight,ratio=devicePixelRatio||1;c.width=Math.round(w*ratio);c.height=Math.round(height*ratio);let ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);let scale=.47*Math.min(w,height)*v.zoom/radius;if(index>1&&overlay.checked)layer(ctx,d.clouds[0],w,height,scale,'radar',.3);layer(ctx,cloud,w,height,scale,cloud.kind,.9);}}
 let pending=false;function redraw(){if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;draw();});}
 const active=new Map();for(const {c} of cs){c.addEventListener('pointerdown',e=>{c.setPointerCapture(e.pointerId);active.set(e.pointerId,[e.clientX,e.clientY]);});c.addEventListener('pointermove',e=>{let old=active.get(e.pointerId);if(!old)return;let dx=e.clientX-old[0],dy=e.clientY-old[1];active.set(e.pointerId,[e.clientX,e.clientY]);if(e.shiftKey){v.panX+=dx;v.panY+=dy;}else{v.yaw+=dx*.008;v.pitch=Math.max(-1.55,Math.min(1.55,v.pitch+dy*.008));}redraw();});for(let ev of ['pointerup','pointercancel'])c.addEventListener(ev,e=>active.delete(e.pointerId));c.addEventListener('wheel',e=>{e.preventDefault();v.zoom=Math.max(.1,Math.min(80,v.zoom*Math.exp(-e.deltaY*.001)));redraw();},{passive:false});}
 slider.addEventListener('input',redraw);overlay.addEventListener('change',redraw);sdfcolor.addEventListener('change',redraw);document.getElementById('reset').onclick=()=>{Object.assign(v,initial);redraw();};window.addEventListener('resize',redraw);redraw();})();
@@ -278,18 +324,28 @@ def main() -> None:
             cropped_clean, k=3, distance_upper_bound=1.5, workers=-1)[0][:, 2])
                             if len(cropped_radar) >= 3 else np.zeros(len(cropped_clean), dtype=bool))
         prefix = args.output_root / f"{frame}_interpolation"
-        write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar)
-        write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), clean)
-        write_ply(prefix.with_name(prefix.name + "_seeds.ply"), seed_xyz, seed_score)
+        write_ply(_pointcloud_path(prefix, "radar"), radar)
+        write_ply(_pointcloud_path(prefix, "clean_lidar"), clean)
+        write_ply(_pointcloud_path(prefix, "seeds"), seed_xyz, seed_score)
         results = {}
-        html_clouds = [{"name": "Radar", "xyz": np.round(cropped_radar, 3).tolist()},
-                       {"name": "Clean LiDAR", "xyz": np.round(cropped_clean, 3).tolist()}]
+        crop_seeds = _crop(seed_xyz, limits)
+        html_clouds = [
+            {"name": "Raw stacked radar", "kind": "radar", "file": _pointcloud_path(prefix, "radar").name,
+             "xyz": np.round(cropped_radar, 3).tolist()},
+            {"name": "Clean LiDAR reference", "kind": "lidar", "file": _pointcloud_path(prefix, "clean_lidar").name,
+             "xyz": np.round(cropped_clean, 3).tolist()},
+            {"name": "Raw Stage I proposals (no interpolation)", "kind": "score",
+             "file": _pointcloud_path(prefix, "seeds").name,
+             "xyz": np.round(seed_xyz[crop_seeds], 3).tolist(),
+             "score": np.round(seed_score[crop_seeds], 4).tolist()},
+        ]
         for key in clouds_xyz:
             xyz, score = clouds_xyz[key], clouds_score[key]
-            write_ply(prefix.with_name(prefix.name + f"_{key}.ply"), xyz, score)
+            write_ply(_pointcloud_path(prefix, key), xyz, score)
             crop = _crop(xyz, limits)
             xyz, score = xyz[crop], score[crop]
-            html_clouds.append({"name": METHOD_LABELS[key],
+            html_clouds.append({"name": METHOD_LABELS[key], "kind": "score",
+                                "file": _pointcloud_path(prefix, key).name,
                                 "xyz": np.round(xyz, 3).tolist(),
                                 "score": np.round(score, 4).tolist()})
             if key == "local_sdf":
@@ -348,6 +404,7 @@ def main() -> None:
         reports.append(report)
         _viewer(prefix.with_suffix(".html"), frame, saved.get("epoch"), html_clouds,
                 limits, args.display_threshold)
+        _bundle_pointclouds(prefix)
         print(f"{frame}: links={fields['edge_aware'].accepted_edges}, matched={selected_count}; " +
               " | ".join(f"{name}={int(np.count_nonzero(clouds_score[name][_crop(clouds_xyz[name], limits)] >= args.display_threshold))}"
                          for name in results) + f" | {prefix.with_suffix('.html')}", flush=True)
