@@ -41,6 +41,7 @@ class VoxelGrid:
 class Stage1Config:
     grid: VoxelGrid = VoxelGrid()
     channels: tuple[int, ...] = (32, 64, 128, 256)
+    encoder_backend: str = "native"  # native keeps existing checkpoints; pfe_spconv uses encoder.py's backbone
     attention_radii_m: tuple[float, ...] = (0.75, 1.5, 3.0, 6.0)
     max_neighbors: int = 24
     attention_dim: int = 64
@@ -49,6 +50,13 @@ class Stage1Config:
     # They define geometric proxies, not verified shared reflector identities.
     positive_radii_m: tuple[float, ...] = (0.4, 0.8, 1.6, 3.2)
     corr_scale_weights: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
+    bottleneck_cross_attention_only: bool = False
+    bottleneck_support_only: bool = False
+    support_stride: int = 2
+    support_eval_threshold: float = 0.25
+    support_loss_weight: float = 1.0
+    support_abstention_weight: float = 0.05
+    bottleneck_distill_weight: float = 0.5
     temperature: float = 0.1
     negative_strategy: str = "nearest"  # nearest (hard local) or random_local
     num_negatives: int = 16
@@ -79,8 +87,14 @@ class Stage1Config:
     surface_region_volume_weight: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.encoder_backend not in ("native", "pfe_spconv"):
+            raise ValueError("encoder_backend must be native or pfe_spconv")
         if not 1 <= len(self.channels) <= 4 or min(self.channels) < 4:
             raise ValueError("Use 1–4 scales with at least four channels")
+        if self.encoder_backend == "pfe_spconv" and len(self.channels) != 4:
+            raise ValueError("The PFE sparse encoder requires four feature scales")
+        if self.encoder_backend == "pfe_spconv" and self.growth_scales:
+            raise ValueError("The PFE sparse encoder has no support-growth convolution; set growth_scales to []")
         if any(b <= a for a,b in zip(self.channels[:-1],self.channels[1:])):
             raise ValueError("Channel widths must increase across scales")
         if len(self.attention_radii_m) < len(self.channels) or any(x <= 0 for x in self.attention_radii_m[:len(self.channels)]):
@@ -89,6 +103,19 @@ class Stage1Config:
             raise ValueError("Each positive radius must be positive and smaller than its local search radius")
         if len(self.corr_scale_weights) < len(self.channels) or any(x < 0 for x in self.corr_scale_weights[:len(self.channels)]):
             raise ValueError("Each correspondence scale weight must be nonnegative")
+        if self.bottleneck_cross_attention_only and (
+                len(self.channels) != 4 or any(self.corr_scale_weights[:-1])
+                or self.corr_scale_weights[-1] <= 0):
+            raise ValueError("Bottleneck correspondence requires four scales and weights [0, 0, 0, positive]")
+        if self.bottleneck_support_only:
+            if (self.encoder_backend != "pfe_spconv" or not self.bottleneck_cross_attention_only or len(self.channels) != 4
+                    or self.support_stride != 2 or self.surface_proposals_per_site
+                    or self.surface_region_enabled or self.confidence_weight):
+                raise ValueError("Bottleneck support needs S4 correspondence, stride-2 support, and no legacy proposal/confidence heads")
+            if not 0 < self.support_eval_threshold < 1:
+                raise ValueError("Support evaluation threshold must be in (0,1)")
+            if min(self.support_loss_weight, self.bottleneck_distill_weight) <= 0 or self.support_abstention_weight < 0:
+                raise ValueError("Bottleneck support loss weights are invalid")
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("Contrastive temperature must be positive")
         if self.negative_strategy not in ("nearest", "random_local") or self.num_negatives < 1:
@@ -135,3 +162,7 @@ class Stage1Config:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def conditioning_channels(self) -> tuple[int, ...]:
+        return (self.attention_dim,) if self.bottleneck_support_only else self.channels

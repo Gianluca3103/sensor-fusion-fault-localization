@@ -69,7 +69,7 @@ class Stage1MetricAccumulator:
             bucket["query_count"]+=count
             neighbors=(intermediates["neighbors"][name] if intermediates is not None
                        else local_neighbors(r,li,self.config.grid,self.config.attention_radii_m[i],self.config.max_neighbors))
-            if count and len(li.coords):
+            if model.has_correspondence(i) and count and len(li.coords):
                 positive=neighbors.valid & (neighbors.distances_m<=self.config.positive_radii_m[i])
                 valid=positive.any(-1)
                 bucket["valid_corr_query_count"]+=int(valid.sum())
@@ -244,8 +244,21 @@ class Stage1MetricAccumulator:
         total_valid=0; total_queries=0; total_knn=0; total_hits={k:0 for k in (1,5,10)}; arrays=[]
         for name,row in self.scales.items():
             valid=row["valid_corr_query_count"]; query=row["query_count"]
+            index=int(name[1:])-1
+            enabled=(self.config.correspondence_weight>0 and
+                     self.config.corr_scale_weights[index]>0 and
+                     (not self.config.bottleneck_cross_attention_only or
+                      index==len(self.config.channels)-1))
+            if not enabled:
+                report["scales"][name]={"query_count":query,"correspondence_enabled":False,
+                    "valid_corr_query_count":0,"no_corr_query_count":0,"no_corr_fraction":None,
+                    "knn_r1":None,**{f"corr_r{k}":None for k in (1,5,10)},
+                    "corr_error_mean_m":None,"corr_error_median_m":None,"corr_error_p90_m":None,
+                    **{f"corr_within_{t:.1f}m":None for t in DISTANCES}}
+                continue
             errors=np.concatenate(row["corr_errors"]) if row["corr_errors"] else np.empty(0)
-            scale={"query_count":query,"valid_corr_query_count":valid,"no_corr_query_count":query-valid,
+            scale={"query_count":query,"correspondence_enabled":True,
+                "valid_corr_query_count":valid,"no_corr_query_count":query-valid,
                 "no_corr_fraction":_fraction(query-valid,query),
                 "knn_r1":_fraction(row["knn_hits"],valid),
                 **{f"corr_r{k}":_fraction(row["corr_hits"][k],valid) for k in (1,5,10)},

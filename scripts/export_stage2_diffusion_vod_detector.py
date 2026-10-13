@@ -65,13 +65,13 @@ def main():
         raise ValueError("Inference fault pattern differs from training")
     stage1_path = args.stage1_checkpoint or Path(saved["stage1_checkpoint"])
     stage1, stage1_saved = load_encoder(stage1_path, args.device)
-    if not stage1.config.surface_region_enabled:
+    if not (stage1.config.surface_region_enabled or stage1.config.bottleneck_support_only):
         raise ValueError("Diffusion export requires the learned-region Stage-I checkpoint")
     variant = saved["radar_variant"]
     trained_variant = stage1_saved.get("data", {}).get("radar_variant")
     if trained_variant and trained_variant != variant:
         raise ValueError("Stage-I and residual Stage-II radar variants differ")
-    model = ResidualSparseDiffusion(stage1.config.channels, config).to(args.device).eval()
+    model = ResidualSparseDiffusion(stage1.config.conditioning_channels, config).to(args.device).eval()
     model.load_state_dict(saved["model"])
     public = resolve_vod_public_root(args.vod_root)
     official = (public / "lidar" / "ImageSets" / "val.txt").read_text(encoding="utf-8").split()

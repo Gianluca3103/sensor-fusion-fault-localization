@@ -45,12 +45,16 @@ def save_diagnostics(model, batch: dict, output_prefix: str | Path, *, max_point
     palette=("#1f77b4","#d62728","#9467bd","#2ca02c")
     records=[]
     selected_xy=[]
+    selected_radii=[]
     for i,(name,li) in enumerate(zip(output.features,teacher)):
         r=output.features[name]
         xyz=r.centers_xyz(model.config.grid).cpu().numpy()
         if len(xyz)>max_points:
             xyz=xyz[rng.choice(len(xyz),max_points,replace=False)]
         axes[1,0].scatter(xyz[:,0],xyz[:,1],s=1.5,c=palette[i],alpha=.55,label=f"{name} {len(r.coords):,} sites")
+        if not model.has_correspondence(i):
+            records.append({"scale":name,"cross_modal_attention":False})
+            continue
         neighbors=local_neighbors(r,li,model.config.grid,model.config.attention_radii_m[i],model.config.max_neighbors)
         attention=model.correspondence[i](r,li,model.config.grid,neighbors,
             model.config.attention_radii_m[i],model.config.positive_radii_m[i],
@@ -71,6 +75,7 @@ def save_diagnostics(model, batch: dict, output_prefix: str | Path, *, max_point
         record={"scale":name,"radar_xyz_m":query_xyz.cpu().tolist(),"matched_lidar_xyz_m":matched.cpu().tolist(),"correspondence_distance_m":float(torch.linalg.vector_norm(matched-query_xyz)),"correspondence_score":float(weights[max_local]),"confidence":float(output.confidence.features[candidate]) if i==0 and candidate<len(output.confidence.features) else None,"candidates":[{"lidar_xyz_m":p,"weight":float(w),"distance_m":float(d)} for p,w,d in zip(li.centers_xyz(model.config.grid)[li_idx].cpu().tolist(),weights.cpu().tolist(),neighbors.distances_m[candidate,valid].cpu().tolist())]}
         records.append(record)
         selected_xy.append(query_xyz[:2].cpu().numpy())
+        selected_radii.append(model.config.attention_radii_m[i])
         axes[1,1].scatter(float(query_xyz[0]),float(query_xyz[1]),s=45,c=palette[i],marker="x",label=f"{name} query")
         locs=li.centers_xyz(model.config.grid)[li_idx].cpu().numpy()
         axes[1,1].scatter(locs[:,0],locs[:,1],s=10+weights.cpu().numpy()*100,c=palette[i],alpha=.4)
@@ -79,7 +84,7 @@ def save_diagnostics(model, batch: dict, output_prefix: str | Path, *, max_point
     axes[1,1].set(title="Selected local radar → LiDAR neighborhoods: XY",xlabel="x [m]",ylabel="y [m]")
     if selected_xy:
         focus=np.mean(selected_xy,axis=0)
-        span=max(4.0,2*max(model.config.attention_radii_m[:len(selected_xy)]))
+        span=max(4.0,2*max(selected_radii))
         axes[1,1].set(xlim=(focus[0]-span,focus[0]+span),ylim=(focus[1]-span,focus[1]+span))
     for ax in axes.flat:
         ax.grid(alpha=.15)

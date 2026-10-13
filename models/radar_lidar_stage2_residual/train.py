@@ -192,7 +192,7 @@ def main():
         raise ValueError("Stage-I checkpoint was trained with a different radar stack")
     for parameter in stage1.parameters():
         parameter.requires_grad_(False)
-    model = ResidualRadarLidarStage2(stage1.config.channels, config).to(args.device)
+    model = ResidualRadarLidarStage2(stage1.config.conditioning_channels, config).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=.01)
     start, best = 1, -float("inf")
     if args.resume:

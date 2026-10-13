@@ -99,7 +99,7 @@ def main() -> None:
     trained_variant = stage1_saved.get("data", {}).get("radar_variant")
     if trained_variant and trained_variant != variant:
         raise ValueError("Stage-I and Stage-II radar variants differ")
-    model = RadarLidarStage2(stage1.config.channels, config).to(args.device).eval()
+    model = RadarLidarStage2(stage1.config.conditioning_channels, config).to(args.device).eval()
     model.load_state_dict(saved["model"])
 
     public = resolve_vod_public_root(args.vod_root)

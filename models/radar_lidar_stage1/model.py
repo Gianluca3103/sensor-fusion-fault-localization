@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from .config import Stage1Config
 from .correspondence import LocalCorrespondence, local_neighbors, local_neighbors_xyz
 from .sparse import PointVoxelEncoder, SparseBackbone, SparseSites, receptive_fields, encode_keys
+from .pfe_spconv import PFEPointVoxelEncoder, PFESpconvBackbone
 
 
 @dataclass
@@ -137,9 +138,14 @@ class RadarOnlyEncoder(nn.Module):
 
     def __init__(self, config: Stage1Config):
         super().__init__()
+        if config.bottleneck_support_only:
+            raise ValueError("Use RadarOnlyBottleneckEncoder for the two-output Stage-I interface")
         self.config=config
-        self.point=PointVoxelEncoder(config.grid,"radar",config.channels[0])
-        self.backbone=SparseBackbone(config.channels,config.growth_scales)
+        pfe=config.encoder_backend=="pfe_spconv"
+        self.point=(PFEPointVoxelEncoder(config.grid,"radar") if pfe else
+                    PointVoxelEncoder(config.grid,"radar",config.channels[0]))
+        self.backbone=(PFESpconvBackbone(config.channels) if pfe else
+                       SparseBackbone(config.channels,config.growth_scales))
         self.projections=nn.ModuleList(nn.Linear(ch,ch) for ch in config.channels)
         self.confidence_head=nn.Linear(config.channels[0],1)
         self.surface_head=SurfaceProposalHead(config) if config.surface_proposals_per_site else None
@@ -156,7 +162,8 @@ class RadarOnlyEncoder(nn.Module):
         surface=None
         if self.surface_head is not None:
             surface=self.surface_head(features)
-        rf=receptive_fields(len(levels),self.config.growth_scales)
+        rf=((7,17,53,125) if self.config.encoder_backend=="pfe_spconv" else
+            receptive_fields(len(levels),self.config.growth_scales))
         scale_stats={}
         for i,level in enumerate(levels):
             scale_stats[f"s{i+1}"]={**operation_stats[i],"representation_channels":features[f"s{i+1}"].features.shape[-1],"shape_zyx":level.shape_zyx,"voxel_spacing_xyz_m":tuple(v*level.stride for v in self.config.grid.size_xyz),"receptive_field_fine_voxels":rf[i],"receptive_field_xyz_m":tuple(v*rf[i] for v in self.config.grid.size_xyz)}
@@ -166,10 +173,13 @@ class RadarOnlyEncoder(nn.Module):
 class LidarTeacher(nn.Module):
     def __init__(self,config: Stage1Config):
         super().__init__()
-        self.point=PointVoxelEncoder(config.grid,"lidar",config.channels[0])
+        pfe=config.encoder_backend=="pfe_spconv"
+        self.point=(PFEPointVoxelEncoder(config.grid,"lidar") if pfe else
+                    PointVoxelEncoder(config.grid,"lidar",config.channels[0]))
         # Supervision sites must descend from measured clean returns. Growing
         # teacher support would turn unmeasured context cells into positives.
-        self.backbone=SparseBackbone(config.channels,())
+        self.backbone=(PFESpconvBackbone(config.channels) if pfe else
+                       SparseBackbone(config.channels,()))
 
     def forward(self,points: torch.Tensor,valid: torch.Tensor, *, defer_diagnostics: bool = False,
                 check_finite: bool = True):
@@ -204,11 +214,24 @@ def probe_target(radar: SparseSites, lidar: SparseSites, neighbors, grid, radius
 class RadarLidarStage1(nn.Module):
     def __init__(self,config: Stage1Config = Stage1Config()):
         super().__init__()
+        if config.bottleneck_support_only:
+            raise ValueError("Use BottleneckSupportStage1 for the two-output Stage-I interface")
         self.config=config
         self.radar_only=RadarOnlyEncoder(config)
         self.lidar_teacher=LidarTeacher(config)
-        self.correspondence=nn.ModuleList(LocalCorrespondence(ch,ch,config.attention_dim) for ch in config.channels)
+        if config.bottleneck_cross_attention_only:
+            self.correspondence=nn.ModuleList(
+                [nn.Identity() for _ in config.channels[:-1]] +
+                [LocalCorrespondence(config.channels[-1],config.channels[-1],config.attention_dim)])
+        else:
+            self.correspondence=nn.ModuleList(
+                LocalCorrespondence(ch,ch,config.attention_dim) for ch in config.channels)
         self.probe=GeometricProbe(config)
+
+    def has_correspondence(self, scale_index: int) -> bool:
+        return (self.config.correspondence_weight > 0 and
+                self.config.corr_scale_weights[scale_index] > 0 and
+                isinstance(self.correspondence[scale_index], LocalCorrespondence))
 
     def forward_radar(self,radar_points: torch.Tensor,radar_valid: torch.Tensor,**kwargs) -> Stage1Output:
         if kwargs:
@@ -232,7 +255,7 @@ class RadarLidarStage1(nn.Module):
             neighbors=local_neighbors(radar,li,self.config.grid,radius,self.config.max_neighbors)
             if intermediates is not None:
                 intermediates["neighbors"][name]=neighbors
-            if self.config.correspondence_weight and self.config.corr_scale_weights[i]:
+            if self.has_correspondence(i):
                 attention=self.correspondence[i](radar,li,self.config.grid,neighbors,radius,
                     self.config.positive_radii_m[i],self.config.temperature,
                     self.config.negative_strategy,self.config.num_negatives,

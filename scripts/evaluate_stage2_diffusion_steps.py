@@ -56,7 +56,7 @@ def main():
     if trained_variant and trained_variant != variant:
         raise ValueError("Stage-I radar variant differs from Stage II")
     stage1.eval()
-    model = ResidualSparseDiffusion(stage1.config.channels, config).to(args.device).eval()
+    model = ResidualSparseDiffusion(stage1.config.conditioning_channels, config).to(args.device).eval()
     model.load_state_dict(saved["model"])
     loader_args = SimpleNamespace(
         vod_root=args.vod_root, fault_samples_root=args.fault_samples_root,

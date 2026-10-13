@@ -15,13 +15,16 @@ import torch
 
 from models.radar_lidar_stage1.data import VoDStage1Dataset
 from models.radar_lidar_stage1.model import RadarOnlyEncoder
+from models.radar_lidar_stage1.bottleneck_support import RadarOnlyBottleneckEncoder, BottleneckSupportOutput
 from models.radar_lidar_stage1.train import config_from_dict
 from models.radar_lidar_stage2.candidate_domain import make_candidates
 
 
 def load_encoder(path: Path, device: str) -> tuple[RadarOnlyEncoder, dict]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    model = RadarOnlyEncoder(config_from_dict(saved["config"]))
+    config = config_from_dict(saved["config"])
+    model = (RadarOnlyBottleneckEncoder(config) if config.bottleneck_support_only
+             else RadarOnlyEncoder(config))
     if "radar_only" in saved:
         model.load_state_dict(saved["radar_only"])
     elif "model" in saved:
@@ -247,7 +250,17 @@ def main() -> None:
         valid = torch.ones(points.shape[:2], dtype=torch.bool, device=args.device)
         output = model(points, valid)
         region_counts = None
-        if output.surface is not None and output.surface.radii_xyz is not None:
+        if isinstance(output, BottleneckSupportOutput):
+            domain = make_candidates(output, model.config.grid,
+                                     confidence_threshold=args.support_threshold)
+            sites = domain.centers_xyz.cpu().numpy()
+            confidence = domain.confidence.cpu().numpy()
+            region_counts = domain.counts
+            third_name = "Interpolated LiDAR support region"
+            cloud_suffix = "_support_region.ply"
+            note = ("Stage I predicts a scored support field from radar-only bottleneck features. "
+                    "This panel shows its edge-aware interpolation, not reconstructed LiDAR points.")
+        elif output.surface is not None and output.surface.radii_xyz is not None:
             domain = make_candidates(output,model.config.grid,
                                      confidence_threshold=args.support_threshold)
             sites = domain.centers_xyz.cpu().numpy()
@@ -276,7 +289,11 @@ def main() -> None:
         write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar[:, :3])
         write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), lidar[:, :3])
         write_ply(prefix.with_name(prefix.name + cloud_suffix), sites, confidence)
-        if output.surface is not None and output.surface.radii_xyz is not None:
+        if isinstance(output, BottleneckSupportOutput):
+            write_ply(prefix.with_name(prefix.name + "_raw_support_field.ply"),
+                      output.confidence_region.centers_xyz(model.config.grid).cpu().numpy(),
+                      output.confidence_region.features[:, 0].cpu().numpy())
+        elif output.surface is not None and output.surface.radii_xyz is not None:
             write_ply(prefix.with_name(prefix.name + "_surface_proposals.ply"),
                       output.surface.xyz.reshape(-1,3).cpu().numpy(),
                       output.surface.score.reshape(-1).cpu().numpy())
@@ -284,7 +301,7 @@ def main() -> None:
                              epoch=saved.get("epoch"), radar=radar[:, :3],
                              lidar=lidar[:, :3], sites=sites, confidence=confidence,
                              limits=limits, max_points=args.max_plot_points,
-                             trained=model.confidence_trained or output.surface is not None,
+                             trained=model.confidence_trained or getattr(output, "surface", None) is not None,
                              calibrated=False, third_name=third_name,
                              description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "
                              "All panels share one metric camera. " + note +
@@ -296,7 +313,7 @@ def main() -> None:
             "radar_variant": variant, "confidence_trained": model.confidence_trained,
             "confidence_calibrated": False,
             "proposal_mode": region_counts["seed_source"] if region_counts else
-                             ("predicted_lidar_surface" if output.surface is not None else "legacy_radar_voxel"),
+                             ("predicted_lidar_surface" if getattr(output, "surface", None) is not None else "legacy_radar_voxel"),
             "support_region_counts": region_counts,
             "support_threshold": args.support_threshold if region_counts else None,
             "score_mean": float(confidence.mean()) if len(confidence) else None,

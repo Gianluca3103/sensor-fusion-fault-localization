@@ -67,12 +67,12 @@ def main() -> None:
         for key, value in raw.items()})
     stage1, saved = load_encoder(Path(args.stage1_checkpoint), args.device)
     stage1.eval()
-    if not stage1.config.surface_region_enabled:
+    if not (stage1.config.surface_region_enabled or stage1.config.bottleneck_support_only):
         raise ValueError("Expected the learned-region Stage-I checkpoint")
     trained_variant = saved.get("data", {}).get("radar_variant")
     if trained_variant and trained_variant != args.radar_variant:
         raise ValueError("Radar variant differs from the Stage-I checkpoint")
-    conditioner = Stage1Conditioning(stage1.config.channels, config.residual).to(args.device).eval()
+    conditioner = Stage1Conditioning(stage1.config.conditioning_channels, config.residual).to(args.device).eval()
     records = []
     with torch.no_grad():
         for _ in range(args.repeats):
@@ -86,13 +86,14 @@ def main() -> None:
             coverage = timed("faulty_coverage", lambda: faulty_coverage(
                 domain, batch["faulty_lidar"], batch["faulty_lidar_valid"],
                 batch["fault_region"], ray_tolerance_m=config.residual.ray_tolerance_m))
-            timed("four_scale_radar_neighbors_and_projection", lambda: conditioner(evidence, domain))
+            timed("stage1_neighbors_and_projection", lambda: conditioner(evidence, domain))
             target = timed("clean_target_and_free_ray_search", lambda: make_residual_targets(
                 domain, batch["clean_lidar"], batch["clean_lidar_valid"], coverage,
                 free_ray_tolerance_m=config.residual.free_ray_tolerance_m))
             sites = len(domain.coordinates)
             records.append({"candidate_sites": sites,
-                            "accepted_regions": domain.counts["accepted_region_proposals"],
+                            "accepted_regions": domain.counts.get("accepted_region_proposals",
+                                                                  domain.counts.get("selected_support_sites", 0)),
                             "unknown_fraction": float((~target.supervised).float().mean()) if sites else 0.,
                             "may_add_fraction": float(coverage.may_add.float().mean()) if sites else 0.})
     print(json.dumps({"frames": batch["frame_id"], "device": args.device,

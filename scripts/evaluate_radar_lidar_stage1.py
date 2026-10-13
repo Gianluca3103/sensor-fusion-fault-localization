@@ -14,6 +14,7 @@ from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.evaluate import evaluate_corruptions, evaluate_object_instances, evaluate_pair
 from models.radar_lidar_stage1.metrics import Stage1MetricAccumulator
 from models.radar_lidar_stage1.train import config_from_dict
+from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportStage1
 
 
 def _tensor_batch(dataset, index, device):
@@ -34,11 +35,48 @@ def main():
     parser.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     args=parser.parse_args()
     checkpoint=torch.load(args.checkpoint,map_location="cpu",weights_only=False)
-    model=RadarLidarStage1(config_from_dict(checkpoint["config"])).to(args.device).eval()
+    config=config_from_dict(checkpoint["config"])
+    model=(BottleneckSupportStage1(config) if config.bottleneck_support_only
+           else RadarLidarStage1(config)).to(args.device).eval()
     model.load_state_dict(checkpoint["model"])
     variant=args.radar_variant or checkpoint.get("data",{}).get("radar_variant","radar_20frames_verified_doppler_radial")
     dataset=VoDStage1Dataset(args.vod_root,args.split,radar_variant=variant)
     count=min(args.limit or len(dataset),len(dataset))
+    if config.bottleneck_support_only:
+        if args.corruptions or args.object_instances:
+            parser.error("Legacy corruption/object diagnostics do not apply to bottleneck support")
+        tp=fp=positives=unknown_selected=support_sites=0
+        frames=[]
+        with torch.no_grad():
+            for i in range(count):
+                batch=_tensor_batch(dataset,i,args.device)
+                loss, diagnostic=model.forward_train(batch["radar"],batch["radar_valid"],
+                    batch["clean_lidar"],batch["clean_lidar_valid"],defer_diagnostics=True)
+                chosen=diagnostic["output"].confidence_region.features[:,0]>config.support_eval_threshold
+                occupied=diagnostic["occupied"]
+                free=diagnostic["known_free"]
+                tp+=int((chosen & occupied).sum())
+                fp+=int((chosen & free).sum())
+                positives+=int(occupied.sum())
+                unknown_selected+=int((chosen & ~(occupied | free)).sum())
+                support_sites+=len(chosen)
+                frames.append({"frame_id":batch["frame_id"][0],
+                               "loss":float(loss["loss/total"]),
+                               "support_sites":len(chosen)})
+        precision=tp/(tp+fp) if tp+fp else 0.
+        recall=tp/positives if positives else 0.
+        summary={"support_precision_on_observed":precision,
+                 "support_threshold":config.support_eval_threshold,
+                 "support_recall_on_eligible_clean":recall,
+                 "support_f1":2*precision*recall/(precision+recall) if precision+recall else 0.,
+                 "unverified_selected_sites":unknown_selected,
+                 "support_sites":support_sites}
+        report={"checkpoint":str(args.checkpoint),"split":args.split,"frames":frames,
+                "summary":summary,"caveat":"Unknown cells are not free-space negatives; these metrics do not measure completed LiDAR reconstruction."}
+        args.output.parent.mkdir(parents=True,exist_ok=True)
+        args.output.write_text(json.dumps(report,indent=2),encoding="utf-8")
+        print(args.output)
+        return
     frames=[]
     metrics=Stage1MetricAccumulator(model.config)
     for i in range(count):

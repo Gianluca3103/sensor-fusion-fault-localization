@@ -101,9 +101,9 @@ def main() -> None:
         raise ValueError(f"Stage-I checkpoint used {trained_variant}, not {args.radar_variant}")
     for parameter in stage1.parameters():
         parameter.requires_grad_(False)
-    if len(stage1.config.channels) != 4:
-        raise ValueError("Stage-I checkpoint must provide S1–S4 radar-only features")
-    model = RadarLidarStage2(stage1.config.channels, config).to(args.device)
+    if len(stage1.config.conditioning_channels) not in (1, 4):
+        raise ValueError("Stage-I checkpoint must provide a bottleneck or S1–S4 features")
+    model = RadarLidarStage2(stage1.config.conditioning_channels, config).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     start_epoch, best_score = 1, -float("inf")
     if args.resume:

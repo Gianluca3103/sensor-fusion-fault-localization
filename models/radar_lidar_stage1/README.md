@@ -4,41 +4,76 @@ This folder learns a **radar-only, sparse 3D geometric representation** with a s
 
 ## Interface
 
-`RadarLidarStage1.forward_radar(radar, radar_valid)` returns sparse S1–S4 radar features, sparse S1 confidence values, coordinates and physical geometry metadata. `RadarOnlyEncoder`, exported separately, contains no teacher, attention or probe weights. Confidence is supervised during training, but it is **not automatically calibrated**; inspect held-out reliability bins before choosing a threshold.
+The active [`radar_lidar_stage1_surface.json`](../../configs/radar_lidar_stage1_surface.json) configuration now selects `BottleneckSupportStage1`. Its exported radar-only encoder returns **exactly two sparse tensors**: a stride-8 LiDAR-aware radar bottleneck embedding `[N4,64]` and a stride-2 3D confidence field `[M,1]`, each with its voxel coordinates. The field is scored, not a LiDAR point cloud; its scores are not calibrated probabilities.
 
-`RadarLidarStage1.forward_train(radar, radar_valid, clean_lidar, clean_valid)` uses clean LiDAR only to train local feature correspondence and a linear geometric probe. The deployed output is computed before the teacher is called. A test explicitly checks that different clean scans leave radar-only output identical.
+During training, the clean-LiDAR encoder and radar encoder are compared **only at the stride-8 bottleneck**. Local attention over clean-LiDAR bottleneck features provides a teacher target, and a radar-only student learns to approximate that representation. Clean LiDAR also supplies support-field positives and measured free-space negatives; unobserved space is not labeled empty. The deployed model receives radar alone. No attention weights, clean features, surface positions, or radii cross its inference boundary.
 
-### Radar-conditioned surface proposals
-
-[`configs/radar_lidar_stage1_surface.json`](../../configs/radar_lidar_stage1_surface.json) enables a new deployed output: two candidate LiDAR surface positions, a score, and learned 3D support radii per grouped radar neighborhood. Fine radar features are pooled within 8-voxel anchor cells, then the head attends to nearby radar features at all four scales. Its positions can move away from the pooled radar-pattern center within a configured 1.5 m local radius. Clean LiDAR teaches the proposed positions through a local bidirectional set-distance loss; scores learn whether each proposed position is near an observed clean surface. A soft region coverage loss rewards patches covering nearby measured clean surfaces, while a scored-volume penalty discourages expansive patches. Anchors with no nearby observed clean surface receive no geometry or coverage target and train the score toward abstention. The clean encoder and training-only radar–LiDAR correspondence loss remain separate from the radar-only deployed path.
-
-Stage II rasterizes each scored proposal's learned ellipsoid into a **connected fine-voxel support patch**. Its sparse U-Net operates over the union of every accepted patch, with no arbitrary site cap. It uses the original radar-site confidence positions for old checkpoints, so previous checkpoints retain their behavior. This is a new interface and needs **new Stage-I training**, followed by new Stage-II training; old weights cannot be converted into learned support regions. The local proposal radius limits the initial search and should be audited against validation coverage. A proposal near a clean point is a geometric proxy, not proof that radar and LiDAR reflected from the same physical surface.
-
-Start with the new config and select the best checkpoint on held-out support-region F1:
+The support head decodes each bottleneck cell onto a stride-2 lattice, using an internal radar skip feature for spatial detail and learning a score per lattice cell. Stage II interpolates the scored field with the edge-aware method, pools only the bottleneck embeddings at the active fine cells, then combines them with faulty-LiDAR features. The previous Stage-II preprocessing cache and all Stage-I/II checkpoints must be rebuilt for this interface.
 
 ```bash
 python -u -m models.radar_lidar_stage1.train \
   --vod-root /path/to/view_of_delft_PUBLIC \
   --radar-variant radar_20frames_verified_doppler_radial \
-  --output-root /path/to/stage1_surface_run \
+  --output-root /path/to/stage1_bottleneck_support \
   --config configs/radar_lidar_stage1_surface.json \
   --epochs 50 --batch-size 8 --validate-every 5 \
-  --selection-metric region_f1 --num-workers 2 --device cuda
+  --selection-metric support_f1 --no-object-instances \
+  --num-workers 2 --device cuda
 ```
 
-Validation logs proposal precision against measured clean voxels and recall over clean voxels within the configured radar support radius, at 0.2 m and 0.5 m. It also rasterizes the full Stage-II support domain and reports the active-cell count, fraction of cells within 0.5 m of clean LiDAR, covered radar-supported clean voxels, and isolated-cell fraction. Candidate scores are thresholded at 0.25 to match Stage II. These proximity metrics do not establish reflector identity or point-cloud correctness; inspect held-out clouds and downstream results before using the support interface.
+Validation reports support precision on measured clean/free cells, recall on clean cells inside the radar-derived lattice, unknown selected sites, and clean coverage before scoring. These metrics cannot prove object reconstruction quality; inspect held-out clouds and Stage-II results.
+
+Visualize a held-out frame with `python -m scripts.visualize_stage1_confidence_cloud --vod-root /path/to/view_of_delft_PUBLIC --checkpoint /path/to/stage1_bottleneck_support/best_selected.ckpt --split val --frame-id 08236 --output-root /path/to/stage1_views --device cuda`. The viewer writes both the raw scored support lattice and its interpolated Stage-II region as uncapped PLY files.
+
+### Historical surface-proposal interface (older checkpoints only)
+
+Earlier Stage-I checkpoints may contain two candidate surface positions, scores, and learned 3D radii per grouped radar neighborhood. This path remains loadable for compatibility, but the active config above no longer trains or exports those proposals.
+
+Legacy Stage-II checkpoints retain their own proposal rasterization behavior. They cannot be paired with the new bottleneck-support checkpoint.
 
 ## Representation and losses
 
+### PFE encoder from `encoder.py`
+
+The bottleneck-support training config sets `encoder_backend=pfe_spconv`. Both
+the radar path and the clean-LiDAR teacher use independent copies of the
+downloaded PFE sparse backbone: a 3×3 submanifold stem, residual blocks at
+strides 1 and 2, two residual blocks at stride 4, and the stride-8 latent
+block with 1×1 compression and final residual block. Its original
+mean-XYZ/log-density 4→16→32 voxel MLP is retained. A separate learned
+attribute branch preserves radar RCS, Doppler and scan age, and LiDAR
+reflectivity. The encoder computes four sparse scales; the active interface
+exports only the stride-8 bottleneck features and a stride-2 confidence field.
+Cross-modal comparison occurs at stride 8. It does not call the original
+encoder's `.dense()` output. The voxel grid remains 0.2 × 0.2 × 0.25 m.
+The original `encoder.py`'s separate `config.py` range and voxel size are
+not used.
+
+This backend requires `spconv.pytorch` in the training environment and
+fails immediately if it is missing. There is no silent zero-feature fallback.
+Old checkpoints without `encoder_backend` continue to select `native`, but
+their weights cannot initialize the new PFE backbone. Start a fresh Stage-I
+run and rebuild Stage-II preprocessing/training from the new Stage-I
+checkpoint. The PFE backbone has no site-growth convolution, so the new
+config sets `growth_scales=[]`. The learned support field defines the new
+Stage-II domain.
+
+The new config sets `bottleneck_cross_attention_only=true` and
+`corr_scale_weights=[0,0,0,1]`. Only the stride-8 radar and clean-LiDAR
+features enter the training-only cross-modal correspondence module. S1–S3
+have no radar–LiDAR attention modules. The new trainer reports bottleneck
+correspondence, distillation and support-field losses. Earlier checkpoints
+retain their four-scale correspondence architecture and metrics.
+
 - Canonical coordinates are current-frame LiDAR XYZ. Radar data are transformed with the per-frame VoD radar/camera/LiDAR calibration in `vod_io.py`. Raw radar attributes are RCS, raw radial velocity, compensated radial velocity and ordinal scan age. LiDAR has reflectivity. Each modality has its own point MLP and learned voxel mean/max/count aggregation.
 - Sparse sites have sorted unique `[batch,z,y,x]` integer coordinates and `[N,C]` features. The native PyTorch backend applies learned 3×3×3 kernels only to active input/output sites. S4 grows axial support by default for context; S3 growth is an optional ablation. Active counts and isolated-site fractions are logged. There is no dense 3D allocation.
-- Each radar query sees at most `max_neighbors` clean-LiDAR sites within the scale's **physical search radius**. Sites inside the independent `positive_radii_m` threshold are positives; local sites outside it are negatives. Multi-positive InfoNCE uses normalized **learned feature similarity only** for ranking, with configurable temperature, scale weights, and nearest or random local negatives. The positive radii default to approximately one voxel diagonal at each stride: 0.4, 0.8, 1.6 and 3.2 m. These are geometric proxies, not verified shared radar/LiDAR reflectors. Queries without a positive are counted and excluded from retrieval denominators.
+- At the enabled correspondence scale, each radar query sees at most `max_neighbors` clean-LiDAR sites within that scale's **physical search radius**. Sites inside the independent `positive_radii_m` threshold are positives; local sites outside it are negatives. Multi-positive InfoNCE uses normalized **learned feature similarity only** for ranking, with configurable temperature and nearest or random local negatives. The new PFE config compares only S4, with a 6.0 m search radius and 3.2 m positive radius. These are geometric proxies, not verified shared radar/LiDAR reflectors. Queries without a positive are counted and excluded from retrieval denominators.
 - The lightweight probe is one linear head per scale. It predicts local clean-surface presence and an XYZ offset from each radar sparse site. `L_geom` is binary cross entropy for local presence plus Smooth L1 for the positive site's XYZ in **meters** (`beta=0.2 m`). The target is the nearest *observed* clean voxel within the scale's search radius. This is site-local geometry, not full-scene reconstruction; no Chamfer is used. The occupancy and offset components have configurable weights within `L_geom`.
 - At S1, the detached confidence target is `1[probe emits a point AND a clean target exists] × exp(-XYZ error / confidence_sigma_m)`. Thus a confident, inaccurate point or an abstention receives zero quality; clean occupancy alone cannot give a high target. `L_conf` is BCE against that soft target. `L_total = λcorr Lcorr + λgeom Lgeom + λconf Lconf`; all three weights can be zero independently, and all raw/weighted losses are logged. Confidence-only training from a randomly initialized probe gives an unreliable target; keep geometry supervision active or use a separately trained probe.
 
 The default four-scale encoder and deployed feature widths are `[32,64,128,256]`; local correspondence projects these to a separate 64-D comparison space. [`configs/radar_lidar_stage1_small.json`](../../configs/radar_lidar_stage1_small.json) uses `[16,32,64,128]`. Edit a copied JSON config to test one scale, four scales, point resolution, channels or independently disable a loss. For a geometry-only ablation set `correspondence_weight=0`, `confidence_weight=0`, `geometric_weight>0`. The model never reads object labels for training.
 
-## Run
+## Legacy Stage-I run and metrics
 
 From the repository root, with a CUDA PyTorch environment:
 
@@ -106,4 +141,4 @@ python -m scripts.rerender_stage1_clouds \
 
 ## Backend and current verification
 
-The local Windows PyTorch 2.8 CUDA installation lacks spconv/MinkowskiEngine/TorchSparse. The portable coordinate-sparse convolution backend was tested on a real VoD frame at base widths; one forward/backward pass with S3/S4 growth used approximately 3.3 GB GPU memory on the local RTX 4090. Full-run throughput must still be measured, especially with multiple data-loader workers. Sparse support growth can produce more S4 active sites than S1; read the logged site counts and isolated fractions before interpreting that level.
+The local Windows PyTorch 2.8 CUDA installation lacks spconv/MinkowskiEngine/TorchSparse, so the new PFE backend cannot be GPU-tested there until a compatible spconv wheel is installed. The older portable coordinate-sparse backend remains available for old checkpoints and local checks. Full-run throughput of the PFE backend remains to be measured on the training machine.

@@ -57,7 +57,7 @@ def main() -> None:
     stage1.eval()
     for parameter in stage1.parameters():
         parameter.requires_grad_(False)
-    model = ResidualSparseDiffusion(stage1.config.channels, config).to(device).train()
+    model = ResidualSparseDiffusion(stage1.config.conditioning_channels, config).to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0002, weight_decay=.01)
 
     ticks: dict[str, list[float]] = {}

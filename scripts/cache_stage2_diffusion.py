@@ -56,7 +56,7 @@ def main() -> None:
     config = DiffusionConfig.from_json(args.config)
     stage1, saved = load_encoder(Path(args.stage1_checkpoint), args.device)
     stage1.eval()
-    if not stage1.config.surface_region_enabled:
+    if not (stage1.config.surface_region_enabled or stage1.config.bottleneck_support_only):
         raise ValueError("The preprocessing cache requires learned Stage-I regions")
     trained_variant = saved.get("data", {}).get("radar_variant")
     if trained_variant and trained_variant != args.radar_variant:

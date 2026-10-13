@@ -74,7 +74,7 @@ def main() -> None:
     stage1_variant = stage1_saved.get("data", {}).get("radar_variant")
     if stage1_variant and stage1_variant != variant:
         raise ValueError("Stage-I and Stage-II radar variants differ")
-    model = RadarLidarStage2(stage1.config.channels, config).to(args.device).eval()
+    model = RadarLidarStage2(stage1.config.conditioning_channels, config).to(args.device).eval()
     model.load_state_dict(saved["model"])
     dataset = VoDStage1Dataset(args.vod_root, args.split, frame_ids=args.frame_id,
                                radar_variant=variant)

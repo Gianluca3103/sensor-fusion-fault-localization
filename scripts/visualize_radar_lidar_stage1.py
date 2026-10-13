@@ -24,6 +24,8 @@ def main():
     args=parser.parse_args()
     checkpoint=torch.load(args.checkpoint,map_location="cpu",weights_only=False) if args.checkpoint else None
     config=config_from_dict(checkpoint["config"]) if checkpoint else Stage1Config()
+    if config.bottleneck_support_only:
+        parser.error("Use scripts.visualize_stage1_confidence_cloud for bottleneck support checkpoints")
     model=RadarLidarStage1(config).to(args.device).eval()
     if checkpoint:
         model.load_state_dict(checkpoint["model"])

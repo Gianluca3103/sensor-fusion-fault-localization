@@ -177,7 +177,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     stage1, stage1_saved = load_encoder(Path(args.stage1_checkpoint), args.device)
-    if not stage1.config.surface_region_enabled:
+    if not (stage1.config.surface_region_enabled or stage1.config.bottleneck_support_only):
         raise ValueError("This diffusion run requires the learned-region Stage-I checkpoint")
     trained_variant = stage1_saved.get("data", {}).get("radar_variant")
     if trained_variant and trained_variant != args.radar_variant:
@@ -185,7 +185,7 @@ def main():
     stage1.eval()
     for parameter in stage1.parameters():
         parameter.requires_grad_(False)
-    model = ResidualSparseDiffusion(stage1.config.channels, config).to(args.device)
+    model = ResidualSparseDiffusion(stage1.config.conditioning_channels, config).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=.01)
     start, best = 1, -float("inf")
     if args.resume:

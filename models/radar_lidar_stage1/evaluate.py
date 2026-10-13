@@ -74,6 +74,8 @@ def evaluate_object_instances(model, radar, radar_valid, clean, clean_valid, lab
     transform=load_vod_lidar_to_camera(lidar_calibration_path)
     report={}
     for i,(name,li) in enumerate(zip(output.features,lidar_levels)):
+        if not model.has_correspondence(i):
+            continue
         r=output.features[name]
         if not len(r.coords) or not len(li.coords):
             report[name]={"count":0}; continue

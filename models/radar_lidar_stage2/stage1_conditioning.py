@@ -1,4 +1,4 @@
-"""Local physical XYZ queries of all deployed radar-only Stage-I scales."""
+"""Local physical XYZ queries of the deployed Stage-I bottleneck or legacy scales."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from models.radar_lidar_stage1.model import Stage1Output
+from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportOutput
 from .candidate_domain import CandidateDomain
 from .config import Stage2Config
 from .cpu_query import query_workers
@@ -39,13 +40,14 @@ def physical_neighbor_map(candidate_xyz: np.ndarray, candidate_batch: np.ndarray
 class Stage1Conditioning(nn.Module):
     def __init__(self, stage1_channels: tuple[int, ...], config: Stage2Config):
         super().__init__()
-        if len(stage1_channels) != 4:
-            raise ValueError("Stage II needs Stage-I S1–S4")
+        if len(stage1_channels) not in (1, 4):
+            raise ValueError("Stage II needs either the bottleneck or legacy S1–S4")
         self.config = config
+        self.source_count = len(stage1_channels)
         self.projections = nn.ModuleList(nn.Sequential(nn.Linear(ch, config.conditioning_dim),
                                                        nn.LayerNorm(config.conditioning_dim), nn.SiLU())
                                          for ch in stage1_channels)
-        self.fuse = nn.Sequential(nn.Linear(4 * (config.conditioning_dim + 1) + 4,
+        self.fuse = nn.Sequential(nn.Linear(self.source_count * (config.conditioning_dim + 1) + 4,
                                             config.channels[0]),
                                   nn.LayerNorm(config.channels[0]), nn.SiLU())
 
@@ -58,19 +60,23 @@ class Stage1Conditioning(nn.Module):
         n = len(domain.coordinates)
         if not n:
             return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
+        if isinstance(stage1, BottleneckSupportOutput) != (self.source_count == 1):
+            raise ValueError("Stage-I output and conditioner checkpoint use different interfaces")
         dest_xyz = domain.centers_xyz_numpy()
         dest_batch = domain.batch_numpy()
         sources, indices, distances = [], [], []
-        for i in range(4):
-            sites = (replacement_stage1 or stage1).features[f"s{i+1}"]
-            if sites.stride != 2 ** i:
+        for i in range(self.source_count):
+            evidence = replacement_stage1 or stage1
+            sites = (evidence.bottleneck if self.source_count == 1 else evidence.features[f"s{i+1}"])
+            scale_index = 3 if self.source_count == 1 else i
+            if sites.stride != 2 ** scale_index:
                 raise ValueError(f"Stage-I s{i+1} stride is inconsistent")
             if sites.shape_zyx != domain.grid.scale_shape(sites.stride):
                 raise ValueError(f"Stage-I s{i+1} physical grid differs from Stage II")
             src_xyz = sites.centers_xyz(domain.grid).detach().cpu().numpy()
             src_batch = sites.coords[:, 0].detach().cpu().numpy()
             idx_np, dist_np = physical_neighbor_map(dest_xyz, dest_batch, src_xyz, src_batch,
-                                                     self.config.query_radii_m[i], self.config.max_neighbors)
+                                                     self.config.query_radii_m[scale_index], self.config.max_neighbors)
             sources.append(sites.features)
             indices.append(torch.as_tensor(idx_np, device=sites.features.device))
             distances.append(torch.as_tensor(dist_np, device=sites.features.device))
@@ -87,10 +93,10 @@ class Stage1Conditioning(nn.Module):
         n = len(domain.coordinates)
         if not n:
             return self.fuse[0].weight.new_empty((0, self.config.channels[0]))
-        if (len(sources) != 4 or len(indices) != 4 or
-                (distances is None and (source_centers is None or len(source_centers) != 4)) or
-                (distances is not None and len(distances) != 4)):
-            raise ValueError("Expected four cached Stage-I scales")
+        if (len(sources) != self.source_count or len(indices) != self.source_count or
+                (distances is None and (source_centers is None or len(source_centers) != self.source_count)) or
+                (distances is not None and len(distances) != self.source_count)):
+            raise ValueError("Cached Stage-I source count differs from the conditioner")
         center = domain.centers_xyz
         parts = []
         for i, (source, index) in enumerate(zip(sources, indices)):
@@ -117,7 +123,7 @@ class Stage1Conditioning(nn.Module):
             linear, norm, activation = self.projections[i]
             if len(source):
                 source = source.detach()
-                if ablation == "zero" or (ablation == "s1_only" and i != 0) or (ablation == "s4_only" and i != 3):
+                if ablation == "zero" or (ablation == "s1_only" and i != 0) or (ablation == "s4_only" and i != self.source_count-1):
                     source = torch.zeros_like(source)
                 elif ablation == "shuffle":
                     source = source.flip(0)

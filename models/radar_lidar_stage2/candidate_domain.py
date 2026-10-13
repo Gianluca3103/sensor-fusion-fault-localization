@@ -16,6 +16,7 @@ import torch
 from models.radar_lidar_stage1.config import VoxelGrid
 from models.radar_lidar_stage1.interpolation import edge_aware_seed_field
 from models.radar_lidar_stage1.model import Stage1Output
+from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportOutput
 from models.radar_lidar_stage1.sparse import decode_keys, encode_keys
 
 
@@ -138,6 +139,61 @@ def _make_edge_aware_candidates(output: Stage1Output, grid: VoxelGrid,
     return CandidateDomain(sites, propagated, grid, counts, cpu_coordinates, cpu_centers)
 
 
+def _make_bottleneck_support_candidates(output: BottleneckSupportOutput, grid: VoxelGrid,
+                                        threshold: float) -> CandidateDomain:
+    """Interpolate a learned support field; never infer a sphere from radar points."""
+    support, bottleneck = output.confidence_region, output.bottleneck
+    if support.stride != 2 or bottleneck.stride != 8:
+        raise ValueError("Expected stride-2 support and stride-8 bottleneck")
+    if support.shape_zyx != grid.scale_shape(2) or bottleneck.shape_zyx != grid.scale_shape(8):
+        raise ValueError("Stage-I support/bottleneck grid differs from reconstruction grid")
+    if support.features.shape != (len(support.coords), 1):
+        raise ValueError("Expected one confidence score per support voxel")
+    if not len(support.coords):
+        empty = support.coords.new_empty((0, 4))
+        return CandidateDomain(empty, support.features.new_empty(0), grid,
+                               {"seed_source": "bottleneck_support_field", "expanded_candidate_sites": 0})
+    parent = support.coords.clone()
+    parent[:, 1:] = torch.div(parent[:, 1:], 4, rounding_mode="floor")
+    keys = encode_keys(bottleneck.coords, bottleneck.shape_zyx)
+    queries = encode_keys(parent, bottleneck.shape_zyx)
+    matched = torch.searchsorted(keys, queries)
+    if not len(keys) or bool((matched >= len(keys)).any()) or not torch.equal(keys[matched], queries):
+        raise ValueError("Every support site must descend from a bottleneck site")
+    guide = bottleneck.features[matched].detach().cpu().numpy()
+    xyz = support.centers_xyz(grid).detach().cpu().numpy()
+    scores = support.features[:, 0].detach().cpu().numpy()
+    batches = support.coords[:, 0].detach().cpu().numpy()
+    coordinates, confidences = [], []
+    accepted_edges = source_sites = 0
+    for frame in np.unique(batches):
+        selected = batches == frame
+        field = edge_aware_seed_field(xyz[selected], scores[selected], guide[selected],
+                                      grid, seed_threshold=threshold)
+        active = field.scores > threshold
+        cells = field.coordinates_xyz[active]
+        source_sites += field.source_seeds
+        accepted_edges += field.accepted_edges
+        if len(cells):
+            coordinates.append(np.column_stack((np.full(len(cells), frame, dtype=np.int64),
+                                                cells[:, [2, 1, 0]])))
+            confidences.append(field.scores[active])
+    if coordinates:
+        rows = np.concatenate(coordinates).astype(np.int64)
+        scores_out = np.concatenate(confidences).astype(np.float32)
+        order = np.lexsort((rows[:, 3], rows[:, 2], rows[:, 1], rows[:, 0]))
+        rows, scores_out = rows[order], scores_out[order]
+        sites = torch.as_tensor(rows, dtype=support.coords.dtype, device=support.coords.device)
+        values = torch.as_tensor(scores_out, dtype=support.features.dtype, device=support.features.device)
+    else:
+        sites = support.coords.new_empty((0, 4))
+        values = support.features.new_empty(0)
+    counts = {"seed_source": "bottleneck_support_field", "support_sites": len(support.coords),
+              "selected_support_sites": source_sites, "accepted_feature_edges": accepted_edges,
+              "expanded_candidate_sites": len(sites)}
+    return CandidateDomain(sites, values, grid, counts)
+
+
 def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
                             confidence_threshold: float) -> CandidateDomain:
     """Rasterize every accepted learned support patch into connected fine cells."""
@@ -237,6 +293,12 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
         raise ValueError("Expansion radius must contain three non-negative voxel counts")
     if max_sites is not None and max_sites < 1:
         raise ValueError("max_sites must be positive")
+    if isinstance(output, BottleneckSupportOutput):
+        if method != "edge_aware":
+            raise ValueError("Bottleneck support uses edge-aware interpolation")
+        if max_sites is not None:
+            raise ValueError("Bottleneck support cannot cap candidate sites")
+        return _make_bottleneck_support_candidates(output, grid, confidence_threshold)
     fine = output.features["s1"]
     confidence = output.confidence
     if fine.stride != 1 or confidence.stride != 1:

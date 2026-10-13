@@ -24,7 +24,7 @@ from models.radar_lidar_stage2_residual.coverage import FaultyCoverage, faulty_c
 from models.radar_lidar_stage2_residual.targets import ResidualTargets, make_residual_targets
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 def preprocessing_code_sha256() -> str:
@@ -80,7 +80,7 @@ def _array(value: torch.Tensor, dtype=None) -> np.ndarray:
 @torch.no_grad()
 def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config, *,
                   include_validation_clouds: bool = True) -> dict[str, np.ndarray]:
-    """Compute all fixed geometry, supervision, and four local neighbor maps."""
+    """Compute fixed geometry, supervision, and deployed Stage-I neighbor maps."""
     if len(batch["frame_id"]) != 1:
         raise ValueError("Cache entries must contain exactly one frame")
     base = config.residual
@@ -115,18 +115,21 @@ def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config, *,
         "clean_points_in_grid": np.asarray(clean.clean_points_in_grid, np.int64),
         "clean_points_in_candidates": np.asarray(clean.clean_points_in_candidates, np.int64),
         "point_centroid_errors": _array(clean.point_centroid_errors_m, np.float32),
+        "source_count": np.asarray(1 if hasattr(evidence, "bottleneck") else 4, np.int32),
     }
     if include_validation_clouds:
         result["clean_lidar"] = _array(batch["clean_lidar"][0, batch["clean_lidar_valid"][0]], np.float32)
         result["faulty_lidar"] = _array(batch["faulty_lidar"][0, batch["faulty_lidar_valid"][0]], np.float32)
     dest_xyz, dest_batch = domain.centers_xyz_numpy(), domain.batch_numpy()
-    for i in range(4):
-        sites = evidence.features[f"s{i+1}"]
+    source_count = int(result["source_count"])
+    for i in range(source_count):
+        sites = evidence.bottleneck if source_count == 1 else evidence.features[f"s{i+1}"]
+        radius = base.query_radii_m[3 if source_count == 1 else i]
         source_xyz = _array(sites.centers_xyz(grid), np.float32)
         source_batch = _array(sites.coords[:, 0], np.int64)
         index, _ = physical_neighbor_map(
             dest_xyz, dest_batch, source_xyz, source_batch,
-            base.query_radii_m[i], base.max_neighbors,
+            radius, base.max_neighbors,
         )
         result[f"source_{i}"] = _array(sites.features, np.float32)
         result[f"source_center_{i}"] = source_xyz
@@ -196,8 +199,11 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
     for row in rows:
         for key, value in json.loads(str(row["counts_json"].item())).items():
             counts[key] = counts.get(key, 0) + value if isinstance(value, (int, float)) else value
+    source_counts = {int(row["source_count"]) for row in rows}
+    if len(source_counts) != 1:
+        raise ValueError("Mixed Stage-I interfaces in the preprocessing cache")
     sources, source_centers, indices = [], [], []
-    for scale in range(4):
+    for scale in range(source_counts.pop()):
         source_rows = [row[f"source_{scale}"] for row in rows]
         sources.append(_cat(rows, f"source_{scale}", np.float32))
         source_centers.append(_cat(rows, f"source_center_{scale}", np.float32))

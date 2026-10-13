@@ -49,10 +49,14 @@ def export_radar_only(path: Path, model: RadarLidarStage1, data: dict | None = N
     torch.save(state,path)
 
 
-def load_radar_only(path: str | Path, device: str = "cpu") -> RadarOnlyEncoder:
+def load_radar_only(path: str | Path, device: str = "cpu") -> RadarOnlyEncoder | "RadarOnlyBottleneckEncoder":
     state=torch.load(path,map_location=device,weights_only=False)
     config=config_from_dict(state["config"])
-    model=RadarOnlyEncoder(config)
+    if config.bottleneck_support_only:
+        from .bottleneck_support import RadarOnlyBottleneckEncoder
+        model=RadarOnlyBottleneckEncoder(config)
+    else:
+        model=RadarOnlyEncoder(config)
     model.load_state_dict(state["radar_only"])
     model.confidence_calibrated=bool(state.get("confidence_calibrated",False))
     model.confidence_trained=bool(state.get("confidence_trained",False))
@@ -113,7 +117,8 @@ def _flat_validation(losses: dict, metrics: dict) -> dict:
     half=next(row for row in metrics["confidence"]["threshold_sweep"] if row["threshold"]==0.5)
     for key in ("coverage","target_coverage","precision","recall","f1"):
         flat[f"val/conf_threshold_0.5/{key}"]=half[key]
-    for key,value in metrics["instances"].get("s1",{}).get("all",{}).items():
+    instance_scale=next(iter(metrics["instances"]),"s1")
+    for key,value in metrics["instances"].get(instance_scale,{}).get("all",{}).items():
         if key in ("r1","r3","r5","same_class_r1","same_class_r3","same_class_r5"):
             flat[f"val/{key.replace('same_class_', 'same_class_instance_') if key.startswith('same_class_') else 'instance_'+key}"]=value
     return flat
@@ -148,17 +153,20 @@ def _corruption_summary(frames: list[dict]) -> dict:
     summary={}
     for condition in ("aligned","x_shift_0.5m","x_shift_1m","x_shift_2m","x_shift_5m","mismatched_scene"):
         rows=[frame["conditions"][condition] for frame in frames if condition in frame["conditions"]]
-        valid=sum(row["s1"]["valid_corr_query_count"] for row in rows)
-        hits=sum((row["s1"]["corr_r1"] or 0)*row["s1"]["valid_corr_query_count"] for row in rows)
-        error_sum=sum((row["s1"]["corr_error_mean_m"] or 0)*row["s1"]["valid_corr_query_count"] for row in rows)
+        scale=next((name for name in ("s1","s2","s3","s4")
+                    if rows and rows[0].get(name,{}).get("correspondence_enabled")),"s1")
+        valid=sum(row[scale]["valid_corr_query_count"] for row in rows)
+        hits=sum((row[scale]["corr_r1"] or 0)*row[scale]["valid_corr_query_count"] for row in rows)
+        error_sum=sum((row[scale]["corr_error_mean_m"] or 0)*row[scale]["valid_corr_query_count"] for row in rows)
         geo=[row["geometry"]["0.2m"] for row in rows]
         tp=sum(row["tp"] for row in geo); predictions=sum(row["predictions"] for row in geo);targets=sum(row["targets"] for row in geo)
         precision=tp/predictions if predictions else None;recall=tp/targets if targets else None
         f1=2*tp/(predictions+targets) if targets else None
         anchors=sum(row["anchor_geometry"]["anchor_count"] for row in rows)
         anchor_hits=sum(row["anchor_geometry"]["coverage_within_1m"]*row["anchor_geometry"]["anchor_count"] for row in rows)
-        summary[condition]={"frames":len(rows),"s1_corr_r1":hits/valid if valid else None,
-            "s1_corr_error_mean_m":error_sum/valid if valid else None,
+        summary[condition]={"frames":len(rows),"correspondence_scale":scale,
+            f"{scale}_corr_r1":hits/valid if valid else None,
+            f"{scale}_corr_error_mean_m":error_sum/valid if valid else None,
             "geom_precision_0.2m":precision,"geom_recall_0.2m":recall,"geom_f1_0.2m":f1,
             "fixed_original_anchor_coverage_1m":anchor_hits/anchors if anchors else None}
     return summary
@@ -177,14 +185,17 @@ def _console(epoch,epochs,train,validation):
     m=validation["metrics"];c=m["correspondence"];g=m["geometry"];q=m["confidence"]
     half=next(row for row in q["threshold_sweep"] if row["threshold"]==.5)
     median="n/a" if c["corr_error_median_m"] is None else f"{c['corr_error_median_m']:.3f} m"
-    print(f"  val loss {validation['loss']['loss/total']:.4f} | corr R@1/5/10 {_pct(c['corr_r1'])}/{_pct(c['corr_r5'])}/{_pct(c['corr_r10'])} | median {median} | within .2 m {_pct(c['corr_within_0.2m'])}",flush=True)
-    fine=m["scales"].get("s1",{})
-    if fine:
-        print(f"  S1 corr R@1 {_pct(fine['corr_r1'])} | within .2 m {_pct(fine['corr_within_0.2m'])} | no corr {fine['no_corr_query_count']}/{fine['query_count']}",flush=True)
+    active_name=next((name for name,row in m["scales"].items()
+                      if row.get("correspondence_enabled")),None)
+    tolerance="1.0m" if active_name=="s4" and not m["scales"]["s1"].get("correspondence_enabled") else "0.2m"
+    print(f"  val loss {validation['loss']['loss/total']:.4f} | corr R@1/5/10 {_pct(c['corr_r1'])}/{_pct(c['corr_r5'])}/{_pct(c['corr_r10'])} | median {median} | within {tolerance} {_pct(c[f'corr_within_{tolerance}'])}",flush=True)
+    if active_name:
+        active=m["scales"][active_name]
+        print(f"  {active_name.upper()} corr R@1 {_pct(active['corr_r1'])} | within {tolerance} {_pct(active[f'corr_within_{tolerance}'])} | no corr {active['no_corr_query_count']}/{active['query_count']}",flush=True)
     print(f"  geom .2 m P/R/F1 {_pct(g['0.2m']['precision'])}/{_pct(g['0.2m']['recall'])}/{_pct(g['0.2m']['f1'])} | .5 m F1 {_pct(g['0.5m']['f1'])}",flush=True)
-    objects=m["instances"].get("s1",{}).get("all")
+    objects=m["instances"].get(active_name,{}).get("all") if active_name else None
     if objects:
-        print(f"  instance R@1 {_pct(objects['r1'])} | same-class instance R@1 {_pct(objects['same_class_r1'])} ({objects['same_class_count']} queries)",flush=True)
+        print(f"  {active_name.upper()} instance R@1 {_pct(objects['r1'])} | same-class instance R@1 {_pct(objects['same_class_r1'])} ({objects['same_class_count']} queries)",flush=True)
     surface=m.get("surface_proposals")
     if surface:
         row=surface["0.2m"]
@@ -212,7 +223,7 @@ def main() -> None:
     parser.add_argument("--train-limit",type=int)
     parser.add_argument("--val-limit",type=int)
     parser.add_argument("--resume",type=Path)
-    parser.add_argument("--selection-metric",choices=("corr_r1","corr_within_0.2m","geom_f1_0.2m","geom_f1_0.5m","surface_f1_0.2m","region_f1"),default="corr_r1")
+    parser.add_argument("--selection-metric",choices=("corr_r1","corr_within_0.2m","geom_f1_0.2m","geom_f1_0.5m","surface_f1_0.2m","region_f1","support_f1"))
     parser.add_argument("--object-instances",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--corruption-every",type=int,default=0,help="Run shifted/mismatched radar diagnostic every N validation epochs; 0 disables")
     parser.add_argument("--corruption-limit",type=int,default=8)
@@ -222,6 +233,12 @@ def main() -> None:
     if min(args.epochs,args.batch_size,args.grad_accum_steps,args.validate_every)<1 or args.corruption_every<0 or args.corruption_limit<1:
         parser.error("epochs, batch size, accumulation and validation interval must be positive")
     config=config_from_dict(json.loads(args.config.read_text())) if args.config else Stage1Config()
+    if args.selection_metric is None:
+        args.selection_metric = "support_f1" if config.bottleneck_support_only else "corr_r1"
+    if config.bottleneck_support_only:
+        from .train_bottleneck_support import train
+        train(args, config)
+        return
     if args.selection_metric=="surface_f1_0.2m" and not config.surface_proposals_per_site:
         parser.error("surface_f1_0.2m requires a surface-proposal Stage-I config")
     if args.selection_metric=="region_f1" and not config.surface_region_enabled:
