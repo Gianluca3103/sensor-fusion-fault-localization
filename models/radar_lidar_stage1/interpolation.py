@@ -20,6 +20,7 @@ class InterpolatedField:
     scores: np.ndarray  # [N], in [0, 1]
     source_seeds: int
     accepted_edges: int = 0
+    signed_distance_m: np.ndarray | None = None
 
     def centers_xyz(self, grid: VoxelGrid) -> np.ndarray:
         origin = np.asarray(grid.minimum_xyz, dtype=np.float64)
@@ -140,6 +141,114 @@ def inverse_distance_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: Voxel
     return _compact_radial_field(xyz, scores, grid, lattice_stride=lattice_stride,
                                  seed_threshold=seed_threshold, method="inverse_distance",
                                  scale=power)
+
+
+def local_signed_distance_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,
+                                groups: np.ndarray | None = None,
+                                lattice_stride: int = 2,
+                                seed_threshold: float = .25,
+                                normal_radius_m: float = 1.5,
+                                max_neighbors: int = 16,
+                                min_independent_neighbors: int = 4,
+                                min_normal_quality: float = .1,
+                                surface_band_m: float = .2,
+                                sensor_origin_xyz: tuple[float, float, float] = (0., 0., 0.)
+                                ) -> InterpolatedField:
+    """Estimate a local oriented distance to radar-predicted surface patches.
+
+    Normals come only from neighboring Stage-I surface proposals. Alternative
+    slots from one radar anchor count as one source. The sign is oriented toward
+    the LiDAR origin: positive faces the sensor, negative is behind the patch.
+    It is a local point-to-plane TSDF approximation, not a global signed volume
+    or a claim that space behind the surface is occupied. Support is scored
+    only in compact neighborhoods of coherent proposals near the zero level.
+    """
+    xyz, scores = _validate_seeds(xyz, scores)
+    if (lattice_stride < 1 or not 0 <= seed_threshold <= 1 or normal_radius_m <= 0
+            or max_neighbors < min_independent_neighbors or min_independent_neighbors < 3
+            or not 0 <= min_normal_quality <= 1 or surface_band_m <= 0):
+        raise ValueError("Invalid local signed-distance settings")
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.shape != (len(xyz),):
+            raise ValueError("Expected one anchor group per proposal")
+    chosen = scores > seed_threshold
+    xyz, scores = xyz[chosen], scores[chosen]
+    if groups is not None:
+        groups = groups[chosen]
+    empty = InterpolatedField(np.empty((0, 3), dtype=np.int32),
+                              np.empty(0, dtype=np.float32), 0,
+                              signed_distance_m=np.empty(0, dtype=np.float32))
+    if len(xyz) < min_independent_neighbors:
+        return empty
+    sensor = np.asarray(sensor_origin_xyz, dtype=np.float64)
+    if sensor.shape != (3,) or not np.isfinite(sensor).all():
+        raise ValueError("Expected a finite sensor origin XYZ")
+    tree = cKDTree(xyz)
+    distance, neighbor_index = tree.query(
+        xyz, k=min(len(xyz), max_neighbors * 4),
+        distance_upper_bound=normal_radius_m)
+    distance = np.atleast_2d(distance)
+    neighbor_index = np.atleast_2d(neighbor_index)
+    normals = np.zeros_like(xyz)
+    quality = np.zeros(len(xyz), dtype=np.float64)
+    for i in range(len(xyz)):
+        selected: list[int] = []
+        selected_distance: list[float] = []
+        seen_groups = set()
+        for d, j in zip(distance[i], neighbor_index[i]):
+            if j >= len(xyz):
+                continue
+            j = int(j)
+            group = groups[j] if groups is not None else j
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
+            selected.append(j)
+            selected_distance.append(float(d))
+            if len(selected) >= max_neighbors:
+                break
+        if len(selected) < min_independent_neighbors:
+            continue
+        neighbors = xyz[selected]
+        weights = scores[selected] * np.exp(-.5 *
+                         (np.asarray(selected_distance) / normal_radius_m) ** 2)
+        weights /= weights.sum()
+        center = np.sum(neighbors * weights[:, None], axis=0)
+        delta = neighbors - center
+        covariance = (delta * weights[:, None]).T @ delta
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        # Planar patches have two substantial tangent eigenvalues. A line or
+        # isolated cluster has an ambiguous normal and should abstain.
+        q = float(np.clip((eigenvalues[1] - eigenvalues[0]) /
+                          max(eigenvalues[2], 1e-12), 0., 1.))
+        if q < min_normal_quality:
+            continue
+        normal = eigenvectors[:, 0]
+        if np.dot(normal, sensor - xyz[i]) < 0:
+            normal = -normal
+        normals[i], quality[i] = normal, q
+    valid = quality >= min_normal_quality
+    if not valid.any():
+        return empty
+    valid_xyz, valid_score = xyz[valid], scores[valid]
+    local = trilinear_seed_field(valid_xyz, valid_score, grid,
+                                lattice_stride=lattice_stride,
+                                seed_threshold=0.)
+    centers = local.centers_xyz(grid).astype(np.float64)
+    nearest_distance, nearest = cKDTree(valid_xyz).query(centers)
+    offset = centers - valid_xyz[nearest]
+    signed = np.sum(offset * normals[valid][nearest], axis=1)
+    # Normal quality is a validity check, not a calibrated probability. Once
+    # a normal is accepted, retain the learned Stage-I score at its surface.
+    scores_out = (local.scores.astype(np.float64) *
+                  np.exp(-.5 * (signed / surface_band_m) ** 2))
+    # The nearest oriented proposal must belong to the same compact patch.
+    max_distance = np.linalg.norm(np.asarray(grid.size_xyz) * lattice_stride)
+    keep = (nearest_distance <= max_distance) & (scores_out > 0)
+    return InterpolatedField(local.coordinates_xyz[keep], scores_out[keep].astype(np.float32),
+                             int(valid.sum()),
+                             signed_distance_m=signed[keep].astype(np.float32))
 
 
 def trilinear_seed_field(xyz: np.ndarray, scores: np.ndarray, grid: VoxelGrid, *,

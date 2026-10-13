@@ -5,7 +5,7 @@ import numpy as np
 from models.radar_lidar_stage1.config import VoxelGrid
 from models.radar_lidar_stage1.interpolation import (
     edge_aware_seed_field, gaussian_seed_field, inverse_distance_seed_field,
-    nearest_seed_field, trilinear_seed_field,
+    local_signed_distance_field, nearest_seed_field, trilinear_seed_field,
 )
 
 
@@ -62,3 +62,33 @@ def test_compact_radial_kernels_do_not_bridge_distant_proposals() -> None:
         assert not np.any((centers[:, 0] > .6) & (centers[:, 0] < 1.4))
         assert np.isclose(field.scores.max(), .8)
         assert np.all((field.scores > 0) & (field.scores <= 1))
+
+
+def test_local_signed_distance_orients_a_planar_patch_toward_sensor() -> None:
+    xyz = np.array([[x, y, -1.] for x in (-.3, 0., .3)
+                    for y in (-.3, 0., .3)])
+    field = local_signed_distance_field(
+        xyz, np.full(len(xyz), .9), GRID, groups=np.arange(len(xyz)),
+        normal_radius_m=1., surface_band_m=.2)
+    centers = field.centers_xyz(GRID)
+    assert field.source_seeds == len(xyz)
+    assert field.signed_distance_m is not None
+    assert field.signed_distance_m.shape == field.scores.shape
+    assert np.any((centers[:, 2] > -1.) & (field.signed_distance_m > 0))
+    assert np.any((centers[:, 2] < -1.) & (field.signed_distance_m < 0))
+    assert np.all((field.scores > 0) & (field.scores <= 1))
+
+
+def test_local_signed_distance_abstains_on_a_line() -> None:
+    xyz = np.array([[x, 0., -1.] for x in (-.5, -.3, -.1, .1, .3, .5)])
+    field = local_signed_distance_field(
+        xyz, np.full(len(xyz), .9), GRID, groups=np.arange(len(xyz)))
+    assert len(field.coordinates_xyz) == 0
+
+
+def test_local_signed_distance_does_not_treat_one_anchor_as_a_patch() -> None:
+    xyz = np.array([[x, y, -1.] for x in (-.3, 0., .3)
+                    for y in (-.3, 0., .3)])
+    field = local_signed_distance_field(
+        xyz, np.full(len(xyz), .9), GRID, groups=np.zeros(len(xyz), dtype=int))
+    assert len(field.coordinates_xyz) == 0
