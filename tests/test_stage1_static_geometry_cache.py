@@ -15,6 +15,7 @@ from models.radar_lidar_stage1 import pfe_spconv
 from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportStage1
 from models.radar_lidar_stage1.config import Stage1Config, VoxelGrid
 from models.radar_lidar_stage1.static_geometry_cache import Stage1StaticGeometryCache
+from scripts.cache_stage1_static_geometry import prebuild_split
 from tests.test_bottleneck_support_interface import ReferenceConv, ReferenceTensor
 
 
@@ -56,6 +57,7 @@ class Stage1StaticCacheTests(unittest.TestCase):
             frames = [_frame(root, "00001"), _frame(root, "00002")]
             cache = Stage1StaticGeometryCache(root / "cache", config, frames)
             model = BottleneckSupportStage1(config).eval()
+            self.assertFalse(cache.has_entry("train", "00001"))
 
             def run(order, use_cache):
                 args = (radar[order], valid[order], lidar[order], valid[order])
@@ -70,6 +72,7 @@ class Stage1StaticCacheTests(unittest.TestCase):
             warm, warm_stats = run([0, 1], True)
             self.assertEqual(cold_stats["cache_builds"], 2)
             self.assertEqual(warm_stats["cache_hits"], 2)
+            self.assertTrue(cache.has_entry("train", "00001"))
             for key in uncached:
                 torch.testing.assert_close(uncached[key], cold[key])
                 torch.testing.assert_close(uncached[key], warm[key])
@@ -98,6 +101,28 @@ class Stage1StaticCacheTests(unittest.TestCase):
             shuffled_cached["loss/total"].backward()
             torch.testing.assert_close(reference_grad,
                                        model.radar_only.support_head[-1].weight.grad)
+
+            class SyntheticDataset:
+                def __init__(self):
+                    self.frames = frames.copy()
+
+                def __len__(self):
+                    return len(self.frames)
+
+                def __getitem__(self, index):
+                    frame = self.frames[index]
+                    position = next(i for i, item in enumerate(frames)
+                                    if item.frame_id == frame.frame_id)
+                    return {"frame_id": frame.frame_id, "split": "train",
+                            "radar": radar[position], "clean_lidar": lidar[position]}
+
+            prebuilt = Stage1StaticGeometryCache(root / "prebuilt", config, frames)
+            prebuild_split(model, prebuilt, SyntheticDataset(), "train",
+                           batch_size=2, num_workers=0, device="cpu")
+            self.assertTrue(all(prebuilt.has_entry("train", frame.frame_id)
+                                for frame in frames))
+            prebuild_split(model, prebuilt, SyntheticDataset(), "train",
+                           batch_size=2, num_workers=0, device="cpu")
 
     def test_changed_source_invalidates_disk_entry(self):
         grid = VoxelGrid((0., 0., 0.), (16., 16., 16.), (1., 1., 1.))

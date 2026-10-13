@@ -80,6 +80,10 @@ class Stage1StaticGeometryCache:
             return None
         return entry
 
+    def has_entry(self, split: str, frame_id: str) -> bool:
+        """Return whether a reusable entry exists for this frame and config."""
+        return self._load(split, frame_id) is not None
+
     def _save(self, split: str, frame_id: str, entry) -> None:
         path = self._path(split, frame_id)
         path.parent.mkdir(parents=True, exist_ok=True)

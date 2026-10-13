@@ -35,6 +35,21 @@ Use `--static-cache-root /path/to/cache` to put it on another volume or
 epoch metrics report reused and built frame counts. Loss statistics stay on
 the GPU until periodic progress updates and the epoch summary.
 
+To build the entire cache before resuming a run, use its `last.ckpt` so the
+dataset variant and grid are taken from that run:
+
+```bash
+python -u -m scripts.cache_stage1_static_geometry \
+  --vod-root /path/to/view_of_delft_PUBLIC \
+  --stage1-checkpoint /path/to/stage1_bottleneck_support/last.ckpt \
+  --cache-root /path/to/stage1_bottleneck_support/static_geometry \
+  --batch-size 2 --num-workers 2 --device cuda
+```
+
+The command resumes a partial build, validates each existing entry's
+configuration and input-file metadata, and prints train/validation counts.
+It does not update model weights. Training then uses the same cache root.
+
 Visualize a held-out frame with `python -m scripts.visualize_stage1_confidence_cloud --vod-root /path/to/view_of_delft_PUBLIC --checkpoint /path/to/stage1_bottleneck_support/best_selected.ckpt --split val --frame-id 08236 --output-root /path/to/stage1_views --device cuda`. The viewer writes both the raw scored support lattice and its interpolated Stage-II region as uncapped PLY files.
 
 ### Historical surface-proposal interface (older checkpoints only)
