@@ -15,7 +15,9 @@ from models.radar_lidar_stage2_bottleneck.config import BottleneckDiffusionConfi
 from models.radar_lidar_stage2_bottleneck.losses import reconstruction_loss, training_state
 from models.radar_lidar_stage2_bottleneck.schedule import NoiseSchedule
 from models.radar_lidar_stage2_bottleneck.model import BottleneckSparseDiffusion
-from models.radar_lidar_stage2_bottleneck.train import load_frozen_stage1, protect_target
+from models.radar_lidar_stage2_bottleneck.train import (
+    LOSS_NAMES, evaluate, load_frozen_stage1, protect_target,
+)
 from models.radar_lidar_stage2_residual.config import ResidualStage2Config
 from models.radar_lidar_stage2_residual.coverage import FaultyCoverage
 from models.radar_lidar_stage2_residual.targets import ResidualTargets
@@ -57,6 +59,39 @@ def test_stage1_loader_requires_radar_student_and_freezes_weights():
                return_value=(invalid, saved)):
         with pytest.raises(ValueError, match="radar-seed"):
             load_frozen_stage1("unused.ckpt", "cpu")
+
+
+def test_validation_counts_frames_without_legacy_frame_key():
+    class FakeMetrics:
+        def add(self, *args):
+            pass
+
+        def summary(self):
+            return {"global_missing_f1_0.2m": 0.1}
+
+    class FakeModel(torch.nn.Module):
+        def sample(self, *args, **kwargs):
+            return object()
+
+    batch = {"frame_id": ["00001", "00002"],
+             "clean_lidar": torch.zeros((2, 0, 4)),
+             "clean_lidar_valid": torch.zeros((2, 0), dtype=torch.bool),
+             "faulty_lidar": torch.zeros((2, 0, 4)),
+             "faulty_lidar_valid": torch.zeros((2, 0), dtype=torch.bool),
+             "fault_kind": ["fog", "total_loss"]}
+    losses = {name: torch.tensor(0.) for name in LOSS_NAMES}
+    with (patch("models.radar_lidar_stage2_bottleneck.train.ReconstructionMetrics", FakeMetrics),
+          patch("models.radar_lidar_stage2_bottleneck.train.prepare_context",
+                return_value=object()),
+          patch("models.radar_lidar_stage2_bottleneck.train.make_target",
+                return_value=object()),
+          patch("models.radar_lidar_stage2_bottleneck.train.denoise_batch",
+                return_value=(losses, {}))):
+        report = evaluate(FakeModel(), torch.nn.Module(), [batch], small_config(),
+                          "cpu", sampling_method="ddim", sampling_steps=10)
+    assert report["frames"] == 2
+    assert report["sampling"]["full_pipeline_seconds_per_frame"] is not None
+    assert report["sampling"]["stage1_encoder_included_in_timing"]
 
 
 def test_config_roundtrip_and_only_edge_aware_growth(tmp_path):

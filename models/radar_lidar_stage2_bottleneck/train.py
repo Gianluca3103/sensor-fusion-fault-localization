@@ -74,32 +74,43 @@ def protect_target(target: ResidualTargets, coverage: FaultyCoverage) -> Residua
                            target.known_free, target.offsets_normalized, target.clean)
 
 
-def context_and_target(model, stage1, batch, config):
+def prepare_context(model, stage1, batch, config):
     if "cache" in batch:
         data = batch["cache"]
         domain = CandidateDomain(data["coordinates"], data["confidence"],
                                  data["grid"], data["counts"])
         coverage = FaultyCoverage(data["coverage_features"], data["measured_voxel"],
                                   data["measured_ray"], data["in_fault_region"])
+        return model.prepare_cached(domain, coverage, data["sources"],
+                                    data["indices"], data["source_centers"],
+                                    data["source_batches"], len(batch["frame_id"]))
+    with torch.no_grad():
+        evidence = stage1(batch["radar"], batch["radar_valid"], defer_diagnostics=True)
+    return model.prepare(evidence, stage1.config.grid,
+                         batch["faulty_lidar"], batch["faulty_lidar_valid"],
+                         batch["fault_region"])
+
+
+def make_target(context, batch, config):
+    if "cache" in batch:
+        data = batch["cache"]
         clean = VoxelTargets(data["clean_occupied"], data["clean_known_free"],
                              data["clean_offsets"], data["clean_centroids"],
                              data["clean_point_count"], data["clean_points_in_grid"],
                              data["clean_points_in_candidates"], data["point_centroid_errors"])
         target = ResidualTargets(data["target_addition"], data["target_observed"],
                                  data["target_known_free"], clean.offsets_normalized, clean)
-        context = model.prepare_cached(domain, coverage, data["sources"],
-                                       data["indices"], data["source_centers"],
-                                       data["source_batches"], len(batch["frame_id"]))
-        return context, protect_target(target, coverage)
-    with torch.no_grad():
-        evidence = stage1(batch["radar"], batch["radar_valid"], defer_diagnostics=True)
-    context = model.prepare(evidence, stage1.config.grid,
-                            batch["faulty_lidar"], batch["faulty_lidar_valid"],
-                            batch["fault_region"])
-    target = make_residual_targets(context.domain, batch["clean_lidar"],
-                                   batch["clean_lidar_valid"], context.coverage,
-                                   free_ray_tolerance_m=config.residual.free_ray_tolerance_m)
-    return context, protect_target(target, context.coverage)
+    else:
+        target = make_residual_targets(context.domain, batch["clean_lidar"],
+                                       batch["clean_lidar_valid"], context.coverage,
+                                       free_ray_tolerance_m=config.residual.free_ray_tolerance_m)
+    return protect_target(target, context.coverage)
+
+
+def context_and_target(model, stage1, batch, config):
+    context = prepare_context(model, stage1, batch, config)
+    target = make_target(context, batch, config)
+    return context, target
 
 
 def denoise_batch(model, context, target, *, amp="off", fixed_timestep=None,
@@ -156,13 +167,27 @@ def evaluate(model, stage1, loader, config, device, *, amp="off",
     stage1.eval()
     metrics = ReconstructionMetrics()
     sums = torch.zeros(len(LOSS_NAMES), device=device, dtype=torch.float64)
-    elapsed = 0.0
+    preparation_elapsed = 0.0
+    sampling_elapsed = 0.0
     peak_bytes = 0
+    cached = False
+    frames_evaluated = 0
     generator = torch.Generator(device=device).manual_seed(config.sample_seed)
     for index, raw in enumerate(tqdm(loader, desc="Bottleneck diffusion validation",
                                      unit="frame", dynamic_ncols=True)):
         batch = to_device(raw, device)
-        context, target = context_and_target(model, stage1, batch, config)
+        frames_evaluated += len(batch["frame_id"])
+        cached = "cache" in batch
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        preparation_start = time.perf_counter()
+        context = prepare_context(model, stage1, batch, config)
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+            peak_bytes = max(peak_bytes, torch.cuda.max_memory_allocated(device))
+        preparation_elapsed += time.perf_counter() - preparation_start
+        target = make_target(context, batch, config)
         losses, _ = denoise_batch(model, context, target, amp=amp,
                                   fixed_timestep=config.timesteps // 2,
                                   generator=generator)
@@ -180,16 +205,23 @@ def evaluate(model, stage1, loader, config, device, *, amp="off",
         if torch.device(device).type == "cuda":
             torch.cuda.synchronize(device)
             peak_bytes = max(peak_bytes, torch.cuda.max_memory_allocated(device))
-        elapsed += time.perf_counter() - start
+        sampling_elapsed += time.perf_counter() - start
         metrics.add(output, target, batch["clean_lidar"], batch["clean_lidar_valid"],
                     batch["faulty_lidar"], batch["faulty_lidar_valid"],
                     batch.get("fault_kind", ["unknown"] * len(batch["frame_id"])),
                     config.residual.occupancy_threshold)
     report = metrics.summary()
+    report["frames"] = frames_evaluated
     report["loss"] = dict(zip(LOSS_NAMES, (sums / max(len(loader), 1)).cpu().tolist()))
+    denominator = max(frames_evaluated, 1)
     report["sampling"] = {"method": sampling_method or config.sampling_method,
                           "steps": sampling_steps or config.timesteps,
-                          "seconds_per_frame": elapsed / max(report["frames"], 1),
+                          "seconds_per_frame": sampling_elapsed / denominator,
+                          "conditioning_seconds_per_frame": preparation_elapsed / denominator,
+                          "full_pipeline_seconds_per_frame": (
+                              (preparation_elapsed + sampling_elapsed) / denominator
+                              if not cached else None),
+                          "stage1_encoder_included_in_timing": not cached,
                           "peak_gpu_allocated_gib": peak_bytes / 2**30}
     return report
 
