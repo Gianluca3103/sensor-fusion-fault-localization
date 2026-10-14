@@ -117,8 +117,11 @@ total/component losses, validation correspondence and confidence metrics,
 and overfitting trends. Full validation every five epochs determines checkpoint
 selection; fixed first-frame quick validation runs in intervening epochs.
 
-Python, CUDA, PyTorch, `spconv`, MinkowskiEngine, NumPy, SciPy, tqdm,
-matplotlib, and TensorBoard are needed for all three GPU phases. The original
+Python, CUDA, PyTorch, `spconv`, MinkowskiEngine, NumPy, SciPy, tqdm, and
+matplotlib are needed for all three GPU phases. TensorBoard is optional when
+the trainers use `--no-tensorboard`; `metrics.jsonl` and PNG plots are still
+written. Install `tensorboard` into the same Python environment and omit that
+flag to write event files. The original
 PFE constructor requires CUDA even though the mathematical unit tests are
 CPU-compatible. On the professor machine, the existing user-space OpenBLAS
 runtime must be on `LD_LIBRARY_PATH` for MinkowskiEngine. The GPU decoder
@@ -154,11 +157,11 @@ mkdir -p "$OUT"
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality radar --output-root "$OUT/radar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 2 --num-workers 2 --device cuda
+  --epochs 25 --batch-size 2 --num-workers 2 --device cuda --no-tensorboard
 "$PY" -u -m models.radar_lidar_crossmodal_v1.pretrain_encoder \
   --vod-root "$VOD" --modality lidar --output-root "$OUT/lidar" \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 2 --num-workers 2 --device cuda
+  --epochs 25 --batch-size 2 --num-workers 2 --device cuda --no-tensorboard
 
 # Phase 1: frozen original encoders, trainable local teacher.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_teacher \
@@ -166,14 +169,14 @@ mkdir -p "$OUT"
   --lidar-encoder "$OUT/lidar/best_encoder.pth" --output-root "$OUT/teacher" \
   --config configs/crossmodal_teacher_raw64.json \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 2 --num-workers 2 --device cuda
+  --epochs 25 --batch-size 2 --num-workers 2 --device cuda --no-tensorboard
 
 # Phase 2: frozen teacher and radar encoder, radar-only student.
 "$PY" -u -m models.radar_lidar_crossmodal_v1.train_student \
   --vod-root "$VOD" --teacher-checkpoint "$OUT/teacher/best_object_r1.ckpt" \
   --output-root "$OUT/student" --config configs/crossmodal_student_raw64.json \
   --online-augmentation-config configs/stage1_online_geometric_augmentation.json \
-  --epochs 25 --batch-size 1 --num-workers 2 --device cuda
+  --epochs 25 --batch-size 1 --num-workers 2 --device cuda --no-tensorboard
 ```
 
 For a one-frame integration check, run each trainer with a new smoke output
@@ -210,7 +213,12 @@ confidence coordinates are stride-1 fine indices. The output is raw and ready
 for future Stage II conditioning. Existing Stage II diffusion checkpoints are
 **not** compatible with this new 64D/stride-8 interface without a new adapter.
 
-There is no locally trained exact-PFE checkpoint and no local sparse CUDA
-backend. Mathematical CPU tests can run locally. GPU end-to-end checks and
-performance/quality results must be obtained on the professor machine before
-claiming that this architecture trains successfully.
+The Windows workspace has no trained exact-PFE checkpoint or sparse CUDA
+backend. On the professor's RTX 4090, one-frame GPU smoke tests passed for
+both independent encoder pretrains, teacher training, student training,
+checkpoint reload/evaluation, and raw radar-only export. The sparse decoder
+expanded one stride-8 site to 512 fine sites and backpropagated finite
+gradients. These runs verify integration only. Full training and held-out
+quality assessment remain necessary. The one-frame smoke student represented
+11.7% of clean returns inside the fixed PFE grid; that candidate-coverage
+ceiling cannot improve through confidence training alone for that frame.
