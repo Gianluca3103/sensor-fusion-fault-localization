@@ -18,6 +18,7 @@ from models.radar_lidar_stage2_bottleneck.model import BottleneckSparseDiffusion
 from models.radar_lidar_stage2_bottleneck.train import (
     LOSS_NAMES, evaluate, load_frozen_stage1, protect_target,
 )
+from models.radar_lidar_stage2_diffusion.cache import collate_cached, prepare_frame
 from models.radar_lidar_stage2_residual.config import ResidualStage2Config
 from models.radar_lidar_stage2_residual.coverage import FaultyCoverage
 from models.radar_lidar_stage2_residual.targets import ResidualTargets
@@ -92,6 +93,34 @@ def test_validation_counts_frames_without_legacy_frame_key():
     assert report["frames"] == 2
     assert report["sampling"]["full_pipeline_seconds_per_frame"] is not None
     assert report["sampling"]["stage1_encoder_included_in_timing"]
+
+
+def test_single_source_stage1_cache_roundtrip():
+    grid = VoxelGrid((0., 0., 0.), (8., 8., 8.), (.5, .5, .5))
+    support_coords = torch.tensor([[0, z, y, x] for z in range(1, 5)
+                                   for y in range(1, 5) for x in range(1, 5)])
+    coarse_coords = torch.unique(torch.cat((support_coords[:, :1],
+                                            support_coords[:, 1:] // 4), dim=1),
+                                 dim=0, sorted=True)
+    evidence = BottleneckSupportOutput(
+        SparseSites(coarse_coords, torch.ones((len(coarse_coords), 4)),
+                    grid.scale_shape(8), 8),
+        SparseSites(support_coords, torch.full((len(support_coords), 1), .9),
+                    grid.scale_shape(2), 2))
+    clean = torch.tensor([[[2.25, 2.25, 2.25, .1]]])
+    batch = {"frame_id": ["00001"], "fault_kind": ["fov_filter"],
+             "faulty_lidar": clean, "faulty_lidar_valid": torch.ones((1, 1), dtype=torch.bool),
+             "clean_lidar": clean, "clean_lidar_valid": torch.ones((1, 1), dtype=torch.bool),
+             "fault_region": [{"full_scan": True}]}
+    row = prepare_frame(evidence, grid, batch, small_config(),
+                        include_validation_clouds=True)
+    assert int(row["source_count"]) == 1
+    restored = collate_cached([row], grid)
+    assert len(restored["cache"]["sources"]) == 1
+    assert len(restored["cache"]["source_batches"][0]) == len(coarse_coords)
+    assert restored["fault_kind"] == ["fov_filter"]
+    assert torch.equal(restored["cache"]["coordinates"][:, 0],
+                       torch.zeros(len(restored["cache"]["coordinates"]), dtype=torch.long))
 
 
 def test_config_roundtrip_and_only_edge_aware_growth(tmp_path):
