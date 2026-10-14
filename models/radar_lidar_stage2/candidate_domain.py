@@ -282,7 +282,7 @@ def _make_region_candidates(output: Stage1Output, grid: VoxelGrid,
 
 def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
                     confidence_threshold: float = 0.25,
-                    expansion_zyx: tuple[int, int, int] = (1, 1, 1),
+                    expansion_zyx: tuple[int, int, int] = (0, 0, 0),
                     max_sites: int | None = None,
                     method: str = "edge_aware") -> CandidateDomain:
     if method not in {"edge_aware", "ellipsoid"}:
@@ -298,6 +298,8 @@ def make_candidates(output: Stage1Output, grid: VoxelGrid, *,
             raise ValueError("Bottleneck support uses edge-aware interpolation")
         if max_sites is not None:
             raise ValueError("Bottleneck support cannot cap candidate sites")
+        # No neighborhood expansion is applied to this interface. Only the
+        # edge-aware interpolation below may create sites beyond Stage-I seeds.
         return _make_bottleneck_support_candidates(output, grid, confidence_threshold)
     fine = output.features["s1"]
     confidence = output.confidence

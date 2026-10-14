@@ -26,6 +26,10 @@ class BottleneckSupportOutput:
     confidence_region: SparseSites  # sparse stride-2 [M, 1], scores in [0, 1]
 
 
+def interface_version(config: Stage1Config) -> str:
+    return "bottleneck_support_v2" if config.support_seed_mode == "radar_s2" else "bottleneck_support_v1"
+
+
 class RadarOnlyBottleneckEncoder(nn.Module):
     """Infer LiDAR-aware features and support using radar, without clean LiDAR."""
 
@@ -56,7 +60,7 @@ class RadarOnlyBottleneckEncoder(nn.Module):
         student_hidden = self.student[:3](coarse.features)
         lidar_aware = coarse.replace_features(F.normalize(
             self.student[3](self.dropout(student_hidden)), dim=-1))
-        support, logits = self._support_field(lidar_aware, levels[1])
+        support, logits = self._support_field(lidar_aware, levels[1], sites)
         return BottleneckSupportOutput(lidar_aware, support), levels, logits
 
     def forward(self, radar_points: torch.Tensor, radar_valid: torch.Tensor, *,
@@ -65,40 +69,66 @@ class RadarOnlyBottleneckEncoder(nn.Module):
                                    defer_diagnostics=defer_diagnostics, check_finite=check_finite)
         return output
 
-    def _support_field(self, bottleneck: SparseSites, fine: SparseSites):
-        """Decode every stride-8 cell to a scored stride-2 lattice.
-
-        The lattice is a set of candidate *locations*, not a radar sphere or a
-        positive label. The head must learn which cells receive confidence.
-        """
-        if bottleneck.stride != 8 or fine.stride != 2:
-            raise ValueError("Expected stride-8 bottleneck and stride-2 radar skip")
-        offsets = torch.tensor(list(product(range(4), repeat=3)), device=bottleneck.coords.device,
-                               dtype=bottleneck.coords.dtype)
-        n = len(bottleneck.coords)
+    def _support_field(self, bottleneck: SparseSites, fine: SparseSites,
+                       raw_radar: SparseSites):
+        """Score observed radar S2 sites; retain dense decoding for old checkpoints."""
+        if bottleneck.stride != 8 or fine.stride != 2 or raw_radar.stride != 1:
+            raise ValueError("Expected stride-8 bottleneck, stride-2 radar features, and stride-1 radar sites")
         shape = self.config.grid.scale_shape(2)
-        coordinates = bottleneck.coords[:, None, :].expand(n, 64, 4).clone()
-        coordinates[:, :, 1:] = bottleneck.coords[:, None, 1:] * 4 + offsets[None]
-        coordinates = coordinates.reshape(-1, 4)
+        if self.config.support_seed_mode == "radar_s2":
+            # Strided sparse convolution can activate additional S2 sites.
+            # Only parents of observed radar voxels may seed support; any
+            # extra active cells must come from edge-aware interpolation.
+            radar_parent = raw_radar.coords.clone()
+            radar_parent[:, 1:] = torch.div(radar_parent[:, 1:], 2, rounding_mode="floor")
+            coordinates = torch.unique(radar_parent, dim=0, sorted=True)
+        else:
+            offsets = torch.tensor(list(product(range(4), repeat=3)), device=bottleneck.coords.device,
+                                   dtype=bottleneck.coords.dtype)
+            n = len(bottleneck.coords)
+            coordinates = bottleneck.coords[:, None, :].expand(n, 64, 4).clone()
+            coordinates[:, :, 1:] = bottleneck.coords[:, None, 1:] * 4 + offsets[None]
+            coordinates = coordinates.reshape(-1, 4)
         if not len(coordinates):
             empty = SparseSites._from_validated(coordinates, bottleneck.features.new_empty((0, 1)),
                                                 shape, 2)
             return empty, bottleneck.features.new_empty((0, 1))
-        order = torch.argsort(encode_keys(coordinates, shape), stable=True)
-        coordinates = coordinates[order]
-        coarse_features = bottleneck.features.repeat_interleave(64, dim=0)[order]
-        relative = offsets.to(coarse_features.dtype).repeat(n, 1)[order]
-        relative = (relative + .5) / 4 - .5
-        keys = encode_keys(fine.coords, shape)
-        queries = encode_keys(coordinates, shape)
-        if len(keys):
-            location = torch.searchsorted(keys, queries)
-            matched = (location < len(keys)) & (keys[location.clamp(max=len(keys)-1)] == queries)
-            skip = coarse_features.new_zeros((len(queries), fine.features.shape[1]))
-            skip[matched] = fine.features[location[matched]]
+        if self.config.support_seed_mode == "radar_s2":
+            keys = encode_keys(fine.coords, shape)
+            queries = encode_keys(coordinates, shape)
+            fine_location = torch.searchsorted(keys, queries)
+            if not len(keys) or bool((fine_location >= len(keys)).any()) or not torch.equal(
+                    keys[fine_location], queries):
+                raise ValueError("Every observed radar S2 seed needs an encoded S2 feature")
+            parent = coordinates.clone()
+            parent[:, 1:] = torch.div(parent[:, 1:], 4, rounding_mode="floor")
+            parent_keys = encode_keys(parent, bottleneck.shape_zyx)
+            coarse_keys = encode_keys(bottleneck.coords, bottleneck.shape_zyx)
+            location = torch.searchsorted(coarse_keys, parent_keys)
+            if not len(coarse_keys) or bool((location >= len(coarse_keys)).any()) or not torch.equal(
+                    coarse_keys[location], parent_keys):
+                raise ValueError("Every radar S2 support seed must descend from a bottleneck site")
+            coarse_features = bottleneck.features[location]
+            relative = (coordinates[:, 1:] % 4).to(coarse_features.dtype)
+            relative = (relative + .5) / 4 - .5
+            skip = fine.features[fine_location]
+            matched = torch.ones(len(coordinates), dtype=torch.bool, device=coordinates.device)
         else:
-            matched = torch.zeros(len(queries), dtype=torch.bool, device=queries.device)
-            skip = coarse_features.new_zeros((len(queries), fine.features.shape[1]))
+            order = torch.argsort(encode_keys(coordinates, shape), stable=True)
+            coordinates = coordinates[order]
+            coarse_features = bottleneck.features.repeat_interleave(64, dim=0)[order]
+            relative = offsets.to(coarse_features.dtype).repeat(n, 1)[order]
+            relative = (relative + .5) / 4 - .5
+            keys = encode_keys(fine.coords, shape)
+            queries = encode_keys(coordinates, shape)
+            if len(keys):
+                location = torch.searchsorted(keys, queries)
+                matched = (location < len(keys)) & (keys[location.clamp(max=len(keys)-1)] == queries)
+                skip = coarse_features.new_zeros((len(queries), fine.features.shape[1]))
+                skip[matched] = fine.features[location[matched]]
+            else:
+                matched = torch.zeros(len(queries), dtype=torch.bool, device=queries.device)
+                skip = coarse_features.new_zeros((len(queries), fine.features.shape[1]))
         support_input = torch.cat((coarse_features, skip, relative,
                                    matched[:, None].to(coarse_features.dtype)), dim=-1)
         support_hidden = self.support_head[:3](support_input)

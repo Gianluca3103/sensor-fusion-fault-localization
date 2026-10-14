@@ -24,6 +24,9 @@ from Fault_Localization_Model.vod_dataset.vod_io import resolve_vod_public_root
 
 def config_from_dict(values: dict) -> Stage1Config:
     values=dict(values)
+    if values.get("bottleneck_support_only") and "support_seed_mode" not in values:
+        # Preserve the exact geometry of checkpoints saved before this field existed.
+        values["support_seed_mode"] = "dense_bottleneck"
     grid=values.pop("grid",{})
     if isinstance(grid,dict):
         values["grid"]=VoxelGrid(**{k:tuple(v) if isinstance(v,list) else v for k,v in grid.items()})

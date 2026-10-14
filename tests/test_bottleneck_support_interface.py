@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -13,10 +14,11 @@ import torch
 
 from models.radar_lidar_stage1 import pfe_spconv
 from models.radar_lidar_stage1.bottleneck_support import (
-    BottleneckSupportOutput, BottleneckSupportStage1)
+    BottleneckSupportOutput, BottleneckSupportStage1, interface_version)
 from models.radar_lidar_stage1.config import Stage1Config, VoxelGrid
 from models.radar_lidar_stage1.sparse import SparseConv3d, SparseSites
 from models.radar_lidar_stage1.train import load_radar_only
+from models.radar_lidar_stage1.train import config_from_dict
 from models.radar_lidar_stage2.candidate_domain import make_candidates
 from models.radar_lidar_stage2.candidate_domain import CandidateDomain
 from models.radar_lidar_stage2.config import Stage2Config
@@ -51,12 +53,21 @@ class ReferenceConv(torch.nn.Module):
 
 
 class BottleneckInterfaceTests(unittest.TestCase):
+    def test_older_checkpoint_config_keeps_historical_dense_decoder(self):
+        config_path = Path(__file__).resolve().parents[1] / "configs" / "radar_lidar_stage1_surface.json"
+        values = json.loads(config_path.read_text(encoding="utf-8"))
+        values.pop("support_seed_mode")
+        old_config = config_from_dict(values)
+        self.assertEqual(old_config.support_seed_mode, "dense_bottleneck")
+        self.assertEqual(interface_version(old_config), "bottleneck_support_v1")
+
     def test_dropout_regularizes_training_heads_but_not_inference(self):
         grid = VoxelGrid((0., 0., 0.), (16., 16., 16.), (1., 1., 1.))
         config = replace(Stage1Config(grid=grid, channels=(8, 16, 32, 64)),
                          encoder_backend="pfe_spconv", growth_scales=(),
                          bottleneck_cross_attention_only=True,
                          bottleneck_support_only=True,
+                         support_seed_mode="radar_s2",
                          corr_scale_weights=(0., 0., 0., 1.),
                          confidence_weight=0., attention_dim=16,
                          bottleneck_dropout=0.1)
@@ -100,8 +111,10 @@ class BottleneckInterfaceTests(unittest.TestCase):
                          encoder_backend="pfe_spconv", growth_scales=(),
                          bottleneck_cross_attention_only=True,
                          bottleneck_support_only=True,
+                         support_seed_mode="radar_s2",
                          corr_scale_weights=(0., 0., 0., 1.),
                          confidence_weight=0., attention_dim=16)
+        self.assertEqual(interface_version(config), "bottleneck_support_v2")
         xyz = torch.tensor([[1., 1., 1.], [2., 3., 3.], [3., 5., 6.],
                             [6., 3., 9.], [7., 7., 12.], [9., 11., 4.],
                             [12., 4., 6.], [14., 14., 14.]])
@@ -119,6 +132,11 @@ class BottleneckInterfaceTests(unittest.TestCase):
             self.assertEqual(output.bottleneck.features.shape[1], config.attention_dim)
             self.assertEqual(output.bottleneck.stride, 8)
             self.assertEqual(output.confidence_region.stride, 2)
+            raw_sites, _ = model.radar_only.point(radar, valid)
+            observed_s2 = raw_sites.coords.clone()
+            observed_s2[:, 1:] = torch.div(observed_s2[:, 1:], 2, rounding_mode="floor")
+            observed_s2 = torch.unique(observed_s2, dim=0, sorted=True)
+            torch.testing.assert_close(output.confidence_region.coords, observed_s2)
             self.assertTrue(bool(((output.confidence_region.features >= 0) &
                                   (output.confidence_region.features <= 1)).all()))
             losses, diagnostics = model.forward_train(radar, valid, lidar, valid)
@@ -130,6 +148,10 @@ class BottleneckInterfaceTests(unittest.TestCase):
 
             domain = make_candidates(output, grid, confidence_threshold=0.0)
             self.assertEqual(domain.counts["seed_source"], "bottleneck_support_field")
+            expanded_setting = make_candidates(output, grid, confidence_threshold=0.0,
+                                               expansion_zyx=(3, 3, 3))
+            torch.testing.assert_close(domain.coordinates, expanded_setting.coordinates)
+            torch.testing.assert_close(domain.confidence, expanded_setting.confidence)
             conditioner = Stage1Conditioning(config.conditioning_channels, Stage2Config()).eval()
             conditioned = conditioner(output, domain)
             self.assertEqual(conditioned.shape, (len(domain.coordinates), Stage2Config().channels[0]))

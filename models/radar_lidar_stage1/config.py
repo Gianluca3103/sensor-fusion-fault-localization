@@ -53,6 +53,9 @@ class Stage1Config:
     bottleneck_cross_attention_only: bool = False
     bottleneck_support_only: bool = False
     bottleneck_dropout: float = 0.0
+    # Historical checkpoints generated 64 sites per stride-8 radar cell.
+    # New runs score only sites containing observed radar returns.
+    support_seed_mode: str = "radar_s2"
     support_stride: int = 2
     support_eval_threshold: float = 0.25
     support_loss_weight: float = 1.0
@@ -109,6 +112,8 @@ class Stage1Config:
                 or self.corr_scale_weights[-1] <= 0):
             raise ValueError("Bottleneck correspondence requires four scales and weights [0, 0, 0, positive]")
         if self.bottleneck_support_only:
+            if self.support_seed_mode not in ("dense_bottleneck", "radar_s2"):
+                raise ValueError("Bottleneck support seed mode must be dense_bottleneck or radar_s2")
             if (self.encoder_backend != "pfe_spconv" or not self.bottleneck_cross_attention_only or len(self.channels) != 4
                     or self.support_stride != 2 or self.surface_proposals_per_site
                     or self.surface_region_enabled or self.confidence_weight):

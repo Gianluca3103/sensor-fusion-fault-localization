@@ -39,6 +39,7 @@ class Stage1StaticCacheTests(unittest.TestCase):
                          encoder_backend="pfe_spconv", growth_scales=(),
                          bottleneck_cross_attention_only=True,
                          bottleneck_support_only=True,
+                         support_seed_mode="radar_s2",
                          corr_scale_weights=(0., 0., 0., 1.),
                          confidence_weight=0., attention_dim=16)
         xyz = torch.tensor([[1., 1., 1.], [2., 3., 3.], [3., 5., 6.],
@@ -135,6 +136,9 @@ class Stage1StaticCacheTests(unittest.TestCase):
             changed_dropout = Stage1StaticGeometryCache(
                 root / "cache", replace(config, bottleneck_dropout=0.1), [frame])
             self.assertEqual(before, changed_dropout._signature("train", "00001"))
+            changed_seeds = Stage1StaticGeometryCache(
+                root / "cache", replace(config, support_seed_mode="dense_bottleneck"), [frame])
+            self.assertNotEqual(before, changed_seeds._signature("train", "00001"))
             frame.radar_path.write_bytes(b"changed radar file contents")
             fresh = Stage1StaticGeometryCache(root / "cache", config, [frame])
             self.assertNotEqual(before, fresh._signature("train", "00001"))

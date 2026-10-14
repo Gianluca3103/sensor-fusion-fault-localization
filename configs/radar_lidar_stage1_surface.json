@@ -15,6 +15,7 @@
   "bottleneck_cross_attention_only": true,
   "bottleneck_support_only": true,
   "bottleneck_dropout": 0.1,
+  "support_seed_mode": "radar_s2",
   "support_stride": 2,
   "support_eval_threshold": 0.25,
   "support_loss_weight": 1.0,

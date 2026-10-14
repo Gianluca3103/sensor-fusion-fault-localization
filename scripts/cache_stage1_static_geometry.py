@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportStage1
+from models.radar_lidar_stage1.bottleneck_support import BottleneckSupportStage1, interface_version
 from models.radar_lidar_stage1.data import VoDStage1Dataset, collate_stage1
 from models.radar_lidar_stage1.static_geometry_cache import Stage1StaticGeometryCache
 from models.radar_lidar_stage1.train import config_from_dict
@@ -77,9 +77,9 @@ def main() -> None:
         parser.error("CUDA was requested but is unavailable")
 
     checkpoint = torch.load(args.stage1_checkpoint, map_location="cpu", weights_only=False)
-    if checkpoint.get("stage1_interface") != "bottleneck_support_v1":
-        parser.error("checkpoint is not a bottleneck-support Stage-I checkpoint")
     config = config_from_dict(checkpoint["config"])
+    if checkpoint.get("stage1_interface") != interface_version(config):
+        parser.error("checkpoint is not a matching bottleneck-support Stage-I checkpoint")
     radar_variant = checkpoint.get("data", {}).get("radar_variant")
     if not radar_variant:
         parser.error("checkpoint has no radar variant provenance")

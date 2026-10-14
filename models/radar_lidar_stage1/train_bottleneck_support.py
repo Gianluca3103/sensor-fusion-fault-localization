@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .bottleneck_support import BottleneckSupportStage1
+from .bottleneck_support import BottleneckSupportStage1, interface_version
 from .data import VoDStage1Dataset, collate_stage1
 from .static_geometry_cache import Stage1StaticGeometryCache
 
@@ -23,7 +23,7 @@ def _checkpoint(path, model, optimizer, scheduler, epoch, step, validation, data
     torch.save({"config": model.config.as_dict(), "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "epoch": epoch, "step": step, "validation": validation,
-                "data": data, "stage1_interface": "bottleneck_support_v1"}, path)
+                "data": data, "stage1_interface": interface_version(model.config)}, path)
 
 
 def train(args, config):
@@ -60,7 +60,7 @@ def train(args, config):
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=args.device, weights_only=False)
         from .train import config_from_dict
-        if (checkpoint.get("stage1_interface") != "bottleneck_support_v1"
+        if (checkpoint.get("stage1_interface") != interface_version(config)
                 or config_from_dict(checkpoint["config"]) != config):
             raise ValueError("Only a matching bottleneck-support checkpoint can be resumed")
         if checkpoint.get("data", {}).get("radar_variant") != args.radar_variant:
@@ -75,7 +75,7 @@ def train(args, config):
         selected_path = args.output_root / "best_selected.ckpt"
         selected = (torch.load(selected_path, map_location="cpu", weights_only=False)
                     if selected_path.is_file() else checkpoint)
-        if selected.get("stage1_interface") != "bottleneck_support_v1":
+        if selected.get("stage1_interface") != interface_version(config):
             raise ValueError("Existing best checkpoint is from another Stage-I interface")
         best = selected.get("validation", {}).get("support_f1", float("-inf"))
     provenance = {"vod_root": str(args.vod_root.resolve()), "radar_variant": args.radar_variant,

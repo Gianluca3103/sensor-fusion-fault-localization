@@ -15,7 +15,7 @@ class Stage2Config:
     max_neighbors: int = 8
     confidence_threshold: float = 0.25
     candidate_method: str = "edge_aware"
-    expansion_zyx: tuple[int, int, int] = (1, 1, 1)
+    expansion_zyx: tuple[int, int, int] = (0, 0, 0)
     max_candidate_sites: int | None = None  # Optional legacy point-proposal limit; learned regions are uncapped.
     occupancy_threshold: float = 0.5
     occupancy_weight: float = 1.0
@@ -55,6 +55,7 @@ class Stage2Config:
         """Old checkpoints used ellipsoids; never reinterpret them as edge-aware."""
         values = dict(saved)
         values.setdefault("candidate_method", "ellipsoid")
+        values.setdefault("expansion_zyx", (1, 1, 1))
         for key in ("channels", "query_radii_m", "expansion_zyx"):
             if key in values:
                 values[key] = tuple(values[key])

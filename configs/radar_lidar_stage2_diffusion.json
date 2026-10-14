@@ -6,7 +6,7 @@
     "max_neighbors": 8,
     "confidence_threshold": 0.25,
     "candidate_method": "edge_aware",
-    "expansion_zyx": [1, 1, 1],
+    "expansion_zyx": [0, 0, 0],
     "occupancy_threshold": 0.5,
     "occupancy_weight": 1.0,
     "offset_weight": 1.0,

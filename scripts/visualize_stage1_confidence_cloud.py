@@ -280,7 +280,11 @@ def main() -> None:
             region_counts = domain.counts
             third_name = "Interpolated LiDAR support region"
             cloud_suffix = "_support_region.ply"
-            note = ("Stage I predicts a scored support field from radar-only bottleneck features. "
+            seed_description = ("Scores originate only at occupied stride-2 radar feature sites. "
+                                if model.config.support_seed_mode == "radar_s2" else
+                                "This historical checkpoint scores a dense stride-2 lattice under radar bottleneck cells. ")
+            note = ("Stage I predicts a scored support field from radar features. "
+                    + seed_description +
                     "This panel shows its edge-aware interpolation, not reconstructed LiDAR points.")
         elif output.surface is not None and output.surface.radii_xyz is not None:
             domain = make_candidates(output,model.config.grid,
@@ -346,6 +350,7 @@ def main() -> None:
             "clean_lidar_range_matched_points": len(lidar),
             "proposal_mode": region_counts["seed_source"] if region_counts else
                              ("predicted_lidar_surface" if getattr(output, "surface", None) is not None else "legacy_radar_voxel"),
+            "support_seed_mode": model.config.support_seed_mode if isinstance(output, BottleneckSupportOutput) else None,
             "support_region_counts": region_counts,
             "support_threshold": args.support_threshold if region_counts else None,
             "score_mean": float(confidence.mean()) if len(confidence) else None,

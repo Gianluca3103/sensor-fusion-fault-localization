@@ -8,7 +8,7 @@ The active [`radar_lidar_stage1_surface.json`](../../configs/radar_lidar_stage1_
 
 During training, the clean-LiDAR encoder and radar encoder are compared **only at the stride-8 bottleneck**. Local attention over clean-LiDAR bottleneck features provides a teacher target, and a radar-only student learns to approximate that representation. Clean LiDAR also supplies support-field positives and measured free-space negatives; unobserved space is not labeled empty. The deployed model receives radar alone. No attention weights, clean features, surface positions, or radii cross its inference boundary.
 
-The support head decodes each bottleneck cell onto a stride-2 lattice, using an internal radar skip feature for spatial detail and learning a score per lattice cell. Stage II interpolates the scored field with the edge-aware method, pools only the bottleneck embeddings at the active fine cells, then combines them with faulty-LiDAR features. The previous Stage-II preprocessing cache and all Stage-I/II checkpoints must be rebuilt for this interface.
+The active support head scores only stride-2 cells containing observed radar returns, using their local features and parent bottleneck embedding. Sites activated solely by the sparse encoder's strided convolution do not become support seeds. The head does not create a dense lattice around each bottleneck cell. Stage II creates additional fine candidate cells only through edge-aware interpolation of those scored seeds, pools bottleneck embeddings at the resulting cells, then combines them with faulty-LiDAR features. This sparse seed policy can miss clean surfaces away from radar sites; evaluate clean coverage as well as candidate precision. Historical checkpoints retain their previous dense decoder through their saved configuration. Start a new Stage-I run with the active config, rebuild its static geometry cache, and rebuild Stage-II preprocessing/training before using the new seed policy.
 
 ```bash
 python -u -m models.radar_lidar_stage1.train \
@@ -22,15 +22,15 @@ python -u -m models.radar_lidar_stage1.train \
   --num-workers 2 --device cuda
 ```
 
-Validation reports support precision on measured clean/free cells, recall on clean cells inside the radar-derived lattice, unknown selected sites, and clean coverage before scoring. These metrics cannot prove object reconstruction quality; inspect held-out clouds and Stage-II results.
+Validation reports support precision on measured clean/free cells, recall on clean cells inside the radar-derived seed set, unknown selected sites, and clean coverage before scoring. These metrics cannot prove object reconstruction quality; inspect held-out clouds and Stage-II results.
 
 The trainer builds a per-frame cache under `output-root/static_geometry` as it
 visits frames. It stores fixed bottleneck neighbor indices and distances plus
-the support lattice's clean occupied and measured free-space labels. The first
+the support seed sites' clean occupied and measured free-space labels. The first
 epoch builds entries; later epochs and resumed runs reuse them even when batch
 order changes. Radar and LiDAR encoder features, attention weights, support
 scores and gradients are computed afresh every step. The cache is invalidated
-when the configuration or source radar/LiDAR/calibration file metadata changes.
+when the configuration, including the support seed mode, or source radar/LiDAR/calibration file metadata changes.
 Use `--static-cache-root /path/to/cache` to put it on another volume or
 `--no-static-cache` to compare with uncached execution. The progress bar and
 epoch metrics report reused and built frame counts. Loss statistics stay on
@@ -38,7 +38,7 @@ the GPU until periodic progress updates and the epoch summary.
 The active config uses 0.1 dropout in the training-only correspondence
 projection and the radar-only bottleneck and support heads. Dropout is disabled
 for validation and export. Changing dropout or optimizer weight decay does not
-change the fixed cache geometry, so a new run can use an existing cache with
+change the fixed cache geometry within the same support seed mode, so a new run can use an existing cache with
 `--static-cache-root`. Use a new output root and train from the start when
 comparing these regularization settings; a checkpoint from the prior config
 cannot be resumed into the changed model config.
@@ -58,7 +58,7 @@ The command resumes a partial build, validates each existing entry's
 configuration and input-file metadata, and prints train/validation counts.
 It does not update model weights. Training then uses the same cache root.
 
-Visualize a held-out frame with `python -m scripts.visualize_stage1_confidence_cloud --vod-root /path/to/view_of_delft_PUBLIC --checkpoint /path/to/stage1_bottleneck_support/best_selected.ckpt --split val --frame-id 08236 --output-root /path/to/stage1_views --device cuda`. The viewer writes both the raw scored support lattice and its interpolated Stage-II region as uncapped PLY files. For visual comparison, clean LiDAR is limited to the farthest observed aligned radar return in each frame (3D radial distance from the LiDAR origin); the original LiDAR count and selected radius are recorded in the JSON. The unrestricted scan is retained as a separate PLY for audit. This does not change model input or supervision. Use `--lidar-range full` to display all clean LiDAR returns. Existing PLY views can be rendered with the same range match, without rerunning the model, using `python -m scripts.rerender_stage1_clouds --input-root /path/to/stage1_views --output-root /path/to/range_matched_views --frame-id 08236`.
+Visualize a held-out frame with `python -m scripts.visualize_stage1_confidence_cloud --vod-root /path/to/view_of_delft_PUBLIC --checkpoint /path/to/stage1_bottleneck_support/best_selected.ckpt --split val --frame-id 08236 --output-root /path/to/stage1_views --device cuda`. The viewer writes both the raw scored support seeds and their edge-aware interpolated Stage-II region as uncapped PLY files. For visual comparison, clean LiDAR is limited to the farthest observed aligned radar return in each frame (3D radial distance from the LiDAR origin); the original LiDAR count and selected radius are recorded in the JSON. The unrestricted scan is retained as a separate PLY for audit. This does not change model input or supervision. Use `--lidar-range full` to display all clean LiDAR returns. Existing PLY views can be rendered with the same range match, without rerunning the model, using `python -m scripts.rerender_stage1_clouds --input-root /path/to/stage1_views --output-root /path/to/range_matched_views --frame-id 08236`.
 
 ### Historical surface-proposal interface (older checkpoints only)
 
