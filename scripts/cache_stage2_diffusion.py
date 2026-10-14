@@ -20,6 +20,7 @@ from models.radar_lidar_stage2_diffusion.cache import (
     prepare_frame, provenance, save_frame,
 )
 from models.radar_lidar_stage2_diffusion.config import DiffusionConfig
+from models.radar_lidar_stage2_bottleneck.config import BottleneckDiffusionConfig
 from models.radar_lidar_stage2_residual.data import PairedFaultDataset, collate_paired
 from scripts.visualize_stage1_confidence_cloud import load_encoder
 
@@ -34,9 +35,12 @@ def _cached(path: Path, frame_id: str) -> bool:
     if not path.exists():
         return False
     with np.load(path, allow_pickle=False) as data:
-        if (str(data["frame_id"].item()) != frame_id or
-                "neighbor_index_3" not in data or "source_center_3" not in data or
-                "neighbor_distance_3" in data):
+        source_count = int(data["source_count"])
+        final = source_count - 1
+        if (str(data["frame_id"].item()) != frame_id or source_count not in (1, 4)
+                or f"neighbor_index_{final}" not in data
+                or f"source_center_{final}" not in data
+                or f"neighbor_distance_{final}" in data):
             raise ValueError(f"Incomplete or mismatched cache entry: {path}")
     return True
 
@@ -53,7 +57,10 @@ def main() -> None:
     parser.add_argument("--compression", choices=("fast", "none"), default="fast")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    config = DiffusionConfig.from_json(args.config)
+    values = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    config = (BottleneckDiffusionConfig.from_dict(values)
+              if values.get("architecture") == "bottleneck_diffusion_v2"
+              else DiffusionConfig.from_json(args.config))
     stage1, saved = load_encoder(Path(args.stage1_checkpoint), args.device)
     stage1.eval()
     if not (stage1.config.surface_region_enabled or stage1.config.bottleneck_support_only):

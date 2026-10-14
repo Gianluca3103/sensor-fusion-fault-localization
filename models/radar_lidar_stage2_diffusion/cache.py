@@ -97,6 +97,7 @@ def prepare_frame(evidence, grid: VoxelGrid, batch: dict, config, *,
     clean = target.clean
     result = {
         "frame_id": np.asarray(batch["frame_id"][0]),
+        "fault_kind": np.asarray(batch.get("fault_kind", ["unknown"])[0]),
         "coordinates": _array(domain.coordinates, np.int32),
         "confidence": _array(domain.confidence, np.float32),
         "counts_json": np.asarray(json.dumps(domain.counts)),
@@ -202,11 +203,14 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
     source_counts = {int(row["source_count"]) for row in rows}
     if len(source_counts) != 1:
         raise ValueError("Mixed Stage-I interfaces in the preprocessing cache")
-    sources, source_centers, indices = [], [], []
+    sources, source_centers, source_batches, indices = [], [], [], []
     for scale in range(source_counts.pop()):
         source_rows = [row[f"source_{scale}"] for row in rows]
         sources.append(_cat(rows, f"source_{scale}", np.float32))
         source_centers.append(_cat(rows, f"source_center_{scale}", np.float32))
+        source_batches.append(torch.cat([
+            torch.full((len(source),), batch_id, dtype=torch.long)
+            for batch_id, source in enumerate(source_rows)]))
         index_rows = []
         source_offset = 0
         for row, source in zip(rows, source_rows):
@@ -239,6 +243,7 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
         "point_centroid_errors": _cat(rows, "point_centroid_errors", np.float32),
         "sources": sources,
         "source_centers": source_centers,
+        "source_batches": source_batches,
         "indices": indices,
     }
     def padded(key: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -255,6 +260,9 @@ def collate_cached(rows: list[dict], grid: VoxelGrid) -> dict:
     clean, clean_valid = padded("clean_lidar")
     faulty, faulty_valid = padded("faulty_lidar")
     return {"cache": cache, "frame_id": [str(row["frame_id"].item()) for row in rows],
+            "fault_kind": [str(row.get("fault_kind", "unknown").item())
+                           if isinstance(row.get("fault_kind"), np.ndarray) else "unknown"
+                           for row in rows],
             "clean_lidar": clean, "clean_lidar_valid": clean_valid,
             "faulty_lidar": faulty, "faulty_lidar_valid": faulty_valid}
 
