@@ -14,7 +14,7 @@ def main():
         raise RuntimeError("The MinkowskiEngine decoder smoke test needs CUDA")
     device = "cuda"
     feature = torch.randn(1, 64, device=device, requires_grad=True)
-    coarse = torch.tensor([[0, 0, 64, 64]], device=device)
+    coarse = torch.tensor([[0, 0, 32, 32]], device=device)
     sites = SparseSites(coarse, feature, GRID.scale_shape(8), 8)
     decoder = RawSparseConfidenceDecoder(StudentConfig()).to(device)
     output = decoder(sites)
