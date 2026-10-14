@@ -1,19 +1,22 @@
 # Exact-PFE cross-modal teacher and radar-only student
 
 This version is separate from `radar_lidar_stage1`, `radar_lidar_stage2`, and
-their existing checkpoints. The exact `Downloads/encoder.py` and its matching
-`Downloads/config.py` are copied unchanged into `vendor/`. The original
+their existing checkpoints. The exact `Downloads/encoder.py` is copied unchanged
+into `vendor/`. Its matching `Downloads/config.py` changes only the requested
+voxel size; the encoder architecture and 64-channel bottleneck are unchanged. The original
 `PFE_Engine.forward` converts its output to a dense volume. The wrapper in
 `encoder.py` invokes the original voxelizer, input MLP, and sparse backbone
 and retains the stride-8 sparse result. It does not alter the vendored source.
 
-The original encoder uses 64 bottleneck channels and a 0.1 × 0.1 × 0.5 m base
-voxel, so the physical stride-8 cell is 0.8 × 0.8 × 4 m. The requested
-128-channel, 0.2 × 0.2 × 0.25 m specification describes a different encoder;
-this version follows the explicit decision to use the exact Downloads file.
+The encoder uses 64 bottleneck channels and now uses a 0.2 × 0.2 × 0.25 m base
+voxel, so the physical stride-8 cell is 1.6 × 1.6 × 2 m. The unchanged
+point-cloud range yields a fine grid of 512 × 512 × 16 cells in XYZ order and
+a stride-8 grid of 64 × 64 × 2 cells. Existing checkpoints and cached geometry
+from the earlier 0.1 × 0.1 × 0.5 m grid must not be resumed for this grid.
 Four attention heads therefore have 16 channels each. The vendor sources have
 SHA256 values `e9090b89276322873b2027a329bd706a7661ea65e6f093ac1419c3ad1a016b89`
-and `7e957a330b6004a1b96feb04cc4f658845564fbeda8d74c5f6fb922ea9272445`.
+and `5a83fe1b302653796bdee062daeb72ff14bbd2d8795c4e1f72f8c0ea33b07023` for
+the voxel-size-adjusted config.
 
 ## Phases and parameters
 
@@ -26,13 +29,19 @@ and `7e957a330b6004a1b96feb04cc4f658845564fbeda8d74c5f6fb922ea9272445`.
 
 No pretrained encoder weights were available for the exact Downloads encoder.
 Phase 0 therefore trains two independent copies. Its **chosen new pretraining
-objective** masks complete stride-8 cells at the input and predicts the
-distribution of observed points over their 512 fine child cells. Cross entropy
-is evaluated only on held-out cells. This learns observed geometry within each
-modality; it does not assert that unmeasured cells are empty and does not itself
-learn radar–LiDAR correspondence. The 512-bin head is discarded. `best_encoder.pth`
+objective** masks input features in complete stride-8 cells and predicts the
+distribution of observed points over their 512 fine child cells. It does not
+assert that unmeasured cells are empty and does not itself learn radar–LiDAR
+correspondence. Sparse input coordinates remain present during masking, so this
+is a feature-masking objective rather than a fully hidden geometry task. The
+current pretrainer also applies its mask helper to already downsampled output
+coordinates, dividing those coordinates by eight a second time. Consequently,
+the sites selected for loss do not consistently match the feature-masked sites.
+This requires a separate correction before Phase 0 learning curves can validate
+the intended objective; the voxel-size-only change here does not alter it. The
+512-bin head is discarded. `best_encoder.pth`
 contains the original `PFE_Engine` state dictionary directly and is loaded
-strictly by Phase 1. The original source and architecture remain unchanged.
+strictly by Phase 1. The original encoder source and architecture remain unchanged.
 
 The PFE voxelizer uses XYZ mean and log point density. Although the input is the
 aligned 20-frame radar stack, this exact encoder does **not** use Doppler, RCS,
@@ -72,7 +81,7 @@ object Recall@1/3/5. The denominator is the count of these eligible queries;
 candidate coverage is eligible divided by all reliably labeled queries.
 Unannotated objects are never verified negatives. Positive/negative cosine
 and their gap use the object-prototype contrastive pairs. Fusion MAE uses the
-same normalized frozen reference as the fusion loss. The 4 m bottleneck height
+same normalized frozen reference as the fusion loss. The 2 m bottleneck height
 is coarse and limits object-level separation.
 
 ### Student
@@ -144,7 +153,7 @@ so each phase can be inspected before starting the next.
 BASE=/mnt/3D10B36523559581/Gianluca
 VOD=/mnt/3D10B36523559581/View-of-Delft/view_of_delft_detection_PUBLIC/view_of_delft_PUBLIC
 PY="$BASE/Sensor-Fusion/.venv_model_v2/bin/python"
-OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_raw64_v1
+OUT=/media/arrubuntu20/EA0A117F0A114A49/sensor_fusion_outputs/crossmodal_raw64_voxel_020_020_025
 export PYTHONPATH="$PWD"
 export LD_LIBRARY_PATH="$BASE/stage2-openblas-runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
@@ -203,22 +212,24 @@ Evaluate and export after training:
   --student-checkpoint "$OUT/student/best_radar_iou.ckpt"
 ```
 
-Each run writes `metrics.jsonl`, TensorBoard events, plots, `last.ckpt`, and
+Each run writes `metrics.jsonl`, plots, `last.ckpt`, and
 its full-validation selected checkpoints. The student export is a `.pt` dict
 with `conditioning_features` `[N,64]`, `conditioning_coords` `[N,4]`,
 `confidence_logits` and `confidence_probabilities` `[M,1]`, `confidence_coords`
 `[M,4]`, `grid_metadata`, and `interface_version`. Coordinates are
 `[batch,z,y,x]`; conditioning coordinates are stride-8 cell indices, while
-confidence coordinates are stride-1 fine indices. The output is raw and ready
+confidence coordinates are stride-1 fine indices. TensorBoard events are written
+only when that optional dependency is installed and logging is enabled. The output is raw and ready
 for future Stage II conditioning. Existing Stage II diffusion checkpoints are
 **not** compatible with this new 64D/stride-8 interface without a new adapter.
 
 The Windows workspace has no trained exact-PFE checkpoint or sparse CUDA
-backend. On the professor's RTX 4090, one-frame GPU smoke tests passed for
+backend. Before this voxel-size change, on the professor's RTX 4090, one-frame GPU smoke tests passed for
 both independent encoder pretrains, teacher training, student training,
 checkpoint reload/evaluation, and raw radar-only export. The sparse decoder
 expanded one stride-8 site to 512 fine sites and backpropagated finite
 gradients. These runs verify integration only. Full training and held-out
 quality assessment remain necessary. The one-frame smoke student represented
-11.7% of clean returns inside the fixed PFE grid; that candidate-coverage
-ceiling cannot improve through confidence training alone for that frame.
+11.7% of clean returns inside the previous fixed PFE grid; that candidate-coverage
+ceiling cannot improve through confidence training alone for that frame. Rerun
+the GPU smoke test and all training phases with the new voxel size.

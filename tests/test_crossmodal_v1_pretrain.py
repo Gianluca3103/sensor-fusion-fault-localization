@@ -19,9 +19,9 @@ def test_mask_is_shared_by_all_fine_voxels_of_a_bottleneck_site():
 
 
 def test_observed_child_loss_uses_only_held_out_sites():
-    sites = SparseSites(torch.tensor([[0, 0, 64, 64], [0, 0, 64, 65]]),
+    sites = SparseSites(torch.tensor([[0, 0, 32, 32], [0, 0, 32, 33]]),
                         torch.zeros(2, 64), GRID.scale_shape(8), 8)
-    points = torch.tensor([[[0.05, 0.05, -1.95], [0.85, 0.05, -1.95]]])
+    points = torch.tensor([[[0.05, 0.05, -1.95], [1.65, 0.05, -1.95]]])
     counts = observed_child_distribution(sites, points,
                                          torch.ones((1, 2), dtype=torch.bool))
     assert counts.sum().item() == 2

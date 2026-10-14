@@ -20,7 +20,7 @@ from models.radar_lidar_stage1.sparse import SparseSites, encode_keys
 
 
 VENDOR = Path(__file__).parent / "vendor"
-GRID = VoxelGrid((-51.2, -51.2, -2.0), (51.2, 51.2, 2.0), (0.1, 0.1, 0.5))
+GRID = VoxelGrid((-51.2, -51.2, -2.0), (51.2, 51.2, 2.0), (0.2, 0.2, 0.25))
 BOTTLENECK_CHANNELS = 64
 
 

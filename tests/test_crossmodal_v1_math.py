@@ -111,7 +111,7 @@ def test_oriented_box_membership_and_ambiguous_voxel_exclusion(tmp_path):
                                   label, torch.eye(4).numpy())
     assert ids.tolist() == [0, -1]
     assert names[0] == "Car"
-    sparse = sites([[0, 0, 64, 64]], torch.zeros(1, 64), 8)
+    sparse = sites([[0, 1, 32, 32]], torch.zeros(1, 64), 8)
     # Two near-center returns share the same original coarse cell, but one is
     # unannotated; a 0.8 dominance rule rejects the mixed identity.
     points = torch.tensor([[[0., 0., 0., 1.], [0.6, 0., 0., 1.]]])
