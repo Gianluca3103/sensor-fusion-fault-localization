@@ -35,7 +35,10 @@ def train(args, config):
         print("Bottleneck Stage I evaluates support and correspondence; object and corruption diagnostics are unavailable in this trainer.", flush=True)
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "config.json").write_text(json.dumps(config.as_dict(), indent=2), encoding="utf-8")
-    train_set = VoDStage1Dataset(args.vod_root, "train", radar_variant=args.radar_variant)
+    train_set = VoDStage1Dataset(args.vod_root, "train", radar_variant=args.radar_variant,
+                                 augmentation_config=args.online_augmentation,
+                                 augmentation_seed=args.augmentation_seed,
+                                 augmentation_grid=config.grid)
     val_set = VoDStage1Dataset(args.vod_root, "val", radar_variant=args.radar_variant)
     if args.train_limit:
         train_set.frames = train_set.frames[:args.train_limit]
@@ -65,6 +68,13 @@ def train(args, config):
             raise ValueError("Only a matching bottleneck-support checkpoint can be resumed")
         if checkpoint.get("data", {}).get("radar_variant") != args.radar_variant:
             raise ValueError("Resume radar variant differs from the original training data")
+        from .online_augmentation import GeometricAugmentationConfig
+        saved_aug = checkpoint.get("data", {}).get("online_augmentation",
+                                                     GeometricAugmentationConfig().to_dict())
+        if (saved_aug != args.online_augmentation.to_dict() or
+                (args.online_augmentation.enabled and
+                 checkpoint.get("data", {}).get("augmentation_seed", 0) != args.augmentation_seed)):
+            raise ValueError("Resume online augmentation differs from original training data")
         saved_weight_decay = checkpoint["optimizer"]["param_groups"][0]["weight_decay"]
         if not math.isclose(saved_weight_decay, args.weight_decay, rel_tol=0, abs_tol=1e-12):
             raise ValueError("Resume weight decay differs from the original optimizer")
@@ -82,11 +92,17 @@ def train(args, config):
                   "train_frames": len(train_set), "val_frames": len(val_set),
                   "learning_rate": args.learning_rate, "weight_decay": args.weight_decay,
                   "batch_size": args.batch_size,
-                  "grad_accum_steps": args.grad_accum_steps}
+                  "grad_accum_steps": args.grad_accum_steps,
+                  "online_augmentation": args.online_augmentation.to_dict(),
+                  "augmentation_seed": args.augmentation_seed}
     print(f"Bottleneck Stage I: train={len(train_set)} val={len(val_set)} "
           f"support stride={config.support_stride} static cache="
-          f"{static_cache.root if static_cache is not None else 'off'}", flush=True)
+          f"{static_cache.root if static_cache is not None else 'off'} "
+          f"online augmentation={args.online_augmentation.enabled}"
+          + (" (validation cache only)" if args.online_augmentation.enabled and static_cache is not None else ""),
+          flush=True)
     for epoch in range(start_epoch, args.epochs + 1):
+        train_set.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_names = ("loss/total", "loss/corr", "loss/distill", "loss/support")
@@ -99,7 +115,8 @@ def train(args, config):
             loss, diagnostics = model.forward_train(batch["radar"], batch["radar_valid"],
                                           batch["clean_lidar"], batch["clean_lidar_valid"],
                                           defer_diagnostics=True, trusted_inputs=True,
-                                          static_cache=static_cache, frame_ids=batch["frame_id"],
+                                          static_cache=(None if args.online_augmentation.enabled else static_cache),
+                                          frame_ids=batch["frame_id"],
                                           split="train")
             group_start = batch_index - batch_index % args.grad_accum_steps
             group_size = min(args.grad_accum_steps, len(loaders["train"]) - group_start)

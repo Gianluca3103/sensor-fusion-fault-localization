@@ -19,6 +19,7 @@ from .data import VoDStage1Dataset, collate_stage1
 from .evaluate import evaluate_corruptions, evaluate_object_instances
 from .metrics import Stage1MetricAccumulator
 from .model import RadarLidarStage1, RadarOnlyEncoder
+from .online_augmentation import GeometricAugmentationConfig
 from Fault_Localization_Model.vod_dataset.vod_io import resolve_vod_public_root
 
 
@@ -224,6 +225,9 @@ def main() -> None:
     parser.add_argument("--learning-rate",type=float,default=2e-4)
     parser.add_argument("--weight-decay",type=float,default=1e-4)
     parser.add_argument("--num-workers",type=int,default=0)
+    parser.add_argument("--online-augmentation-config",type=Path,
+                        help="JSON geometry augmentation for paired training radar and clean LiDAR")
+    parser.add_argument("--augmentation-seed",type=int,default=0)
     parser.add_argument("--static-cache-root",type=Path,
                         help="Bottleneck Stage-I fixed geometry cache; defaults to output-root/static_geometry")
     parser.add_argument("--no-static-cache",action="store_true",
@@ -243,6 +247,9 @@ def main() -> None:
         parser.error("epochs, batch size, accumulation and validation interval must be positive")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error("weight decay must be finite and nonnegative")
+    args.online_augmentation = GeometricAugmentationConfig.from_dict(
+        json.loads(args.online_augmentation_config.read_text(encoding="utf-8"))
+        if args.online_augmentation_config else None)
     config=config_from_dict(json.loads(args.config.read_text())) if args.config else Stage1Config()
     if args.selection_metric is None:
         args.selection_metric = "support_f1" if config.bottleneck_support_only else "corr_r1"
@@ -263,7 +270,9 @@ def main() -> None:
         except ImportError as exc:
             raise RuntimeError("--tensorboard requires: python -m pip install tensorboard") from exc
         writer=SummaryWriter(log_dir=str(args.output_root/"tensorboard"))
-    train=VoDStage1Dataset(args.vod_root,"train",radar_variant=args.radar_variant)
+    train=VoDStage1Dataset(args.vod_root,"train",radar_variant=args.radar_variant,
+                           augmentation_config=args.online_augmentation,
+                           augmentation_seed=args.augmentation_seed,augmentation_grid=config.grid)
     val=VoDStage1Dataset(args.vod_root,"val",radar_variant=args.radar_variant)
     mismatch_dataset=VoDStage1Dataset(args.vod_root,"val",radar_variant=args.radar_variant) if args.corruption_every else None
     if args.train_limit: train.frames=train.frames[:args.train_limit]
@@ -282,6 +291,10 @@ def main() -> None:
         old_variant=checkpoint.get("data",{}).get("radar_variant")
         if old_variant and old_variant!=args.radar_variant:
             raise ValueError("Resume radar variant differs from original training data")
+        old_aug=checkpoint.get("data",{}).get("online_augmentation",GeometricAugmentationConfig().to_dict())
+        if old_aug!=args.online_augmentation.to_dict() or (args.online_augmentation.enabled and
+                checkpoint.get("data",{}).get("augmentation_seed",0)!=args.augmentation_seed):
+            raise ValueError("Resume online augmentation differs from original training data")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -296,6 +309,7 @@ def main() -> None:
         model.radar_only.confidence_trained=bool(checkpoint.get("confidence_trained",False))
     interactive_progress=sys.stderr.isatty()
     for epoch in range(start_epoch,args.epochs+1):
+        train.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         totals={};train_count=0
@@ -387,7 +401,10 @@ def main() -> None:
         record={"epoch":epoch,"step":step,"train":averaged,"sparse_diagnostics":diagnostic_mean,"validation":validation}
         with (args.output_root/"metrics.jsonl").open("a",encoding="utf-8") as file:
             file.write(json.dumps(record)+"\n")
-        provenance={"vod_root":str(args.vod_root.resolve()),"radar_variant":args.radar_variant,"train_frames":len(train),"val_frames":len(val)}
+        provenance={"vod_root":str(args.vod_root.resolve()),"radar_variant":args.radar_variant,
+                    "train_frames":len(train),"val_frames":len(val),
+                    "online_augmentation":args.online_augmentation.to_dict(),
+                    "augmentation_seed":args.augmentation_seed}
         if validation:
             for label,metric_name in (("corr","corr_r1"),("geom","geom_f1_0.2m"),("selected",args.selection_metric)):
                 score=_selection_value(validation["metrics"],metric_name)
