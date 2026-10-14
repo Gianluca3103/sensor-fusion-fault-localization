@@ -18,7 +18,7 @@ from models.radar_lidar_stage1.sparse import SparseSites
 from models.radar_lidar_stage1.train import config_from_dict, export_radar_only, load_radar_only
 from models.radar_lidar_stage2.candidate_domain import make_candidates
 from scripts.rerender_stage1_clouds import read_ply
-from scripts.visualize_stage1_confidence_cloud import save_viewer, write_ply
+from scripts.visualize_stage1_confidence_cloud import match_lidar_range_to_radar, save_viewer, write_ply
 
 
 GRID = VoxelGrid((0.,0.,0.), (8.,8.,8.), (.5,.5,.5))
@@ -173,6 +173,14 @@ class SurfaceStage1Tests(unittest.TestCase):
             write_ply(ply,xyz)
             loaded,_ = read_ply(ply)
             np.testing.assert_array_equal(loaded,xyz)
+
+    def test_lidar_range_matches_farthest_aligned_radar_return(self):
+        radar = np.array([[3., 4., 0., 10.], [0., 0., 2., 20.]], np.float32)
+        lidar = np.array([[0., 0., 5., 1.], [0., 0., 5.01, 2.],
+                          [1., 1., 1., 3.]], np.float32)
+        matched, distance = match_lidar_range_to_radar(radar, lidar)
+        self.assertEqual(distance, 5.0)
+        np.testing.assert_array_equal(matched, lidar[[0, 2]])
 
 
 if __name__ == "__main__":

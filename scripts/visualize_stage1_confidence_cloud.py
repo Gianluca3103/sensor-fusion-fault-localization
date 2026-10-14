@@ -1,4 +1,4 @@
-"""Compare aligned VoD radar, full clean LiDAR, and Stage-I output in 3D.
+"""Compare aligned VoD radar, range-matched clean LiDAR, and Stage-I output in 3D.
 
 New checkpoints show radar-only proposed LiDAR surfaces; legacy checkpoints
 show scores at radar-derived S1 voxel centers. Clean LiDAR is visual only.
@@ -79,6 +79,21 @@ def display_subset(xyz: np.ndarray, maximum: int | None, limits: tuple[float, ..
     return xyz[indices], None if values is None else values[indices], in_view
 
 
+def match_lidar_range_to_radar(radar: np.ndarray, lidar: np.ndarray) -> tuple[np.ndarray, float]:
+    """Keep clean returns within the farthest observed radar return in LiDAR coordinates.
+
+    Both clouds are already aligned. This is a radial visualization filter,
+    not a radar visibility mask or a training target change.
+    """
+    if radar.ndim != 2 or radar.shape[1] < 3 or lidar.ndim != 2 or lidar.shape[1] < 3:
+        raise ValueError("Radar and LiDAR clouds must have XYZ columns")
+    if not np.isfinite(radar[:, :3]).all() or not np.isfinite(lidar[:, :3]).all():
+        raise ValueError("Radar and LiDAR coordinates must be finite")
+    maximum = float(np.linalg.norm(radar[:, :3].astype(np.float64), axis=1).max()) if len(radar) else 0.0
+    distance = np.linalg.norm(lidar[:, :3].astype(np.float64), axis=1)
+    return lidar[distance <= maximum], maximum
+
+
 def save_viewer(path: Path, *, frame_id: str, epoch: int | None, radar: np.ndarray,
                 lidar: np.ndarray, sites: np.ndarray, confidence: np.ndarray,
                 limits: tuple[float, ...], max_points: int | None, trained: bool,
@@ -134,7 +149,7 @@ h2{font-size:15px;margin:0 0 5px}canvas{width:100%;height:70vh;max-height:780px;
 <label><input id="overlay-compare" type="checkbox"> Overlay <span id="overlay-name"></span> on third panel</label>
 <button id="zoom-in">Zoom in</button><button id="zoom-out">Zoom out</button><button id="reset">Reset view</button></div>
 <div id="panels" class="panels"></div><div class="legend"><span id="legend-name"></span> 0 <span class="ramp"></span> 1 · colors show a model score, not measured surface accuracy</div>
-<p id="notice"></p><p>The confidence slider filters model points only. Raw radar is hidden in the third panel by default. All points within the shared display crop are shown by default. PLY files retain the full clouds.</p>
+<p id="notice"></p><p>The confidence slider filters model points only. Raw radar is hidden in the third panel by default. All points within the shared display crop are shown by default. PLY files retain all points in each exported cloud.</p>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 (() => {
@@ -220,6 +235,8 @@ def main() -> None:
                         help="Optional display limit when explicitly requested; default shows all points")
     parser.add_argument("--support-threshold", type=float, default=0.25,
                         help="Proposal score threshold used to create the support region")
+    parser.add_argument("--lidar-range", choices=("radar", "full"), default="radar",
+                        help="By default show/export clean LiDAR only through the farthest aligned radar return; full disables this filter")
     parser.add_argument("--x-min", type=float, default=0.0)
     parser.add_argument("--x-max", type=float, default=80.0)
     parser.add_argument("--y-min", type=float, default=-40.0)
@@ -245,7 +262,12 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     for sample in dataset:
         radar = sample["radar"].numpy()
-        lidar = sample["clean_lidar"].numpy()
+        lidar_full = sample["clean_lidar"].numpy()
+        lidar = lidar_full
+        lidar_original_count = len(lidar_full)
+        radar_range_m = None
+        if args.lidar_range == "radar":
+            lidar, radar_range_m = match_lidar_range_to_radar(radar, lidar)
         points = sample["radar"].unsqueeze(0).to(args.device)
         valid = torch.ones(points.shape[:2], dtype=torch.bool, device=args.device)
         output = model(points, valid)
@@ -288,6 +310,9 @@ def main() -> None:
         prefix = args.output_root / f"{sample['frame_id']}_stage1"
         write_ply(prefix.with_name(prefix.name + "_radar.ply"), radar[:, :3])
         write_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"), lidar[:, :3])
+        if args.lidar_range == "radar":
+            write_ply(prefix.with_name(prefix.name + "_clean_lidar_unrestricted.ply"),
+                      lidar_full[:, :3])
         write_ply(prefix.with_name(prefix.name + cloud_suffix), sites, confidence)
         if isinstance(output, BottleneckSupportOutput):
             write_ply(prefix.with_name(prefix.name + "_raw_support_field.ply"),
@@ -305,6 +330,9 @@ def main() -> None:
                              calibrated=False, third_name=third_name,
                              description="Drag to rotate · wheel or pinch to zoom · Shift-drag to pan. "
                              "All panels share one metric camera. " + note +
+                             (f" Clean LiDAR is shown through the farthest aligned radar return "
+                              f"({radar_range_m:.1f} m radial distance)." if radar_range_m is not None else
+                              " Clean LiDAR is shown at full range.") +
                              " Clean LiDAR is never an inference input.",
                              notice=note+" Scores are not calibrated probabilities of a correct surface.")
         prefix.with_suffix(".json").write_text(json.dumps({
@@ -312,6 +340,10 @@ def main() -> None:
             "checkpoint": str(args.checkpoint.resolve()), "epoch": saved.get("epoch"),
             "radar_variant": variant, "confidence_trained": model.confidence_trained,
             "confidence_calibrated": False,
+            "lidar_range_mode": args.lidar_range,
+            "radar_max_observed_range_m": radar_range_m,
+            "clean_lidar_original_points": lidar_original_count,
+            "clean_lidar_range_matched_points": len(lidar),
             "proposal_mode": region_counts["seed_source"] if region_counts else
                              ("predicted_lidar_surface" if getattr(output, "surface", None) is not None else "legacy_radar_voxel"),
             "support_region_counts": region_counts,

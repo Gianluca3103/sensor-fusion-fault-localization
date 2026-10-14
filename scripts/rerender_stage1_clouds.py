@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.visualize_stage1_confidence_cloud import save_viewer
+from scripts.visualize_stage1_confidence_cloud import match_lidar_range_to_radar, save_viewer
 
 
 def read_ply(path: Path, *, scored: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
@@ -44,6 +44,8 @@ def main() -> None:
     parser.add_argument("--frame-id", nargs="+", required=True)
     parser.add_argument("--max-plot-points", type=int,
                         help="Optional display limit when explicitly requested; default shows all points")
+    parser.add_argument("--lidar-range", choices=("radar", "full"), default="radar",
+                        help="By default show clean LiDAR only through the farthest aligned radar return")
     args = parser.parse_args()
     if args.max_plot_points is not None and args.max_plot_points < 1:
         parser.error("--max-plot-points must be positive")
@@ -54,7 +56,12 @@ def main() -> None:
         metadata_path = prefix.with_suffix(".json")
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
         radar, _ = read_ply(prefix.with_name(prefix.name + "_radar.ply"))
-        clean, _ = read_ply(prefix.with_name(prefix.name + "_clean_lidar.ply"))
+        unrestricted = prefix.with_name(prefix.name + "_clean_lidar_unrestricted.ply")
+        clean, _ = read_ply(unrestricted if unrestricted.exists() else
+                            prefix.with_name(prefix.name + "_clean_lidar.ply"))
+        radar_range_m = None
+        if args.lidar_range == "radar":
+            clean, radar_range_m = match_lidar_range_to_radar(radar, clean)
         region_path = prefix.with_name(prefix.name + "_support_region.ply")
         surface_path = prefix.with_name(prefix.name + "_surface_proposals.ply")
         legacy_path = prefix.with_name(prefix.name + "_confidence.ply")
@@ -77,7 +84,10 @@ def main() -> None:
                              +( "The third panel shows active fine voxels in learned support patches. "
                                 if region else ("The third panel shows radar-only predicted LiDAR surface locations. "
                                 if surface else "The third panel shows scores at occupied radar voxels, not LiDAR surfaces. "))
-                             +"Clean LiDAR is displayed for comparison only.",
+                             +(f"Clean LiDAR is shown through the farthest aligned radar return "
+                               f"({radar_range_m:.1f} m radial distance). " if radar_range_m is not None
+                               else "Clean LiDAR is shown at full range. ")+
+                             "Clean LiDAR is displayed for comparison only.",
                              notice=("Support regions are predicted from radar only, and are not confirmed LiDAR returns. "
                                      if region else ("Proposed LiDAR locations are predicted from radar only. "
                                      if surface else "Legacy confidence is scored at radar voxel centers. "))+
