@@ -29,7 +29,6 @@ def main():
         variant = saved["radar_variant"]
     else:
         student, saved = load_student(args.checkpoint, args.device)
-        from .train_teacher import load_teacher
         teacher, _ = load_teacher(saved["teacher_checkpoint"], args.device)
         variant = saved["radar_variant"]
     dataset = paired_dataset(args.vod_root, args.split, variant, limit=args.limit)
