@@ -67,10 +67,12 @@ def local_neighbors_xyz(query_xyz: torch.Tensor, query_batch: torch.Tensor,
 class LocalCorrespondence(nn.Module):
     """Train radar/LiDAR feature alignment with local geometric proxy labels."""
 
-    def __init__(self, radar_channels: int, lidar_channels: int, dim: int):
+    def __init__(self, radar_channels: int, lidar_channels: int, dim: int,
+                 dropout: float = 0.0):
         super().__init__()
         self.query = nn.Linear(radar_channels,dim,bias=False)
         self.key_value = nn.Linear(lidar_channels,dim,bias=False)
+        self.dropout = nn.Dropout(dropout)
     def forward(self, radar_z: SparseSites, lidar: SparseSites, grid: VoxelGrid, neighborhood: Neighborhood,
                 radius_m: float, positive_radius_m: float, temperature: float = 0.1,
                 negative_strategy: str = "nearest", num_negatives: int = 16,
@@ -81,8 +83,8 @@ class LocalCorrespondence(nn.Module):
         if n == 0:
             zero=radar_z.features.sum()*0
             return {"loss":zero,"valid_queries":0,"positive_queries":0,"contrastive_queries":0,"weights":zero.new_zeros((0,k)),"logits":zero.new_zeros((0,k)),"positive_mask":torch.zeros((0,k),dtype=torch.bool,device=zero.device)}
-        q=F.normalize(self.query(radar_z.features),dim=-1)
-        all_k=F.normalize(self.key_value(lidar.features),dim=-1)
+        q=F.normalize(self.query(self.dropout(radar_z.features)),dim=-1)
+        all_k=F.normalize(self.key_value(self.dropout(lidar.features)),dim=-1)
         if len(all_k)==0:
             zero=radar_z.features.sum()*0
             return {"loss":zero,"valid_queries":0,"positive_queries":0,"contrastive_queries":0,"weights":zero.new_zeros((n,k)),"logits":zero.new_full((n,k),-1e4),"positive_mask":torch.zeros((n,k),dtype=torch.bool,device=zero.device)}

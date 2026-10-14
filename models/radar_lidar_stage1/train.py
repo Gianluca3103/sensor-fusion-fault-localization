@@ -6,6 +6,7 @@ import argparse
 import csv
 from dataclasses import fields
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -218,6 +219,7 @@ def main() -> None:
     parser.add_argument("--batch-size",type=int,default=1)
     parser.add_argument("--grad-accum-steps",type=int,default=1)
     parser.add_argument("--learning-rate",type=float,default=2e-4)
+    parser.add_argument("--weight-decay",type=float,default=1e-4)
     parser.add_argument("--num-workers",type=int,default=0)
     parser.add_argument("--static-cache-root",type=Path,
                         help="Bottleneck Stage-I fixed geometry cache; defaults to output-root/static_geometry")
@@ -236,6 +238,8 @@ def main() -> None:
     args=parser.parse_args()
     if min(args.epochs,args.batch_size,args.grad_accum_steps,args.validate_every)<1 or args.corruption_every<0 or args.corruption_limit<1:
         parser.error("epochs, batch size, accumulation and validation interval must be positive")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("weight decay must be finite and nonnegative")
     config=config_from_dict(json.loads(args.config.read_text())) if args.config else Stage1Config()
     if args.selection_metric is None:
         args.selection_metric = "support_f1" if config.bottleneck_support_only else "corr_r1"
@@ -264,7 +268,7 @@ def main() -> None:
     train_loader=DataLoader(train,batch_size=args.batch_size,shuffle=True,num_workers=args.num_workers,collate_fn=collate_stage1,pin_memory=args.device.startswith("cuda"))
     val_loader=DataLoader(val,batch_size=1,shuffle=False,num_workers=args.num_workers,collate_fn=collate_stage1,pin_memory=args.device.startswith("cuda"))
     model=RadarLidarStage1(config).to(args.device)
-    optimizer=torch.optim.AdamW(model.parameters(),lr=args.learning_rate,weight_decay=1e-4)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=args.learning_rate,weight_decay=args.weight_decay)
     scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=args.epochs)
     start_epoch,step=1,0
     best_scores={}

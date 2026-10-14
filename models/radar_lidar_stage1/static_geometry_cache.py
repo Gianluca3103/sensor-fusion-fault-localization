@@ -66,7 +66,11 @@ class Stage1StaticGeometryCache:
                          frame.radar_calibration_path, frame.lidar_calibration_path):
                 stat = path.stat()
                 files.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
-            payload = (_SCHEMA, self.config.as_dict(), frame.radar_variant, files)
+            geometry_config = self.config.as_dict()
+            # Dropout changes features and scores, never sparse coordinates or
+            # clean-scan labels. Keep caches from the pre-dropout model valid.
+            geometry_config.pop("bottleneck_dropout", None)
+            payload = (_SCHEMA, geometry_config, frame.radar_variant, files)
             self._signatures[key] = sha256(json.dumps(
                 payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return self._signatures[key]

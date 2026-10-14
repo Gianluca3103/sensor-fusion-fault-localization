@@ -52,6 +52,7 @@ class Stage1Config:
     corr_scale_weights: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
     bottleneck_cross_attention_only: bool = False
     bottleneck_support_only: bool = False
+    bottleneck_dropout: float = 0.0
     support_stride: int = 2
     support_eval_threshold: float = 0.25
     support_loss_weight: float = 1.0
@@ -116,6 +117,8 @@ class Stage1Config:
                 raise ValueError("Support evaluation threshold must be in (0,1)")
             if min(self.support_loss_weight, self.bottleneck_distill_weight) <= 0 or self.support_abstention_weight < 0:
                 raise ValueError("Bottleneck support loss weights are invalid")
+        if not math.isfinite(self.bottleneck_dropout) or not 0 <= self.bottleneck_dropout < 1:
+            raise ValueError("Bottleneck dropout must be in [0, 1)")
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("Contrastive temperature must be positive")
         if self.negative_strategy not in ("nearest", "random_local") or self.num_negatives < 1:

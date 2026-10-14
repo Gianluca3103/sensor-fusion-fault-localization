@@ -132,6 +132,9 @@ class Stage1StaticCacheTests(unittest.TestCase):
             frame = _frame(root, "00001")
             cache = Stage1StaticGeometryCache(root / "cache", config, [frame])
             before = cache._signature("train", "00001")
+            changed_dropout = Stage1StaticGeometryCache(
+                root / "cache", replace(config, bottleneck_dropout=0.1), [frame])
+            self.assertEqual(before, changed_dropout._signature("train", "00001"))
             frame.radar_path.write_bytes(b"changed radar file contents")
             fresh = Stage1StaticGeometryCache(root / "cache", config, [frame])
             self.assertNotEqual(before, fresh._signature("train", "00001"))

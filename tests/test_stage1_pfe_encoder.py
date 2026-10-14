@@ -33,11 +33,14 @@ class PFEEncoderTests(unittest.TestCase):
         self.assertEqual(config.growth_scales, ())
         self.assertTrue(config.bottleneck_cross_attention_only)
         self.assertEqual(config.corr_scale_weights, (0., 0., 0., 1.))
+        self.assertEqual(config.bottleneck_dropout, 0.1)
 
     def test_old_checkpoints_keep_native_backend(self):
         old = Stage1Config().as_dict()
         old.pop("encoder_backend")
+        old.pop("bottleneck_dropout")
         self.assertEqual(config_from_dict(old).encoder_backend, "native")
+        self.assertEqual(config_from_dict(old).bottleneck_dropout, 0.0)
         self.assertFalse(config_from_dict(old).bottleneck_cross_attention_only)
 
     def test_cross_modal_comparison_only_uses_bottleneck(self):

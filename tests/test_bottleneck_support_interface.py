@@ -51,6 +51,49 @@ class ReferenceConv(torch.nn.Module):
 
 
 class BottleneckInterfaceTests(unittest.TestCase):
+    def test_dropout_regularizes_training_heads_but_not_inference(self):
+        grid = VoxelGrid((0., 0., 0.), (16., 16., 16.), (1., 1., 1.))
+        config = replace(Stage1Config(grid=grid, channels=(8, 16, 32, 64)),
+                         encoder_backend="pfe_spconv", growth_scales=(),
+                         bottleneck_cross_attention_only=True,
+                         bottleneck_support_only=True,
+                         corr_scale_weights=(0., 0., 0., 1.),
+                         confidence_weight=0., attention_dim=16,
+                         bottleneck_dropout=0.1)
+        xyz = torch.tensor([[1., 1., 1.], [2., 3., 3.], [3., 5., 6.],
+                            [6., 3., 9.], [7., 7., 12.], [9., 11., 4.],
+                            [12., 4., 6.], [14., 14., 14.]])
+        radar = torch.cat((xyz, torch.ones(8, 4)), dim=1)[None]
+        valid = torch.ones((1, 8), dtype=torch.bool)
+        reference = SimpleNamespace(SubMConv3d=ReferenceConv,
+                                    SparseConv3d=ReferenceConv,
+                                    SparseConvTensor=ReferenceTensor)
+        with patch.object(pfe_spconv, "spconv", reference):
+            model = BottleneckSupportStage1(config)
+            self.assertEqual(model.radar_only.dropout.p, 0.1)
+            self.assertEqual(model.correspondence.dropout.p, 0.1)
+            model.train()
+            torch.manual_seed(1)
+            first = model.forward_radar(radar, valid)
+            torch.manual_seed(2)
+            second = model.forward_radar(radar, valid)
+            self.assertFalse(torch.equal(first.confidence_region.features,
+                                         second.confidence_region.features))
+            model.eval()
+            with torch.no_grad():
+                first = model.forward_radar(radar, valid)
+                second = model.forward_radar(radar, valid)
+            torch.testing.assert_close(first.confidence_region.features,
+                                       second.confidence_region.features)
+            model.train()
+            lidar = torch.cat((xyz + .1, torch.ones(8, 1)), dim=1)[None]
+            optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4,
+                                           weight_decay=5e-4)
+            losses, _ = model.forward_train(radar, valid, lidar, valid)
+            self.assertTrue(torch.isfinite(losses["loss/total"]))
+            losses["loss/total"].backward()
+            optimizer.step()
+
     def test_training_inference_and_stage2_boundary(self):
         grid = VoxelGrid((0., 0., 0.), (16., 16., 16.), (1., 1., 1.))
         config = replace(Stage1Config(grid=grid, channels=(8, 16, 32, 64)),

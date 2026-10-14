@@ -17,6 +17,7 @@ python -u -m models.radar_lidar_stage1.train \
   --output-root /path/to/stage1_bottleneck_support \
   --config configs/radar_lidar_stage1_surface.json \
   --epochs 50 --batch-size 8 --validate-every 5 \
+  --weight-decay 0.0005 \
   --selection-metric support_f1 --no-object-instances \
   --num-workers 2 --device cuda
 ```
@@ -34,6 +35,13 @@ Use `--static-cache-root /path/to/cache` to put it on another volume or
 `--no-static-cache` to compare with uncached execution. The progress bar and
 epoch metrics report reused and built frame counts. Loss statistics stay on
 the GPU until periodic progress updates and the epoch summary.
+The active config uses 0.1 dropout in the training-only correspondence
+projection and the radar-only bottleneck and support heads. Dropout is disabled
+for validation and export. Changing dropout or optimizer weight decay does not
+change the fixed cache geometry, so a new run can use an existing cache with
+`--static-cache-root`. Use a new output root and train from the start when
+comparing these regularization settings; a checkpoint from the prior config
+cannot be resumed into the changed model config.
 
 To build the entire cache before resuming a run, use its `last.ckpt` so the
 dataset variant and grid are taken from that run:

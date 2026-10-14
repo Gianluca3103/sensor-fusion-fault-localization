@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import torch
 from torch.utils.data import DataLoader
@@ -52,15 +53,21 @@ def train(args, config):
                           pin_memory=args.device.startswith("cuda")),
     }
     model = BottleneckSupportStage1(config).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
+                                  weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     start_epoch, step, best = 1, 0, float("-inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=args.device, weights_only=False)
-        if checkpoint.get("stage1_interface") != "bottleneck_support_v1" or checkpoint["config"] != config.as_dict():
+        from .train import config_from_dict
+        if (checkpoint.get("stage1_interface") != "bottleneck_support_v1"
+                or config_from_dict(checkpoint["config"]) != config):
             raise ValueError("Only a matching bottleneck-support checkpoint can be resumed")
         if checkpoint.get("data", {}).get("radar_variant") != args.radar_variant:
             raise ValueError("Resume radar variant differs from the original training data")
+        saved_weight_decay = checkpoint["optimizer"]["param_groups"][0]["weight_decay"]
+        if not math.isclose(saved_weight_decay, args.weight_decay, rel_tol=0, abs_tol=1e-12):
+            raise ValueError("Resume weight decay differs from the original optimizer")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -72,7 +79,10 @@ def train(args, config):
             raise ValueError("Existing best checkpoint is from another Stage-I interface")
         best = selected.get("validation", {}).get("support_f1", float("-inf"))
     provenance = {"vod_root": str(args.vod_root.resolve()), "radar_variant": args.radar_variant,
-                  "train_frames": len(train_set), "val_frames": len(val_set)}
+                  "train_frames": len(train_set), "val_frames": len(val_set),
+                  "learning_rate": args.learning_rate, "weight_decay": args.weight_decay,
+                  "batch_size": args.batch_size,
+                  "grad_accum_steps": args.grad_accum_steps}
     print(f"Bottleneck Stage I: train={len(train_set)} val={len(val_set)} "
           f"support stride={config.support_stride} static cache="
           f"{static_cache.root if static_cache is not None else 'off'}", flush=True)

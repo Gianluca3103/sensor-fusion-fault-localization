@@ -43,6 +43,7 @@ class RadarOnlyBottleneckEncoder(nn.Module):
             nn.Linear(config.attention_dim + config.channels[1] + 4, config.channels[-1]),
             nn.LayerNorm(config.channels[-1]), nn.SiLU(),
             nn.Linear(config.channels[-1], 1))
+        self.dropout = nn.Dropout(config.bottleneck_dropout)
         self.confidence_calibrated = False
         self.confidence_trained = True
 
@@ -52,7 +53,9 @@ class RadarOnlyBottleneckEncoder(nn.Module):
                               defer_diagnostics=defer_diagnostics, check_finite=check_finite)
         levels, _ = self.backbone(sites, defer_diagnostics=defer_diagnostics)
         coarse = levels[-1]
-        lidar_aware = coarse.replace_features(F.normalize(self.student(coarse.features), dim=-1))
+        student_hidden = self.student[:3](coarse.features)
+        lidar_aware = coarse.replace_features(F.normalize(
+            self.student[3](self.dropout(student_hidden)), dim=-1))
         support, logits = self._support_field(lidar_aware, levels[1])
         return BottleneckSupportOutput(lidar_aware, support), levels, logits
 
@@ -96,8 +99,10 @@ class RadarOnlyBottleneckEncoder(nn.Module):
         else:
             matched = torch.zeros(len(queries), dtype=torch.bool, device=queries.device)
             skip = coarse_features.new_zeros((len(queries), fine.features.shape[1]))
-        logits = self.support_head(torch.cat((coarse_features, skip, relative,
-                                              matched[:, None].to(coarse_features.dtype)), dim=-1))
+        support_input = torch.cat((coarse_features, skip, relative,
+                                   matched[:, None].to(coarse_features.dtype)), dim=-1)
+        support_hidden = self.support_head[:3](support_input)
+        logits = self.support_head[3](self.dropout(support_hidden))
         support = SparseSites._from_validated(coordinates, torch.sigmoid(logits), shape, 2)
         return support, logits
 
@@ -114,7 +119,8 @@ class BottleneckSupportStage1(nn.Module):
         self.lidar_point = PFEPointVoxelEncoder(config.grid, "lidar")
         self.lidar_backbone = PFESpconvBackbone(config.channels)
         self.correspondence = LocalCorrespondence(config.channels[-1], config.channels[-1],
-                                                   config.attention_dim)
+                                                   config.attention_dim,
+                                                   dropout=config.bottleneck_dropout)
 
     def forward_radar(self, radar_points, radar_valid) -> BottleneckSupportOutput:
         return self.radar_only(radar_points, radar_valid)
